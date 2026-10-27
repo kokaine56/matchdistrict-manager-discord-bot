@@ -1,12 +1,15 @@
 # MatchDistrict Manager Discord Bot
 
 Standalone Discord Bot for the MatchDistrict gaming community.
-- Sends personalized welcome direct messages (DMs) to every player joining the Discord server.
-- Supports **prefix commands** with default prefix `.`:
+- Sends personalized welcome direct messages (DMs) to players joining the server (enabled per-server via `.setup`).
+- Creates a private admin log channel (`#matchdistrict-logs`) where all welcome DM delivery logs are posted in real-time.
+- Supports **prefix commands** (default prefix `.`):
+  - `.setup` — *(Admin only)* Enable welcome DMs on the server & automatically create the private `#matchdistrict-logs` channel.
+  - `.status` — Check whether welcome messaging is currently active on the server.
+  - `.website` — Display the official MatchDistrict platform URL and features.
   - `.ping` — Check bot response time & WebSocket latency.
   - `.help` — Display list of available commands and bot help.
-  - `.website` — Display the official MatchDistrict platform URL.
-- Supports equivalent slash commands: `/ping`, `/help`, `/website`.
+- Supports equivalent slash commands: `/setup`, `/status`, `/ping`, `/help`, `/website`.
 - Built-in HTTP health check endpoint for zero-configuration deployment on hosting platforms like Render, Railway, Fly.io, or Docker.
 
 ---
@@ -21,19 +24,38 @@ Standalone Discord Bot for the MatchDistrict gaming community.
 
 ### 2. Enable Privileged Gateway Intents (CRITICAL)
 On the **Bot** tab, scroll down to the **Privileged Gateway Intents** section:
-1. Toggle **ON** the switch for **SERVER MEMBERS INTENT** (allows sending welcome DMs to new members).
-2. Toggle **ON** the switch for **MESSAGE CONTENT INTENT** (allows bot to read and respond to `.` prefix commands like `.ping`, `.help`, `.website`).
+1. Toggle **ON** the switch for **SERVER MEMBERS INTENT** (allows bot to detect when new members join).
+2. Toggle **ON** the switch for **MESSAGE CONTENT INTENT** (allows bot to read `.` prefix commands like `.setup`, `.ping`, `.help`, `.website`).
 3. Click **Save Changes** at the bottom of the page.
 
-### 3. Generate Invite Link
+### 3. Generate Invite Link & Permissions
 1. Go to **OAuth2** -> **OAuth2 URL Generator**.
 2. Under **Scopes**, select:
    - `bot`
    - `applications.commands` (for slash commands)
 3. Under **Bot Permissions**, select:
+   - `Manage Channels` (required for `.setup` to create the private `#matchdistrict-logs` channel)
    - `Send Messages`
+   - `Embed Links`
    - `Read Message History`
 4. Copy the generated URL at the bottom and open it in a browser to invite the bot to your server.
+
+---
+
+## Server Setup Workflow (For Server Admins)
+
+1. Invite the bot to your Discord server.
+2. An Administrator runs:
+   ```text
+   .setup
+   ```
+3. The bot will:
+   - Enable welcome DMs for all new members joining that server.
+   - Automatically create a private `#matchdistrict-logs` text channel visible only to Server Administrators and the bot.
+   - Post a confirmation in the current channel and an activation receipt in `#matchdistrict-logs`.
+4. Whenever a new player joins:
+   - The bot directly DMs them the welcome greeting and website details (`https://matchdistrict.in`).
+   - The bot records a delivery log (success/failure) in `#matchdistrict-logs`.
 
 ---
 
