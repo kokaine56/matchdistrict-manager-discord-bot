@@ -50,23 +50,31 @@ function getBotToken() {
 
 /**
  * Formats the official MatchDistrict welcome message for a new member.
+ * Sends complete platform details, tournaments info, and website link.
  * @param {string} username - Personalized name of the member.
+ * @param {string} [guildName] - Name of the Discord server.
  * @returns {string} The formatted welcome message.
  */
-export function buildWelcomeMessage(username) {
-  return `Hey ${username}! Welcome to MatchDistrict!
+export function buildWelcomeMessage(username, guildName = 'MatchDistrict') {
+  return `Hey **${username}**! Welcome to **${guildName}**! 🎉
 
-We're glad to have you join our gaming community.
+We are thrilled to have you in our esports gaming community!
 
-Discover tournaments, compete with other players, and stay updated with the latest esports events.
+🌐 **Official Website & Platform Details:**
+• 🔗 **Website:** https://matchdistrict.in
+• 🏆 **Tournaments & Scrims:** Join daily competitive cups, custom rooms, and paid/free tournaments (BGMI, Free Fire, Valorant, CODM).
+• 📊 **Live Leaderboards:** Real-time player statistics, match results, standings, and automated qualification tracking.
+• 👥 **Team Management:** Create or join esports squads, manage rosters, and register with your teammates.
+• 💰 **Verified Prize Payouts:** Secure, transparent payouts directly to tournament winners.
 
-Visit our website: https://matchdistrict.in
+🤖 **Server Bot Commands (Prefix: \`.\`):**
+• \`.website\` — Get direct links to the MatchDistrict platform
+• \`.ping\` — Check bot latency & status
+• \`.help\` — View available commands
 
-Check out the server's rules, announcements, and tournament channels to get started.
+Have fun, play fair, and see you in the battleground! 🚀
 
-Good luck, and have fun!
-
-— Team MatchDistrict`;
+— **Team MatchDistrict**`;
 }
 
 /**
@@ -215,26 +223,35 @@ client.on(Events.GuildMemberAdd, async (member) => {
 
     const username = member.user?.globalName || member.user?.username || member.displayName || 'Gamer';
     const userTag = member.user?.tag || member.user?.username || member.id;
-    const guildName = member.guild?.name || 'MatchDistrict Server';
+    const guildName = member.guild?.name || 'MatchDistrict';
 
     console.log(`[Discord Bot] 👤 New member joined "${guildName}": ${userTag} (${member.id})`);
 
-    const welcomeMessage = buildWelcomeMessage(username);
+    const welcomeMessage = buildWelcomeMessage(username, guildName);
 
     // Attempt to deliver the welcome message via Direct Message (DM)
-    await member.send(welcomeMessage);
-
-    console.log(`[Discord Bot] ✅ Successfully sent welcome DM to ${userTag} (${member.id})`);
-  } catch (error) {
-    const userTag = member?.user?.tag || member?.user?.username || member?.id || 'Unknown';
-
-    // Handle members with DMs disabled (Discord error code 50007: "Cannot send messages to this user")
-    if (error?.code === 50007) {
-      console.warn(`[Discord Bot] ⚠️ Could not send welcome DM to ${userTag} (${member?.id}): User has direct messages disabled or has blocked the bot (Error 50007).`);
-    } else {
-      console.warn(`[Discord Bot] ⚠️ Could not send welcome DM to ${userTag} (${member?.id}): ${error.message}`);
+    try {
+      await member.send(welcomeMessage);
+      console.log(`[Discord Bot] ✅ Successfully sent welcome DM to ${userTag} (${member.id})`);
+    } catch (dmError) {
+      // Handle members with DMs disabled (Discord error code 50007: "Cannot send messages to this user")
+      if (dmError?.code === 50007) {
+        console.warn(`[Discord Bot] ⚠️ Could not send welcome DM to ${userTag} (${member.id}): User has DMs disabled or blocked. Attempting fallback to public welcome channel.`);
+        // Fallback: Post welcoming greeting with website link in system/welcome channel if available
+        const welcomeChannel = member.guild?.systemChannel || member.guild?.channels?.cache?.find(c =>
+          c.isTextBased?.() && /welcome|general|lounge|chat/i.test(c.name)
+        );
+        if (welcomeChannel && welcomeChannel.permissionsFor(member.guild.members.me)?.has('SendMessages')) {
+          await welcomeChannel.send(
+            `Hey ${member}! Welcome to **${guildName}**! 🎉 Check out our platform and tournaments at https://matchdistrict.in *(Enable DMs from server members to receive full tournament updates!)*`
+          );
+        }
+      } else {
+        console.warn(`[Discord Bot] ⚠️ Could not send welcome DM to ${userTag} (${member.id}): ${dmError.message}`);
+      }
     }
-    // Failed DM must never crash or stop the bot
+  } catch (error) {
+    console.warn('[Discord Bot] ⚠️ Unexpected error in GuildMemberAdd handler:', error.message);
   }
 });
 
