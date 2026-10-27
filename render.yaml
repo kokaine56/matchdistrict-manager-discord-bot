@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: matchdistrict-manager-discord-bot
+    runtime: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false

@@ -1,0 +1,26 @@
+{
+  "name": "matchdistrict-manager-discord-bot",
+  "version": "1.0.0",
+  "description": "MatchDistrict Discord Welcome & Management Bot",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.4.7"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "matchdistrict",
+    "discord",
+    "bot",
+    "welcome"
+  ],
+  "author": "MatchDistrict Team",
+  "license": "UNLICENSED"
+}
