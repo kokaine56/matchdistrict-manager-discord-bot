@@ -70,16 +70,50 @@ Good luck, and have fun!
 }
 
 /**
- * Initialize Discord Client with minimal required intents and partials.
- * Only GatewayIntentBits.Guilds and GatewayIntentBits.GuildMembers (Server Members Intent)
- * are requested. Administrator permission is NOT requested or required.
+ * Bot Command Prefix (Default: '.')
+ */
+export const PREFIX = process.env.DISCORD_PREFIX || '.';
+
+/**
+ * Command response templates
+ */
+export function getPingResponse(roundtripLatency, wsLatency) {
+  return `🏓 **Pong!**\n• Latency: **${roundtripLatency}ms**\n• WebSocket API: **${wsLatency >= 0 ? wsLatency : 0}ms**`;
+}
+
+export function getHelpResponse(prefix = PREFIX) {
+  return (
+    `🎮 **MatchDistrict Bot Commands**\n` +
+    `Prefix: \`${prefix}\`\n\n` +
+    `• \`${prefix}ping\` — Check bot response time & WebSocket latency\n` +
+    `• \`${prefix}website\` — Get the official MatchDistrict platform link\n` +
+    `• \`${prefix}help\` — Show this list of commands\n\n` +
+    `🌐 Visit our platform: https://matchdistrict.in\n` +
+    `— Team MatchDistrict`
+  );
+}
+
+export function getWebsiteResponse() {
+  return (
+    `🌐 **MatchDistrict Platform**\n` +
+    `Official Website: https://matchdistrict.in\n\n` +
+    `Compete in esports tournaments, discover teams, and climb live leaderboards!`
+  );
+}
+
+/**
+ * Initialize Discord Client with required intents and partials.
+ * Includes Guilds, GuildMembers (welcome DMs), GuildMessages, and MessageContent (prefix commands).
  */
 export const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers, // Privileged Server Members Intent
+    GatewayIntentBits.GuildMessages, // Message receive intent
+    GatewayIntentBits.MessageContent, // Privileged Message Content Intent (for .prefix commands)
+    GatewayIntentBits.DirectMessages,
   ],
-  partials: [Partials.GuildMember, Partials.User],
+  partials: [Partials.GuildMember, Partials.User, Partials.Channel, Partials.Message],
 });
 
 /**
@@ -90,19 +124,59 @@ const COMMANDS = [
     name: 'ping',
     description: 'Check MatchDistrict bot response time and WebSocket latency',
   },
+  {
+    name: 'help',
+    description: 'Show MatchDistrict bot commands and prefix information',
+  },
+  {
+    name: 'website',
+    description: 'Get the official MatchDistrict platform website link',
+  },
 ];
 
 // Bot ready event listener
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`[Discord Bot] 🚀 Logged in as ${readyClient.user.tag} (ID: ${readyClient.user.id})`);
-  console.log(`[Discord Bot] 🎮 MatchDistrict Welcome Bot is active across ${readyClient.guilds.cache.size} server(s).`);
+  console.log(`[Discord Bot] 🎮 MatchDistrict Bot is active across ${readyClient.guilds.cache.size} server(s).`);
+  console.log(`[Discord Bot] ⚡ Active command prefix: "${PREFIX}" (.ping, .help, .website)`);
 
   try {
-    // Automatically register /ping slash command with Discord API
+    // Automatically register slash commands with Discord API
     await readyClient.application.commands.set(COMMANDS);
-    console.log('[Discord Bot] ⚡ Registered /ping slash command successfully.');
+    console.log('[Discord Bot] ⚡ Registered slash commands successfully.');
   } catch (error) {
-    console.warn('[Discord Bot] ⚠️ Could not register /ping slash command:', error.message);
+    console.warn('[Discord Bot] ⚠️ Could not register slash commands:', error.message);
+  }
+});
+
+// Handle Prefix Commands (.ping, .help, .website)
+client.on(Events.MessageCreate, async (message) => {
+  try {
+    // Ignore bots and empty messages
+    if (!message || message.author?.bot) return;
+
+    const content = message.content?.trim();
+    if (!content || !content.startsWith(PREFIX)) return;
+
+    // Parse command and arguments
+    const withoutPrefix = content.slice(PREFIX.length).trim();
+    if (!withoutPrefix) return;
+
+    const [rawCmd] = withoutPrefix.split(/\s+/);
+    const cmd = rawCmd.toLowerCase();
+
+    if (cmd === 'ping') {
+      const sent = await message.reply('🏓 Pinging...');
+      const roundtripLatency = sent.createdTimestamp - message.createdTimestamp;
+      const wsLatency = Math.round(message.client.ws.ping);
+      await sent.edit(getPingResponse(roundtripLatency, wsLatency));
+    } else if (cmd === 'help') {
+      await message.reply(getHelpResponse(PREFIX));
+    } else if (cmd === 'website' || cmd === 'site') {
+      await message.reply(getWebsiteResponse());
+    }
+  } catch (error) {
+    console.warn('[Discord Bot] ⚠️ Error executing prefix command:', error.message);
   }
 });
 
@@ -110,8 +184,8 @@ client.once(Events.ClientReady, async (readyClient) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  if (interaction.commandName === 'ping') {
-    try {
+  try {
+    if (interaction.commandName === 'ping') {
       const sent = await interaction.reply({
         content: '🏓 Pinging...',
         fetchReply: true,
@@ -120,12 +194,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const roundtripLatency = sent.createdTimestamp - interaction.createdTimestamp;
       const wsLatency = Math.round(interaction.client.ws.ping);
 
-      await interaction.editReply(
-        `🏓 **Pong!**\n• Latency: **${roundtripLatency}ms**\n• WebSocket API: **${wsLatency >= 0 ? wsLatency : 0}ms**`
-      );
-    } catch (error) {
-      console.warn('[Discord Bot] ⚠️ Error executing /ping command:', error.message);
+      await interaction.editReply(getPingResponse(roundtripLatency, wsLatency));
+    } else if (interaction.commandName === 'help') {
+      await interaction.reply(getHelpResponse(PREFIX));
+    } else if (interaction.commandName === 'website') {
+      await interaction.reply(getWebsiteResponse());
     }
+  } catch (error) {
+    console.warn(`[Discord Bot] ⚠️ Error executing /${interaction.commandName} command:`, error.message);
   }
 });
 
@@ -194,7 +270,9 @@ export async function startBot(tokenOverride) {
   } catch (error) {
     console.error('[Discord Bot] ❌ Connection failed:');
     if (error.message?.includes('Privileged intent') || error.message?.includes('disallowed intent')) {
-      console.error('[Discord Bot] 🚨 Privileged Gateway Intent missing! You MUST enable "SERVER MEMBERS INTENT" under Bot -> Privileged Gateway Intents in the Discord Developer Portal.');
+      console.error('[Discord Bot] 🚨 Privileged Gateway Intent missing! In the Discord Developer Portal, under Bot -> Privileged Gateway Intents, ensure you enable:');
+      console.error('[Discord Bot]    1. "SERVER MEMBERS INTENT" (for welcome DMs)');
+      console.error('[Discord Bot]    2. "MESSAGE CONTENT INTENT" (for prefix commands .ping, .help, .website)');
     } else if (error.message?.includes('An invalid token')) {
       console.error('[Discord Bot] 🚨 The provided DISCORD_BOT_TOKEN is invalid. Please double-check your bot token.');
     } else {

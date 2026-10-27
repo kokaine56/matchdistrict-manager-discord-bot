@@ -2,7 +2,11 @@
 
 Standalone Discord Bot for the MatchDistrict gaming community.
 - Sends personalized welcome direct messages (DMs) to every player joining the Discord server.
-- Supports the `/ping` slash command for latency and health verification.
+- Supports **prefix commands** with default prefix `.`:
+  - `.ping` — Check bot response time & WebSocket latency.
+  - `.help` — Display list of available commands and bot help.
+  - `.website` — Display the official MatchDistrict platform URL.
+- Supports equivalent slash commands: `/ping`, `/help`, `/website`.
 - Built-in HTTP health check endpoint for zero-configuration deployment on hosting platforms like Render, Railway, Fly.io, or Docker.
 
 ---
@@ -15,17 +19,17 @@ Standalone Discord Bot for the MatchDistrict gaming community.
 3. Navigate to the **Bot** tab on the left sidebar.
 4. Click **Reset Token** and copy your bot token securely (keep it confidential!).
 
-### 2. Enable Server Members Intent (CRITICAL)
-1. On the **Bot** tab, scroll down to the **Privileged Gateway Intents** section.
-2. Toggle **ON** the switch for **SERVER MEMBERS INTENT**.
+### 2. Enable Privileged Gateway Intents (CRITICAL)
+On the **Bot** tab, scroll down to the **Privileged Gateway Intents** section:
+1. Toggle **ON** the switch for **SERVER MEMBERS INTENT** (allows sending welcome DMs to new members).
+2. Toggle **ON** the switch for **MESSAGE CONTENT INTENT** (allows bot to read and respond to `.` prefix commands like `.ping`, `.help`, `.website`).
 3. Click **Save Changes** at the bottom of the page.
-> ⚠️ **Notice**: If this intent is disabled, the bot will not detect when new members join the server.
 
 ### 3. Generate Invite Link
 1. Go to **OAuth2** -> **OAuth2 URL Generator**.
 2. Under **Scopes**, select:
    - `bot`
-   - `applications.commands` (for `/ping` command)
+   - `applications.commands` (for slash commands)
 3. Under **Bot Permissions**, select:
    - `Send Messages`
    - `Read Message History`
