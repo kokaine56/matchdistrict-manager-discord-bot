@@ -288,45 +288,11 @@ export const client = new Client({
   partials: [Partials.GuildMember, Partials.User, Partials.Channel, Partials.Message],
 });
 
-/**
- * Application Slash Commands definition
- */
-const COMMANDS = [
-  {
-    name: 'setup',
-    description: 'Enable welcome DMs and create the private log channel (Admin only)',
-  },
-  {
-    name: 'status',
-    description: 'Check if welcome DMs are enabled on this server',
-  },
-  {
-    name: 'ping',
-    description: 'Check MatchDistrict bot response time and WebSocket latency',
-  },
-  {
-    name: 'help',
-    description: 'Show MatchDistrict bot commands and prefix information',
-  },
-  {
-    name: 'website',
-    description: 'Get the official MatchDistrict platform website link',
-  },
-];
-
 // Bot ready event listener
-client.once(Events.ClientReady, async (readyClient) => {
+client.once(Events.ClientReady, (readyClient) => {
   console.log(`[Discord Bot] 🚀 Logged in as ${readyClient.user.tag} (ID: ${readyClient.user.id})`);
   console.log(`[Discord Bot] 🎮 MatchDistrict Bot is active across ${readyClient.guilds.cache.size} server(s).`);
-  console.log(`[Discord Bot] ⚡ Active command prefix: "${PREFIX}" (.setup, .status, .ping, .help, .website)`);
-
-  try {
-    // Automatically register slash commands with Discord API
-    await readyClient.application.commands.set(COMMANDS);
-    console.log('[Discord Bot] ⚡ Registered slash commands successfully.');
-  } catch (error) {
-    console.warn('[Discord Bot] ⚠️ Could not register slash commands:', error.message);
-  }
+  console.log(`[Discord Bot] ⚡ Command prefix: "${PREFIX}" (Prefix commands: ${PREFIX}setup, ${PREFIX}status, ${PREFIX}ping, ${PREFIX}help, ${PREFIX}website)`);
 });
 
 // Handle Prefix Commands (.setup, .status, .ping, .help, .website)
@@ -361,41 +327,6 @@ client.on(Events.MessageCreate, async (message) => {
     }
   } catch (error) {
     console.warn('[Discord Bot] ⚠️ Error executing prefix command:', error.message);
-  }
-});
-
-// Handle Slash Commands (Interactions)
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
-  try {
-    if (interaction.commandName === 'setup') {
-      await interaction.deferReply();
-      await handleSetupCommand(interaction.guild, interaction.member, async (text) => {
-        if (interaction.deferred || interaction.replied) {
-          return interaction.editReply(text);
-        }
-        return interaction.reply(text);
-      });
-    } else if (interaction.commandName === 'status') {
-      await handleStatusCommand(interaction.guild, (text) => interaction.reply(text));
-    } else if (interaction.commandName === 'ping') {
-      const sent = await interaction.reply({
-        content: '🏓 Pinging...',
-        fetchReply: true,
-      });
-
-      const roundtripLatency = sent.createdTimestamp - interaction.createdTimestamp;
-      const wsLatency = Math.round(interaction.client.ws.ping);
-
-      await interaction.editReply(getPingResponse(roundtripLatency, wsLatency));
-    } else if (interaction.commandName === 'help') {
-      await interaction.reply(getHelpResponse(PREFIX));
-    } else if (interaction.commandName === 'website') {
-      await interaction.reply(getWebsiteResponse());
-    }
-  } catch (error) {
-    console.warn(`[Discord Bot] ⚠️ Error executing /${interaction.commandName} command:`, error.message);
   }
 });
 

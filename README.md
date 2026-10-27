@@ -3,13 +3,12 @@
 Standalone Discord Bot for the MatchDistrict gaming community.
 - Sends personalized welcome direct messages (DMs) to players joining the server (enabled per-server via `.setup`).
 - Creates a private admin log channel (`#matchdistrict-logs`) where all welcome DM delivery logs are posted in real-time.
-- Supports **prefix commands** (default prefix `.`):
+- **Exclusive Command Prefix: `.` (No slash commands)**:
   - `.setup` — *(Admin only)* Enable welcome DMs on the server & automatically create the private `#matchdistrict-logs` channel.
   - `.status` — Check whether welcome messaging is currently active on the server.
   - `.website` — Display the official MatchDistrict platform URL and features.
   - `.ping` — Check bot response time & WebSocket latency.
   - `.help` — Display list of available commands and bot help.
-- Supports equivalent slash commands: `/setup`, `/status`, `/ping`, `/help`, `/website`.
 - Built-in HTTP health check endpoint for zero-configuration deployment on hosting platforms like Render, Railway, Fly.io, or Docker.
 
 ---
@@ -32,7 +31,6 @@ On the **Bot** tab, scroll down to the **Privileged Gateway Intents** section:
 1. Go to **OAuth2** -> **OAuth2 URL Generator**.
 2. Under **Scopes**, select:
    - `bot`
-   - `applications.commands` (for slash commands)
 3. Under **Bot Permissions**, select:
    - `Manage Channels` (required for `.setup` to create the private `#matchdistrict-logs` channel)
    - `Send Messages`
