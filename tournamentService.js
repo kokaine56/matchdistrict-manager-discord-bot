@@ -32,7 +32,6 @@ import {
   saveTournamentToDb,
   deleteTournamentFromDb,
   getTournamentFromDb,
-  getAllTournamentsFromDb,
   recordAuditLog,
   enforceSingleActiveRoundInDb,
   findTournamentByBotCommandsChannel,
@@ -492,23 +491,6 @@ function buildTournamentSelectionRows(tournaments) {
   return rows;
 }
 
-async function getCurrentMongoTournamentList(guildId, showAll = false) {
-  const records = await getAllTournamentsFromDb(guildId);
-  return records
-    .filter((record) => record?.tournamentId && !['deleted', 'deletion_pending', 'deleting'].includes(record.deletionStatus) && record.setupStatus !== 'deleted')
-    .map((record) => ({
-      id: record.tournamentId,
-      title: record.tournamentTitle || record.title || record.tournamentId,
-      game: record.game || 'Esports',
-      status: record.status || (record.setupStatus === 'active' ? 'active' : 'draft'),
-      is_draft: record.is_draft ?? record.setupStatus !== 'active',
-      registration_status: record.registration_status || 'open',
-      slots_filled: record.slots_filled || 0,
-      slots_total: record.slots_total || 'Unlimited',
-    }))
-    .filter((record) => showAll || !record.is_draft);
-}
-
 export async function handleTournamentSelectionButton(interaction) {
   const tournamentId = String(interaction.customId || '').split(':')[3];
   if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate().catch(() => {});
@@ -518,10 +500,20 @@ export async function handleTournamentSelectionButton(interaction) {
       await interaction.followUp({ content: access.reason, ephemeral: true }).catch(() => {});
       return;
     }
-    const tournaments = await getCurrentMongoTournamentList(interaction.guild.id, true);
+    let organiserId = access.organiserId;
+    if (!organiserId) {
+      const organiserLink = await getOrganiserLinkForGuild(interaction.guild.id);
+      organiserId = organiserLink?.organiserId || null;
+      if (organiserLink?.status === 'linked') {
+        guildSettingsCache[interaction.guild.id] ||= {};
+        guildSettingsCache[interaction.guild.id].organiserLink = organiserLink;
+      }
+    }
+    if (access.isOrganiserLinked && !organiserId) throw new Error('The linked organiser account ID is missing from MongoDB. Re-link this server with its organiser code.');
+    const tournaments = await fetchTournamentsFromBackend({ status: 'all', organizerId });
     if (!tournaments.some((tournament) => String(tournament.id) === String(tournamentId))) {
       await interaction.editReply({
-        content: tournaments.length ? formatTournamentListPages(tournaments, { pageSize: 25, showAll: true })[0] : 'ℹ️ No current tournaments found in MongoDB.',
+        content: tournaments.length ? formatTournamentListPages(tournaments, { pageSize: 25, showAll: true })[0] : 'ℹ️ **No Tournaments Found:** MatchDistrict returned an empty tournament list.',
         components: buildTournamentSelectionRows(tournaments),
       });
       return;
@@ -529,7 +521,7 @@ export async function handleTournamentSelectionButton(interaction) {
     await handleSelectTournamentCommand(interaction.guild, interaction.member, tournamentId, (text) => interaction.editReply({ content: typeof text === 'string' ? text : text.content }));
   } catch (error) {
     console.error('[Discord Bot] Tournament selection failed:', error);
-    await interaction.editReply({ content: `❌ Could not load the current tournament list: ${error.message}`, components: [] }).catch(() => {});
+    await interaction.editReply({ content: `❌ **MatchDistrict fetch failed:** ${error.message}`, components: [] }).catch(() => {});
   }
 }
 
@@ -2035,6 +2027,13 @@ export async function handleSelectTournamentCommand(guild, member, tournamentId,
  * Handles the ".list tournament" command.
  */
 export async function handleListTournamentCommand(guild, member, args = [], replyFn) {
+  if (guild?.id && !guildSettingsCache[guild.id]?.organiserLink && isMongoConnected()) {
+    const organiserLink = await getOrganiserLinkForGuild(guild.id);
+    if (organiserLink?.status === 'linked') {
+      guildSettingsCache[guild.id] ||= {};
+      guildSettingsCache[guild.id].organiserLink = organiserLink;
+    }
+  }
   const access = checkTournamentAccess(guild, member);
   if (!access.allowed) {
     await replyFn(access.reason);
@@ -2052,7 +2051,13 @@ export async function handleListTournamentCommand(guild, member, args = [], repl
   }
 
   try {
-    const tournaments = await getCurrentMongoTournamentList(guild.id, showAll);
+    if (access.isOrganiserLinked && !access.organiserId) {
+      throw new Error('The linked organiser account ID is missing from MongoDB. Re-link this server with its organiser code.');
+    }
+    const tournaments = await fetchTournamentsFromBackend({
+      status: showAll ? 'all' : 'published',
+      organizerId: access.organiserId,
+    });
 
     if (tournaments.length === 0) {
       if (access.organiserId) {
@@ -2074,7 +2079,8 @@ export async function handleListTournamentCommand(guild, member, args = [], repl
     const pageItems = tournaments.slice((currentPage - 1) * pageSize, currentPage * pageSize);
     await replyFn({ content: pages[0], components: buildTournamentSelectionRows(pageItems) });
   } catch (err) {
-    await replyFn(`❌ **Error retrieving tournaments from MatchDistrict:**\n> ${err.message}`);
+    console.error(`[Discord Bot] Failed to fetch tournaments for guild ${guild.id} (organiser ${access.organiserId || 'all'}):`, err);
+    await replyFn(`❌ **MatchDistrict fetch failed:** Could not retrieve tournaments. ${err.message}`);
   }
 }
 
