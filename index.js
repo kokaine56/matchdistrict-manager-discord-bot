@@ -89,6 +89,7 @@ import {
   generateEmptyRoundGroups,
   handleDashCommand,
   handleDashboardNavigationInteraction,
+  handleDashboardQualifySelection,
   fetchTournamentRegistrationsFromBackend,
   handlePermanentTournamentDeleteCommand,
   executeTournamentPermanentDeletion,
@@ -213,6 +214,7 @@ export {
   generateEmptyRoundGroups,
   handleDashCommand,
   handleDashboardNavigationInteraction,
+  handleDashboardQualifySelection,
   fetchTournamentRegistrationsFromBackend,
   handlePermanentTournamentDeleteCommand,
   executeTournamentPermanentDeletion,
@@ -2446,6 +2448,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     if (interaction.isStringSelectMenu() && (
+      interaction.customId?.startsWith('dash:qualify:select:') ||
       interaction.customId?.startsWith('md_tour_') ||
       interaction.customId?.startsWith('md_round_') ||
       interaction.customId?.startsWith('md_group_') ||
@@ -2453,6 +2456,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       interaction.customId?.startsWith('md_select_qualify_teams') ||
       interaction.customId === 'md_select_tournament'
     )) {
+      if (interaction.customId?.startsWith('dash:qualify:select:')) {
+        await handleDashboardQualifySelection(interaction);
+        return;
+      }
       await handleTournamentSelectMenuInteraction(interaction);
       return;
     }
