@@ -408,19 +408,21 @@ export function buildTournamentControlPanelEmbed(tournament, summary, channelsSt
       let totalSlots = 0;
       let occupiedSlots = 0;
       let lockedSlots = 0;
+      let unusedSlots = 0;
       let emptySlots = 0;
       for (const g of activeRound.groups) {
         for (const s of g.slots || []) {
           totalSlots++;
           if (s.status === 'LOCKED') lockedSlots++;
           else if (s.status === 'OCCUPIED') occupiedSlots++;
+          else if (s.status === 'UNUSED' || s.status === 'RESERVED') unusedSlots++;
           else emptySlots++;
         }
       }
       groupSlotStatusText =
-        `• **Active Groups:** **${totalGroups}** (${totalSlots} slots total)\n` +
-        `• **Group Slot Policy:** Exactly 16 slots/group (Slots 01-02 LOCKED, 14 assignable teams/group)\n` +
-        `• **Allocation Breakdown:** 🔒 **${lockedSlots}** locked | 🎮 **${occupiedSlots}** occupied | ⚪ **${emptySlots}** empty`;
+        `• **Active Groups:** **${totalGroups}** (${totalSlots} slots total, 25 slots/group)\n` +
+        `• **Group Slot Policy:** 16 teams/group (Slots 01-02 LOCKED, Slots 03-18 Teams, Slots 19-25 UNUSED)\n` +
+        `• **Allocation Breakdown:** 🔒 **${lockedSlots}** locked | 🎮 **${occupiedSlots}** occupied | ⚪ **${emptySlots}** empty | ⛔ **${unusedSlots}** unused`;
     } else {
       groupSlotStatusText = `• **Status:** Round configured in **Draft** state.\n• Click **Start Round** below to allocate registered teams into groups.`;
     }
@@ -2846,7 +2848,7 @@ export async function handleStartRoundButton(interaction, tournamentId) {
     const promptText = `⚠️ **Confirm Starting ${targetRound.name}**\n` +
       `This will execute the official allocation workflow:\n` +
       `• Fetch latest verified registrations from MatchDistrict backend\n` +
-      `• Divide eligible teams into groups of 16 (Slots 01 & 02 LOCKED, max 14 teams per group)\n` +
+      `• Divide eligible teams into groups of 16 across 25 slots (Slots 01-02 LOCKED, Slots 03-18 Teams, Slots 19-25 UNUSED)\n` +
       `• Create/reuse dedicated group roles and private ID/password channels\n` +
       `• Assign group roles to verified linked Discord players\n` +
       `• Publish allocation summary to <#${savedTournament.channels?.botCommandsId || 'bot-commands'}>\n\n` +
@@ -2933,8 +2935,8 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       }
 
       // Group & Slot Allocation Rules:
-      // Group size: exactly 16 slots. Slots 01 and 02 are LOCKED. Slots 03-16 are available (14 teams max per group).
-      const ASSIGNABLE_SLOTS_PER_GROUP = 14;
+      // Group size: exactly 25 slots. Slots 01-02: LOCKED. Slots 03-18: 16 teams. Slots 19-25: UNUSED.
+      const ASSIGNABLE_SLOTS_PER_GROUP = 16;
       const groupCount = Math.ceil(eligibleTeams.length / ASSIGNABLE_SLOTS_PER_GROUP) || 1;
 
       // Ensure canonical category exists
@@ -2958,7 +2960,8 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       for (let g = 1; g <= groupCount; g++) {
         const groupId = `${round.roundId}_g${g}`;
         const groupNumber = g;
-        const roleName = `${tourPrefix}-r${roundNum}-g${g}`;
+        const roleName = `${tournament.title} R${roundNum} G${g}`.slice(0, 100);
+        const altRoleName = `${tourPrefix}-r${roundNum}-g${g}`;
         const channelName = sanitizeChannelName(`${tourPrefix}-r${roundNum}-g${g}`);
 
         // 1. Create or reuse group role (no admin permissions)
@@ -2969,7 +2972,11 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
             await guild.roles.fetch(existingGroup.roleId).catch(() => null);
         }
         if (!groupRole && guild.roles) {
-          groupRole = guild.roles.cache.find((r) => r.name.toLowerCase() === roleName.toLowerCase()) || null;
+          groupRole = guild.roles.cache.find(
+            (r) =>
+              r.name.toLowerCase() === roleName.toLowerCase() ||
+              r.name.toLowerCase() === altRoleName.toLowerCase()
+          ) || null;
         }
         if (!groupRole && typeof guild.roles?.create === 'function') {
           groupRole = await guild.roles.create({
@@ -3044,13 +3051,14 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
           });
         }
 
-        // 3. Populate slots 1-16
+        // 3. Populate slots 1-25
         const slots = [
           { slotNumber: 1, status: 'LOCKED', label: 'LOCKED', teamId: null, teamName: null, members: [] },
           { slotNumber: 2, status: 'LOCKED', label: 'LOCKED', teamId: null, teamName: null, members: [] },
         ];
 
-        for (let s = 3; s <= 16; s++) {
+        // Slots 03–18: exactly 16 team positions
+        for (let s = 3; s <= 18; s++) {
           const teamIdx = (g - 1) * ASSIGNABLE_SLOTS_PER_GROUP + (s - 3);
           if (teamIdx < eligibleTeams.length) {
             const team = eligibleTeams[teamIdx];
@@ -3122,6 +3130,18 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
           }
         }
 
+        // Slots 19–25: "UNUSED" or "RESERVED"; do not assign teams to these positions
+        for (let s = 19; s <= 25; s++) {
+          slots.push({
+            slotNumber: s,
+            status: 'UNUSED',
+            label: 'UNUSED',
+            teamId: null,
+            teamName: null,
+            members: [],
+          });
+        }
+
         groups.push({
           groupId,
           groupNumber: g,
@@ -3157,7 +3177,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
 
       const successMsg = `✅ **${round.name} Started Successfully!**\n` +
         `• **Eligible Teams Allocated:** **${eligibleTeams.length}** across **${groupCount}** group(s)\n` +
-        `• **Capacity Policy:** Exactly 16 slots/group (Slots 01-02 LOCKED, 14 assignable teams/group)\n` +
+        `• **Capacity Policy:** Exactly 16 teams/group across 25 slots (Slots 01-02 LOCKED, Slots 03-18 Teams, Slots 19-25 UNUSED)\n` +
         `• **Group Roles & Channels:** **${groups.length}** private text channel(s) and role(s) configured\n` +
         `• **Group Roles Assigned:** **${totalAssignedMembers}** verified member(s)\n` +
         (unlinkedTeamsCount > 0 ? `• ⚠️ **Pending Links:** **${unlinkedTeamsCount}** team(s) have unlinked Discord accounts\n` : '') +
@@ -3214,7 +3234,7 @@ export async function handleTournamentSelectMenuInteraction(interaction) {
   const promptText = `⚠️ **Confirm Starting ${round.name}**\n` +
     `This will execute the official allocation workflow:\n` +
     `• Fetch latest verified registrations from MatchDistrict backend\n` +
-    `• Divide eligible teams into groups of 16 (Slots 01 & 02 LOCKED, max 14 teams per group)\n` +
+    `• Divide eligible teams into groups of 16 across 25 slots (Slots 01-02 LOCKED, Slots 03-18 Teams, Slots 19-25 UNUSED)\n` +
     `• Create/reuse dedicated group roles and private ID/password channels\n` +
     `• Assign group roles to verified linked Discord players\n` +
     `• Publish allocation summary to <#${savedTournament.channels?.botCommandsId || 'bot-commands'}>\n\n` +
@@ -3249,7 +3269,7 @@ export async function publishRoundAllocationSummary(guild, tournament, round, bo
   const header = `📊 **Round Allocation Summary — ${round.name}** (ID: \`${round.roundId}\`)\n` +
     `• **Tournament:** **${tournament.title}** (\`${tournament.id}\`)\n` +
     `• **Round Status:** 🟢 **${round.status}**\n` +
-    `• **Groups:** **${round.groups.length}** | **Capacity:** 16 slots per group (Slots 01-02 LOCKED, Slots 03–16 assigned)\n` +
+    `• **Groups:** **${round.groups.length}** | **Capacity:** 25 slots per group (Slots 01-02 LOCKED, Slots 03–18 Teams [max 16], Slots 19-25 UNUSED)\n` +
     `• **Allocated At:** <t:${Math.floor(new Date(round.startedAt || Date.now()).getTime() / 1000)}:f>\n` +
     `────────────────────────────────────────\n\n`;
 
@@ -3269,6 +3289,8 @@ export async function publishRoundAllocationSummary(guild, tournament, round, bo
       } else if (slot.status === 'OCCUPIED') {
         const linkedCount = Array.isArray(slot.members) ? slot.members.length : 0;
         groupText += `  • 🎮 **Slot ${slotNumStr}:** **${slot.teamName}** (${linkedCount} linked member${linkedCount === 1 ? '' : 's'})\n`;
+      } else if (slot.status === 'UNUSED' || slot.status === 'RESERVED') {
+        groupText += `  • ⛔ **Slot ${slotNumStr}:** \`UNUSED\`\n`;
       } else {
         groupText += `  • ⚪ **Slot ${slotNumStr}:** *EMPTY*\n`;
       }
