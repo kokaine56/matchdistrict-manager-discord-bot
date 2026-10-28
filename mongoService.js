@@ -310,6 +310,7 @@ export async function upsertManagedMessage(client, options) {
     pageIndex = null,
     payload,
     extraMetadata = {},
+    existingMessageId = null,
   } = options;
 
   if (!guildId || !channelId || !logicalKey || !payload) {
@@ -322,26 +323,56 @@ export async function upsertManagedMessage(client, options) {
     // If Mongo is offline, try fetching target channel and sending/editing as fallback
     const channel = client.channels.cache.get(channelId) || (await client.channels.fetch(channelId).catch(() => null));
     if (!channel) throw new Error(`Target channel ${channelId} not found`);
+
+    if (existingMessageId && typeof channel.messages?.fetch === 'function') {
+      try {
+        const fallbackMsg = await channel.messages.fetch(existingMessageId).catch(() => null);
+        if (fallbackMsg && typeof fallbackMsg.edit === 'function') {
+          await fallbackMsg.edit(payload);
+          return { message: fallbackMsg, created: false, updated: true, unchanged: false, messageId: fallbackMsg.id };
+        }
+      } catch {}
+    }
+
     const sentMsg = await channel.send(payload);
     return { message: sentMsg, created: true, updated: false, unchanged: false, messageId: sentMsg?.id || null };
   }
 
   const msgCol = mongoDb.collection('discord_managed_messages');
 
-  // Step 1: Look up existing record in MongoDB
-  const existingRecord = await msgCol.findOne({ guildId, logicalKey }).catch((err) => {
+  // Step 1: Look up existing record in MongoDB (including backwards-compatible legacy keys)
+  const logicalKeyVariants = [logicalKey];
+  if (messageType === 'tournament_control_panel' && tournamentId) {
+    logicalKeyVariants.push(`guild:${guildId}:tournament:${tournamentId}:control_panel`);
+    logicalKeyVariants.push(`tournament:${tournamentId}:management-dashboard`);
+  }
+
+  const lookupOrConditions = logicalKeyVariants.map((k) => ({ logicalKey: k }));
+  if (existingMessageId) {
+    lookupOrConditions.push({ messageId: existingMessageId });
+  }
+  if (messageType === 'tournament_control_panel' && tournamentId) {
+    lookupOrConditions.push({ tournamentId, messageType: 'tournament_control_panel', status: 'active' });
+  }
+
+  let existingRecord = await msgCol.findOne({
+    guildId,
+    $or: lookupOrConditions,
+  }).catch((err) => {
     console.warn(`[MongoDB] Error looking up managed message ${logicalKey}:`, err.message);
     return null;
   });
 
-  if (existingRecord && existingRecord.status !== 'deleted' && existingRecord.messageId) {
-    const targetChannelId = existingRecord.channelId || channelId;
+  const candidateMsgId = existingRecord?.messageId || existingMessageId;
+
+  if (candidateMsgId) {
+    const targetChannelId = existingRecord?.channelId || channelId;
     const channel = client.channels.cache.get(targetChannelId) || (await client.channels.fetch(targetChannelId).catch(() => null));
 
     if (channel && typeof channel.messages?.fetch === 'function') {
       let discordMsg = null;
       try {
-        discordMsg = await channel.messages.fetch(existingRecord.messageId).catch((err) => {
+        discordMsg = await channel.messages.fetch(candidateMsgId).catch((err) => {
           if (err.code === 10008) return null; // Unknown message (manually deleted)
           throw err;
         });
@@ -349,17 +380,24 @@ export async function upsertManagedMessage(client, options) {
         if (fetchErr.code === 10008) {
           discordMsg = null;
         } else {
-          console.warn(`[MongoDB] Error fetching message ${existingRecord.messageId}:`, fetchErr.message);
+          console.warn(`[MongoDB] Error fetching message ${candidateMsgId}:`, fetchErr.message);
         }
       }
 
       if (discordMsg) {
         // Message exists in Discord
-        if (existingRecord.contentHash === payloadHash) {
-          // Exactly identical content and components -> do nothing
+        const nextVersion = (existingRecord?.version || 0) + 1;
+        if (existingRecord?.contentHash === payloadHash) {
+          // Exactly identical content and components -> update timestamp without re-editing
           await msgCol.updateOne(
             { _id: existingRecord._id },
-            { $set: { lastSyncedAt: new Date(), status: 'active' } }
+            {
+              $set: {
+                logicalKey,
+                lastSyncedAt: new Date(),
+                status: 'active',
+              },
+            }
           ).catch(() => {});
 
           return {
@@ -375,17 +413,27 @@ export async function upsertManagedMessage(client, options) {
         try {
           await discordMsg.edit(payload);
           await msgCol.updateOne(
-            { _id: existingRecord._id },
+            { _id: existingRecord?._id || `msg_${guildId}_${Date.now()}` },
             {
               $set: {
+                guildId,
+                logicalKey,
                 contentHash: payloadHash,
                 channelId: channel.id,
+                messageId: discordMsg.id,
+                messageType: messageType || existingRecord?.messageType || 'unknown',
+                tournamentId: tournamentId || existingRecord?.tournamentId || null,
+                version: nextVersion,
                 updatedAt: new Date(),
                 lastSyncedAt: new Date(),
                 status: 'active',
-                metadata: { ...existingRecord.metadata, ...extraMetadata },
+                metadata: { ...existingRecord?.metadata, ...extraMetadata, version: nextVersion },
               },
-            }
+              $setOnInsert: {
+                createdAt: new Date(),
+              },
+            },
+            { upsert: true }
           ).catch((upErr) => {
             console.warn(`[MongoDB] Error updating managed message record ${logicalKey}:`, upErr.message);
           });
@@ -415,7 +463,11 @@ export async function upsertManagedMessage(client, options) {
 
   try {
     // Re-check after lock acquired to handle racing creations
-    const doubleCheck = await msgCol.findOne({ guildId, logicalKey }).catch(() => null);
+    const doubleCheck = await msgCol.findOne({
+      guildId,
+      $or: logicalKeyVariants.map((k) => ({ logicalKey: k })),
+    }).catch(() => null);
+
     if (doubleCheck && doubleCheck.status !== 'deleted' && doubleCheck.messageId) {
       const channel = client.channels.cache.get(doubleCheck.channelId || channelId) ||
         (await client.channels.fetch(doubleCheck.channelId || channelId).catch(() => null));
@@ -426,9 +478,19 @@ export async function upsertManagedMessage(client, options) {
             return { message: doubleMsg, created: false, updated: false, unchanged: true, messageId: doubleMsg.id };
           }
           await doubleMsg.edit(payload);
+          const nextVer = (doubleCheck.version || 0) + 1;
           await msgCol.updateOne(
             { _id: doubleCheck._id },
-            { $set: { contentHash: payloadHash, updatedAt: new Date(), lastSyncedAt: new Date(), status: 'active' } }
+            {
+              $set: {
+                logicalKey,
+                contentHash: payloadHash,
+                version: nextVer,
+                updatedAt: new Date(),
+                lastSyncedAt: new Date(),
+                status: 'active',
+              },
+            }
           ).catch(() => {});
           return { message: doubleMsg, created: false, updated: true, unchanged: false, messageId: doubleMsg.id };
         }
@@ -443,11 +505,13 @@ export async function upsertManagedMessage(client, options) {
 
     // Save record to MongoDB with upsert
     const recordId = existingRecord?._id || `msg_${guildId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const initialVersion = (existingRecord?.version || 0) + 1;
     await msgCol.updateOne(
       { guildId, logicalKey },
       {
         $set: {
           guildId,
+          logicalKey,
           channelId: channel.id,
           messageId: createdMsg.id,
           messageType,
@@ -456,10 +520,11 @@ export async function upsertManagedMessage(client, options) {
           groupId: groupId || null,
           pageIndex: pageIndex ?? null,
           contentHash: payloadHash,
+          version: initialVersion,
           status: 'active',
           updatedAt: new Date(),
           lastSyncedAt: new Date(),
-          metadata: extraMetadata || {},
+          metadata: { ...extraMetadata, version: initialVersion },
         },
         $setOnInsert: {
           _id: recordId,
@@ -787,13 +852,15 @@ export async function deleteTournamentFromDb(guildId, tournamentId) {
  * @returns {Promise<object|null>}
  */
 export async function findTournamentByBotCommandsChannel(guildId, channelId) {
-  if (!isMongoConnected() || !guildId || !channelId) return null;
+  if (!isMongoConnected() || !channelId) return null;
   try {
     const tourCol = mongoDb.collection('discord_tournaments');
-    return await tourCol.findOne({
-      guildId,
-      'channels.botCommandsId': channelId,
-    });
+    const query = guildId ? { guildId, 'channels.botCommandsId': channelId } : { 'channels.botCommandsId': channelId };
+    let tour = await tourCol.findOne(query);
+    if (!tour && guildId) {
+      tour = await tourCol.findOne({ 'channels.botCommandsId': channelId });
+    }
+    return tour;
   } catch (err) {
     console.warn(`[MongoDB] Error looking up tournament for channel ${channelId}:`, err.message);
     return null;
@@ -1171,29 +1238,41 @@ export async function reconcileManagedBotState(client, officialGuildId) {
   try {
     console.log('[MongoDB] 🔄 Reconciling managed bot state across Discord and MongoDB...');
 
-    const guild = officialGuildId ? client.guilds.cache.get(officialGuildId) || (await client.guilds.fetch(officialGuildId).catch(() => null)) : null;
-
-    if (!guild) {
-      console.log('[MongoDB] ℹ️ Official guild not yet cached or configured for full reconciliation.');
-      return;
-    }
-
     const msgCol = mongoDb.collection('discord_managed_messages');
-    const activeMessages = await msgCol.find({ guildId: guild.id, status: 'active' }).toArray();
+    // Fetch all active managed messages across all servers (including linked organiser servers)
+    const activeMessages = await msgCol.find({ status: 'active' }).toArray().catch(() => []);
 
     let verifiedCount = 0;
     let missingCount = 0;
+    const seenControlPanels = new Map(); // tournamentId -> recordId
 
     for (const record of activeMessages) {
       try {
-        const channel = guild.channels.cache.get(record.channelId) || (await guild.channels.fetch(record.channelId).catch(() => null));
-        if (!channel) {
+        const guild = client.guilds.cache.get(record.guildId) || (await client.guilds.fetch(record.guildId).catch(() => null));
+        if (!guild) {
           missingCount++;
           continue;
         }
 
+        const channel = guild.channels.cache.get(record.channelId) || (await guild.channels.fetch(record.channelId).catch(() => null));
+        if (!channel) {
+          missingCount++;
+          await msgCol.updateOne({ _id: record._id }, { $set: { status: 'deleted', deletedAt: new Date() } });
+          continue;
+        }
+
+        // Deduplicate active tournament control panel records in MongoDB: keep newest, mark duplicates as deleted
+        if (record.messageType === 'tournament_control_panel' && record.tournamentId) {
+          if (seenControlPanels.has(record.tournamentId)) {
+            await msgCol.updateOne({ _id: record._id }, { $set: { status: 'deleted', deletedAt: new Date(), note: 'duplicate_cleaned' } });
+            missingCount++;
+            continue;
+          }
+          seenControlPanels.set(record.tournamentId, record._id);
+        }
+
         const msg = await channel.messages.fetch(record.messageId).catch((err) => {
-          if (err.code === 10008) return null;
+          if (err.code === 10008 || err.code === 10003) return null;
           return null;
         });
 
@@ -1203,6 +1282,13 @@ export async function reconcileManagedBotState(client, officialGuildId) {
           await msgCol.updateOne({ _id: record._id }, { $set: { status: 'deleted', deletedAt: new Date() } });
         } else {
           verifiedCount++;
+          // Upgrade legacy key to canonical logicalKey format if needed
+          if (record.messageType === 'tournament_control_panel' && record.tournamentId) {
+            const canonicalKey = `tournament:${record.tournamentId}:management-dashboard`;
+            if (record.logicalKey !== canonicalKey) {
+              await msgCol.updateOne({ _id: record._id }, { $set: { logicalKey: canonicalKey } });
+            }
+          }
         }
       } catch {
         missingCount++;

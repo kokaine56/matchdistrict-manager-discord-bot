@@ -24,6 +24,7 @@ import {
 } from './auditLogger.js';
 import {
   isMongoConnected,
+  getDb,
   ensurePersistenceAvailable,
   upsertManagedMessage,
   upsertManagedMessageBatch,
@@ -1375,6 +1376,109 @@ export async function handleSyncRolesCommand(guild, member, args = [], replyFn, 
 }
 
 /**
+ * Cleans up obsolete bot-generated messages from #bot-commands for a tournament,
+ * keeping exactly one canonical management dashboard and removing old panels,
+ * expired summaries, duplicate slot lists, and temporary status messages.
+ * Never touches human messages or messages from unknown sources.
+ *
+ * @param {import('discord.js').Guild} guild
+ * @param {import('discord.js').TextChannel} botCommandsChannel
+ * @param {string} tournamentId
+ * @param {string} activeDashboardMessageId
+ * @param {string} [activeSubmissionMessageId]
+ */
+export async function cleanupBotCommandsClutter(guild, botCommandsChannel, tournamentId, activeDashboardMessageId, activeSubmissionMessageId = null) {
+  if (!botCommandsChannel || typeof botCommandsChannel.messages?.fetch !== 'function') return;
+
+  try {
+    const fetched = await botCommandsChannel.messages.fetch({ limit: 50 }).catch(() => null);
+    if (!fetched || fetched.size === 0) return;
+
+    const botUserId = guild?.client?.user?.id;
+    const toDelete = [];
+
+    for (const msg of fetched.values()) {
+      // Rule 1: Never delete human messages
+      if (!msg.author?.bot) continue;
+
+      // Rule 2: Only manage messages authored by this bot
+      if (botUserId && msg.author.id !== botUserId) continue;
+
+      // Rule 3: Always preserve the active canonical dashboard
+      if (activeDashboardMessageId && msg.id === activeDashboardMessageId) continue;
+
+      // Rule 4: Always preserve the active global submission panel if present
+      if (activeSubmissionMessageId && msg.id === activeSubmissionMessageId) continue;
+
+      // Identify bot management clutter:
+      // a) Older dashboard / control panel duplicates
+      const hasDashboardTitle = msg.embeds?.some((e) =>
+        e.title?.includes('MatchDistrict Tournament Control Panel') ||
+        e.title?.includes('Tournament Management & Control Panel') ||
+        e.title?.includes('Tournament Control Panel')
+      );
+      const hasDashboardButtons = msg.components?.some((row) =>
+        row.components?.some((c) =>
+          c.customId?.startsWith('md_tour_create_channels') ||
+          c.customId?.startsWith('md_tour_sync_refresh') ||
+          c.customId?.startsWith('md_tour_round_mgmt') ||
+          c.customId?.startsWith('md_tour_view_rounds') ||
+          c.customId?.startsWith('md_tour_delete_channels')
+        )
+      );
+
+      // b) Old temporary status / notification messages
+      const isTemporaryNotification =
+        msg.content?.includes('Dashboard Restored:') ||
+        msg.content?.includes('Participant channels provisioned') ||
+        msg.content?.includes('Tournament Synchronized & Refreshed') ||
+        msg.content?.includes('Sync & Refresh Completed') ||
+        msg.content?.includes('Failed to restore dashboard') ||
+        msg.content?.includes('Database Unavailable');
+
+      // c) Old slot dump messages or outdated round allocation summaries
+      const isOutdatedAllocation =
+        (msg.content?.includes('Round Allocation & Qualification Summary') && !msg.content?.includes(tournamentId)) ||
+        (msg.content?.includes('Capacity: 25 slots per group') && msg.content?.includes('Group 1'));
+
+      if (hasDashboardTitle || hasDashboardButtons || isTemporaryNotification || isOutdatedAllocation) {
+        toDelete.push(msg);
+      }
+    }
+
+    // Delete identified obsolete messages safely with error suppression
+    for (const msg of toDelete) {
+      await msg.delete().catch(() => {});
+    }
+
+    // Mark outdated managed message records in MongoDB for this channel/tournament as deleted
+    if (isMongoConnected() && activeDashboardMessageId) {
+      const db = getDb();
+      if (db) {
+        const msgCol = db.collection('discord_managed_messages');
+        await msgCol.updateMany(
+          {
+            guildId: guild.id,
+            channelId: botCommandsChannel.id,
+            messageType: 'tournament_control_panel',
+            messageId: { $ne: activeDashboardMessageId },
+            status: 'active',
+          },
+          {
+            $set: {
+              status: 'deleted',
+              deletedAt: new Date(),
+            },
+          }
+        ).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.warn(`[Discord Bot] ⚠️ Error in cleanupBotCommandsClutter for ${tournamentId}:`, err.message);
+  }
+}
+
+/**
  * Sets up or refreshes the Tournament Control Panel inside #bot-commands.
  */
 export async function setupTournamentControlPanel(guild, tournament, summary, botMember) {
@@ -1582,15 +1686,16 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
 
   // 5. Update or Send Control Panel Message in #bot-commands idempotently
   let panelMessage = null;
-  const logicalKey = `guild:${guild.id}:tournament:${tournamentId}:control_panel`;
+  const canonicalLogicalKey = `tournament:${tournamentId}:management-dashboard`;
 
   try {
     const upsertRes = await upsertManagedMessage(guild.client, {
       guildId: guild.id,
       channelId: botCommandsChannel.id,
-      logicalKey,
+      logicalKey: canonicalLogicalKey,
       messageType: 'tournament_control_panel',
       tournamentId,
+      existingMessageId: savedTournament.controlPanelMessageId || null,
       payload: { embeds: [embed], components: buttons },
       extraMetadata: { tournamentTitle: tournament.title },
     });
@@ -1609,6 +1714,26 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
       }
     }
 
+    // Secondary fallback: scan recent messages to adopt existing dashboard if message ID was unrecorded
+    if (!panelMessage && typeof botCommandsChannel.messages?.fetch === 'function') {
+      try {
+        const recent = await botCommandsChannel.messages.fetch({ limit: 15 }).catch(() => null);
+        if (recent) {
+          for (const m of recent.values()) {
+            if (m.author?.id === guild.client?.user?.id) {
+              const isPanel = m.embeds?.some((e) => e.title?.includes('MatchDistrict Tournament Control Panel')) ||
+                m.components?.some((r) => r.components?.some((c) => c.customId?.includes(tournamentId)));
+              if (isPanel && typeof m.edit === 'function') {
+                await m.edit({ embeds: [embed], components: buttons });
+                panelMessage = m;
+                break;
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+
     if (!panelMessage && typeof botCommandsChannel.send === 'function') {
       panelMessage = await botCommandsChannel.send({ embeds: [embed], components: buttons });
     }
@@ -1622,6 +1747,8 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   savedTournament.channels.botCommandsId = botCommandsChannel.id;
   savedTournament.setupStatus = isConfigured ? 'active' : 'pending_channels';
   savedTournament.controlPanelMessageId = panelMessage ? panelMessage.id : null;
+  savedTournament.controlPanelLogicalKey = canonicalLogicalKey;
+  savedTournament.controlPanelVersion = (savedTournament.controlPanelVersion || 0) + 1;
   savedTournament.lastSyncedAt = new Date().toISOString();
 
   currentSettings.tournaments[tournamentId] = savedTournament;
@@ -1633,6 +1760,17 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   const activeRound = Object.values(savedTournament.rounds || {}).find((r) => r.status === 'Active' || r.status === 'Started');
   if (activeRound) {
     await updateGlobalSubmissionControlPanel(guild, tournament, activeRound, botCommandsChannel);
+  }
+
+  // 7. Prune management clutter and duplicate panels from #bot-commands
+  if (panelMessage?.id) {
+    await cleanupBotCommandsClutter(
+      guild,
+      botCommandsChannel,
+      tournamentId,
+      panelMessage.id,
+      activeRound?.globalSubmissionControlMessageId || null
+    );
   }
 
   return {
@@ -1680,7 +1818,15 @@ export async function handleSelectTournamentCommand(guild, member, tournamentId,
     return;
   }
 
-  const panelResult = await setupTournamentControlPanel(guild, tournament, summary, botMember);
+  let panelResult;
+  try {
+    panelResult = await withTournamentLock(tournamentId, async () => {
+      return await setupTournamentControlPanel(guild, tournament, summary, botMember);
+    }, 'select_tournament');
+  } catch (lockErr) {
+    await replyFn(`⚠️ **Operation in progress:** ${lockErr.message}`);
+    return;
+  }
 
   await replyFn(
     `✅ **Tournament Selected:** **${tournament.title}** (ID: \`${tournament.id}\`)\n` +
@@ -7971,18 +8117,20 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
         await originalMessage.delete().catch(() => {});
       }
 
-      // Fetch live registrations & tournament details from backend
-      const backendData = await fetchTournamentRegistrationsFromBackend(resolvedTournamentId);
-      const { tournament, summary } = backendData;
+      await withTournamentLock(resolvedTournamentId, async () => {
+        // Fetch live registrations & tournament details from backend
+        const backendData = await fetchTournamentRegistrationsFromBackend(resolvedTournamentId);
+        const { tournament, summary } = backendData;
 
-      const botMember = guild.members.me;
-      await setupTournamentControlPanel(guild, tournament, summary, botMember);
+        const botMember = guild.members.me;
+        await setupTournamentControlPanel(guild, tournament, summary, botMember);
 
-      // Brief confirmation notification that auto-deletes
-      const notifyMsg = await channel.send(`✅ **Dashboard Restored:** Control panel for **${tournament.title}** (\`${resolvedTournamentId}\`) is synchronized and active.`);
-      setTimeout(() => {
-        notifyMsg.delete().catch(() => {});
-      }, 5000);
+        // Brief confirmation notification that auto-deletes to keep channel spotless
+        const notifyMsg = await channel.send(`✅ **Dashboard Restored:** Control panel for **${tournament.title}** (\`${resolvedTournamentId}\`) is synchronized and active.`);
+        setTimeout(() => {
+          notifyMsg.delete().catch(() => {});
+        }, 3000);
+      }, 'dashboard_restore');
     } catch (err) {
       console.warn(`[Discord Bot] Error in .dash command for tournament ${resolvedTournamentId}:`, err.message);
       await replyFn(`❌ **Failed to restore dashboard:** ${err.message}`);
