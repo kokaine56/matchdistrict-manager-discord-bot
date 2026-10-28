@@ -1,4 +1,5 @@
 import process from 'node:process';
+import crypto from 'crypto';
 import {
   ChannelType,
   PermissionFlagsBits,
@@ -7617,35 +7618,196 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
    * Handles the ".organiser" or ".organizer" prefix command.
    * Guides administrators through connecting their Discord server to a MatchDistrict organiser account.
    */
-  export async function handleOrganiserCommand(guild, member, channel, args = [], replyFn) {
+  /**
+   * Executes the complete backend verification and MongoDB persistence pipeline for an organiser linking code.
+   */
+  export async function executeOrganiserLinkVerification({
+    guild,
+    user,
+    rawCode,
+    correlationId = null,
+    replyFn = null,
+    interaction = null,
+    originalMessage = null,
+  }) {
+    const corrId = correlationId || crypto.randomBytes(4).toString('hex');
+    console.log(`[Discord Bot] [corr:${corrId}] 4. Organiser handler invoked: guild=${guild.id}, user=${user.id}, hasCode=${Boolean(rawCode)}`);
+
+    const sendResponse = async (payload) => {
+      if (interaction) {
+        if (interaction.deferred || interaction.replied) {
+          return await interaction.editReply(payload).catch(() => {});
+        }
+        return await interaction.reply(payload).catch(() => {});
+      }
+      if (replyFn) {
+        return await replyFn(payload);
+      }
+    };
+
+    const botSecret = getBackendBotSecret();
+    if (!botSecret) {
+      console.warn(`[Discord Bot] [corr:${corrId}] 7. Linking failed: Missing MATCHDISTRICT_BOT_SECRET`);
+      await sendResponse('❌ **Configuration Error:** Missing required environment variable `MATCHDISTRICT_BOT_SECRET`. Please configure it in your bot environment variables.');
+      return;
+    }
+
+    const code = (rawCode || '').trim();
+    if (!code) {
+      await sendResponse('❌ **Invalid Code:** Please provide a valid Organiser Linking Code (e.g. `MD-ORG-XXXX-XXXX-XXXX`).');
+      return;
+    }
+
+    const apiUrl = getBackendApiUrl();
+    console.log(`[Discord Bot] [corr:${corrId}] 5. Backend verification request started: url="${apiUrl}/api/bot/organizer/verify-link", guild=${guild.id}`);
+
+    let response = null;
+    let data = null;
+
+    try {
+      response = await fetch(`${apiUrl}/api/bot/organizer/verify-link`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'User-Agent': 'MatchDistrict-Discord-Bot/1.0',
+          'x-bot-secret': botSecret,
+          'Authorization': `Bearer ${botSecret}`,
+        },
+        body: JSON.stringify({
+          code,
+          guild_id: guild.id,
+          guild_name: guild.name,
+          discord_user_id: user.id,
+        }),
+      });
+
+      data = await response.json().catch(() => null);
+    } catch (netErr) {
+      console.warn(`[Discord Bot] [corr:${corrId}] 6. Backend request error:`, netErr.message);
+      await sendResponse(`❌ **Service Unavailable:** Could not contact MatchDistrict backend server (${netErr.message}). Please verify the backend API is online.`);
+      return;
+    }
+
+    console.log(`[Discord Bot] [corr:${corrId}] 6. Backend verification response received: status=${response?.status}, success=${Boolean(data?.success)}`);
+
+    if (!response.ok || !data || !data.success) {
+      const errMsg = data?.message || data?.error || `Verification failed with HTTP ${response.status}`;
+      console.warn(`[Discord Bot] [corr:${corrId}] 7. Organiser linking failed: reason="${errMsg}"`);
+      await sendResponse(`❌ **Linking Failed:** ${errMsg}`);
+      return;
+    }
+
+    const organiser = data.organizer;
+    const tournaments = data.tournaments || [];
+
+    // Save link persistently to MongoDB
+    const linkDoc = {
+      guildId: guild.id,
+      guildName: guild.name,
+      organiserId: organiser.id,
+      organiserName: organiser.name,
+      organiserHandle: organiser.handle,
+      status: 'linked',
+      linkedBy: user.id,
+      linkedAt: new Date().toISOString(),
+    };
+
+    try {
+      await saveOrganiserLink(guild.id, linkDoc);
+      console.log(`[Discord Bot] [corr:${corrId}] 7. MongoDB link saved successfully: organiserId=${organiser.id}, guild=${guild.id}`);
+    } catch (dbErr) {
+      console.warn(`[Discord Bot] [corr:${corrId}] 7. MongoDB save error:`, dbErr.message);
+    }
+
+    // Update in-memory cache
+    if (!guildSettingsCache[guild.id]) guildSettingsCache[guild.id] = {};
+    guildSettingsCache[guild.id].organiserLink = linkDoc;
+    saveGuildSettings(guildSettingsCache);
+
+    // Record audit log
+    await recordAuditLog(guild.id, 'LINK_ORGANISER', {
+      organiserId: organiser.id,
+      organiserName: organiser.name,
+      guildId: guild.id,
+      guildName: guild.name,
+      adminId: user.id,
+      tournamentsCount: tournaments.length,
+    }).catch(() => {});
+
+    const successEmbed = new EmbedBuilder()
+      .setTitle('🎉 Server Successfully Linked!')
+      .setColor(0x10b981)
+      .setDescription(
+        `**${guild.name}** is now connected to your MatchDistrict organiser account.\n\n` +
+        `• **Organiser:** **${organiser.name}** (\`${organiser.handle || organiser.id}\`)\n` +
+        `• **Discord Server:** **${guild.name}** (\`${guild.id}\`)\n` +
+        `• **Active Tournaments Available:** **${tournaments.length}**\n\n` +
+        `🚀 **What to do next:**\n` +
+        `1️⃣ Run \`.list tournament\` in any channel to view and select your tournaments.\n` +
+        `2️⃣ Select your tournament to provision the management dashboard in \`#bot-commands\`.\n` +
+        `3️⃣ Manage rounds, 25-slot group allocations, and match credentials directly from Discord!`
+      )
+      .setFooter({ text: 'MatchDistrict Multi-Organiser System' })
+      .setTimestamp();
+
+    await sendResponse({ embeds: [successEmbed] });
+
+    // If command was sent via chat message, delete it to protect code from chat history
+    if (originalMessage && typeof originalMessage.delete === 'function') {
+      originalMessage.delete().catch(() => {});
+    }
+  }
+
+  /**
+   * Handles the .organiser command across subcommands, code arguments, and status checks.
+   */
+  export async function handleOrganiserCommand(guild, member, channel, args = [], replyFn, message = null) {
+    const corrId = crypto.randomBytes(4).toString('hex');
+
     if (!guild) {
       await replyFn('❌ **Error:** The `.organiser` command can only be used within a Discord server, not in Direct Messages.');
       return;
     }
 
-    // Check user permissions: Administrator or ManageGuild
-    const hasServerAuthority = member.permissions.has(PermissionFlagsBits.Administrator) ||
-      member.permissions.has(PermissionFlagsBits.ManageGuild);
+    // Safely resolve member if uncached
+    let resolvedMember = member;
+    if (!resolvedMember && guild && message?.author?.id && typeof guild.members?.fetch === 'function') {
+      resolvedMember = await guild.members.fetch(message.author.id).catch(() => null);
+    }
+    const user = resolvedMember?.user || message?.author || { id: 'unknown' };
+
+    // Check user permissions: Administrator, ManageGuild, or Server Owner
+    const isOwner = guild.ownerId === (resolvedMember?.id || user.id);
+    const isAdminUser = Boolean(resolvedMember?.permissions?.has?.(PermissionFlagsBits.Administrator));
+    const isManageGuild = Boolean(resolvedMember?.permissions?.has?.(PermissionFlagsBits.ManageGuild));
+    const hasServerAuthority = isOwner || isAdminUser || isManageGuild;
 
     if (!hasServerAuthority) {
       await replyFn('🚫 **Permission Denied:** You must be a server Administrator or have `Manage Server` permissions to link this server to an organiser account.');
       return;
     }
 
-    // Check bot permissions: SendMessages, EmbedLinks, ManageChannels, ManageRoles
-    const botMember = guild.members.me;
-    const missingBotPerms = [];
-    if (!botMember.permissions.has(PermissionFlagsBits.SendMessages)) missingBotPerms.push('Send Messages');
-    if (!botMember.permissions.has(PermissionFlagsBits.EmbedLinks)) missingBotPerms.push('Embed Links');
-    if (!botMember.permissions.has(PermissionFlagsBits.ManageChannels)) missingBotPerms.push('Manage Channels');
-    if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) missingBotPerms.push('Manage Roles');
-
-    if (missingBotPerms.length > 0) {
-      await replyFn(`⚠️ **Missing Bot Permissions:** MatchDistrict bot requires the following permissions to manage tournaments in this server: **${missingBotPerms.join(', ')}**.`);
-      return;
+    // Safely resolve botMember
+    let botMember = guild.members.me;
+    if (!botMember && typeof guild.members?.fetchMe === 'function') {
+      botMember = await guild.members.fetchMe().catch(() => null);
     }
 
-    const sub = (args[0] || '').toLowerCase();
+    // Check basic bot permissions
+    if (botMember && typeof botMember.permissions?.has === 'function') {
+      const missingBasic = [];
+      if (!botMember.permissions.has(PermissionFlagsBits.SendMessages)) missingBasic.push('Send Messages');
+      if (!botMember.permissions.has(PermissionFlagsBits.EmbedLinks)) missingBasic.push('Embed Links');
+      if (missingBasic.length > 0) {
+        await replyFn(`⚠️ **Missing Bot Permissions:** MatchDistrict bot requires **${missingBasic.join(', ')}** in this server.`);
+        return;
+      }
+    }
+
+    const firstArg = (args[0] || '').trim();
+    const sub = firstArg.toLowerCase();
+    const argStr = args.join(' ').trim();
 
     // Subcommand: unlink
     if (sub === 'unlink') {
@@ -7677,7 +7839,56 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       return;
     }
 
-    // Check current link status
+    // Subcommand: status
+    if (sub === 'status') {
+      let currentLink = guildSettingsCache[guild.id]?.organiserLink || (isMongoConnected() ? await getOrganiserLinkForGuild(guild.id) : null);
+      if (!currentLink || currentLink.status !== 'linked') {
+        await replyFn('ℹ️ **Status:** This Discord server is not linked to any MatchDistrict organiser account. Run `.organiser <CODE>` or `.organiser` to connect.');
+        return;
+      }
+
+      const statusEmbed = new EmbedBuilder()
+        .setTitle('🔗 MatchDistrict Organiser Link Status')
+        .setColor(0x10b981)
+        .setDescription(
+          `• **Status:** ✅ **Active Link**\n` +
+          `• **Organiser:** **${currentLink.organiserName}** (\`${currentLink.organiserHandle || currentLink.organiserId}\`)\n` +
+          `• **Discord Server:** **${guild.name}** (\`${guild.id}\`)\n` +
+          `• **Linked By:** <@${currentLink.linkedBy}>\n` +
+          `• **Linked At:** <t:${Math.floor(new Date(currentLink.linkedAt || Date.now()).getTime() / 1000)}:R>`
+        )
+        .setFooter({ text: 'MatchDistrict Organiser System' })
+        .setTimestamp();
+
+      await replyFn({ embeds: [statusEmbed] });
+      return;
+    }
+
+    // Check if an organiser linking code was provided in the arguments
+    let codeCandidate = null;
+    if (sub === 'link' && args[1]) {
+      codeCandidate = args.slice(1).join(' ').trim();
+    } else if (firstArg && (firstArg.toUpperCase().startsWith('MD-ORG-') || /^MD-ORG/i.test(firstArg))) {
+      codeCandidate = firstArg;
+    } else if (argStr && /^MD-ORG-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/i.test(argStr)) {
+      codeCandidate = argStr;
+    } else if (firstArg && firstArg.length >= 10 && firstArg.includes('-') && !['unlink', 'status', 'help'].includes(sub)) {
+      codeCandidate = firstArg;
+    }
+
+    if (codeCandidate) {
+      await executeOrganiserLinkVerification({
+        guild,
+        user,
+        rawCode: codeCandidate,
+        correlationId: corrId,
+        replyFn,
+        originalMessage: message,
+      });
+      return;
+    }
+
+    // No code provided: Check current link status
     let link = guildSettingsCache[guild.id]?.organiserLink;
     if (!link && isMongoConnected()) {
       link = await getOrganiserLinkForGuild(guild.id);
@@ -7716,19 +7927,22 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       return;
     }
 
-    // Not linked: Provide explanation and button to open modal
+    // Not linked: Provide explanation and instructions
     const linkEmbed = new EmbedBuilder()
       .setTitle('🔗 Connect Server to MatchDistrict Organiser')
       .setColor(0x3b82f6)
       .setDescription(
         `Connect **${guild.name}** to your MatchDistrict organiser account to host and manage esports tournaments, allocate groups, and run private ID/password channels.\n\n` +
-        `**How to get your linking code:**\n` +
+        `**How to link your server:**\n` +
         `1️⃣ Sign in to your organiser account on the **[MatchDistrict Website](https://matchdistrict.in)**.\n` +
         `2️⃣ Go to your **Profile / Organizer Dashboard**.\n` +
-        `3️⃣ Find your unique **Organiser Linking Code** and click **Copy**.\n` +
-        `4️⃣ Click the button below to enter your code securely.`
+        `3️⃣ Find your unique **Organiser Linking Code** and click **Copy**.\n\n` +
+        `**Choose how to link:**\n` +
+        `• **Option A:** Click **Enter Organiser Code** below to submit via modal.\n` +
+        `• **Option B:** Run \`.organiser <CODE>\` directly in this channel.\n` +
+        `  *(Example: \`.organiser MD-ORG-XXXX-XXXX-XXXX\`)*`
       )
-      .setFooter({ text: 'Never share your linking code in public channels' })
+      .setFooter({ text: 'Never share your linking code with unauthorized parties' })
       .setTimestamp();
 
     const enterCodeRow = new ActionRowBuilder().addComponents(
@@ -7755,11 +7969,13 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
     }
 
     const member = interaction.member;
-    const hasServerAuthority = member.permissions.has(PermissionFlagsBits.Administrator) ||
-      member.permissions.has(PermissionFlagsBits.ManageGuild);
+    const isOwner = guild.ownerId === (member?.id || interaction.user?.id);
+    const hasServerAuthority = isOwner ||
+      Boolean(member?.permissions?.has?.(PermissionFlagsBits.Administrator)) ||
+      Boolean(member?.permissions?.has?.(PermissionFlagsBits.ManageGuild));
 
     if (!hasServerAuthority) {
-      await interaction.reply({ content: '🚫 You must be a server Administrator to link this server.', ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: '🚫 You must be a server Administrator or have `Manage Server` permissions to link this server.', ephemeral: true }).catch(() => {});
       return;
     }
 
@@ -7767,99 +7983,15 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
     await interaction.deferReply({ ephemeral: true }).catch(() => {});
 
     const rawCode = (interaction.fields.getTextInputValue('org_code') || '').trim();
-    if (!rawCode) {
-      await interaction.editReply({ content: '❌ Linking code cannot be empty.' }).catch(() => {});
-      return;
-    }
+    const corrId = crypto.randomBytes(4).toString('hex');
 
-    try {
-      const apiUrl = getBackendApiUrl();
-      const botSecret = getBackendBotSecret();
-
-      const response = await fetch(`${apiUrl}/api/bot/organizer/verify-link`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'User-Agent': 'MatchDistrict-Discord-Bot/1.0',
-          'x-bot-secret': botSecret,
-          'Authorization': `Bearer ${botSecret}`,
-        },
-        body: JSON.stringify({
-          code: rawCode,
-          guild_id: guild.id,
-          guild_name: guild.name,
-          discord_user_id: interaction.user.id,
-        }),
-      });
-
-      const data = await response.json().catch(() => null);
-
-      if (!response.ok || !data || !data.success) {
-        const errMsg = data?.message || data?.error || `Verification failed with HTTP ${response.status}`;
-        await interaction.editReply({
-          content: `❌ **Linking Failed:** ${errMsg}`,
-        }).catch(() => {});
-        return;
-      }
-
-      const organiser = data.organizer;
-      const tournaments = data.tournaments || [];
-
-      // Save link persistently to MongoDB
-      const linkDoc = {
-        guildId: guild.id,
-        guildName: guild.name,
-        organiserId: organiser.id,
-        organiserName: organiser.name,
-        organiserHandle: organiser.handle,
-        status: 'linked',
-        linkedBy: interaction.user.id,
-        linkedAt: new Date().toISOString(),
-      };
-
-      await saveOrganiserLink(guild.id, linkDoc);
-
-      // Update in-memory cache
-      if (!guildSettingsCache[guild.id]) guildSettingsCache[guild.id] = {};
-      guildSettingsCache[guild.id].organiserLink = linkDoc;
-      saveGuildSettings(guildSettingsCache);
-
-      // Record audit log
-      await recordAuditLog(guild.id, 'LINK_ORGANISER', {
-        organiserId: organiser.id,
-        organiserName: organiser.name,
-        guildId: guild.id,
-        guildName: guild.name,
-        adminId: interaction.user.id,
-        tournamentsCount: tournaments.length,
-      }).catch(() => {});
-
-      const successEmbed = new EmbedBuilder()
-        .setTitle('🎉 Server Successfully Linked!')
-        .setColor(0x10b981)
-        .setDescription(
-          `**${guild.name}** is now connected to your MatchDistrict organiser account.\n\n` +
-          `• **Organiser:** **${organiser.name}** (\`${organiser.handle || organiser.id}\`)\n` +
-          `• **Discord Server:** **${guild.name}** (\`${guild.id}\`)\n` +
-          `• **Active Tournaments Available:** **${tournaments.length}**\n\n` +
-          `🚀 **What to do next:**\n` +
-          `1️⃣ Run \`.list tournament\` in any channel to view and select your tournaments.\n` +
-          `2️⃣ Select your tournament to provision the management dashboard in \`#bot-commands\`.\n` +
-          `3️⃣ Manage rounds, 25-slot group allocations, and match credentials directly from Discord!`
-        )
-        .setFooter({ text: 'MatchDistrict Multi-Organiser System' })
-        .setTimestamp();
-
-      await interaction.editReply({
-        embeds: [successEmbed],
-      }).catch(() => {});
-    } catch (err) {
-      console.warn('[Discord Bot] Error verifying organiser linking code:', err.message);
-      await interaction.editReply({
-        content: `❌ **Connection Error:** Could not contact MatchDistrict backend (${err.message}).`,
-      }).catch(() => {});
-    }
+    await executeOrganiserLinkVerification({
+      guild,
+      user: interaction.user,
+      rawCode,
+      correlationId: corrId,
+      interaction,
+    });
   }
 
   /**

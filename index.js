@@ -1,5 +1,6 @@
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import process from 'node:process';
 import http from 'http';
@@ -93,6 +94,7 @@ import {
   handleOrganiserCommand,
   handleOrganiserModalSubmit,
   handleOrganiserButtonInteraction,
+  executeOrganiserLinkVerification,
   initOrganiserLinksCache,
   isAuthorizedGuild,
 } from './tournamentService.js';
@@ -214,6 +216,7 @@ export {
   handleOrganiserCommand,
   handleOrganiserModalSubmit,
   handleOrganiserButtonInteraction,
+  executeOrganiserLinkVerification,
   initOrganiserLinksCache,
   isAuthorizedGuild,
   initMongo,
@@ -590,9 +593,10 @@ export function isAuditOrLogChannel(channel, guildId) {
  */
 export function isAdmin(member) {
   if (!member) return false;
+  if (member.guild && member.guild.ownerId === member.id) return true;
   return (
-    member.permissions?.has(PermissionFlagsBits.Administrator) ||
-    member.permissions?.has(PermissionFlagsBits.ManageGuild) ||
+    Boolean(member.permissions?.has(PermissionFlagsBits.Administrator)) ||
+    Boolean(member.permissions?.has(PermissionFlagsBits.ManageGuild)) ||
     false
   );
 }
@@ -2122,19 +2126,40 @@ client.on(Events.MessageCreate, async (message) => {
   try {
     if (!message || message.author?.bot) return;
 
+    const corrId = crypto.randomBytes(4).toString('hex');
+    console.log(`[Discord Bot] [corr:${corrId}] 1. Message event received: guildId=${message.guild?.id || 'DM'}, authorId=${message.author?.id}, hasContent=${Boolean(message.content)}`);
+
     // Check if message is a submission screenshot upload in temporary upload channel/thread
     const handledScreenshot = await handleSubmissionScreenshotUpload(message);
     if (handledScreenshot) return;
 
     const content = message.content?.trim();
 
-    // Check if this is a prefix command
+    // Diagnostic notice if message content intent is stripped by Discord Gateway
+    if (!content && message.guild) {
+      console.warn(`[Discord Bot] [corr:${corrId}] ⚠️ Message received but message.content is empty! Ensure "MESSAGE CONTENT INTENT" is enabled in Discord Developer Portal under Bot -> Privileged Gateway Intents.`);
+    }
+
+    // Check if this is a prefix command (supports PREFIX or bot mention)
+    let isCommand = false;
+    let withoutPrefix = '';
+
     if (content && content.startsWith(PREFIX)) {
-      const withoutPrefix = content.slice(PREFIX.length).trim();
-      if (!withoutPrefix) return;
+      isCommand = true;
+      withoutPrefix = content.slice(PREFIX.length).trim();
+    } else if (content && client.user && (content.startsWith(`<@${client.user.id}>`) || content.startsWith(`<@!${client.user.id}>`))) {
+      isCommand = true;
+      const mentionMatch = content.match(/^<@!?\d+>\s*/);
+      withoutPrefix = content.slice(mentionMatch[0].length).trim();
+    }
+
+    if (isCommand && withoutPrefix) {
+      console.log(`[Discord Bot] [corr:${corrId}] 2. Message recognized as prefix command (prefix: "${PREFIX}")`);
 
       const args = withoutPrefix.split(/\s+/);
       const cmd = (args.shift() || '').toLowerCase();
+
+      console.log(`[Discord Bot] [corr:${corrId}] 3. Command parsed: "${cmd}", argsCount=${args.length}`);
 
       if (cmd === 'setup') {
         const subCmd = (args[0] || '').toLowerCase();
@@ -2160,13 +2185,28 @@ client.on(Events.MessageCreate, async (message) => {
         await handleDeleteManagedMessageCommand(message.guild, message.member, args, (text) => message.reply(text));
         return;
       } else if (cmd === 'organiser' || cmd === 'organizer') {
-        await handleOrganiserCommand(
-          message.guild,
-          message.member,
-          message.channel,
-          args,
-          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts })
-        );
+        try {
+          await handleOrganiserCommand(
+            message.guild,
+            message.member,
+            message.channel,
+            args,
+            async (text, opts) => {
+              try {
+                if (typeof text === 'object') {
+                  return await message.reply(text);
+                }
+                return await message.reply({ content: text, ...opts });
+              } catch (replyErr) {
+                return await message.channel.send(typeof text === 'object' ? text : { content: text, ...opts }).catch(() => {});
+              }
+            },
+            message
+          );
+        } catch (orgErr) {
+          console.error(`[Discord Bot] [corr:${corrId}] ❌ Error in handleOrganiserCommand:`, orgErr);
+          await message.reply(`❌ **An unexpected error occurred:** ${orgErr.message}`).catch(() => {});
+        }
         return;
       } else if (cmd === 'dash' || cmd === 'dashboard') {
         await handleDashCommand(
