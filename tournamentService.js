@@ -567,17 +567,17 @@ export function buildTournamentControlPanelEmbed(tournament, summary, channelsSt
 export function buildTournamentControlPanelButtons(tournamentId) {
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`md_tour_create_channels:${tournamentId}`)
+      .setCustomId(`dash:main:create-channels:${tournamentId}`)
       .setLabel('Create Channels')
       .setEmoji('📁')
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
-      .setCustomId(`md_tour_sync_refresh:${tournamentId}`)
+      .setCustomId(`dash:main:sync:${tournamentId}`)
       .setLabel('Sync & Refresh')
       .setEmoji('🔄')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
-      .setCustomId('dash:home:refresh')
+      .setCustomId(`dash:main:refresh:${tournamentId}`)
       .setLabel('Refresh')
       .setEmoji('🔃')
       .setStyle(ButtonStyle.Secondary),
@@ -590,12 +590,12 @@ export function buildTournamentControlPanelButtons(tournamentId) {
 
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`md_tour_delete_channels:${tournamentId}`)
+      .setCustomId(`dash:main:delete-channels:${tournamentId}`)
       .setLabel('Delete All Channels')
       .setEmoji('🗑️')
       .setStyle(ButtonStyle.Danger),
     new ButtonBuilder()
-      .setCustomId(`md_tour_delete_permanent:${tournamentId}`)
+      .setCustomId(`dash:main:delete-tournament:${tournamentId}`)
       .setLabel('Delete Tournament')
       .setEmoji('💣')
       .setStyle(ButtonStyle.Danger)
@@ -662,6 +662,24 @@ export async function handleDashboardNavigationInteraction(interaction) {
       await handleBackToTournamentPanel(interaction, tournamentId);
       return true;
     }
+  }
+
+  if (screen === 'main') {
+    const actionMap = {
+      'create-channels': 'create_channels',
+      sync: 'sync_refresh',
+      refresh: 'refresh',
+      'delete-channels': 'delete_channels',
+      'confirm-delete-channels': 'confirm_delete',
+      'cancel-delete-channels': 'cancel_delete',
+      'delete-tournament': 'delete_permanent',
+      'confirm-delete-tournament': 'confirm_delete_permanent',
+      'cancel-delete-tournament': 'cancel_delete_permanent',
+    };
+    const mappedAction = actionMap[action];
+    if (!mappedAction) return false;
+    await handleTournamentButtonInteraction(interaction, `md_tour_${mappedAction}:${tournamentId}`);
+    return true;
   }
 
   if (screen === 'home' && action === 'rounds') {
@@ -2990,8 +3008,8 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
    * - md_tour_confirm_delete:<tournamentId>
    * - md_tour_cancel_delete:<tournamentId>
    */
-  export async function handleTournamentButtonInteraction(interaction) {
-    const customId = interaction.customId || '';
+  export async function handleTournamentButtonInteraction(interaction, customIdOverride = null) {
+    const customId = customIdOverride || interaction.customId || '';
     if (
       !customId.startsWith('md_tour_') &&
       !customId.startsWith('md_round_') &&
@@ -3419,12 +3437,12 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
       const confirmRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
-          .setCustomId(`md_tour_confirm_delete:${tournamentId}`)
+          .setCustomId(`dash:main:confirm-delete-channels:${tournamentId}`)
           .setLabel('Yes, Delete All Channels')
           .setEmoji('⚠️')
           .setStyle(ButtonStyle.Danger),
         new ButtonBuilder()
-          .setCustomId(`md_tour_cancel_delete:${tournamentId}`)
+          .setCustomId(`dash:main:cancel-delete-channels:${tournamentId}`)
           .setLabel('Cancel')
           .setStyle(ButtonStyle.Secondary)
       );
@@ -3449,32 +3467,14 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
         `*(You can recreate all required channels at any time by clicking **Create Channels**)*\n` +
         `⏱️ **This confirmation prompt will expire in 30 seconds.**`;
 
-      if (typeof interaction.reply === 'function') {
-        const sent = await interaction.reply({
-          content: promptText,
-          components: [confirmRow],
-          ephemeral: true,
-        });
-
-        if (sent?.createMessageComponentCollector) {
-          const collector = sent.createMessageComponentCollector({ time: 30000 });
-          collector.on('end', (collected, reason) => {
-            if (reason === 'time') {
-              interaction.editReply({
-                content: '⏱️ **Confirmation Timed Out:** Tournament channel deletion was cancelled.',
-                components: [],
-              }).catch(() => { });
-            }
-          });
-        }
-      }
+      await interaction.editReply({ content: promptText, components: [confirmRow], embeds: [] }).catch(() => {});
       return;
     }
 
     // Action: Cancel Delete
     if (action === 'cancel_delete') {
-      if (typeof interaction.update === 'function') {
-        await interaction.update({
+      if (typeof interaction.editReply === 'function') {
+        await interaction.editReply({
           content: 'ℹ️ **Deletion Cancelled:** All tournament channels and configuration remain intact.',
           components: [],
         });
@@ -3506,8 +3506,8 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
         return;
       }
 
-      if (typeof interaction.update === 'function') {
-        await interaction.update({ content: '⏳ **Deleting tournament channels, ID/PWD channels, and category...**', components: [] });
+      if (typeof interaction.editReply === 'function') {
+        await interaction.editReply({ content: '⏳ **Deleting tournament channels, ID/PWD channels, and category...**', components: [] });
       }
 
       const deletionSummary = await deleteTournamentDiscordChannels(guild, tournamentId);
@@ -7904,12 +7904,12 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
 
     const confirmRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
-        .setCustomId(`md_tour_confirm_delete_permanent:${tournamentId}`)
+        .setCustomId(`dash:main:confirm-delete-tournament:${tournamentId}`)
         .setLabel('Confirm Permanent Deletion')
         .setEmoji('💣')
         .setStyle(ButtonStyle.Danger),
       new ButtonBuilder()
-        .setCustomId(`md_tour_cancel_delete_permanent:${tournamentId}`)
+        .setCustomId(`dash:main:cancel-delete-tournament:${tournamentId}`)
         .setLabel('Cancel')
         .setStyle(ButtonStyle.Secondary)
     );
@@ -7923,25 +7923,7 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       `• All MongoDB tournament documents, rounds, slot lists, and managed message mappings\n\n` +
       `⏱️ **This confirmation prompt will expire in 30 seconds.**`;
 
-    if (typeof interaction.reply === 'function') {
-      const sent = await interaction.reply({
-        content: promptText,
-        components: [confirmRow],
-        ephemeral: true,
-      });
-
-      if (sent?.createMessageComponentCollector) {
-        const collector = sent.createMessageComponentCollector({ time: 30000 });
-        collector.on('end', (collected, reason) => {
-          if (reason === 'time') {
-            interaction.editReply({
-              content: '⏱️ **Confirmation Timed Out:** Permanent tournament deletion was cancelled.',
-              components: [],
-            }).catch(() => {});
-          }
-        });
-      }
-    }
+    await interaction.editReply({ content: promptText, components: [confirmRow], embeds: [] }).catch(() => {});
   }
 
   /**
@@ -7961,8 +7943,8 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       return;
     }
 
-    if (typeof interaction.update === 'function') {
-      await interaction.update({
+    if (typeof interaction.editReply === 'function') {
+      await interaction.editReply({
         content: `⏳ **Initiating permanent deletion for tournament \`${tournamentId}\`...**\n*Deleting channels, roles, and MongoDB data.*`,
         components: [],
       }).catch(() => {});
