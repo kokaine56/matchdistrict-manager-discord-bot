@@ -88,6 +88,8 @@ import {
   handleSubmitResultPromptCommand,
   generateEmptyRoundGroups,
   handleDashCommand,
+  handleDashboardNavigationInteraction,
+  fetchTournamentRegistrationsFromBackend,
   handlePermanentTournamentDeleteCommand,
   executeTournamentPermanentDeletion,
   resumePendingTournamentDeletions,
@@ -210,6 +212,8 @@ export {
   handleSubmitResultPromptCommand,
   generateEmptyRoundGroups,
   handleDashCommand,
+  handleDashboardNavigationInteraction,
+  fetchTournamentRegistrationsFromBackend,
   handlePermanentTournamentDeleteCommand,
   executeTournamentPermanentDeletion,
   resumePendingTournamentDeletions,
@@ -2119,12 +2123,50 @@ client.once(Events.ClientReady, async (readyClient) => {
   } catch (recErr) {
     console.warn('[MongoDB] ⚠️ Error in startup recovery and reconciliation:', recErr.message);
   }
+
+  // Restore each persisted dashboard in place and clean its command channel after every restart.
+  for (const guild of readyClient.guilds.cache.values()) {
+    const tournaments = guildSettingsCache[guild.id]?.tournaments || {};
+    for (const [tournamentId, savedTournament] of Object.entries(tournaments)) {
+      if (!savedTournament?.channels?.botCommandsId || ['deletion_pending', 'deleting', 'deleted'].includes(savedTournament.deletionStatus)) continue;
+      try {
+        const channel = guild.channels.cache.get(savedTournament.channels.botCommandsId) ||
+          await guild.channels.fetch(savedTournament.channels.botCommandsId).catch(() => null);
+        if (!channel) continue;
+        const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId);
+        await setupTournamentControlPanel(guild, backendData.tournament, backendData.summary, guild.members.me);
+      } catch (dashboardErr) {
+        console.warn(`[Discord Bot] Dashboard startup refresh failed for tournament ${tournamentId}:`, dashboardErr.message);
+      }
+    }
+  }
 });
 
 // Handle prefix commands and message create logging
 client.on(Events.MessageCreate, async (message) => {
   try {
-    if (!message || message.author?.bot) return;
+    if (!message) return;
+    if (message.guild && message.channel?.id) {
+      const savedTournaments = guildSettingsCache[message.guild.id]?.tournaments || {};
+      const dashboard = Object.values(savedTournaments).find((saved) => saved?.channels?.botCommandsId === message.channel.id);
+      const isDashboard = message.id === dashboard?.controlPanelMessageId ||
+        (message.author?.bot && message.embeds?.some((embed) => embed.title?.startsWith('🏆 Tournament Control Panel:')));
+      if (dashboard && !isDashboard) {
+        const commandText = message.content?.trim() || '';
+        const withoutPrefix = commandText.startsWith(PREFIX)
+          ? commandText.slice(PREFIX.length).trim()
+          : commandText.replace(new RegExp(`^<@!?${client.user?.id}>\\s*`), '');
+        const dashboardCommand = (commandText.startsWith(PREFIX) || withoutPrefix !== commandText) &&
+          ['dash', 'dashboard'].includes(withoutPrefix.split(/\s+/)[0]?.toLowerCase());
+        if (dashboardCommand) {
+          // Let .dash run; its handler deletes the invocation after access checks.
+        } else {
+          await message.delete().catch(() => {});
+          return;
+        }
+      }
+    }
+    if (message.author?.bot) return;
 
     const corrId = crypto.randomBytes(4).toString('hex');
     console.log(`[Discord Bot] [corr:${corrId}] 1. Message event received: guildId=${message.guild?.id || 'DM'}, authorId=${message.author?.id}, hasContent=${Boolean(message.content)}`);
@@ -2348,7 +2390,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  let dashboardContext = null;
   try {
+    if (interaction.isButton?.() && interaction.guild && interaction.channelId) {
+      const savedTournaments = guildSettingsCache[interaction.guild.id]?.tournaments || {};
+      const match = Object.entries(savedTournaments).find(([, saved]) => saved?.channels?.botCommandsId === interaction.channelId);
+      if (match) {
+        dashboardContext = { tournamentId: match[0], savedTournament: match[1] };
+        const isCanonicalDashboard = interaction.message?.id === match[1]?.controlPanelMessageId;
+        const opensModal = isCanonicalDashboard && (
+          interaction.customId?.startsWith('md_tour_create_round:') ||
+          interaction.customId?.startsWith('md_round_edit:')
+        );
+        if (!opensModal && !interaction.deferred && !interaction.replied) await interaction.deferUpdate();
+        if (!isCanonicalDashboard) {
+          const backendData = await fetchTournamentRegistrationsFromBackend(match[0]);
+          await setupTournamentControlPanel(interaction.guild, backendData.tournament, backendData.summary, interaction.guild.members.me);
+          return;
+        }
+      }
+    }
+
+    if (interaction.isButton() && (
+      interaction.customId?.startsWith('dash:')
+    )) {
+      const handled = await handleDashboardNavigationInteraction(interaction);
+      if (handled) return;
+    }
     if (interaction.isButton() && (
       interaction.customId?.startsWith('md_tour_') ||
       interaction.customId?.startsWith('md_round_') ||
@@ -2388,9 +2456,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleTournamentSelectMenuInteraction(interaction);
       return;
     }
+    if (interaction.isButton() && dashboardContext) {
+      // Unknown or stale dashboard buttons recover to the canonical Home screen.
+      const backendData = await fetchTournamentRegistrationsFromBackend(dashboardContext.tournamentId);
+      await setupTournamentControlPanel(interaction.guild, backendData.tournament, backendData.summary, interaction.guild.members.me);
+      return;
+    }
   } catch (error) {
     console.warn('[Discord Bot] ⚠️ Error in InteractionCreate handler:', error.message);
     try {
+      if (dashboardContext && interaction.guild) {
+        const backendData = await fetchTournamentRegistrationsFromBackend(dashboardContext.tournamentId);
+        await setupTournamentControlPanel(interaction.guild, backendData.tournament, backendData.summary, interaction.guild.members.me);
+        return;
+      }
       if (!interaction.isModalSubmit()) {
         const errorMsg = `❌ **Interaction Error:** ${error.message}`;
         if (interaction.deferred) {

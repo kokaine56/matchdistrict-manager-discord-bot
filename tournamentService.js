@@ -577,7 +577,12 @@ export function buildTournamentControlPanelButtons(tournamentId) {
       .setEmoji('🔄')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
-      .setCustomId(`md_tour_view_rounds:${tournamentId}`)
+      .setCustomId('dash:home:refresh')
+      .setLabel('Refresh')
+      .setEmoji('🔃')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('dash:home:rounds')
       .setLabel('Round Management')
       .setEmoji('⚔️')
       .setStyle(ButtonStyle.Secondary)
@@ -597,6 +602,88 @@ export function buildTournamentControlPanelButtons(tournamentId) {
   );
 
   return [row1, row2];
+}
+
+function updateDashboardNavigation(guild, tournamentId, operation, screen = null) {
+  const settings = guildSettingsCache[guild?.id] || {};
+  const savedTournament = settings.tournaments?.[tournamentId];
+  if (!savedTournament) return;
+  const stack = Array.isArray(savedTournament.dashboardNavigationStack) && savedTournament.dashboardNavigationStack.length
+    ? [...savedTournament.dashboardNavigationStack]
+    : [{ screen: 'home' }];
+
+  if (operation === 'push' && screen) {
+    const current = stack[stack.length - 1];
+    if (JSON.stringify(current) !== JSON.stringify(screen)) stack.push(screen);
+  } else if (operation === 'back' && stack.length > 1) {
+    stack.pop();
+  } else if (operation === 'home') {
+    stack.splice(0, stack.length, { screen: 'home' });
+  }
+
+  savedTournament.dashboardNavigationStack = stack;
+  settings.tournaments[tournamentId] = savedTournament;
+  guildSettingsCache[guild.id] = settings;
+  saveGuildSettings(guildSettingsCache);
+  saveTournamentToDb(guild.id, tournamentId, savedTournament);
+}
+
+export async function handleDashboardNavigationInteraction(interaction) {
+  const [namespace, screen, action] = String(interaction.customId || '').split(':');
+  if (namespace !== 'dash') return false;
+  const settings = guildSettingsCache[interaction.guild.id] || {};
+  const match = Object.entries(settings.tournaments || {}).find(([, saved]) => saved?.channels?.botCommandsId === interaction.channelId);
+  if (!match) return false;
+  const [tournamentId, savedTournament] = match;
+  const stack = Array.isArray(savedTournament.dashboardNavigationStack) && savedTournament.dashboardNavigationStack.length
+    ? savedTournament.dashboardNavigationStack
+    : [{ screen: 'home' }];
+
+  if (screen === 'home' && action === 'rounds') {
+    updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'rounds' });
+    await handleViewRoundsScreen(interaction, tournamentId);
+    return true;
+  }
+  if (screen === 'home' && action === 'refresh') {
+    const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId);
+    await setupTournamentControlPanel(interaction.guild, backendData.tournament, backendData.summary, interaction.guild.members.me);
+    return true;
+  }
+  if (screen === 'rounds' && action === 'refresh') {
+    await handleViewRoundsScreen(interaction, tournamentId);
+    return true;
+  }
+  if (screen === 'rounds' && action === 'back') {
+    updateDashboardNavigation(interaction.guild, tournamentId, 'home');
+    await handleBackToTournamentPanel(interaction, tournamentId);
+    return true;
+  }
+  if (screen === 'round' && action === 'refresh') {
+    const current = stack[stack.length - 1];
+    if (current?.screen === 'round' && current.roundId) {
+      await handleOpenIndividualRoundMenu(interaction, tournamentId, current.roundId);
+    } else {
+      updateDashboardNavigation(interaction.guild, tournamentId, 'home');
+      await handleBackToTournamentPanel(interaction, tournamentId);
+    }
+    return true;
+  }
+  if (screen === 'round' && action === 'back') {
+    updateDashboardNavigation(interaction.guild, tournamentId, 'back');
+    const prior = savedTournament.dashboardNavigationStack?.at(-1);
+    if (prior?.screen === 'rounds') await handleViewRoundsScreen(interaction, tournamentId);
+    else {
+      updateDashboardNavigation(interaction.guild, tournamentId, 'home');
+      await handleBackToTournamentPanel(interaction, tournamentId);
+    }
+    return true;
+  }
+  if (screen === 'round' && action === 'home') {
+    updateDashboardNavigation(interaction.guild, tournamentId, 'home');
+    await handleBackToTournamentPanel(interaction, tournamentId);
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -1376,82 +1463,30 @@ export async function handleSyncRolesCommand(guild, member, args = [], replyFn, 
 }
 
 /**
- * Cleans up obsolete bot-generated messages from #bot-commands for a tournament,
- * keeping exactly one canonical management dashboard and removing old panels,
- * expired summaries, duplicate slot lists, and temporary status messages.
- * Never touches human messages or messages from unknown sources.
+ * Keeps exactly one message in #bot-commands: the canonical dashboard.
  *
  * @param {import('discord.js').Guild} guild
  * @param {import('discord.js').TextChannel} botCommandsChannel
  * @param {string} tournamentId
  * @param {string} activeDashboardMessageId
- * @param {string} [activeSubmissionMessageId]
  */
 export async function cleanupBotCommandsClutter(guild, botCommandsChannel, tournamentId, activeDashboardMessageId, activeSubmissionMessageId = null) {
   if (!botCommandsChannel || typeof botCommandsChannel.messages?.fetch !== 'function') return;
 
   try {
-    const fetched = await botCommandsChannel.messages.fetch({ limit: 50 }).catch(() => null);
-    if (!fetched || fetched.size === 0) return;
-
-    const botUserId = guild?.client?.user?.id;
-    const toDelete = [];
-
-    for (const msg of fetched.values()) {
-      // Rule 1: Never delete human messages
-      if (!msg.author?.bot) continue;
-
-      // Rule 2: Only manage messages authored by this bot
-      if (botUserId && msg.author.id !== botUserId) continue;
-
-      // Rule 3: Always preserve the active canonical dashboard
-      if (activeDashboardMessageId && msg.id === activeDashboardMessageId) continue;
-
-      // Rule 4: Always preserve the active global submission panel if present
-      if (activeSubmissionMessageId && msg.id === activeSubmissionMessageId) continue;
-
-      // Identify bot management clutter:
-      // a) Older dashboard / control panel duplicates
-      const hasDashboardTitle = msg.embeds?.some((e) =>
-        e.title?.includes('MatchDistrict Tournament Control Panel') ||
-        e.title?.includes('Tournament Management & Control Panel') ||
-        e.title?.includes('Tournament Control Panel')
-      );
-      const hasDashboardButtons = msg.components?.some((row) =>
-        row.components?.some((c) =>
-          c.customId?.startsWith('md_tour_create_channels') ||
-          c.customId?.startsWith('md_tour_sync_refresh') ||
-          c.customId?.startsWith('md_tour_round_mgmt') ||
-          c.customId?.startsWith('md_tour_view_rounds') ||
-          c.customId?.startsWith('md_tour_delete_channels')
-        )
-      );
-
-      // b) Old temporary status / notification messages
-      const isTemporaryNotification =
-        msg.content?.includes('Dashboard Restored:') ||
-        msg.content?.includes('Participant channels provisioned') ||
-        msg.content?.includes('Tournament Synchronized & Refreshed') ||
-        msg.content?.includes('Sync & Refresh Completed') ||
-        msg.content?.includes('Failed to restore dashboard') ||
-        msg.content?.includes('Database Unavailable');
-
-      // c) Old slot dump messages or outdated round allocation summaries
-      const isOutdatedAllocation =
-        (msg.content?.includes('Round Allocation & Qualification Summary') && !msg.content?.includes(tournamentId)) ||
-        (msg.content?.includes('Capacity: 25 slots per group') && msg.content?.includes('Group 1'));
-
-      if (hasDashboardTitle || hasDashboardButtons || isTemporaryNotification || isOutdatedAllocation) {
-        toDelete.push(msg);
+    let before;
+    let hasMore = true;
+    while (hasMore) {
+      const fetched = await botCommandsChannel.messages.fetch({ limit: 100, ...(before ? { before } : {}) }).catch(() => null);
+      if (!fetched?.size) break;
+      for (const msg of fetched.values()) {
+        if (msg.id !== activeDashboardMessageId) await msg.delete().catch(() => {});
       }
+      before = fetched.last()?.id;
+      hasMore = fetched.size === 100 && Boolean(before);
     }
 
-    // Delete identified obsolete messages safely with error suppression
-    for (const msg of toDelete) {
-      await msg.delete().catch(() => {});
-    }
-
-    // Mark outdated managed message records in MongoDB for this channel/tournament as deleted
+    // Mark every other managed message record for this channel as deleted.
     if (isMongoConnected() && activeDashboardMessageId) {
       const db = getDb();
       if (db) {
@@ -1460,7 +1495,6 @@ export async function cleanupBotCommandsClutter(guild, botCommandsChannel, tourn
           {
             guildId: guild.id,
             channelId: botCommandsChannel.id,
-            messageType: 'tournament_control_panel',
             messageId: { $ne: activeDashboardMessageId },
             status: 'active',
           },
@@ -1500,6 +1534,9 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
 
   if (!savedTournament.channels) {
     savedTournament.channels = {};
+  }
+  if (!Array.isArray(savedTournament.dashboardNavigationStack) || savedTournament.dashboardNavigationStack.length === 0) {
+    savedTournament.dashboardNavigationStack = [{ screen: 'home' }];
   }
 
   // Ensure tournament role exists or is fetched
@@ -1756,20 +1793,14 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   saveGuildSettings(guildSettingsCache);
   saveTournamentToDb(guild.id, tournamentId, savedTournament);
 
-  // If an active round exists, ensure global submission control panel is kept updated in #bot-commands
-  const activeRound = Object.values(savedTournament.rounds || {}).find((r) => r.status === 'Active' || r.status === 'Started');
-  if (activeRound) {
-    await updateGlobalSubmissionControlPanel(guild, tournament, activeRound, botCommandsChannel);
-  }
-
-  // 7. Prune management clutter and duplicate panels from #bot-commands
+  // Keep the dashboard as the only message in this channel.
+  // 7. Remove command invocations, user messages, and any other messages.
   if (panelMessage?.id) {
     await cleanupBotCommandsClutter(
       guild,
       botCommandsChannel,
       tournamentId,
-      panelMessage.id,
-      activeRound?.globalSubmissionControlMessageId || null
+      panelMessage.id
     );
   }
 
@@ -3109,6 +3140,8 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
     // Action: View Rounds / Round Management (Dedicated Screen)
     if (action === 'view_rounds' || action === 'round_mgmt' || action === 'back_to_rounds') {
+      if (action === 'back_to_rounds') updateDashboardNavigation(guild, tournamentId, 'back');
+      else updateDashboardNavigation(guild, tournamentId, 'push', { screen: 'rounds' });
       await handleViewRoundsScreen(interaction, tournamentId);
       return;
     }
@@ -3131,8 +3164,14 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
       return;
     }
 
+    if (action === 'refresh_round') {
+      await handleOpenIndividualRoundMenu(interaction, tournamentId, extraParam);
+      return;
+    }
+
     // Action: Back to Tournament Dashboard
     if (action === 'back_to_panel') {
+      updateDashboardNavigation(guild, tournamentId, 'home');
       await handleBackToTournamentPanel(interaction, tournamentId);
       return;
     }
@@ -3625,12 +3664,12 @@ export async function handleViewRoundsScreen(interaction, tournamentId) {
       .setEmoji('➕')
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
-      .setCustomId(`md_tour_refresh_rounds:${tournamentId}`)
+      .setCustomId('dash:rounds:refresh')
       .setLabel('Refresh')
       .setEmoji('🔄')
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
-      .setCustomId(`md_tour_back_to_panel:${tournamentId}`)
+      .setCustomId('dash:rounds:back')
       .setLabel('Back to Dashboard')
       .setEmoji('⬅️')
       .setStyle(ButtonStyle.Secondary)
@@ -3846,15 +3885,20 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
       .setStyle(ButtonStyle.Success)
   );
 
-  // Row 2: Back to Rounds, Back to Dashboard
+  // Row 2: Refresh the current screen and navigate back.
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`md_round_back_to_rounds:${tournamentId}`)
+      .setCustomId('dash:round:refresh')
+      .setLabel('Refresh')
+      .setEmoji('🔄')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('dash:round:back')
       .setLabel('Back to Rounds')
       .setEmoji('📋')
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
-      .setCustomId(`md_tour_back_to_panel:${tournamentId}`)
+      .setCustomId('dash:round:home')
       .setLabel('Back to Dashboard')
       .setEmoji('⬅️')
       .setStyle(ButtonStyle.Secondary)
@@ -5223,6 +5267,7 @@ export async function handleTournamentSelectMenuInteraction(interaction) {
   if (customId.startsWith('md_tour_select_round_menu:')) {
     const tournamentId = customId.split(':')[1];
     const roundId = interaction.values?.[0];
+    if (roundId) updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'round', roundId });
     await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId);
     return;
   }
@@ -8122,14 +8167,12 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
         const backendData = await fetchTournamentRegistrationsFromBackend(resolvedTournamentId);
         const { tournament, summary } = backendData;
 
+        updateDashboardNavigation(guild, resolvedTournamentId, 'home');
+
         const botMember = guild.members.me;
         await setupTournamentControlPanel(guild, tournament, summary, botMember);
 
-        // Brief confirmation notification that auto-deletes to keep channel spotless
-        const notifyMsg = await channel.send(`✅ **Dashboard Restored:** Control panel for **${tournament.title}** (\`${resolvedTournamentId}\`) is synchronized and active.`);
-        setTimeout(() => {
-          notifyMsg.delete().catch(() => {});
-        }, 3000);
+        // The dashboard message is the sole message in this channel; avoid posting a confirmation.
       }, 'dashboard_restore');
     } catch (err) {
       console.warn(`[Discord Bot] Error in .dash command for tournament ${resolvedTournamentId}:`, err.message);
