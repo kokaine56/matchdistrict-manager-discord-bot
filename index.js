@@ -31,6 +31,13 @@ import {
   handleSelectTournamentCommand,
   handleTournamentButtonInteraction,
   deleteTournamentDiscordChannels,
+  updateTeamsRosterMessages,
+  updateRegistrationLinkMessage,
+  formatRegistrationMessage,
+  withTournamentLock,
+  fetchUserEligibleTournamentsFromBackend,
+  syncMemberTournamentAccess,
+  reconcileAllTournamentAccess,
 } from './tournamentService.js';
 
 export {
@@ -48,6 +55,13 @@ export {
   handleSelectTournamentCommand,
   handleTournamentButtonInteraction,
   deleteTournamentDiscordChannels,
+  updateTeamsRosterMessages,
+  updateRegistrationLinkMessage,
+  formatRegistrationMessage,
+  withTournamentLock,
+  fetchUserEligibleTournamentsFromBackend,
+  syncMemberTournamentAccess,
+  reconcileAllTournamentAccess,
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -65,20 +79,93 @@ for (const envPath of candidateEnvPaths) {
   }
 }
 
-// Optional HTTP health check endpoint for platforms like Render Web Services
+// HTTP server for health checks & secure backend-to-bot sync endpoints
 let healthServer = null;
 const healthPort = process.env.PORT;
 if (healthPort) {
   try {
-    healthServer = http.createServer((req, res) => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', service: 'matchdistrict-manager-discord-bot' }));
+    healthServer = http.createServer(async (req, res) => {
+      const parsedUrl = new URL(req.url, 'http://localhost');
+      const pathname = parsedUrl.pathname;
+
+      if (req.method === 'GET' && (pathname === '/' || pathname === '/health')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', service: 'matchdistrict-manager-discord-bot' }));
+        return;
+      }
+
+      // Authenticated Webhook / Sync endpoint: POST /api/bot/sync/user
+      if (req.method === 'POST' && pathname === '/api/bot/sync/user') {
+        const secret = process.env.MATCHDISTRICT_BOT_SECRET;
+        const incoming = req.headers['x-bot-secret'] || (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null);
+        if (!secret || incoming !== secret) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'UNAUTHORIZED' }));
+          return;
+        }
+
+        let bodyStr = '';
+        req.on('data', (chunk) => { bodyStr += chunk; });
+        req.on('end', async () => {
+          try {
+            const body = JSON.parse(bodyStr || '{}');
+            const discordId = body.discord_id;
+            const officialGuildId = getOfficialGuildId();
+            if (discordId && officialGuildId && client?.guilds) {
+              const guild = client.guilds.cache.get(officialGuildId) || await client.guilds.fetch(officialGuildId).catch(() => null);
+              if (guild) {
+                const member = guild.members.cache.get(discordId) || await guild.members.fetch(discordId).catch(() => null);
+                if (member) {
+                  const syncResult = await syncMemberTournamentAccess(member);
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: true, member_found: true, syncResult }));
+                  return;
+                }
+              }
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: true, member_found: false }));
+          } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // Authenticated Webhook / Reconcile endpoint: POST /api/bot/sync/reconcile
+      if (req.method === 'POST' && pathname === '/api/bot/sync/reconcile') {
+        const secret = process.env.MATCHDISTRICT_BOT_SECRET;
+        const incoming = req.headers['x-bot-secret'] || (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null);
+        if (!secret || incoming !== secret) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'UNAUTHORIZED' }));
+          return;
+        }
+
+        const officialGuildId = getOfficialGuildId();
+        if (officialGuildId && client?.guilds) {
+          const guild = client.guilds.cache.get(officialGuildId) || await client.guilds.fetch(officialGuildId).catch(() => null);
+          if (guild) {
+            const results = await reconcileAllTournamentAccess(guild);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: true, results }));
+            return;
+          }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Official guild not found or client not ready' }));
+        return;
+      }
+
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'NOT_FOUND' }));
     });
     healthServer.listen(healthPort, '0.0.0.0', () => {
-      console.log(`[Discord Bot] 🌐 Health check server listening on port ${healthPort}`);
+      console.log(`[Discord Bot] 🌐 Server listening on port ${healthPort}`);
     });
   } catch (err) {
-    console.warn('[Discord Bot] ⚠️ Health check server error:', err.message);
+    console.warn('[Discord Bot] ⚠️ Server error:', err.message);
   }
 }
 
@@ -1567,6 +1654,19 @@ client.on(Events.MessageCreate, async (message) => {
         }
         await handleSelectTournamentCommand(message.guild, message.member, targetId, (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }));
         return;
+      } else if (cmd === 'sync' || cmd === 'reconcile') {
+        const access = checkTournamentAccess(message.guild, message.member);
+        if (!access.allowed) {
+          await message.reply(access.reason);
+          return;
+        }
+        const waitMsg = await message.reply('⏳ **Reconciling tournament participant access in official Discord server...**');
+        const results = await reconcileAllTournamentAccess(message.guild);
+        await waitMsg.edit(
+          `✅ **Reconciliation Complete:** Synchronized **${results.synchronizedTournaments}** tournament(s).` +
+          (results.failures.length > 0 ? `\n⚠️ Warnings: ${results.failures.join(', ')}` : '')
+        );
+        return;
       } else if (cmd === 'status') {
         await handleStatusCommand(message.guild, (text) => message.reply(text));
         return;
@@ -1625,6 +1725,7 @@ client.on(Events.GuildBanRemove, async (ban) => {
 // Member join listener
 client.on(Events.GuildMemberAdd, async (member) => {
   await handleGuildMemberAdd(member);
+  await syncMemberTournamentAccess(member);
 });
 
 // Error listeners

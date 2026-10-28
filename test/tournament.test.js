@@ -30,6 +30,13 @@ import {
   handleSelectTournamentCommand,
   handleTournamentButtonInteraction,
   deleteTournamentDiscordChannels,
+  updateTeamsRosterMessages,
+  updateRegistrationLinkMessage,
+  formatRegistrationMessage,
+  withTournamentLock,
+  fetchUserEligibleTournamentsFromBackend,
+  syncMemberTournamentAccess,
+  reconcileAllTournamentAccess,
 } from '../tournamentService.js';
 import {
   guildSettingsCache,
@@ -493,13 +500,14 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     assert.equal(result.categoryAction, 'created');
     assert.ok(result.categoryId);
 
-    // Verify exactly 4 channels were created
-    assert.equal(result.channelsCreated.length, 4);
+    // Verify exactly 5 channels were created
+    assert.equal(result.channelsCreated.length, 5);
     assert.deepEqual(result.channelsCreated, [
       'bot-commands',
       'tournament-update',
       'tournament-teams',
       'tournament-helpdesk',
+      'tournament-register',
     ]);
 
     // Verify NO squad channels exist (e.g. team-godlike or team-soul-esports)
@@ -533,15 +541,12 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     assert.ok(updateOw1.deny.includes('SendMessages'));
     assert.ok(updateOw1.deny.includes('CreatePublicThreads'));
 
-    // C. #tournament-teams: Eligible participants can read; CANNOT post; contains published roster
+    // C. #tournament-teams: Administrator and Bot access only; ordinary participants must NOT be granted access
     const teamsCh = guild.channels.cache.get(result.channelIds.tournamentTeamsId);
     assert.ok(teamsCh);
     assert.equal(teamsCh.parentId, result.categoryId);
-    const teamsOw1 = teamsCh.permissionOverwrites.cache.get('111111111111111111');
-    assert.ok(teamsOw1);
-    assert.ok(teamsOw1.allow.includes('ViewChannel'));
-    assert.ok(teamsOw1.deny.includes('SendMessages'));
-    // Ineligible member 444444444444444444 must NOT have access
+    assert.equal(teamsCh.permissionOverwrites.cache.has('111111111111111111'), false);
+    assert.equal(teamsCh.permissionOverwrites.cache.has('222222222222222222'), false);
     assert.equal(teamsCh.permissionOverwrites.cache.has('444444444444444444'), false);
     // Verified teams roster was published to teamsCh
     assert.equal(result.teamsUpdatedInChannel, true);
@@ -559,6 +564,18 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     assert.ok(helpdeskOw1.allow.includes('SendMessages'));
     assert.ok(helpdeskOw1.allow.includes('AttachFiles'));
 
+    // E. #tournament-register: Eligible participants can read direct details link; CANNOT post
+    const registerCh = guild.channels.cache.get(result.channelIds.tournamentRegisterId);
+    assert.ok(registerCh);
+    assert.equal(registerCh.parentId, result.categoryId);
+    const registerOw1 = registerCh.permissionOverwrites.cache.get('111111111111111111');
+    assert.ok(registerOw1);
+    assert.ok(registerOw1.allow.includes('ViewChannel'));
+    assert.ok(registerOw1.deny.includes('SendMessages'));
+    assert.ok(registerCh.sentMessages.length > 0);
+    assert.match(registerCh.sentMessages[0].content, /Official Tournament Registration & Details/);
+    assert.match(registerCh.sentMessages[0].content, /tour-sync-1/);
+
     // Verify persistent storage
     const saved = guildSettingsCache[guild.id]?.tournaments?.[mockTournament.id];
     assert.ok(saved);
@@ -567,6 +584,7 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     assert.equal(saved.channels.tournamentUpdateId, result.channelIds.tournamentUpdateId);
     assert.equal(saved.channels.tournamentTeamsId, result.channelIds.tournamentTeamsId);
     assert.equal(saved.channels.tournamentHelpdeskId, result.channelIds.tournamentHelpdeskId);
+    assert.equal(saved.channels.tournamentRegisterId, result.channelIds.tournamentRegisterId);
   });
 
   test('11. Channel Reuse: reuses existing category and all 4 channels without creating duplicates', async () => {
@@ -593,14 +611,14 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     // First run
     const firstSync = await syncTournamentDiscordChannels(guild, mockTournament, initialTeams, botMember);
     assert.equal(firstSync.categoryAction, 'created');
-    assert.equal(firstSync.channelsCreated.length, 4);
+    assert.equal(firstSync.channelsCreated.length, 5);
 
     // Second run
     const secondSync = await syncTournamentDiscordChannels(guild, mockTournament, initialTeams, botMember);
     assert.equal(secondSync.categoryAction, 'reused');
     assert.equal(secondSync.categoryId, firstSync.categoryId);
     assert.equal(secondSync.channelsCreated.length, 0);
-    assert.equal(secondSync.channelsReused.length, 4);
+    assert.equal(secondSync.channelsReused.length, 5);
     assert.deepEqual(secondSync.channelIds, firstSync.channelIds);
   });
 
@@ -698,8 +716,8 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     assert.equal(guild.channels.cache.has(obsoleteSquadChannel.id), false);
     // Unrelated channel preserved
     assert.equal(guild.channels.cache.has(unrelatedChannel.id), true);
-    // 4 shared tournament channels created
-    assert.equal(syncResult.channelsCreated.length, 4);
+    // 5 shared tournament channels created
+    assert.equal(syncResult.channelsCreated.length, 5);
   });
 
   test('14. Context Resolution: .fetch teams resolves tournament ID automatically when run inside #bot-commands', async () => {
@@ -1225,5 +1243,311 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     });
     await handleTournamentButtonInteraction(nonAdminInteraction);
     assert.match(nonAdminInteraction.getReplied().content, /Administrator/i);
+  });
+
+  // --- Acceptance Tests (Deduplication, Channel Access Rules & Member Sync) ---
+
+  test('Acceptance 1 & 2: First refresh sends team-list message and saves ID; second refresh edits existing message in-place', async () => {
+    const guild = createMockGuild(OFFICIAL_GUILD_ID);
+    const tournament = { id: 'tour-dedup-1', title: 'Free Fire Cup', game: 'Free Fire' };
+    const initialTeams = [
+      { id: 't-1', team_name: 'Squad One', captain: 'Player 1', is_eligible: true, members: [] },
+    ];
+    const teamsChannel = await guild.channels.create({ name: 'tournament-teams', type: ChannelType.GuildText });
+    const savedTournament = { channels: { tournamentTeamsId: teamsChannel.id }, teamListMessageIds: [] };
+
+    // 1st refresh: creates message and saves ID
+    await updateTeamsRosterMessages(guild, tournament, initialTeams, teamsChannel, savedTournament);
+    assert.equal(teamsChannel.sentMessages.length, 1);
+    assert.equal(savedTournament.teamListMessageIds.length, 1);
+    const firstMsgId = savedTournament.teamListMessageIds[0];
+    assert.match(teamsChannel.sentMessages[0].content, /Squad One/);
+
+    // 2nd refresh with new team: edits existing message, does NOT send new message
+    const updatedTeams = [
+      { id: 't-1', team_name: 'Squad One Updated', captain: 'Player 1', is_eligible: true, members: [] },
+      { id: 't-2', team_name: 'Squad Two', captain: 'Player 2', is_eligible: true, members: [] },
+    ];
+    await updateTeamsRosterMessages(guild, tournament, updatedTeams, teamsChannel, savedTournament);
+    assert.equal(teamsChannel.sentMessages.length, 1); // Still exactly 1 message
+    assert.equal(savedTournament.teamListMessageIds[0], firstMsgId);
+    assert.match(teamsChannel.sentMessages[0].content, /Squad One Updated/);
+    assert.match(teamsChannel.sentMessages[0].content, /Squad Two/);
+  });
+
+  test('Acceptance 3: Restarting the bot preserves teamListMessageIds in storage and avoids duplicate messages', async () => {
+    const guild = createMockGuild(OFFICIAL_GUILD_ID);
+    const tournament = { id: 'tour-restart-1', title: 'Restart League', game: 'PUBG' };
+    const teams = [{ id: 't-1', team_name: 'Alpha Team', captain: 'Captain A', is_eligible: true, members: [] }];
+    const teamsChannel = await guild.channels.create({ name: 'tournament-teams', type: ChannelType.GuildText });
+
+    const savedTournament = {
+      tournamentId: 'tour-restart-1',
+      channels: { tournamentTeamsId: teamsChannel.id },
+      teamListMessageIds: [],
+    };
+    guildSettingsCache[guild.id] = { tournaments: { 'tour-restart-1': savedTournament } };
+
+    // Initial publish
+    await updateTeamsRosterMessages(guild, tournament, teams, teamsChannel, savedTournament);
+    assert.equal(teamsChannel.sentMessages.length, 1);
+    const storedMsgId = savedTournament.teamListMessageIds[0];
+
+    // Simulate bot restart: reload from persistent settings
+    const loadedSettings = JSON.parse(JSON.stringify(guildSettingsCache[guild.id]));
+    const reloadedTournament = loadedSettings.tournaments['tour-restart-1'];
+    assert.deepEqual(reloadedTournament.teamListMessageIds, [storedMsgId]);
+
+    // Refresh after restart: edits existing message
+    const teamsAfterRestart = [
+      { id: 't-1', team_name: 'Alpha Team Post-Restart', captain: 'Captain A', is_eligible: true, members: [] },
+    ];
+    await updateTeamsRosterMessages(guild, tournament, teamsAfterRestart, teamsChannel, reloadedTournament);
+    assert.equal(teamsChannel.sentMessages.length, 1); // No duplicate message sent
+    assert.match(teamsChannel.sentMessages[0].content, /Alpha Team Post-Restart/);
+  });
+
+  test('Acceptance 4: Concurrent refresh requests are guarded by per-tournament lock', async () => {
+    const tournamentId = 'tour-lock-test';
+    let task1Completed = false;
+
+    // Start task 1 holding lock
+    const promise1 = withTournamentLock(tournamentId, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      task1Completed = true;
+      return 'done1';
+    });
+
+    // Attempt concurrent task 2 with same tournamentId
+    await assert.rejects(
+      async () => {
+        await withTournamentLock(tournamentId, async () => 'done2');
+      },
+      /already running/
+    );
+
+    const result1 = await promise1;
+    assert.equal(result1, 'done1');
+    assert.equal(task1Completed, true);
+
+    // After task 1 finishes, lock is released and task 3 succeeds
+    const result3 = await withTournamentLock(tournamentId, async () => 'done3');
+    assert.equal(result3, 'done3');
+  });
+
+  test('Acceptance 5 & 6: Registered linked user who joins receives access to update, helpdesk, register; CANNOT access bot-commands or tournament-teams', async () => {
+    const mockServer = http.createServer((req, res) => {
+      const url = new URL(req.url, 'http://localhost');
+      if (url.pathname === '/api/bot/users/111222333444555666/eligible-tournaments') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: true,
+          discord_id: '111222333444555666',
+          user_id: 'usr-eligible-1',
+          eligible_tournaments: [
+            { id: 'tour-join-test', title: 'Join Championship', game: 'Valorant' },
+          ],
+        }));
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'NOT_FOUND' }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const botMember = guild.members.me;
+
+      // Provision 5 channels for tour-join-test
+      const mockTour = { id: 'tour-join-test', title: 'Join Championship', game: 'Valorant' };
+      const syncRes = await syncTournamentDiscordChannels(guild, mockTour, [], botMember);
+      assert.equal(syncRes.channelsCreated.length, 5);
+
+      // Simulate member joining
+      const joiningMember = {
+        id: '111222333444555666',
+        guild,
+      };
+
+      const syncResult = await syncMemberTournamentAccess(joiningMember);
+      assert.equal(syncResult.success, true);
+      assert.equal(syncResult.grantedCount, 3); // update, register, helpdesk
+
+      // Verify access to update, register, helpdesk
+      const updateCh = guild.channels.cache.get(syncRes.channelIds.tournamentUpdateId);
+      const registerCh = guild.channels.cache.get(syncRes.channelIds.tournamentRegisterId);
+      const helpdeskCh = guild.channels.cache.get(syncRes.channelIds.tournamentHelpdeskId);
+
+      assert.ok(updateCh.permissionOverwrites.cache.has(joiningMember.id));
+      assert.ok(registerCh.permissionOverwrites.cache.has(joiningMember.id));
+      assert.ok(helpdeskCh.permissionOverwrites.cache.has(joiningMember.id));
+
+      // Criteria 6: User CANNOT access bot-commands or tournament-teams
+      const botCmdCh = guild.channels.cache.get(syncRes.channelIds.botCommandsId);
+      const teamsCh = guild.channels.cache.get(syncRes.channelIds.tournamentTeamsId);
+      assert.equal(botCmdCh.permissionOverwrites.cache.has(joiningMember.id), false);
+      assert.equal(teamsCh.permissionOverwrites.cache.has(joiningMember.id), false);
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Acceptance 7: User with no linked Discord account receives no tournament-specific access upon joining', async () => {
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        discord_id: '999888777666555444',
+        user_id: null,
+        eligible_tournaments: [],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const unlinkedMember = { id: '999888777666555444', guild };
+
+      const syncResult = await syncMemberTournamentAccess(unlinkedMember);
+      assert.equal(syncResult.success, true);
+      assert.equal(syncResult.grantedCount, 0);
+      assert.equal(syncResult.reason, 'no_eligible_tournaments');
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Acceptance 8: Member who links their account after joining receives access through synchronization mechanism', async () => {
+    let isLinked = false;
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (!isLinked) {
+        res.end(JSON.stringify({ success: true, discord_id: '555444333222111000', user_id: null, eligible_tournaments: [] }));
+      } else {
+        res.end(JSON.stringify({
+          success: true,
+          discord_id: '555444333222111000',
+          user_id: 'usr-late-linker',
+          eligible_tournaments: [{ id: 'tour-late-link', title: 'Late Link Tourney', game: 'CS2' }],
+        }));
+      }
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const botMember = guild.members.me;
+      const syncRes = await syncTournamentDiscordChannels(guild, { id: 'tour-late-link', title: 'Late Link Tourney' }, [], botMember);
+
+      const existingMember = { id: '555444333222111000', guild };
+
+      // Member joined prior to linking: 0 granted
+      const resBefore = await syncMemberTournamentAccess(existingMember);
+      assert.equal(resBefore.grantedCount, 0);
+
+      // User links account on website
+      isLinked = true;
+
+      // Sync triggered (post-link event/webhook): access granted
+      const resAfter = await syncMemberTournamentAccess(existingMember);
+      assert.equal(resAfter.success, true);
+      assert.equal(resAfter.grantedCount, 3);
+
+      const updateCh = guild.channels.cache.get(syncRes.channelIds.tournamentUpdateId);
+      assert.ok(updateCh.permissionOverwrites.cache.has(existingMember.id));
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Acceptance 9 & 10: Users registered for multiple tournaments receive access only to their eligible tournaments; ineligible registrations excluded', async () => {
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        discord_id: '777666555444333222',
+        user_id: 'usr-multi-tour',
+        eligible_tournaments: [
+          // Eligible for Tour A only; NOT eligible for Tour B (cancelled/rejected)
+          { id: 'tour-multi-A', title: 'Tournament Alpha', game: 'Apex' },
+        ],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const botMember = guild.members.me;
+
+      const syncA = await syncTournamentDiscordChannels(guild, { id: 'tour-multi-A', title: 'Tournament Alpha' }, [], botMember);
+      const syncB = await syncTournamentDiscordChannels(guild, { id: 'tour-multi-B', title: 'Tournament Beta' }, [], botMember);
+
+      const member = { id: '777666555444333222', guild };
+      const syncResult = await syncMemberTournamentAccess(member);
+      assert.equal(syncResult.success, true);
+
+      // Access granted to Tour A channels
+      const updateChA = guild.channels.cache.get(syncA.channelIds.tournamentUpdateId);
+      assert.ok(updateChA.permissionOverwrites.cache.has(member.id));
+
+      // No access to Tour B channels
+      const updateChB = guild.channels.cache.get(syncB.channelIds.tournamentUpdateId);
+      assert.equal(updateChB.permissionOverwrites.cache.has(member.id), false);
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Acceptance 11, 12, & 13: Channel IDs & Message IDs are reused; no per-squad channels; registration channel contains authentic URL', async () => {
+    const guild = createMockGuild(OFFICIAL_GUILD_ID);
+    const botMember = guild.members.me;
+    const tournament = {
+      id: 'tour-accept-11',
+      title: 'Grand Invitational',
+      url: 'https://matchdistrict.in/tournaments/tour-accept-11',
+    };
+    const teams = [
+      { id: 't-1', team_name: 'Squad Uno', captain: 'Leader 1', is_eligible: true, members: [] },
+    ];
+
+    // First setup
+    const sync1 = await syncTournamentDiscordChannels(guild, tournament, teams, botMember);
+    assert.equal(sync1.channelsCreated.length, 5);
+
+    // Verify registration link channel content
+    const regCh = guild.channels.cache.get(sync1.channelIds.tournamentRegisterId);
+    assert.ok(regCh);
+    assert.equal(regCh.sentMessages.length, 1);
+    assert.match(regCh.sentMessages[0].content, /https:\/\/matchdistrict\.in\/tournaments\/tour-accept-11/);
+
+    const saved1 = guildSettingsCache[guild.id].tournaments['tour-accept-11'];
+    assert.ok(saved1.registrationMessageId);
+    assert.ok(saved1.teamListMessageIds.length > 0);
+
+    // Second setup: verify channel IDs and message IDs are reused
+    const sync2 = await syncTournamentDiscordChannels(guild, tournament, teams, botMember);
+    assert.equal(sync2.channelsCreated.length, 0);
+    assert.equal(sync2.channelsReused.length, 5);
+    assert.deepEqual(sync2.channelIds, sync1.channelIds);
+
+    // Verify no new message posted to registration channel (edited in place)
+    assert.equal(regCh.sentMessages.length, 1);
+
+    // Acceptance 12: Verify no per-squad channels created
+    const allChannels = Array.from(guild.channels.cache.values());
+    assert.equal(allChannels.some((c) => c.name.startsWith('team-')), false);
   });
 });
