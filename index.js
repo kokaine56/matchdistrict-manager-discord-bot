@@ -111,6 +111,7 @@ import {
   saveGuildSettingsToDb,
   getGuildSettingsFromDb,
   loadAllGuildSettingsFromDb,
+  loadAllTournamentsFromDb,
   syncGuildSettingsCacheToDb,
   migrateJsonToMongo,
   reconcileManagedBotState,
@@ -234,6 +235,7 @@ export {
   saveGuildSettingsToDb,
   getGuildSettingsFromDb,
   loadAllGuildSettingsFromDb,
+  loadAllTournamentsFromDb,
   syncGuildSettingsCacheToDb,
   migrateJsonToMongo,
   reconcileManagedBotState,
@@ -2584,15 +2586,22 @@ export async function startBot(tokenOverride) {
     // 1. Connect to MongoDB and synchronize persistent state before starting Gateway
     try {
       const mongoOk = await initMongo();
-      if (mongoOk) {
-        await migrateJsonToMongo(guildSettingsCache);
-        const dbSettings = await loadAllGuildSettingsFromDb();
-        if (dbSettings && Object.keys(dbSettings).length > 0) {
-          guildSettingsCache = { ...guildSettingsCache, ...dbSettings };
-        }
+      if (!mongoOk) throw new Error('MongoDB must be connected before the Discord bot starts.');
+      await migrateJsonToMongo(guildSettingsCache);
+      const [dbSettings, tournaments] = await Promise.all([
+        loadAllGuildSettingsFromDb(),
+        loadAllTournamentsFromDb(),
+      ]);
+      guildSettingsCache = { ...guildSettingsCache, ...dbSettings };
+      for (const tournament of tournaments) {
+        if (!tournament.guildId || !tournament.tournamentId) continue;
+        guildSettingsCache[tournament.guildId] ||= {};
+        guildSettingsCache[tournament.guildId].tournaments ||= {};
+        guildSettingsCache[tournament.guildId].tournaments[tournament.tournamentId] = tournament;
       }
     } catch (mongoErr) {
-      console.warn('[MongoDB] ⚠️ Initialization warning:', mongoErr.message);
+      console.error('[MongoDB] ❌ Initialization failed; Discord Gateway startup cancelled:', mongoErr.message);
+      throw mongoErr;
     }
 
     console.log('[Discord Bot] 🔄 Connecting to Discord Gateway...');

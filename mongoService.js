@@ -830,6 +830,16 @@ export async function getAllTournamentsFromDb(guildId) {
   }
 }
 
+export async function loadAllTournamentsFromDb() {
+  if (!isMongoConnected()) return [];
+  try {
+    return await mongoDb.collection('discord_tournaments').find({}).toArray();
+  } catch (err) {
+    console.warn('[MongoDB] Error loading tournaments from MongoDB:', err.message);
+    throw err;
+  }
+}
+
 /**
  * Removes a tournament record from MongoDB.
  * @param {string} guildId
