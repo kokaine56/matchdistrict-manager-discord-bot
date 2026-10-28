@@ -37,6 +37,12 @@ import {
   fetchUserEligibleTournamentsFromBackend,
   syncMemberTournamentAccess,
   reconcileAllTournamentAccess,
+  normalizeTournamentRoleName,
+  getOrCreateTournamentRole,
+  syncTournamentRoles,
+  syncMemberTournamentRoles,
+  reconcileAllTournamentRoles,
+  handleSyncRolesCommand,
 } from '../tournamentService.js';
 import {
   guildSettingsCache,
@@ -46,6 +52,7 @@ import {
 // --- MOCK BUILDERS ---
 
 function createMockGuild(id = 'official-guild-12345', name = 'MatchDistrict Official') {
+  guildSettingsCache[id] = { tournaments: {} };
   const channelsMap = new Map();
   channelsMap.filter = (fn) => {
     const res = new Map();
@@ -56,12 +63,89 @@ function createMockGuild(id = 'official-guild-12345', name = 'MatchDistrict Offi
   };
   let channelIdCounter = 1;
   let messageCounter = 1;
+  let roleIdCounter = 100;
+
+  const rolesMap = new Map();
+  rolesMap.set(id, { id: id, name: '@everyone', mentionable: true });
+
+  const membersMap = new Map();
+  const botMember = {
+    id: 'bot-user-999',
+    user: { id: 'bot-user-999', tag: 'MatchDistrictBot#0001' },
+    permissions: {
+      has: (perm) => true,
+    },
+    roles: {
+      cache: new Map(),
+      highest: { comparePositionTo: () => 1 },
+      add: async () => {},
+      remove: async () => {},
+    },
+  };
+  membersMap.set(botMember.id, botMember);
+
+  const getOrCreateMember = (memberId) => {
+    if (membersMap.has(memberId)) return membersMap.get(memberId);
+    const memberRoles = new Map();
+    const newMember = {
+      id: memberId,
+      guild: null,
+      user: { id: memberId, tag: `User${memberId}#0001` },
+      roles: {
+        cache: memberRoles,
+        add: async (roleId) => {
+          const r = rolesMap.get(roleId) || { id: roleId, name: roleId };
+          memberRoles.set(roleId, r);
+          return newMember;
+        },
+        remove: async (roleId) => {
+          memberRoles.delete(roleId);
+          return newMember;
+        },
+      },
+    };
+    membersMap.set(memberId, newMember);
+    return newMember;
+  };
 
   const guild = {
     id,
     name,
     roles: {
       everyone: { id: id, name: '@everyone' },
+      cache: rolesMap,
+      fetch: async (roleId) => rolesMap.get(roleId) || null,
+      create: async (data) => {
+        const newRoleId = `role-${roleIdCounter++}`;
+        const newRole = {
+          id: newRoleId,
+          name: data.name,
+          mentionable: Boolean(data.mentionable),
+          members: {
+            get size() {
+              let count = 0;
+              for (const m of membersMap.values()) {
+                if (m.roles?.cache?.has(newRoleId)) count++;
+              }
+              return count;
+            },
+          },
+          delete: async () => {
+            rolesMap.delete(newRoleId);
+            for (const m of membersMap.values()) {
+              m.roles?.cache?.delete(newRoleId);
+            }
+          },
+        };
+        rolesMap.set(newRoleId, newRole);
+        return newRole;
+      },
+    },
+    members: {
+      me: botMember,
+      cache: membersMap,
+      fetch: async (memberId) => membersMap.get(memberId) || null,
+      getOrCreate: getOrCreateMember,
     },
     channels: {
       cache: channelsMap,
@@ -129,16 +213,9 @@ function createMockGuild(id = 'official-guild-12345', name = 'MatchDistrict Offi
         return channel;
       },
     },
-    members: {
-      me: {
-        id: 'bot-user-999',
-        permissions: {
-          has: (perm) => true,
-        },
-      },
-    },
   };
 
+  botMember.guild = guild;
   return guild;
 }
 
@@ -196,10 +273,25 @@ function createMockMember(options = {}) {
   const {
     id = 'user-admin-1',
     isAdmin = true,
+    guild = null,
   } = options;
 
-  return {
+  const rolesMap = new Map();
+  const member = {
     id,
+    guild,
+    user: { id, tag: `User${id}#0001` },
+    roles: {
+      cache: rolesMap,
+      add: async (roleId) => {
+        rolesMap.set(roleId, { id: roleId, name: roleId });
+        return member;
+      },
+      remove: async (roleId) => {
+        rolesMap.delete(roleId);
+        return member;
+      },
+    },
     permissions: {
       has: (perm) => {
         if (!isAdmin) return false;
@@ -210,6 +302,8 @@ function createMockMember(options = {}) {
       },
     },
   };
+
+  return member;
 }
 
 describe('MatchDistrict Discord Bot Tournament Integration', () => {
@@ -514,37 +608,39 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     const allChannelNames = Array.from(guild.channels.cache.values()).map((c) => c.name);
     assert.equal(allChannelNames.some((n) => n.startsWith('team-')), false);
 
-    // Verify Category
+    // Verify Category (visible to everyone)
     const categoryChannel = guild.channels.cache.get(result.categoryId);
     assert.equal(categoryChannel.type, ChannelType.GuildCategory);
     assert.match(categoryChannel.name, /BGMI Super League/);
     const catEveryoneOw = categoryChannel.permissionOverwrites.cache.get(guild.roles.everyone.id);
-    assert.ok(catEveryoneOw.deny.includes(PermissionFlagsBits.ViewChannel));
+    assert.ok(catEveryoneOw.allow.includes(PermissionFlagsBits.ViewChannel));
 
     // A. #bot-commands: Admin only; participants CANNOT view
     const botCmdCh = guild.channels.cache.get(result.channelIds.botCommandsId);
     assert.ok(botCmdCh);
     assert.equal(botCmdCh.parentId, result.categoryId);
     const botCmdEveryoneOw = botCmdCh.permissionOverwrites.cache.get(guild.roles.everyone.id);
-    assert.ok(botCmdEveryoneOw.deny.includes(PermissionFlagsBits.ViewChannel));
-    // Participants have NO overwrite to view bot-commands
+    assert.ok(botCmdEveryoneOw.deny.includes(PermissionFlagsBits.ViewChannel) || botCmdEveryoneOw.deny.includes('ViewChannel'));
+    // Ordinary participants have NO view overwrite to bot-commands
     assert.equal(botCmdCh.permissionOverwrites.cache.has('111111111111111111'), false);
     assert.equal(botCmdCh.permissionOverwrites.cache.has('222222222222222222'), false);
 
-    // B. #tournament-update: Eligible participants can read; CANNOT post
+    // B. #tournament-update: Public for @everyone to view; read-only for participants
     const updateCh = guild.channels.cache.get(result.channelIds.tournamentUpdateId);
     assert.ok(updateCh);
     assert.equal(updateCh.parentId, result.categoryId);
-    const updateOw1 = updateCh.permissionOverwrites.cache.get('111111111111111111');
-    assert.ok(updateOw1);
-    assert.ok(updateOw1.allow.includes('ViewChannel'));
-    assert.ok(updateOw1.deny.includes('SendMessages'));
-    assert.ok(updateOw1.deny.includes('CreatePublicThreads'));
+    const updateEveryoneOw = updateCh.permissionOverwrites.cache.get(guild.roles.everyone.id);
+    assert.ok(updateEveryoneOw.allow.includes('ViewChannel') || updateEveryoneOw.allow.includes(PermissionFlagsBits.ViewChannel));
+    assert.ok(updateEveryoneOw.deny.includes('SendMessages') || updateEveryoneOw.deny.includes(PermissionFlagsBits.SendMessages));
+    // User-specific overwrites removed
+    assert.equal(updateCh.permissionOverwrites.cache.has('111111111111111111'), false);
 
     // C. #tournament-teams: Administrator and Bot access only; ordinary participants must NOT be granted access
     const teamsCh = guild.channels.cache.get(result.channelIds.tournamentTeamsId);
     assert.ok(teamsCh);
     assert.equal(teamsCh.parentId, result.categoryId);
+    const teamsEveryoneOw = teamsCh.permissionOverwrites.cache.get(guild.roles.everyone.id);
+    assert.ok(teamsEveryoneOw.deny.includes(PermissionFlagsBits.ViewChannel) || teamsEveryoneOw.deny.includes('ViewChannel'));
     assert.equal(teamsCh.permissionOverwrites.cache.has('111111111111111111'), false);
     assert.equal(teamsCh.permissionOverwrites.cache.has('222222222222222222'), false);
     assert.equal(teamsCh.permissionOverwrites.cache.has('444444444444444444'), false);
@@ -554,24 +650,23 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     assert.match(teamsCh.sentMessages[0].content, /GodLike/);
     assert.match(teamsCh.sentMessages[0].content, /Soul Esports/);
 
-    // D. #tournament-helpdesk: Eligible participants CAN post messages
+    // D. #tournament-helpdesk: Public for @everyone to view and send messages
     const helpdeskCh = guild.channels.cache.get(result.channelIds.tournamentHelpdeskId);
     assert.ok(helpdeskCh);
     assert.equal(helpdeskCh.parentId, result.categoryId);
-    const helpdeskOw1 = helpdeskCh.permissionOverwrites.cache.get('111111111111111111');
-    assert.ok(helpdeskOw1);
-    assert.ok(helpdeskOw1.allow.includes('ViewChannel'));
-    assert.ok(helpdeskOw1.allow.includes('SendMessages'));
-    assert.ok(helpdeskOw1.allow.includes('AttachFiles'));
+    const helpdeskEveryoneOw = helpdeskCh.permissionOverwrites.cache.get(guild.roles.everyone.id);
+    assert.ok(helpdeskEveryoneOw.allow.includes('ViewChannel') || helpdeskEveryoneOw.allow.includes(PermissionFlagsBits.ViewChannel));
+    assert.ok(helpdeskEveryoneOw.allow.includes('SendMessages') || helpdeskEveryoneOw.allow.includes(PermissionFlagsBits.SendMessages));
+    assert.equal(helpdeskCh.permissionOverwrites.cache.has('111111111111111111'), false);
 
-    // E. #tournament-register: Eligible participants can read direct details link; CANNOT post
+    // E. #tournament-register: Public for @everyone to view; read-only for participants
     const registerCh = guild.channels.cache.get(result.channelIds.tournamentRegisterId);
     assert.ok(registerCh);
     assert.equal(registerCh.parentId, result.categoryId);
-    const registerOw1 = registerCh.permissionOverwrites.cache.get('111111111111111111');
-    assert.ok(registerOw1);
-    assert.ok(registerOw1.allow.includes('ViewChannel'));
-    assert.ok(registerOw1.deny.includes('SendMessages'));
+    const registerEveryoneOw = registerCh.permissionOverwrites.cache.get(guild.roles.everyone.id);
+    assert.ok(registerEveryoneOw.allow.includes('ViewChannel') || registerEveryoneOw.allow.includes(PermissionFlagsBits.ViewChannel));
+    assert.ok(registerEveryoneOw.deny.includes('SendMessages') || registerEveryoneOw.deny.includes(PermissionFlagsBits.SendMessages));
+    assert.equal(registerCh.permissionOverwrites.cache.has('111111111111111111'), false);
     assert.ok(registerCh.sentMessages.length > 0);
     assert.match(registerCh.sentMessages[0].content, /Official Tournament Registration & Details/);
     assert.match(registerCh.sentMessages[0].content, /tour-sync-1/);
@@ -622,7 +717,7 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     assert.deepEqual(secondSync.channelIds, firstSync.channelIds);
   });
 
-  test('12. Ineligibility Revocation: removes participant channel access when a team/user becomes ineligible', async () => {
+  test('12. Ineligibility Revocation: removes tournament role and participant access when a team/user becomes ineligible', async () => {
     const guild = createMockGuild(OFFICIAL_GUILD_ID);
     const botMember = guild.members.me;
 
@@ -631,6 +726,9 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
       title: 'Apex Legends Cup',
       status: 'published',
     };
+
+    // Pre-register member in guild
+    const member = guild.members.getOrCreate('111111111111111111');
 
     const initialTeams = [
       {
@@ -644,11 +742,9 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     ];
 
     const firstSync = await syncTournamentDiscordChannels(guild, mockTournament, initialTeams, botMember);
-    const updateCh = guild.channels.cache.get(firstSync.channelIds.tournamentUpdateId);
-    const helpdeskCh = guild.channels.cache.get(firstSync.channelIds.tournamentHelpdeskId);
-
-    assert.ok(updateCh.permissionOverwrites.cache.has('111111111111111111'));
-    assert.ok(helpdeskCh.permissionOverwrites.cache.has('111111111111111111'));
+    const roleId = firstSync.roleStats?.roleId;
+    assert.ok(roleId);
+    assert.ok(member.roles.cache.has(roleId));
 
     // Second sync: Team X cancelled/disqualified -> user is no longer eligible
     const revokedTeams = [
@@ -663,11 +759,8 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     ];
 
     const secondSync = await syncTournamentDiscordChannels(guild, mockTournament, revokedTeams, botMember);
-    assert.ok(secondSync.permissionsRemoved > 0);
-
-    // Permissions on update and helpdesk channels must be removed!
-    assert.equal(updateCh.permissionOverwrites.cache.has('111111111111111111'), false);
-    assert.equal(helpdeskCh.permissionOverwrites.cache.has('111111111111111111'), false);
+    assert.equal(secondSync.roleStats?.removed, 1);
+    assert.equal(member.roles.cache.has(roleId), false);
   });
 
   test('13. Migration & Obsolete Squad Channel Cleanup: deletes legacy per-squad channels safely', async () => {
@@ -853,7 +946,15 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
       statusText: '🟢 **Active** — All 4 channels configured',
     };
 
-    const embed = buildTournamentControlPanelEmbed(tournament, summary, channelsStatus);
+    const roleInfo = {
+      roleId: 'role-123456789012345678',
+      roleName: 'apexlegends',
+      membersWithRole: 15,
+      statusText: '🟢 Synchronized (15 assigned, 0 removed)',
+      lastSyncedAt: new Date().toISOString(),
+    };
+
+    const embed = buildTournamentControlPanelEmbed(tournament, summary, channelsStatus, roleInfo);
     const data = embed.data || embed;
 
     assert.match(data.title, /Tournament Control Panel/);
@@ -868,17 +969,20 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     assert.ok(fields.some((f) => f.name.includes('Registration Statistics') && f.value.includes('20')));
     assert.ok(fields.some((f) => f.name.includes('Registration Statistics') && f.value.includes('54')));
     assert.ok(fields.some((f) => f.name.includes('Registration Statistics') && f.value.includes('6')));
+    assert.ok(fields.some((f) => f.name.includes('Tournament Role') && f.value.includes('apexlegends')));
+    assert.ok(fields.some((f) => f.name.includes('Tournament Role') && f.value.includes('role-123456789012345678')));
     assert.ok(fields.some((f) => f.name.includes('Discord Channels Setup Status')));
 
     const actionRows = buildTournamentControlPanelButtons('tour-cp-1');
     assert.equal(actionRows.length, 1);
     const row = actionRows[0];
     const buttons = row.components;
-    assert.equal(buttons.length, 3);
+    assert.equal(buttons.length, 4);
 
     const btn1 = buttons[0].data || buttons[0];
     const btn2 = buttons[1].data || buttons[1];
     const btn3 = buttons[2].data || buttons[2];
+    const btn4 = buttons[3].data || buttons[3];
 
     assert.equal(btn1.custom_id, 'md_tour_create_channels:tour-cp-1');
     assert.equal(btn1.label, 'Create Channels');
@@ -886,8 +990,11 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     assert.equal(btn2.custom_id, 'md_tour_refresh:tour-cp-1');
     assert.equal(btn2.label, 'Refresh Tournament Data');
 
-    assert.equal(btn3.custom_id, 'md_tour_delete_channels:tour-cp-1');
-    assert.equal(btn3.label, 'Delete All Channels');
+    assert.equal(btn3.custom_id, 'md_tour_sync_roles:tour-cp-1');
+    assert.equal(btn3.label, 'Sync Tournament Roles');
+
+    assert.equal(btn4.custom_id, 'md_tour_delete_channels:tour-cp-1');
+    assert.equal(btn4.label, 'Delete All Channels');
   });
 
   test('17. setupTournamentControlPanel: creates category and #bot-commands with embed and buttons idempotently', async () => {
@@ -1549,5 +1656,314 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     // Acceptance 12: Verify no per-squad channels created
     const allChannels = Array.from(guild.channels.cache.values());
     assert.equal(allChannels.some((c) => c.name.startsWith('team-')), false);
+  });
+
+  // --- Tournament Roles & Automatic Synchronization Tests ---
+
+  test('Role 1: normalizeTournamentRoleName generates lowercase alphanumeric role name', () => {
+    assert.equal(normalizeTournamentRoleName('BGIS 2026'), 'bgis2026');
+    assert.equal(normalizeTournamentRoleName('PUBG Mobile (Club Open) 2026!'), 'pubgmobileclubopen2026');
+    assert.equal(normalizeTournamentRoleName('Valorant Champions Tour @ Berlin'), 'valorantchampionstourberlin');
+    assert.equal(normalizeTournamentRoleName('   Special   Chars #42   '), 'specialchars42');
+    assert.equal(normalizeTournamentRoleName('!@#$%^&*()', '123'), 'tour123');
+    assert.equal(normalizeTournamentRoleName('', '456'), 'tour456');
+    assert.equal(normalizeTournamentRoleName(''), 'tourrole');
+  });
+
+  test('Role 2: getOrCreateTournamentRole creates role idempotently and persists mapping', async () => {
+    const guild = createMockGuild(OFFICIAL_GUILD_ID);
+    const tournament = { id: 'tour-bgis', title: 'BGIS 2026' };
+
+    // First call creates role
+    const role1 = await getOrCreateTournamentRole(guild, tournament);
+    assert.ok(role1);
+    assert.equal(role1.name, 'bgis2026');
+    assert.equal(role1.mentionable, true);
+
+    const saved = guildSettingsCache[guild.id]?.tournaments?.['tour-bgis'];
+    assert.ok(saved);
+    assert.equal(saved.roleId, role1.id);
+    assert.equal(saved.roleName, 'bgis2026');
+
+    // Second call reuses role without creating a new one
+    const role2 = await getOrCreateTournamentRole(guild, tournament);
+    assert.equal(role2.id, role1.id);
+    assert.equal(guild.roles.cache.size, 2); // @everyone + 1 role
+  });
+
+  test('Role 3: syncTournamentRoles assigns role, skips unlinked/missing members, deduplicates, and revokes on ineligibility', async () => {
+    const guild = createMockGuild(OFFICIAL_GUILD_ID);
+    const tournament = { id: 'tour-roles-sync', title: 'BGIS 2026' };
+
+    // Set up members in guild
+    const member1 = guild.members.getOrCreate('111111111111111111');
+    const member2 = guild.members.getOrCreate('222222222222222222');
+    // Pre-assign an unrelated role to member1 to verify it is NOT removed
+    await member1.roles.add('unrelated-role-999');
+
+    // User 333333333333333333 is eligible but NOT in the server (skipped)
+    // User unlinked has no discord ID (skipped)
+    // member1 is on two different teams (deduplicated)
+    const teams = [
+      {
+        id: 'team-alpha',
+        team_name: 'Team Alpha',
+        is_eligible: true,
+        linked_members: [
+          { discord_id: '111111111111111111', is_linked: true },
+          { discord_id: '222222222222222222', is_linked: true },
+          { discord_id: null, is_linked: false },
+        ],
+      },
+      {
+        id: 'team-beta',
+        team_name: 'Team Beta',
+        is_eligible: true,
+        linked_members: [
+          { discord_id: '111111111111111111', is_linked: true }, // duplicate
+          { discord_id: '333333333333333333', is_linked: true }, // not in server
+        ],
+      },
+    ];
+
+    const stats1 = await syncTournamentRoles(guild, tournament.id, { tournament, teams });
+    assert.equal(stats1.assigned, 2); // member1 and member2
+    assert.equal(stats1.alreadyAssigned, 0);
+    assert.equal(stats1.skipped, 1); // 333333333333333333 (not in server)
+    assert.equal(stats1.removed, 0);
+    assert.equal(stats1.membersWithRole, 2);
+
+    assert.ok(member1.roles.cache.has(stats1.roleId));
+    assert.ok(member2.roles.cache.has(stats1.roleId));
+    // Unrelated role remains intact
+    assert.ok(member1.roles.cache.has('unrelated-role-999'));
+
+    // Second sync: member1 and member2 already have role
+    const stats2 = await syncTournamentRoles(guild, tournament.id, { tournament, teams });
+    assert.equal(stats2.assigned, 0);
+    assert.equal(stats2.alreadyAssigned, 2);
+
+    // Third sync: member2's team is disqualified/ineligible -> role revoked from member2
+    const revokedTeams = [
+      {
+        id: 'team-alpha',
+        team_name: 'Team Alpha',
+        is_eligible: false, // disqualified!
+        linked_members: [
+          { discord_id: '222222222222222222', is_linked: true },
+        ],
+      },
+      {
+        id: 'team-beta',
+        team_name: 'Team Beta',
+        is_eligible: true,
+        linked_members: [
+          { discord_id: '111111111111111111', is_linked: true },
+        ],
+      },
+    ];
+
+    const stats3 = await syncTournamentRoles(guild, tournament.id, { tournament, teams: revokedTeams });
+    assert.equal(stats3.removed, 1);
+    assert.equal(member2.roles.cache.has(stats1.roleId), false);
+    assert.ok(member1.roles.cache.has(stats1.roleId));
+    assert.ok(member1.roles.cache.has('unrelated-role-999')); // untouched
+  });
+
+  test('Role 4: syncMemberTournamentRoles assigns multiple tournament roles on member join', async () => {
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        discord_id: '666777888999000111',
+        eligible_tournaments: [
+          { id: 'tour-bgis-2026', title: 'BGIS 2026' },
+          { id: 'tour-pmco-2026', title: 'PMCO 2026' },
+        ],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const botMember = guild.members.me;
+
+      // Provision both tournaments
+      await syncTournamentDiscordChannels(guild, { id: 'tour-bgis-2026', title: 'BGIS 2026' }, [], botMember);
+      await syncTournamentDiscordChannels(guild, { id: 'tour-pmco-2026', title: 'PMCO 2026' }, [], botMember);
+
+      const joiningMember = guild.members.getOrCreate('666777888999000111');
+      joiningMember.guild = guild;
+
+      const result = await syncMemberTournamentRoles(joiningMember);
+      assert.equal(result.success, true);
+      assert.equal(result.assignedCount, 2);
+
+      const savedBgis = guildSettingsCache[guild.id]?.tournaments?.['tour-bgis-2026'];
+      const savedPmco = guildSettingsCache[guild.id]?.tournaments?.['tour-pmco-2026'];
+
+      assert.ok(joiningMember.roles.cache.has(savedBgis.roleId));
+      assert.ok(joiningMember.roles.cache.has(savedPmco.roleId));
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Role 5: Button interaction md_tour_sync_roles synchronizes roles and updates control panel', async () => {
+    let mockTeams = [
+      {
+        id: 'team-btn',
+        team_name: 'Button Squad',
+        is_eligible: true,
+        linked_members: [{ discord_id: '123123123123123123', is_linked: true }],
+      },
+    ];
+
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        tournament: { id: 'tour-btn-sync', title: 'Button Tourney' },
+        teams: mockTeams,
+        summary: {
+          total_registered_teams: mockTeams.length,
+          eligible_teams_count: mockTeams.filter(t => t.is_eligible).length,
+          ineligible_teams_count: 0,
+          eligible_linked_members_count: 1,
+          unlinked_members_count: 0,
+        },
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const botMember = guild.members.me;
+
+      // Setup tournament channels & control panel
+      await syncTournamentDiscordChannels(guild, { id: 'tour-btn-sync', title: 'Button Tourney' }, mockTeams, botMember);
+      await setupTournamentControlPanel(guild, { id: 'tour-btn-sync', title: 'Button Tourney' }, {
+        total_registered_teams: 1,
+        eligible_teams_count: 1,
+        ineligible_teams_count: 0,
+        eligible_linked_members_count: 1,
+        unlinked_members_count: 0,
+      }, botMember);
+
+      const targetMember = guild.members.getOrCreate('123123123123123123');
+
+      const interaction = createMockButtonInteraction({
+        customId: 'md_tour_sync_roles:tour-btn-sync',
+        guild,
+        member: createMockMember({ isAdmin: true, guild }),
+      });
+
+      await handleTournamentButtonInteraction(interaction);
+      assert.ok(interaction.isDeferred());
+      const reply = interaction.getReplied();
+      assert.ok(reply);
+      assert.match(reply.content, /Tournament Roles Synchronized/);
+      assert.match(reply.content, /buttontourney/);
+
+      // Verify role assigned to targetMember
+      const saved = guildSettingsCache[guild.id]?.tournaments?.['tour-btn-sync'];
+      assert.ok(targetMember.roles.cache.has(saved.roleId));
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Role 6: handleSyncRolesCommand synchronizes roles and auto-detects context from #bot-commands', async () => {
+    let mockTeams = [
+      {
+        id: 'team-cmd',
+        team_name: 'Command Squad',
+        is_eligible: true,
+        linked_members: [{ discord_id: '456456456456456456', is_linked: true }],
+      },
+    ];
+
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        tournament: { id: 'tour-cmd-sync', title: 'Command Tourney' },
+        teams: mockTeams,
+        summary: {
+          total_registered_teams: 1,
+          eligible_teams_count: 1,
+          ineligible_teams_count: 0,
+          eligible_linked_members_count: 1,
+          unlinked_members_count: 0,
+        },
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const botMember = guild.members.me;
+
+      // Setup tournament
+      const syncResult = await syncTournamentDiscordChannels(guild, { id: 'tour-cmd-sync', title: 'Command Tourney' }, mockTeams, botMember);
+      const botCommandsChannel = guild.channels.cache.get(syncResult.channelIds.botCommandsId);
+
+      guild.members.getOrCreate('456456456456456456');
+
+      let replyOutput = '';
+      const replyFn = (msg) => {
+        replyOutput = typeof msg === 'object' ? (msg.content || '') : msg;
+      };
+
+      const adminMember = createMockMember({ isAdmin: true, guild });
+
+      // Run .sync roles inside #bot-commands without specifying ID
+      await handleSyncRolesCommand(guild, adminMember, [], replyFn, botCommandsChannel);
+
+      assert.match(replyOutput, /Tournament Roles Synchronized/);
+      assert.match(replyOutput, /tour-cmd-sync/);
+      assert.match(replyOutput, /commandtourney/);
+
+      // Verify non-admin is rejected
+      const regularMember = createMockMember({ isAdmin: false, guild });
+      let rejectOutput = '';
+      await handleSyncRolesCommand(guild, regularMember, ['tour-cmd-sync'], (msg) => { rejectOutput = msg; }, botCommandsChannel);
+      assert.match(rejectOutput, /Permission Denied/);
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Role 7: deleteTournamentDiscordChannels deletes mapped tournament role and clears storage', async () => {
+    const guild = createMockGuild(OFFICIAL_GUILD_ID);
+    const botMember = guild.members.me;
+
+    const tournament = { id: 'tour-del-role', title: 'Role Deletion Cup' };
+    const teams = [{ id: 't1', team_name: 'Squad 1', is_eligible: true, linked_members: [] }];
+
+    await syncTournamentDiscordChannels(guild, tournament, teams, botMember);
+
+    const saved = guildSettingsCache[guild.id]?.tournaments?.['tour-del-role'];
+    const roleId = saved.roleId;
+    assert.ok(roleId);
+    assert.ok(guild.roles.cache.has(roleId));
+
+    // Delete channels & role
+    const delSummary = await deleteTournamentDiscordChannels(guild, 'tour-del-role');
+    assert.equal(delSummary.roleDeleted, true);
+    assert.equal(guild.roles.cache.has(roleId), false);
+
+    // Verify stored roleId is cleared
+    assert.equal(saved.roleId, null);
+    assert.equal(saved.roleName, null);
   });
 });

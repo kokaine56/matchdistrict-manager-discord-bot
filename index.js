@@ -38,6 +38,12 @@ import {
   fetchUserEligibleTournamentsFromBackend,
   syncMemberTournamentAccess,
   reconcileAllTournamentAccess,
+  normalizeTournamentRoleName,
+  getOrCreateTournamentRole,
+  syncTournamentRoles,
+  syncMemberTournamentRoles,
+  reconcileAllTournamentRoles,
+  handleSyncRolesCommand,
 } from './tournamentService.js';
 
 export {
@@ -62,6 +68,12 @@ export {
   fetchUserEligibleTournamentsFromBackend,
   syncMemberTournamentAccess,
   reconcileAllTournamentAccess,
+  normalizeTournamentRoleName,
+  getOrCreateTournamentRole,
+  syncTournamentRoles,
+  syncMemberTournamentRoles,
+  reconcileAllTournamentRoles,
+  handleSyncRolesCommand,
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -116,9 +128,10 @@ if (healthPort) {
               if (guild) {
                 const member = guild.members.cache.get(discordId) || await guild.members.fetch(discordId).catch(() => null);
                 if (member) {
-                  const syncResult = await syncMemberTournamentAccess(member);
+                  const roleResult = await syncMemberTournamentRoles(member).catch(() => null);
+                  const syncResult = await syncMemberTournamentAccess(member).catch(() => null);
                   res.writeHead(200, { 'Content-Type': 'application/json' });
-                  res.end(JSON.stringify({ success: true, member_found: true, syncResult }));
+                  res.end(JSON.stringify({ success: true, member_found: true, roleResult, syncResult }));
                   return;
                 }
               }
@@ -147,9 +160,10 @@ if (healthPort) {
         if (officialGuildId && client?.guilds) {
           const guild = client.guilds.cache.get(officialGuildId) || await client.guilds.fetch(officialGuildId).catch(() => null);
           if (guild) {
-            const results = await reconcileAllTournamentAccess(guild);
+            const roleResults = await reconcileAllTournamentRoles(guild).catch(() => null);
+            const accessResults = await reconcileAllTournamentAccess(guild).catch(() => null);
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: true, results }));
+            res.end(JSON.stringify({ success: true, roleResults, accessResults }));
             return;
           }
         }
@@ -1655,6 +1669,11 @@ client.on(Events.MessageCreate, async (message) => {
         await handleSelectTournamentCommand(message.guild, message.member, targetId, (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }));
         return;
       } else if (cmd === 'sync' || cmd === 'reconcile') {
+        const sub = (args[0] || '').toLowerCase();
+        if (sub === 'roles' || sub === 'role') {
+          await handleSyncRolesCommand(message.guild, message.member, args.slice(1), (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }), message.channel);
+          return;
+        }
         const access = checkTournamentAccess(message.guild, message.member);
         if (!access.allowed) {
           await message.reply(access.reason);
@@ -1725,7 +1744,10 @@ client.on(Events.GuildBanRemove, async (ban) => {
 // Member join listener
 client.on(Events.GuildMemberAdd, async (member) => {
   await handleGuildMemberAdd(member);
-  await syncMemberTournamentAccess(member);
+  if (isOfficialGuild(member.guild)) {
+    await syncMemberTournamentRoles(member).catch(() => {});
+    await syncMemberTournamentAccess(member).catch(() => {});
+  }
 });
 
 // Error listeners
