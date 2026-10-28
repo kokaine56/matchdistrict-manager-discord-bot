@@ -270,6 +270,20 @@ export function checkTournamentAccess(guild, member) {
   };
 }
 
+async function loadOrganiserLinkForGuild(guildId) {
+  if (!guildId) return null;
+  const cachedLink = guildSettingsCache[guildId]?.organiserLink;
+  if (cachedLink?.status === 'linked' && cachedLink.organiserId) return cachedLink;
+  if (!isMongoConnected()) return cachedLink || null;
+
+  const organiserLink = await getOrganiserLinkForGuild(guildId);
+  if (organiserLink?.status === 'linked') {
+    guildSettingsCache[guildId] ||= {};
+    guildSettingsCache[guildId].organiserLink = organiserLink;
+  }
+  return organiserLink || cachedLink || null;
+}
+
 /**
  * Retrieve the backend API Base URL.
  */
@@ -495,22 +509,15 @@ export async function handleTournamentSelectionButton(interaction) {
   const tournamentId = String(interaction.customId || '').split(':')[3];
   if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate().catch(() => {});
   try {
+    const organiserLink = await loadOrganiserLinkForGuild(interaction.guild.id);
     const access = checkTournamentAccess(interaction.guild, interaction.member);
     if (!access.allowed) {
       await interaction.followUp({ content: access.reason, ephemeral: true }).catch(() => {});
       return;
     }
-    let organiserId = access.organiserId;
-    if (!organiserId) {
-      const organiserLink = await getOrganiserLinkForGuild(interaction.guild.id);
-      organiserId = organiserLink?.organiserId || null;
-      if (organiserLink?.status === 'linked') {
-        guildSettingsCache[interaction.guild.id] ||= {};
-        guildSettingsCache[interaction.guild.id].organiserLink = organiserLink;
-      }
-    }
+    const organiserId = organiserLink?.organiserId || access.organiserId;
     if (access.isOrganiserLinked && !organiserId) throw new Error('The linked organiser account ID is missing from MongoDB. Re-link this server with its organiser code.');
-    const tournaments = await fetchTournamentsFromBackend({ status: 'all', organizerId });
+    const tournaments = await fetchTournamentsFromBackend({ status: 'all', organizerId: organiserId });
     if (!tournaments.some((tournament) => String(tournament.id) === String(tournamentId))) {
       await interaction.editReply({
         content: tournaments.length ? formatTournamentListPages(tournaments, { pageSize: 25, showAll: true })[0] : 'ℹ️ **No Tournaments Found:** MatchDistrict returned an empty tournament list.',
@@ -2027,13 +2034,7 @@ export async function handleSelectTournamentCommand(guild, member, tournamentId,
  * Handles the ".list tournament" command.
  */
 export async function handleListTournamentCommand(guild, member, args = [], replyFn) {
-  if (guild?.id && !guildSettingsCache[guild.id]?.organiserLink && isMongoConnected()) {
-    const organiserLink = await getOrganiserLinkForGuild(guild.id);
-    if (organiserLink?.status === 'linked') {
-      guildSettingsCache[guild.id] ||= {};
-      guildSettingsCache[guild.id].organiserLink = organiserLink;
-    }
-  }
+  if (guild?.id) await loadOrganiserLinkForGuild(guild.id);
   const access = checkTournamentAccess(guild, member);
   if (!access.allowed) {
     await replyFn(access.reason);
