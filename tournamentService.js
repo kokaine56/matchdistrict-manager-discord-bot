@@ -555,8 +555,13 @@ export function buildTournamentControlPanelEmbed(tournament, summary, channelsSt
 
 /**
  * Builds the Interactive Action Buttons for the Tournament Control Panel.
- * Button Row 1: Create Channels, Refresh Tournament Data, View Rounds, Delete All Channels
- * Button Row 2: Sync Tournament Roles
+ * Row 1 (Primary, Synchronization & Management):
+ *   - Create Channels (Primary Action)
+ *   - Sync & Refresh (Combined Data & Role Sync)
+ *   - Round Management (Dedicated round progression screen)
+ * Row 2 (Danger Zone):
+ *   - Delete All Channels (Channel cleanup with MongoDB data retained)
+ *   - Delete Tournament (Permanent deletion workflow)
  */
 export function buildTournamentControlPanelButtons(tournamentId) {
   const row1 = new ActionRowBuilder().addComponents(
@@ -566,28 +571,23 @@ export function buildTournamentControlPanelButtons(tournamentId) {
       .setEmoji('📁')
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
-      .setCustomId(`md_tour_refresh:${tournamentId}`)
-      .setLabel('Refresh Tournament Data')
+      .setCustomId(`md_tour_sync_refresh:${tournamentId}`)
+      .setLabel('Sync & Refresh')
       .setEmoji('🔄')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId(`md_tour_view_rounds:${tournamentId}`)
-      .setLabel('View Rounds')
-      .setEmoji('📋')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
-      .setCustomId(`md_tour_delete_channels:${tournamentId}`)
-      .setLabel('Delete All Channels')
-      .setEmoji('🗑️')
-      .setStyle(ButtonStyle.Danger)
+      .setCustomId(`md_tour_view_rounds:${tournamentId}`)
+      .setLabel('Round Management')
+      .setEmoji('⚔️')
+      .setStyle(ButtonStyle.Secondary)
   );
 
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`md_tour_sync_roles:${tournamentId}`)
-      .setLabel('Sync Tournament Roles')
-      .setEmoji('👥')
-      .setStyle(ButtonStyle.Primary),
+      .setCustomId(`md_tour_delete_channels:${tournamentId}`)
+      .setLabel('Delete All Channels')
+      .setEmoji('🗑️')
+      .setStyle(ButtonStyle.Danger),
     new ButtonBuilder()
       .setCustomId(`md_tour_delete_permanent:${tournamentId}`)
       .setLabel('Delete Tournament')
@@ -2795,6 +2795,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
       !customId.startsWith('md_round_') &&
       !customId.startsWith('md_group_') &&
       !customId.startsWith('md_result_') &&
+      !customId.startsWith('md_qual_') &&
       !customId.startsWith('md_qualify_') &&
       customId !== 'md_cancel_qualify'
     ) return;
@@ -2809,7 +2810,20 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     // Qualify team button in ID/PWD channel
     if (customId.startsWith('md_qualify_team:')) {
       const [, tourId, rId, gId] = customId.split(':');
-      await handleQualifyTeamButton(interaction, tourId, rId, gId);
+      await handleRoundQualifySlotSelection(interaction, tourId, rId, gId);
+      return;
+    }
+
+    if (customId.startsWith('md_qual_group:')) {
+      const [, tourId, rId, gId] = customId.split(':');
+      await handleRoundQualifySlotSelection(interaction, tourId, rId, gId);
+      return;
+    }
+
+    if (customId.startsWith('md_qual_commit:')) {
+      const [, tourId, rId, gId, slotsParam] = customId.split(':');
+      const slotNumbers = (slotsParam || '').split(',').map((n) => parseInt(n, 10)).filter(Boolean);
+      await handleExecuteQualifyCommit(interaction, tourId, rId, gId, slotNumbers);
       return;
     }
 
@@ -2912,7 +2926,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
       interaction.message?.id &&
       interaction.channelId === currentTourSaved.channels?.botCommandsId &&
       interaction.message.id !== currentTourSaved.controlPanelMessageId &&
-      ['create_channels', 'refresh', 'view_rounds', 'sync_roles', 'delete_channels', 'delete_permanent'].includes(action)
+      ['create_channels', 'refresh', 'sync_refresh', 'view_rounds', 'round_mgmt', 'sync_roles', 'delete_channels', 'delete_permanent'].includes(action)
     ) {
       const obsoleteMsg = '⚠️ **Obsolete Dashboard:** This dashboard control panel has been replaced by a newer version. Please use the active dashboard in this channel or run `.dash` to restore it.';
       if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
@@ -2947,13 +2961,19 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
       return;
     }
 
-    // Action: View Rounds (Dedicated Screen)
-    if (action === 'view_rounds' || action === 'back_to_rounds') {
+    // Action: View Rounds / Round Management (Dedicated Screen)
+    if (action === 'view_rounds' || action === 'round_mgmt' || action === 'back_to_rounds') {
       await handleViewRoundsScreen(interaction, tournamentId);
       return;
     }
 
-    // Action: Create Sequential Round
+    // Action: Qualify Teams (Dedicated Group Selection Screen)
+    if (action === 'qualify') {
+      await handleRoundQualifyGroupSelection(interaction, tournamentId, extraParam);
+      return;
+    }
+
+    // Action: Create Sequential Round (Legacy fallback)
     if (action === 'create_sequential_round') {
       await handleCreateSequentialRound(interaction, tournamentId);
       return;
@@ -2965,14 +2985,14 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
       return;
     }
 
-    // Action: Back to Tournament Panel
+    // Action: Back to Tournament Dashboard
     if (action === 'back_to_panel') {
       await handleBackToTournamentPanel(interaction, tournamentId);
       return;
     }
 
     // Action: Open / Back to Individual Round Menu
-    if (action === 'back_to_menu' || action === 'manage_round') {
+    if (action === 'back_to_menu' || action === 'manage_round' || action === 'cancel_nav') {
       await handleOpenIndividualRoundMenu(interaction, tournamentId, extraParam);
       return;
     }
@@ -3028,7 +3048,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
       return;
     }
 
-    // Action: Create Round (Modal fallback)
+    // Action: Create Round (Modal)
     if (action === 'create_round') {
       const modal = new ModalBuilder()
         .setCustomId(`md_modal_create_round:${tournamentId}`)
@@ -3036,13 +3056,25 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
       const roundNameInput = new TextInputBuilder()
         .setCustomId('round_name')
-        .setLabel('Round Name or Number')
-        .setPlaceholder('e.g. Round 1, Round 2, Quarter Finals')
+        .setLabel('Round Name')
+        .setPlaceholder('e.g. Round 1, Quarter Finals')
         .setStyle(TextInputStyle.Short)
         .setRequired(true)
         .setMaxLength(50);
 
-      modal.addComponents(new ActionRowBuilder().addComponents(roundNameInput));
+      const capacityInput = new TextInputBuilder()
+        .setCustomId('teams_per_group')
+        .setLabel('Teams Per Group (Max 23)')
+        .setPlaceholder('e.g. 16')
+        .setValue('16')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(4);
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(roundNameInput),
+        new ActionRowBuilder().addComponents(capacityInput)
+      );
       await interaction.showModal(modal).catch(() => {});
       return;
     }
@@ -3082,71 +3114,66 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
       return;
     }
 
-    // Action: Refresh Tournament Data
-    if (action === 'refresh') {
+    // Action: Sync & Refresh (combines registration/channel sync + role sync + statistics refresh)
+    if (action === 'sync_refresh' || action === 'refresh' || action === 'sync_roles') {
       if (typeof interaction.deferReply === 'function') {
         await interaction.deferReply({ ephemeral: true }).catch(() => { });
       }
 
       try {
         await withTournamentLock(tournamentId, async () => {
+          // 1. Fetch latest backend data
           const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId);
           const { tournament, teams, summary } = backendData;
 
-          // Perform full channel & participant sync (edits roster in #tournament-teams & registration link in place)
-          await syncTournamentDiscordChannels(guild, tournament, teams, botMember);
+          // 2. Perform channel & participant sync (edits roster in #tournament-teams & registration link in place)
+          let channelSyncError = null;
+          let syncResult = null;
+          try {
+            syncResult = await syncTournamentDiscordChannels(guild, tournament, teams, botMember);
+          } catch (err) {
+            channelSyncError = err.message;
+          }
 
-          // Refresh Control Panel embed
+          // 3. Refresh tournament role assignments
+          let roleSyncError = null;
+          let roleStats = null;
+          try {
+            roleStats = await syncTournamentRoles(guild, tournamentId, backendData);
+          } catch (err) {
+            roleSyncError = err.message;
+          }
+
+          // 4. Refresh Control Panel embed & statistics
           await setupTournamentControlPanel(guild, tournament, summary, botMember);
 
-          const replyContent = `✅ **Tournament Data Refreshed:** Live registrations, stats, and roster updated.`;
-          if (typeof interaction.editReply === 'function') {
-            await interaction.editReply({ content: replyContent });
-          } else if (typeof interaction.reply === 'function') {
-            await interaction.reply({ content: replyContent, ephemeral: true });
+          // 5. Check for partial failures and report clearly
+          if (channelSyncError || roleSyncError) {
+            const warningMsg = `⚠️ **Sync & Refresh Completed with Warnings:**\n` +
+              (channelSyncError ? `• **Channel/Roster Sync Failed:** ${channelSyncError}\n` : `• **Channels:** Updated successfully.\n`) +
+              (roleSyncError ? `• **Role Sync Failed:** ${roleSyncError}\n` : `• **Roles:** ${roleStats ? `${roleStats.assigned} assigned, ${roleStats.alreadyAssigned} verified.` : 'Updated.'}\n`) +
+              `• **Dashboard:** Refreshed with latest registrations.`;
+            if (typeof interaction.editReply === 'function') {
+              await interaction.editReply({ content: warningMsg });
+            } else if (typeof interaction.reply === 'function') {
+              await interaction.reply({ content: warningMsg, ephemeral: true });
+            }
+          } else {
+            const roleMention = roleStats?.roleId ? `<@&${roleStats.roleId}>` : `\`${roleStats?.roleName || 'Tournament Role'}\``;
+            const replyContent = `✅ **Tournament Synchronized & Refreshed Successfully!**\n` +
+              `• **Registrations:** **${summary.total_registered_teams}** teams (**${summary.eligible_teams_count}** eligible)\n` +
+              `• **Linked Discord Accounts:** **${summary.eligible_linked_members_count}** verified\n` +
+              `• **Roles Synchronized:** ${roleMention} — **${roleStats?.assigned || 0}** newly assigned, **${roleStats?.alreadyAssigned || 0}** verified, **${roleStats?.removed || 0}** removed (ineligible)\n` +
+              `• **Channels & Dashboard:** Updated in place without duplicates.`;
+            if (typeof interaction.editReply === 'function') {
+              await interaction.editReply({ content: replyContent });
+            } else if (typeof interaction.reply === 'function') {
+              await interaction.reply({ content: replyContent, ephemeral: true });
+            }
           }
         });
       } catch (err) {
-        const errorMsg = `❌ **Failed to refresh tournament data:** ${err.message}`;
-        if (typeof interaction.editReply === 'function') {
-          await interaction.editReply({ content: errorMsg });
-        } else if (typeof interaction.reply === 'function') {
-          await interaction.reply({ content: errorMsg, ephemeral: true });
-        }
-      }
-      return;
-    }
-
-    // Action: Sync Tournament Roles
-    if (action === 'sync_roles') {
-      if (typeof interaction.deferReply === 'function') {
-        await interaction.deferReply({ ephemeral: true }).catch(() => { });
-      }
-
-      try {
-        const stats = await syncTournamentRoles(guild, tournamentId);
-        const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId);
-        const { tournament, summary } = backendData;
-
-        // Refresh Control Panel embed with updated role statistics
-        await setupTournamentControlPanel(guild, tournament, summary, botMember);
-
-        const roleMention = stats.roleId ? `<@&${stats.roleId}>` : `\`${stats.roleName}\``;
-        const resp = `✅ **Tournament Roles Synchronized:**\n` +
-          `• **Role:** ${roleMention} (\`${stats.roleName}\` | ID: \`${stats.roleId}\`)\n` +
-          `• **Roles Assigned:** **${stats.assigned}** new member(s)\n` +
-          `• **Already Assigned:** **${stats.alreadyAssigned}** member(s)\n` +
-          `• **Roles Removed (Ineligible):** **${stats.removed}** member(s)\n` +
-          `• **Skipped:** **${stats.skipped}** (unlinked accounts or users not in server)\n` +
-          `• **Total Members Holding Role:** **${stats.membersWithRole}**`;
-
-        if (typeof interaction.editReply === 'function') {
-          await interaction.editReply({ content: resp });
-        } else if (typeof interaction.reply === 'function') {
-          await interaction.reply({ content: resp, ephemeral: true });
-        }
-      } catch (err) {
-        const errorMsg = `❌ **Failed to sync tournament roles:** ${err.message}`;
+        const errorMsg = `❌ **Failed to sync & refresh tournament:** ${err.message}`;
         if (typeof interaction.editReply === 'function') {
           await interaction.editReply({ content: errorMsg });
         } else if (typeof interaction.reply === 'function') {
@@ -3404,7 +3431,7 @@ export async function handleViewRoundsScreen(interaction, tournamentId) {
 
       roundsText +=
         `• ${statusEmoji} **${r.name}** (\`${r.roundId}\`)\n` +
-        `  └ **Status:** **${r.status}** | **Groups:** **${r.groups?.length || 0}** | **Teams Allocated:** **${allocatedTeams}**\n`;
+        `  └ **Status:** **${r.status}** | **Groups:** **${r.groups?.length || 0}** | **Teams/Group:** **${r.teamsPerGroup || 16}** | **Allocated:** **${allocatedTeams}**\n`;
     }
     embed.addFields({
       name: `📋 Existing Rounds (${sortedRounds.length})`,
@@ -3432,7 +3459,7 @@ export async function handleViewRoundsScreen(interaction, tournamentId) {
       return new StringSelectMenuOptionBuilder()
         .setLabel(r.name.slice(0, 100))
         .setValue(r.roundId)
-        .setDescription(`Status: ${r.status} | Groups: ${r.groups?.length || 0} | Teams: ${allocatedTeams}`.slice(0, 100))
+        .setDescription(`Status: ${r.status} | Groups: ${r.groups?.length || 0} | Teams/Group: ${r.teamsPerGroup || 16} | Teams: ${allocatedTeams}`.slice(0, 100))
         .setEmoji(emoji);
     });
 
@@ -3447,7 +3474,7 @@ export async function handleViewRoundsScreen(interaction, tournamentId) {
   // Action Buttons
   const buttonRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`md_tour_create_sequential_round:${tournamentId}`)
+      .setCustomId(`md_tour_create_round:${tournamentId}`)
       .setLabel('Create Round')
       .setEmoji('➕')
       .setStyle(ButtonStyle.Success),
@@ -3458,7 +3485,7 @@ export async function handleViewRoundsScreen(interaction, tournamentId) {
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`md_tour_back_to_panel:${tournamentId}`)
-      .setLabel('Back to Tournament Panel')
+      .setLabel('Back to Dashboard')
       .setEmoji('⬅️')
       .setStyle(ButtonStyle.Secondary)
   );
@@ -3636,8 +3663,10 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
         name: '👥 Groups & Slot Allocation',
         value:
           `• **Total Groups:** **${round.groups?.length || 0}**\n` +
+          `• **Configured Capacity:** **${round.teamsPerGroup || 16}** teams per group\n` +
           `• **Teams Allocated:** **${totalAllocatedTeams}**\n` +
-          `• **Capacity Policy:** 25 slots per group (Slots 01-02 LOCKED, Slots 03-18 Teams [max 16], Slots 19-25 UNUSED)\n` +
+          `• **Qualified from this Round:** **${(round.qualifications || []).length}** 🏆\n` +
+          `• **Capacity Policy:** 25 slots per group (Slots 01-02 LOCKED, Slots 03 to ${2 + (round.teamsPerGroup || 16)} Teams, Remaining Slots UNUSED)\n` +
           `${groupsDetailText}`,
         inline: false,
       }
@@ -3645,34 +3674,33 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
     .setTimestamp();
 
   // Action Buttons:
-  // Row 1: Start Round, Edit Round, Delete Round, View Allocation
+  // Row 1 (4 actions): Edit, Delete, Start, Qualify
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`md_round_start:${tournamentId}:${round.roundId}`)
-      .setLabel('Start Round')
-      .setEmoji('▶️')
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(isActive || isCompleted),
-    new ButtonBuilder()
       .setCustomId(`md_round_edit:${tournamentId}:${round.roundId}`)
-      .setLabel('Edit Round')
+      .setLabel('Edit')
       .setEmoji('✏️')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
       .setCustomId(`md_round_delete:${tournamentId}:${round.roundId}`)
-      .setLabel('Delete Round')
+      .setLabel('Delete')
       .setEmoji('🗑️')
       .setStyle(ButtonStyle.Danger)
       .setDisabled(isActive),
     new ButtonBuilder()
-      .setCustomId(`md_round_view_alloc:${tournamentId}:${round.roundId}`)
-      .setLabel('View Allocation')
-      .setEmoji('👁️')
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(!round.groups || round.groups.length === 0)
+      .setCustomId(`md_round_start:${tournamentId}:${round.roundId}`)
+      .setLabel('Start')
+      .setEmoji('▶️')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(isActive || isCompleted),
+    new ButtonBuilder()
+      .setCustomId(`md_round_qualify:${tournamentId}:${round.roundId}`)
+      .setLabel('Qualify')
+      .setEmoji('🏆')
+      .setStyle(ButtonStyle.Success)
   );
 
-  // Row 2: Back to Rounds, Back to Tournament Panel
+  // Row 2: Back to Rounds, Back to Dashboard
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`md_round_back_to_rounds:${tournamentId}`)
@@ -3681,7 +3709,7 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`md_tour_back_to_panel:${tournamentId}`)
-      .setLabel('Back to Tournament Panel')
+      .setLabel('Back to Dashboard')
       .setEmoji('⬅️')
       .setStyle(ButtonStyle.Secondary)
   );
@@ -3743,13 +3771,36 @@ export async function handlePromptStartRound(interaction, tournamentId, roundId)
       `Starting **${round.name}** will automatically transition **${existingActive.name}** to **Completed**.\n\n`;
   }
 
+  const precedingRounds = Object.values(savedTournament.rounds || {})
+    .filter((r) => (r.roundNumber || 0) < (round.roundNumber || 1))
+    .sort((a, b) => (b.roundNumber || 0) - (a.roundNumber || 0));
+  const prevRound = precedingRounds[0];
+  const hasPrevQuals = prevRound && Array.isArray(prevRound.qualifications) && prevRound.qualifications.length > 0;
+
+  const capacity = Math.min(Math.max(round.teamsPerGroup || 16, 1), 23);
+  let poolSourceText = '';
+  let estimatedGroupsText = '';
+
+  if (hasPrevQuals) {
+    const qualCount = prevRound.qualifications.length;
+    const calcGroups = Math.ceil(qualCount / capacity) || 1;
+    poolSourceText = `• **Allocation Source:** Qualified from **${prevRound.name}** (**${qualCount}** team(s))\n`;
+    estimatedGroupsText = `• **Estimated Groups to Provision:** **${calcGroups}** group(s) based on capacity **${capacity}** teams/group\n`;
+  } else {
+    poolSourceText = `• **Allocation Source:** Verified eligible registrations from MatchDistrict backend\n`;
+    estimatedGroupsText = `• **Configured Group Capacity:** **${capacity}** teams/group\n`;
+  }
+
   const promptText = `⚠️ **Confirm Starting ${round.name}**\n\n` +
     activeWarning +
     `This will execute the official tournament allocation workflow:\n` +
-    `• Fetch latest verified registrations from MatchDistrict backend\n` +
-    `• Divide eligible teams into groups of 16 across 25 slots (Slots 01-02 LOCKED, Slots 03-18 Teams, Slots 19-25 UNUSED)\n` +
+    poolSourceText +
+    estimatedGroupsText +
+    `• **25-Slot Policy:** Slots 01–02 LOCKED, Slots 03–${2 + capacity} Teams, Slots ${3 + capacity}–25 UNUSED\n` +
     `• Create/reuse dedicated group roles and private ID/password channels\n` +
+    `• Set strict read-only permissions on group channels for participants\n` +
     `• Assign group roles to verified linked Discord players\n` +
+    `• Clean up obsolete group roles from preceding rounds (preserving tournament role)\n` +
     `• Transition **${round.name}** to **Active** status\n` +
     `• Publish allocation summary to <#${savedTournament.channels?.botCommandsId || 'bot-commands'}>\n\n` +
     `Click **Confirm & Start ${round.name}** to proceed.`;
@@ -3810,6 +3861,14 @@ export async function handleEditRoundButton(interaction, tournamentId, roundId) 
     .setRequired(true)
     .setMaxLength(50);
 
+  const capacityInput = new TextInputBuilder()
+    .setCustomId('teams_per_group')
+    .setLabel('Teams Per Group (Capacity 1-23)')
+    .setValue(String(round.teamsPerGroup || 16))
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(4);
+
   const notesInput = new TextInputBuilder()
     .setCustomId('round_notes')
     .setLabel('Round Stage Description / Notes')
@@ -3820,6 +3879,7 @@ export async function handleEditRoundButton(interaction, tournamentId, roundId) 
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(nameInput),
+    new ActionRowBuilder().addComponents(capacityInput),
     new ActionRowBuilder().addComponents(notesInput)
   );
 
@@ -3829,7 +3889,7 @@ export async function handleEditRoundButton(interaction, tournamentId, roundId) 
 /**
  * Handles submission of Edit Round modal.
  */
-export async function handleEditRoundSubmit(interaction, tournamentId, roundId, newName, newNotes) {
+export async function handleEditRoundSubmit(interaction, tournamentId, roundId, newName, capacityStr = '16', newNotes = '') {
   const guild = interaction.guild;
   const access = checkTournamentAccess(guild, interaction.member);
   if (!access.allowed) {
@@ -3853,10 +3913,20 @@ export async function handleEditRoundSubmit(interaction, tournamentId, roundId, 
     return;
   }
 
+  const parsedCap = parseInt(capacityStr, 10);
+  if (isNaN(parsedCap) || parsedCap < 1 || parsedCap > 23) {
+    await interaction.reply({
+      content: '❌ **Teams per group must be a positive integer between 1 and 23** (slots 01–02 are locked in the 25-slot layout).',
+      ephemeral: true,
+    }).catch(() => {});
+    return;
+  }
+
   // Defer reply immediately so modal submit responds well within 3s deadline
   await interaction.deferReply({ ephemeral: true }).catch(() => {});
 
   round.name = newName;
+  round.teamsPerGroup = parsedCap;
   round.notes = newNotes || '';
   guildSettingsCache[guild.id] = currentSettings;
   saveGuildSettings(guildSettingsCache);
@@ -3870,8 +3940,13 @@ export async function handleEditRoundSubmit(interaction, tournamentId, roundId, 
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
       .setCustomId(`md_round_back_to_rounds:${tournamentId}`)
-      .setLabel('View Rounds')
+      .setLabel('Back to Rounds')
       .setEmoji('📋')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`md_tour_back_to_panel:${tournamentId}`)
+      .setLabel('Back to Dashboard')
+      .setEmoji('⬅️')
       .setStyle(ButtonStyle.Secondary)
   );
 
@@ -4273,7 +4348,7 @@ export async function handleBackToTournamentPanel(interaction, tournamentId) {
 /**
  * Handles round creation submission from modal.
  */
-export async function handleCreateRoundSubmit(interaction, tournamentId, roundName) {
+export async function handleCreateRoundSubmit(interaction, tournamentId, roundName, teamsPerGroupStr = '16') {
   const guild = interaction.guild;
   const member = interaction.member;
 
@@ -4285,6 +4360,15 @@ export async function handleCreateRoundSubmit(interaction, tournamentId, roundNa
 
   if (!roundName) {
     await interaction.reply({ content: '❌ **Round name cannot be empty.**', ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  const parsedCapacity = parseInt(teamsPerGroupStr, 10);
+  if (isNaN(parsedCapacity) || parsedCapacity < 1 || parsedCapacity > 23) {
+    await interaction.reply({
+      content: '❌ **Teams per group must be a positive integer between 1 and 23** (slots 01–02 are locked for coordinators in the 25-slot layout).',
+      ephemeral: true,
+    }).catch(() => {});
     return;
   }
 
@@ -4330,10 +4414,14 @@ export async function handleCreateRoundSubmit(interaction, tournamentId, roundNa
     roundNumber: roundNum,
     name: roundName,
     tournamentId,
+    teamsPerGroup: parsedCapacity,
     status: 'Draft',
+    notes: '',
     createdAt: new Date().toISOString(),
     startedAt: null,
+    completedAt: null,
     groups: [],
+    qualifications: [],
     summaryMessageIds: [],
   };
 
@@ -4342,9 +4430,28 @@ export async function handleCreateRoundSubmit(interaction, tournamentId, roundNa
   saveGuildSettings(guildSettingsCache);
   saveTournamentToDb(guild.id, tournamentId, savedTournament);
 
+  const actionRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`md_round_back_to_menu:${tournamentId}:${candidateRoundId}`)
+      .setLabel(`Manage ${roundName}`)
+      .setEmoji('⚔️')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`md_round_back_to_rounds:${tournamentId}`)
+      .setLabel('Back to Rounds')
+      .setEmoji('📋')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`md_tour_back_to_panel:${tournamentId}`)
+      .setLabel('Back to Dashboard')
+      .setEmoji('⬅️')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
   await interaction.editReply({
-    content: `✅ Created **${roundName}** (ID: \`${candidateRoundId}\`) with status **Draft**.\n` +
-      `Click **Start Round** when you are ready to allocate registered teams into groups.`,
+    content: `✅ Created **${roundName}** (ID: \`${candidateRoundId}\`) with capacity **${parsedCapacity}** teams/group in status **Draft**.\n` +
+      `Click **Manage ${roundName}** when you are ready to review allocations and start the round.`,
+    components: [actionRow],
   }).catch(() => {});
 
   // Background refresh of Control Panel embed (non-blocking)
@@ -4486,14 +4593,47 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId);
       const { tournament, teams, summary } = backendData;
 
-      const eligibleTeams = teams.filter((t) => t.is_eligible);
+      // Determine eligible allocation pool: derived from preceding round's qualifications if present, otherwise live backend registrations
+      const precedingRounds = Object.values(savedTournament.rounds || {})
+        .filter((r) => (r.roundNumber || 0) < (round.roundNumber || 1))
+        .sort((a, b) => (b.roundNumber || 0) - (a.roundNumber || 0));
+      const prevRound = precedingRounds[0];
+      const hasPrevQuals = prevRound && Array.isArray(prevRound.qualifications) && prevRound.qualifications.length > 0;
+
+      let eligibleTeams = [];
+      if (hasPrevQuals) {
+        // Derive eligible pool from preceding round's qualified teams
+        for (const qual of prevRound.qualifications) {
+          qual.destinationRoundId = round.roundId;
+          eligibleTeams.push({
+            id: qual.teamId,
+            team_id: qual.teamId,
+            team_name: qual.teamName,
+            is_eligible: true,
+            members: qual.members || [],
+            linked_members: qual.members || [],
+            leader: qual.members?.[0] || null,
+            sourceRoundId: qual.sourceRoundId,
+            sourceGroupId: qual.sourceGroupId,
+            sourceSlot: qual.sourceSlot,
+          });
+        }
+      } else {
+        eligibleTeams = teams.filter((t) => t.is_eligible);
+      }
+
       if (eligibleTeams.length === 0) {
-        throw new Error(`No eligible registered teams found for tournament "${tournament.title}". Cannot allocate empty round.`);
+        throw new Error(
+          hasPrevQuals
+            ? `No qualified teams found from "${prevRound?.name || 'preceding round'}". Cannot start round without eligible teams.`
+            : `No eligible registered teams found for tournament "${tournament.title}". Cannot allocate empty round.`
+        );
       }
 
       // Group & Slot Allocation Rules:
-      // Group size: exactly 25 slots. Slots 01-02: LOCKED. Slots 03-18: 16 teams. Slots 19-25: UNUSED.
-      const ASSIGNABLE_SLOTS_PER_GROUP = 16;
+      // Configured capacity per group (default 16, max 23 in 25-slot layout)
+      const ASSIGNABLE_SLOTS_PER_GROUP = Math.min(Math.max(round.teamsPerGroup || 16, 1), 23);
+      round.teamsPerGroup = ASSIGNABLE_SLOTS_PER_GROUP;
       const groupCount = Math.ceil(eligibleTeams.length / ASSIGNABLE_SLOTS_PER_GROUP) || 1;
 
       // Ensure canonical category exists
@@ -4513,6 +4653,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       const groups = [];
       let totalAssignedMembers = 0;
       let unlinkedTeamsCount = 0;
+      const newAssignedGroupMembers = new Map(); // discordId -> Set of roleIds in this round
 
       for (let g = 1; g <= groupCount; g++) {
         const groupId = `${round.roundId}_g${g}`;
@@ -4641,8 +4782,9 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
           { slotNumber: 2, status: 'LOCKED', label: 'LOCKED', teamId: null, teamName: null, members: [] },
         ];
 
-        // Slots 03–18: exactly 16 team positions
-        for (let s = 3; s <= 18; s++) {
+        const maxAssignableSlot = 2 + ASSIGNABLE_SLOTS_PER_GROUP;
+
+        for (let s = 3; s <= maxAssignableSlot; s++) {
           const teamIdx = (g - 1) * ASSIGNABLE_SLOTS_PER_GROUP + (s - 3);
           if (teamIdx < eligibleTeams.length) {
             const team = eligibleTeams[teamIdx];
@@ -4688,11 +4830,16 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
               teamId: team.id || team.team_id || String(teamIdx + 1),
               teamName: team.team_name,
               members: linkedMembers,
+              qualificationStatus: 'Pending',
             });
 
             // Assign group role to verified linked members
             if (groupRole) {
               for (const mem of linkedMembers) {
+                if (!newAssignedGroupMembers.has(mem.discord_id)) {
+                  newAssignedGroupMembers.set(mem.discord_id, new Set());
+                }
+                newAssignedGroupMembers.get(mem.discord_id).add(groupRole.id);
                 try {
                   const gm = await guild.members.fetch(mem.discord_id).catch(() => null);
                   if (gm && !gm.roles.cache.has(groupRole.id)) {
@@ -4710,12 +4857,13 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
               teamId: null,
               teamName: null,
               members: [],
+              qualificationStatus: 'Pending',
             });
           }
         }
 
-        // Slots 19–25: "UNUSED" or "RESERVED"; do not assign teams to these positions
-        for (let s = 19; s <= 25; s++) {
+        // Slots after configured capacity up to 25 are UNUSED
+        for (let s = maxAssignableSlot + 1; s <= 25; s++) {
           slots.push({
             slotNumber: s,
             status: 'UNUSED',
@@ -4746,6 +4894,52 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
           await applyStrictGroupChannelPermissions(guild, groupChannel, groupRole, tourRole, botMember);
           await removeGroupResultControlMessage(guild, groupObj, groupChannel);
           await updateGroupSlotListMessage(guild, tournament, round, groupObj, groupChannel);
+        }
+      }
+
+      // Role transition: Clean up obsolete group roles from preceding rounds of THIS tournament
+      const previousGroupRoleIds = new Set();
+      for (const pr of Object.values(savedTournament.rounds || {})) {
+        if (pr.roundId !== round.roundId && Array.isArray(pr.groups)) {
+          for (const pg of pr.groups) {
+            if (pg.roleId) previousGroupRoleIds.add(pg.roleId);
+          }
+        }
+      }
+
+      if (previousGroupRoleIds.size > 0) {
+        for (const [discordId, assignedRoleSet] of newAssignedGroupMembers.entries()) {
+          try {
+            const gm = await guild.members.fetch(discordId).catch(() => null);
+            if (gm) {
+              for (const prevRoleId of previousGroupRoleIds) {
+                if (gm.roles.cache.has(prevRoleId) && !assignedRoleSet.has(prevRoleId)) {
+                  await gm.roles.remove(prevRoleId, `Progression transition to ${round.name}`).catch(() => {});
+                }
+              }
+            }
+          } catch {}
+        }
+      }
+
+      // Also clean up obsolete group roles for members who did not qualify for this round
+      if (hasPrevQuals && prevRound && Array.isArray(prevRound.groups)) {
+        for (const pg of prevRound.groups) {
+          if (!pg.roleId) continue;
+          for (const pslot of (pg.slots || [])) {
+            if (pslot.status === 'OCCUPIED' && Array.isArray(pslot.members)) {
+              for (const mem of pslot.members) {
+                if (mem.discord_id && !newAssignedGroupMembers.has(mem.discord_id)) {
+                  try {
+                    const gm = await guild.members.fetch(mem.discord_id).catch(() => null);
+                    if (gm && gm.roles.cache.has(pg.roleId)) {
+                      await gm.roles.remove(pg.roleId, `Did not qualify for ${round.name}`).catch(() => {});
+                    }
+                  } catch {}
+                }
+              }
+            }
+          }
         }
       }
 
@@ -4793,9 +4987,10 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       // Refresh Control Panel embed
       await setupTournamentControlPanel(guild, tournament, summary, botMember);
 
+      const maxAssignableSlot = 2 + ASSIGNABLE_SLOTS_PER_GROUP;
       const successMsg = `✅ **${round.name} Started Successfully!**\n` +
         `• **Eligible Teams Allocated:** **${eligibleTeams.length}** across **${groupCount}** group(s)\n` +
-        `• **Capacity Policy:** Exactly 16 teams/group across 25 slots (Slots 01-02 LOCKED, Slots 03-18 Teams, Slots 19-25 UNUSED)\n` +
+        `• **Capacity Policy:** Configured **${ASSIGNABLE_SLOTS_PER_GROUP}** teams/group across 25 slots (Slots 01-02 LOCKED, Slots 03 to ${maxAssignableSlot} Teams, Slots ${maxAssignableSlot + 1}-25 UNUSED)\n` +
         `• **Group Roles & Channels:** **${groups.length}** private text channel(s) and role(s) configured\n` +
         `• **Group Roles Assigned:** **${totalAssignedMembers}** verified member(s)\n` +
         (unlinkedTeamsCount > 0 ? `• ⚠️ **Pending Links:** **${unlinkedTeamsCount}** team(s) have unlinked Discord accounts\n` : '') +
@@ -4809,12 +5004,12 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
           .setStyle(ButtonStyle.Primary),
         new ButtonBuilder()
           .setCustomId(`md_round_back_to_rounds:${tournamentId}`)
-          .setLabel('View Rounds')
+          .setLabel('Back to Rounds')
           .setEmoji('📋')
           .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
           .setCustomId(`md_tour_back_to_panel:${tournamentId}`)
-          .setLabel('Back to Tournament Panel')
+          .setLabel('Back to Dashboard')
           .setEmoji('⬅️')
           .setStyle(ButtonStyle.Secondary)
       );
@@ -4843,6 +5038,7 @@ export async function handleTournamentSelectMenuInteraction(interaction) {
   if (
     !customId.startsWith('md_tour_select_') &&
     !customId.startsWith('md_round_select_') &&
+    !customId.startsWith('md_qual_select_') &&
     !customId.startsWith('md_select_qualify_teams:') &&
     customId !== 'md_select_tournament'
   ) return;
@@ -4872,9 +5068,9 @@ export async function handleTournamentSelectMenuInteraction(interaction) {
     return;
   }
 
-  if (customId.startsWith('md_select_qualify_teams:')) {
+  if (customId.startsWith('md_qual_select_slots:') || customId.startsWith('md_select_qualify_teams:')) {
     const [, tourId, rId, gId] = customId.split(':');
-    await handleConfirmQualifyTeams(interaction, tourId, rId, gId, interaction.values || []);
+    await handleQualifyPromptConfirmation(interaction, tourId, rId, gId, interaction.values || []);
     return;
   }
 
@@ -4901,7 +5097,8 @@ export async function handleTournamentModalSubmit(interaction) {
   if (customId.startsWith('md_modal_create_round:')) {
     const tournamentId = customId.split(':')[1];
     const roundName = interaction.fields?.getTextInputValue('round_name')?.trim();
-    await handleCreateRoundSubmit(interaction, tournamentId, roundName);
+    const capacityStr = interaction.fields?.getTextInputValue('teams_per_group')?.trim();
+    await handleCreateRoundSubmit(interaction, tournamentId, roundName, capacityStr);
     return;
   }
 
@@ -4910,8 +5107,9 @@ export async function handleTournamentModalSubmit(interaction) {
     const tournamentId = parts[1];
     const roundId = parts[2];
     const newName = interaction.fields?.getTextInputValue('round_name')?.trim();
+    const capacityStr = interaction.fields?.getTextInputValue('teams_per_group')?.trim();
     const newNotes = interaction.fields?.getTextInputValue('round_notes')?.trim() || '';
-    await handleEditRoundSubmit(interaction, tournamentId, roundId, newName, newNotes);
+    await handleEditRoundSubmit(interaction, tournamentId, roundId, newName, capacityStr, newNotes);
     return;
   }
 
@@ -5183,13 +5381,16 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
   let slotsText = '';
   const slots = Array.isArray(group.slots) ? group.slots : [];
 
+  const capacity = Math.min(Math.max(round.teamsPerGroup || 16, 1), 23);
+  const maxTeamSlot = 2 + capacity;
+
   for (let s = 1; s <= 25; s++) {
     const slotNum = String(s).padStart(2, '0');
     const slotData = slots.find((sl) => sl.slotNumber === s);
 
     if (s >= 1 && s <= 2) {
       slotsText += `🔒 **Slot ${slotNum}:** \`LOCKED\`\n`;
-    } else if (s >= 3 && s <= 18) {
+    } else if (s >= 3 && s <= maxTeamSlot) {
       if (slotData && (slotData.status === 'OCCUPIED' || slotData.teamName)) {
         const isQualified = slotData.qualificationStatus === 'Qualified';
         const qualTag = isQualified ? ' **[QUALIFIED 🏆]**' : ' *[Pending ⏳]*';
@@ -5548,64 +5749,219 @@ export function generateEmptyRoundGroups(count = 4, roundName = 'Round 2') {
 }
 
 /**
- * Handles the "Qualify Team" button click in an ID/PWD channel.
- * Opens an ephemeral StringSelectMenu allowing the administrator to select teams.
+ * Step A — Select Source Group for Qualification.
+ * Displays all actual groups in the selected round as buttons [ G1 ] [ G2 ] [ G3 ]...
  */
-export async function handleQualifyTeamButton(interaction, tournamentId, roundId, groupId) {
+export async function handleRoundQualifyGroupSelection(interaction, tournamentId, roundId) {
   const guild = interaction.guild;
-  const member = interaction.member;
-
-  const access = checkTournamentAccess(guild, member);
+  const access = checkTournamentAccess(guild, interaction.member);
   if (!access.allowed) {
-    await interaction.reply({ content: access.reason, ephemeral: true }).catch(() => {});
+    if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: access.reason, ephemeral: true }).catch(() => {});
+    }
     return;
+  }
+
+  if (!interaction.deferred && !interaction.replied) {
+    if (typeof interaction.deferUpdate === 'function') {
+      await interaction.deferUpdate().catch(() => {});
+    }
   }
 
   const currentSettings = guildSettingsCache[guild.id] || {};
   const savedTournament = currentSettings.tournaments?.[tournamentId];
   if (!savedTournament) {
-    await interaction.reply({ content: '❌ Tournament configuration not found.', ephemeral: true }).catch(() => {});
+    const errText = `❌ Tournament \`${tournamentId}\` not found.`;
+    if (interaction.deferred) await interaction.editReply({ content: errText, embeds: [], components: [] }).catch(() => {});
     return;
   }
 
   const round = savedTournament.rounds?.[roundId];
   if (!round) {
-    await interaction.reply({ content: '❌ Round not found.', ephemeral: true }).catch(() => {});
+    const errText = `❌ Round \`${roundId}\` not found.`;
+    if (interaction.deferred) await interaction.editReply({ content: errText, embeds: [], components: [] }).catch(() => {});
     return;
   }
 
-  const group = (round.groups || []).find((g) => g.groupId === groupId || g.groupNumber === Number(groupId));
+  const groups = Array.isArray(round.groups) ? round.groups : [];
+  if (groups.length === 0) {
+    const noGroupsText = `⚠️ **No Groups Allocated Yet:** Round **${round.name}** has not been started and has no active groups.\n` +
+      `Please click **Start** in the round menu to allocate registered teams into groups before qualifying.`;
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`md_round_back_to_menu:${tournamentId}:${round.roundId}`)
+        .setLabel('Back to Round')
+        .setEmoji('⬅️')
+        .setStyle(ButtonStyle.Secondary)
+    );
+    if (interaction.deferred) {
+      await interaction.editReply({ content: noGroupsText, embeds: [], components: [backRow] }).catch(() => {});
+    } else if (typeof interaction.update === 'function') {
+      await interaction.update({ content: noGroupsText, embeds: [], components: [backRow] }).catch(() => {});
+    }
+    return;
+  }
+
+  // Count total qualified teams across all groups of this round
+  let totalQualified = 0;
+  for (const g of groups) {
+    for (const s of (g.slots || [])) {
+      if (s.qualificationStatus === 'Qualified') totalQualified++;
+    }
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🏆 ${round.name} — Qualify Teams`)
+    .setColor(0x22c55e)
+    .setDescription(
+      `Select a source group from **${round.name}** to inspect its 25-slot list and qualify winning teams into the next round stage.\n\n` +
+      `• **Source Round:** **${round.name}** (\`${round.roundId}\`)\n` +
+      `• **Total Groups:** **${groups.length}** group(s)\n` +
+      `• **Configured Capacity:** **${round.teamsPerGroup || 16}** teams per group\n` +
+      `• **Currently Qualified:** **${totalQualified}** team(s) qualified from this round\n\n` +
+      `*Click a group button below to choose teams to qualify:*`
+    )
+    .setTimestamp();
+
+  // Create group buttons in rows of up to 5
+  const components = [];
+  let currentRow = new ActionRowBuilder();
+
+  for (let i = 0; i < groups.length; i++) {
+    const g = groups[i];
+    const groupQualifiedCount = (g.slots || []).filter((s) => s.qualificationStatus === 'Qualified').length;
+    const btnLabel = `G${g.groupNumber}${groupQualifiedCount > 0 ? ` (${groupQualifiedCount} 🏆)` : ''}`;
+
+    currentRow.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`md_qual_group:${tournamentId}:${round.roundId}:${g.groupId}`)
+        .setLabel(btnLabel.slice(0, 80))
+        .setStyle(groupQualifiedCount > 0 ? ButtonStyle.Success : ButtonStyle.Primary)
+    );
+
+    if (currentRow.components.length === 5 || i === groups.length - 1) {
+      components.push(currentRow);
+      currentRow = new ActionRowBuilder();
+    }
+    if (components.length >= 4) break; // Maximum 4 button rows for groups (20 groups)
+  }
+
+  // Navigation Row
+  const navRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`md_round_back_to_menu:${tournamentId}:${round.roundId}`)
+      .setLabel('Back to Round')
+      .setEmoji('⬅️')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`md_tour_back_to_panel:${tournamentId}`)
+      .setLabel('Back to Dashboard')
+      .setEmoji('🏠')
+      .setStyle(ButtonStyle.Secondary)
+  );
+  components.push(navRow);
+
+  if (interaction.deferred) {
+    await interaction.editReply({ content: null, embeds: [embed], components }).catch(() => {});
+  } else if (typeof interaction.update === 'function') {
+    await interaction.update({ content: null, embeds: [embed], components }).catch(() => {});
+  } else if (typeof interaction.reply === 'function') {
+    await interaction.reply({ embeds: [embed], components, ephemeral: true }).catch(() => {});
+  }
+}
+
+/**
+ * Step B — Select Slots for the chosen group.
+ * Displays the group's occupied team slots (excluding locked 01-02 and unused slots).
+ * Allows admin to select teams to qualify.
+ */
+export async function handleRoundQualifySlotSelection(interaction, tournamentId, roundId, groupId) {
+  const guild = interaction.guild;
+  const access = checkTournamentAccess(guild, interaction.member);
+  if (!access.allowed) {
+    if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: access.reason, ephemeral: true }).catch(() => {});
+    }
+    return;
+  }
+
+  if (!interaction.deferred && !interaction.replied) {
+    if (typeof interaction.deferUpdate === 'function') {
+      await interaction.deferUpdate().catch(() => {});
+    }
+  }
+
+  const currentSettings = guildSettingsCache[guild.id] || {};
+  const savedTournament = currentSettings.tournaments?.[tournamentId];
+  const round = savedTournament?.rounds?.[roundId];
+  if (!round) {
+    const errText = `❌ Round \`${roundId}\` not found.`;
+    if (interaction.deferred) await interaction.editReply({ content: errText, embeds: [], components: [] }).catch(() => {});
+    return;
+  }
+
+  const group = (round.groups || []).find((g) => g.groupId === groupId || String(g.groupNumber) === String(groupId));
   if (!group) {
-    await interaction.reply({ content: '❌ Group not found.', ephemeral: true }).catch(() => {});
+    const errText = `❌ Group not found in round ${round.name}.`;
+    if (interaction.deferred) await interaction.editReply({ content: errText, embeds: [], components: [] }).catch(() => {});
     return;
   }
 
-  const assignedSlots = (group.slots || []).filter((s) => s.status === 'OCCUPIED' && s.teamName);
-  if (assignedSlots.length === 0) {
-    await interaction.reply({
-      content: `⚠️ No teams are currently assigned to **Group ${group.groupNumber}**.`,
-      ephemeral: true,
-    }).catch(() => {});
+  const occupiedSlots = (group.slots || []).filter((s) => s.status === 'OCCUPIED' && s.teamName);
+  if (occupiedSlots.length === 0) {
+    const noTeamsText = `⚠️ No teams are currently occupied in **Group ${group.groupNumber}**.`;
+    const backRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`md_round_qualify:${tournamentId}:${round.roundId}`)
+        .setLabel('Back to Groups')
+        .setEmoji('⬅️')
+        .setStyle(ButtonStyle.Secondary)
+    );
+    if (interaction.deferred) {
+      await interaction.editReply({ content: noTeamsText, embeds: [], components: [backRow] }).catch(() => {});
+    } else if (typeof interaction.update === 'function') {
+      await interaction.update({ content: noTeamsText, embeds: [], components: [backRow] }).catch(() => {});
+    }
     return;
   }
 
-  const targetRoundNum = (round.roundNumber || 1) + 1;
-  const nextRoundName = `Round ${targetRoundNum}`;
+  const qualifiedSlots = occupiedSlots.filter((s) => s.qualificationStatus === 'Qualified');
 
+  const slotSummaryLines = occupiedSlots.map((s) => {
+    const isQual = s.qualificationStatus === 'Qualified';
+    const qualTag = isQual ? '🏆 **(QUALIFIED)**' : '⏳ *(Pending)*';
+    return `• **Slot ${String(s.slotNumber).padStart(2, '0')}:** **${s.teamName}** ${qualTag}`;
+  });
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🏆 Qualify Teams — ${round.name} (Group ${group.groupNumber})`)
+    .setColor(0x22c55e)
+    .setDescription(
+      `Select one or more team slots from **Group ${group.groupNumber}** to qualify for the next round stage.\n\n` +
+      `• **Group:** Group ${group.groupNumber} (${occupiedSlots.length} team(s) assigned)\n` +
+      `• **Already Qualified:** **${qualifiedSlots.length}** team(s)\n` +
+      `• **Display Policy:** Locked slots (01–02) and unused slots cannot be selected.\n\n` +
+      `**Current Team Slots:**\n` +
+      slotSummaryLines.slice(0, 16).join('\n')
+    )
+    .setFooter({ text: 'Admin Action • Select teams below to proceed to confirmation' })
+    .setTimestamp();
+
+  // Select menu for occupied slots
   const selectMenu = new StringSelectMenuBuilder()
-    .setCustomId(`md_select_qualify_teams:${tournamentId}:${roundId}:${group.groupId}`)
-    .setPlaceholder('Select team(s) to qualify into next round...')
+    .setCustomId(`md_qual_select_slots:${tournamentId}:${round.roundId}:${group.groupId}`)
+    .setPlaceholder(`Select team(s) from Group ${group.groupNumber} to qualify...`)
     .setMinValues(1)
-    .setMaxValues(assignedSlots.length);
+    .setMaxValues(occupiedSlots.length);
 
-  for (const slot of assignedSlots) {
+  for (const slot of occupiedSlots) {
     const isQual = slot.qualificationStatus === 'Qualified';
     const label = `Slot ${String(slot.slotNumber).padStart(2, '0')}: ${slot.teamName}`.slice(0, 100);
     const desc = isQual ? 'ALREADY QUALIFIED 🏆' : 'Pending Qualification ⏳';
     selectMenu.addOptions(
       new StringSelectMenuOptionBuilder()
         .setLabel(label)
-        .setValue(`team_${slot.teamId || slot.slotNumber}`)
+        .setValue(`slot_${slot.slotNumber}`)
         .setDescription(desc)
         .setEmoji(isQual ? '🏆' : '🎮')
     );
@@ -5614,34 +5970,120 @@ export async function handleQualifyTeamButton(interaction, tournamentId, roundId
   const row1 = new ActionRowBuilder().addComponents(selectMenu);
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId('md_cancel_qualify')
+      .setCustomId(`md_round_qualify:${tournamentId}:${round.roundId}`)
+      .setLabel('Back to Groups')
+      .setEmoji('⬅️')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`md_round_back_to_menu:${tournamentId}:${round.roundId}`)
+      .setLabel('Back to Round')
+      .setEmoji('⚔️')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  if (interaction.deferred) {
+    await interaction.editReply({ content: null, embeds: [embed], components: [row1, row2] }).catch(() => {});
+  } else if (typeof interaction.update === 'function') {
+    await interaction.update({ content: null, embeds: [embed], components: [row1, row2] }).catch(() => {});
+  } else if (typeof interaction.reply === 'function') {
+    await interaction.reply({ embeds: [embed], components: [row1, row2], ephemeral: true }).catch(() => {});
+  }
+}
+
+/**
+ * Step B Confirmation — Shows preview of selected teams and requests explicit admin confirmation.
+ */
+export async function handleQualifyPromptConfirmation(interaction, tournamentId, roundId, groupId, selectedSlotValues = []) {
+  const guild = interaction.guild;
+  const access = checkTournamentAccess(guild, interaction.member);
+  if (!access.allowed) {
+    if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: access.reason, ephemeral: true }).catch(() => {});
+    }
+    return;
+  }
+
+  if (!interaction.deferred && !interaction.replied) {
+    if (typeof interaction.deferUpdate === 'function') {
+      await interaction.deferUpdate().catch(() => {});
+    }
+  }
+
+  const currentSettings = guildSettingsCache[guild.id] || {};
+  const savedTournament = currentSettings.tournaments?.[tournamentId];
+  const round = savedTournament?.rounds?.[roundId];
+  const group = (round?.groups || []).find((g) => g.groupId === groupId || String(g.groupNumber) === String(groupId));
+
+  if (!round || !group) {
+    const errText = '❌ Round or group configuration not found.';
+    if (interaction.deferred) await interaction.editReply({ content: errText, embeds: [], components: [] }).catch(() => {});
+    return;
+  }
+
+  const slotNums = selectedSlotValues
+    .map((v) => parseInt(v.replace(/^slot_/, '').replace(/^team_/, ''), 10))
+    .filter((n) => !isNaN(n));
+
+  const selectedSlots = (group.slots || []).filter((s) => slotNums.includes(s.slotNumber));
+  if (selectedSlots.length === 0) {
+    const errText = '⚠️ No valid team slots were selected.';
+    if (interaction.deferred) await interaction.editReply({ content: errText, embeds: [], components: [] }).catch(() => {});
+    return;
+  }
+
+  const slotNumbersCsv = selectedSlots.map((s) => s.slotNumber).join(',');
+
+  const teamListText = selectedSlots.map((s) => {
+    const isQual = s.qualificationStatus === 'Qualified';
+    return `• **Slot ${String(s.slotNumber).padStart(2, '0')}:** **${s.teamName}** ${isQual ? '(Already Qualified 🏆)' : '(New Qualification 🟢)'}`;
+  }).join('\n');
+
+  const embed = new EmbedBuilder()
+    .setTitle(`⚠️ Confirm Qualification — ${round.name} (Group ${group.groupNumber})`)
+    .setColor(0xeab308) // Amber
+    .setDescription(
+      `Are you sure you want to qualify the following **${selectedSlots.length}** team(s) from **Group ${group.groupNumber}**?\n\n` +
+      `${teamListText}\n\n` +
+      `🛡️ **Progression Rule:**\n` +
+      `• Qualified teams will be saved in MongoDB with persistent qualification records.\n` +
+      `• When you create and start the next round, these qualified teams will form the eligible allocation pool.\n` +
+      `• The source slot list and qualification summary will be updated in place immediately.\n\n` +
+      `Click **Qualify Selected Teams** to commit.`
+    )
+    .setFooter({ text: `Admin: ${interaction.member?.user?.tag || interaction.member?.id}` })
+    .setTimestamp();
+
+  const confirmRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`md_qual_commit:${tournamentId}:${round.roundId}:${group.groupId}:${slotNumbersCsv}`)
+      .setLabel('Qualify Selected Teams')
+      .setEmoji('🏆')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`md_qual_group:${tournamentId}:${round.roundId}:${group.groupId}`)
+      .setLabel('Back to Slots')
+      .setEmoji('⬅️')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`md_round_back_to_menu:${tournamentId}:${round.roundId}`)
       .setLabel('Cancel')
       .setStyle(ButtonStyle.Secondary)
   );
 
-  const embed = new EmbedBuilder()
-    .setTitle(`🏆 Qualify Teams — ${round.name} (Group ${group.groupNumber})`)
-    .setColor(0x22c55e)
-    .setDescription(
-      `Select one or more teams from **Group ${group.groupNumber}** to qualify for **${nextRoundName}**.\n\n` +
-      `• **Current Group:** Group ${group.groupNumber} (${assignedSlots.length} teams assigned)\n` +
-      `• **Destination:** **${nextRoundName}**\n\n` +
-      `*Selected teams will have their status updated to Qualified and will be automatically allocated into open slots of ${nextRoundName}.*`
-    )
-    .setFooter({ text: 'Admin Action • Changes are saved immediately upon selection' });
-
-  await interaction.reply({
-    embeds: [embed],
-    components: [row1, row2],
-    ephemeral: true,
-  }).catch(() => {});
+  if (interaction.deferred) {
+    await interaction.editReply({ content: null, embeds: [embed], components: [confirmRow] }).catch(() => {});
+  } else if (typeof interaction.update === 'function') {
+    await interaction.update({ content: null, embeds: [embed], components: [confirmRow] }).catch(() => {});
+  } else if (typeof interaction.reply === 'function') {
+    await interaction.reply({ embeds: [embed], components: [confirmRow], ephemeral: true }).catch(() => {});
+  }
 }
 
 /**
- * Handles confirmation of team qualification from select menu.
- * Idempotently qualifies selected teams and allocates them to the destination round.
+ * Step C — Persist Qualification.
+ * Persists qualification records idempotently, updates slot lists in place, and records audit log.
  */
-export async function handleConfirmQualifyTeams(interaction, tournamentId, roundId, groupId, selectedTeamValues) {
+export async function handleExecuteQualifyCommit(interaction, tournamentId, roundId, groupId, slotNumbers = []) {
   const guild = interaction.guild;
   const member = interaction.member;
 
@@ -5653,7 +6095,6 @@ export async function handleConfirmQualifyTeams(interaction, tournamentId, round
     return;
   }
 
-  // Acknowledge interaction immediately within Discord deadline (<3s)
   if (!interaction.deferred && !interaction.replied) {
     if (typeof interaction.deferUpdate === 'function') {
       await interaction.deferUpdate().catch(() => {});
@@ -5662,205 +6103,139 @@ export async function handleConfirmQualifyTeams(interaction, tournamentId, round
 
   const currentSettings = guildSettingsCache[guild.id] || {};
   const savedTournament = currentSettings.tournaments?.[tournamentId];
-  if (!savedTournament) {
-    const errText = '❌ Tournament configuration not found.';
-    if (interaction.deferred) {
-      await interaction.editReply({ content: errText, embeds: [], components: [] }).catch(() => {});
-    } else if (typeof interaction.update === 'function') {
-      await interaction.update({ content: errText, embeds: [], components: [] }).catch(() => {});
-    }
+  const round = savedTournament?.rounds?.[roundId];
+  const group = (round?.groups || []).find((g) => g.groupId === groupId || String(g.groupNumber) === String(groupId));
+
+  if (!round || !group) {
+    const errText = '❌ Round or group configuration not found.';
+    if (interaction.deferred) await interaction.editReply({ content: errText, embeds: [], components: [] }).catch(() => {});
     return;
   }
 
-  const round = savedTournament.rounds?.[roundId];
-  if (!round) {
-    const errText = '❌ Source round not found.';
-    if (interaction.deferred) {
-      await interaction.editReply({ content: errText, embeds: [], components: [] }).catch(() => {});
-    } else if (typeof interaction.update === 'function') {
-      await interaction.update({ content: errText, embeds: [], components: [] }).catch(() => {});
-    }
-    return;
+  if (!Array.isArray(round.qualifications)) {
+    round.qualifications = [];
   }
 
-  const group = (round.groups || []).find((g) => g.groupId === groupId || g.groupNumber === Number(groupId));
-  if (!group) {
-    const errText = '❌ Source group not found.';
-    if (interaction.deferred) {
-      await interaction.editReply({ content: errText, embeds: [], components: [] }).catch(() => {});
-    } else if (typeof interaction.update === 'function') {
-      await interaction.update({ content: errText, embeds: [], components: [] }).catch(() => {});
-    }
-    return;
-  }
-
-  if (!selectedTeamValues || selectedTeamValues.length === 0) {
-    const noTeamsText = '⚠️ No teams were selected for qualification.';
-    if (interaction.deferred) {
-      await interaction.editReply({ content: noTeamsText, embeds: [], components: [] }).catch(() => {});
-    } else if (typeof interaction.update === 'function') {
-      await interaction.update({ content: noTeamsText, embeds: [], components: [] }).catch(() => {});
-    }
-    return;
-  }
-
-  const currentRoundNum = round.roundNumber || 1;
-  const destRoundNum = currentRoundNum + 1;
-
-  let destRound = Object.values(savedTournament.rounds || {}).find((r) => r.roundNumber === destRoundNum);
-  if (!destRound) {
-    const destRoundId = `round-${destRoundNum}-${Date.now().toString(36)}`;
-    destRound = {
-      roundId: destRoundId,
-      roundNumber: destRoundNum,
-      name: `Round ${destRoundNum}`,
-      status: 'Upcoming',
-      groups: generateEmptyRoundGroups(4, `Round ${destRoundNum}`),
-      createdAt: new Date().toISOString(),
-      globalSubmissionStatus: 'Closed',
-      qualifications: [],
-    };
-    savedTournament.rounds[destRoundId] = destRound;
-  } else if (!Array.isArray(destRound.groups) || destRound.groups.length === 0) {
-    destRound.groups = generateEmptyRoundGroups(4, destRound.name);
-  }
-
-  // Destination capacity check before applying batch
-  let availableDestSlots = 0;
-  for (const dg of destRound.groups) {
-    for (const dslot of dg.slots || []) {
-      if (dslot.slotNumber >= 3 && dslot.slotNumber <= 18 && dslot.status !== 'OCCUPIED') {
-        availableDestSlots++;
-      }
-    }
-  }
-
-  const teamsToAllocate = [];
+  const newlyQualifiedNames = [];
   const alreadyQualifiedNames = [];
 
-  for (const teamVal of selectedTeamValues) {
-    const cleanId = teamVal.replace(/^team_/, '');
-    const sourceSlot = (group.slots || []).find(
-      (s) => s.teamId === cleanId || String(s.slotNumber) === cleanId || s.teamName === cleanId
-    );
+  for (const num of slotNumbers) {
+    const slot = (group.slots || []).find((s) => s.slotNumber === num);
+    if (!slot || slot.status !== 'OCCUPIED' || !slot.teamName) continue;
 
-    if (!sourceSlot || sourceSlot.status !== 'OCCUPIED' || !sourceSlot.teamName) {
-      continue;
-    }
-
-    const alreadyInDest = destRound.groups.some((dg) =>
-      (dg.slots || []).some((ds) => ds.status === 'OCCUPIED' && (ds.teamId === sourceSlot.teamId || ds.teamName === sourceSlot.teamName))
-    );
-
-    if (alreadyInDest) {
-      alreadyQualifiedNames.push(sourceSlot.teamName);
-      sourceSlot.qualificationStatus = 'Qualified';
-    } else {
-      teamsToAllocate.push(sourceSlot);
-    }
-  }
-
-  if (teamsToAllocate.length > availableDestSlots) {
-    await interaction.update({
-      content: `❌ **Insufficient Capacity in ${destRound.name}:** Needed **${teamsToAllocate.length}** open slot(s), but only **${availableDestSlots}** slot(s) remain open. Qualification batch cancelled to prevent partial assignment.`,
-      embeds: [],
-      components: [],
-    }).catch(() => {});
-    return;
-  }
-
-  // Apply qualification and allocation atomically
-  const newlyQualifiedNames = [];
-  if (!Array.isArray(round.qualifications)) round.qualifications = [];
-
-  for (const sourceSlot of teamsToAllocate) {
-    sourceSlot.qualificationStatus = 'Qualified';
-
-    let allocated = false;
-    for (const dg of destRound.groups) {
-      for (const dslot of dg.slots) {
-        if (dslot.slotNumber >= 3 && dslot.slotNumber <= 18 && dslot.status !== 'OCCUPIED') {
-          dslot.status = 'OCCUPIED';
-          dslot.teamId = sourceSlot.teamId || `team-${Date.now().toString(36)}`;
-          dslot.teamName = sourceSlot.teamName;
-          dslot.label = sourceSlot.teamName;
-          dslot.members = sourceSlot.members || [];
-          dslot.qualificationStatus = 'Pending';
-          allocated = true;
-          break;
-        }
-      }
-      if (allocated) break;
-    }
+    slot.qualificationStatus = 'Qualified';
 
     const qualRecord = {
-      teamId: sourceSlot.teamId,
-      teamName: sourceSlot.teamName,
+      tournamentId,
       sourceRoundId: round.roundId,
       sourceGroupId: group.groupId,
-      destinationRoundId: destRound.roundId,
+      sourceSlot: slot.slotNumber,
+      teamId: slot.teamId || `team_${slot.slotNumber}`,
+      teamName: slot.teamName,
+      members: slot.members || [],
+      qualificationStatus: 'Qualified',
       adminId: member.id,
       timestamp: new Date().toISOString(),
+      destinationRoundId: null,
     };
-    round.qualifications.push(qualRecord);
-    newlyQualifiedNames.push(sourceSlot.teamName);
+
+    const existingIdx = round.qualifications.findIndex(
+      (q) => q.sourceGroupId === group.groupId && q.sourceSlot === slot.slotNumber
+    );
+
+    if (existingIdx >= 0) {
+      round.qualifications[existingIdx] = { ...round.qualifications[existingIdx], ...qualRecord };
+      alreadyQualifiedNames.push(slot.teamName);
+    } else {
+      round.qualifications.push(qualRecord);
+      newlyQualifiedNames.push(slot.teamName);
+    }
   }
 
-  // Persist state in memory and database
+  // Save to memory cache & MongoDB persistently
   guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
   saveGuildSettings(guildSettingsCache);
   await saveTournamentToDb(guild.id, tournamentId, savedTournament);
-  await recordAuditLog(guild.id, 'QUALIFY_TEAMS', {
-    tournamentId,
-    sourceRoundId: round.roundId,
-    sourceGroupId: group.groupId,
-    destinationRoundId: destRound.roundId,
-    newlyQualified: newlyQualifiedNames,
-    adminId: member.id,
-  });
 
-  // Update source group's slot-list message in its channel in place
-  const groupChannel = group.channelId ? (guild.channels.cache.get(group.channelId) || await guild.channels.fetch(group.channelId).catch(() => null)) : null;
+  // Update source group's slot-list message in its private channel in place
+  const groupChannel = group.channelId
+    ? (guild.channels.cache.get(group.channelId) || await guild.channels.fetch(group.channelId).catch(() => null))
+    : null;
   if (groupChannel) {
     await updateGroupSlotListMessage(guild, savedTournament, round, group, groupChannel);
   }
 
-  // Refresh #bot-commands
+  // Update allocation summary in #bot-commands
   const botCommandsChannel = savedTournament.channels?.botCommandsId
     ? (guild.channels.cache.get(savedTournament.channels.botCommandsId) || await guild.channels.fetch(savedTournament.channels.botCommandsId).catch(() => null))
     : null;
-
   if (botCommandsChannel) {
     await publishRoundAllocationSummary(guild, savedTournament, round, botCommandsChannel, savedTournament);
     await updateGlobalSubmissionControlPanel(guild, savedTournament, round, botCommandsChannel);
   }
 
+  await recordAuditLog(guild.id, 'QUALIFY_TEAMS', {
+    tournamentId,
+    sourceRoundId: round.roundId,
+    sourceGroupId: group.groupId,
+    newlyQualified: newlyQualifiedNames,
+    alreadyQualified: alreadyQualifiedNames,
+    adminId: member.id,
+    adminTag: member.user?.tag,
+  }).catch(() => {});
+
   const successEmbed = new EmbedBuilder()
-    .setTitle(`🏆 Qualification Confirmed — ${round.name} (Group ${group.groupNumber})`)
+    .setTitle(`🏆 Qualification Confirmed — Group ${group.groupNumber}`)
     .setColor(0x22c55e)
     .setDescription(
-      `Successfully qualified **${newlyQualifiedNames.length + alreadyQualifiedNames.length}** team(s) from **Group ${group.groupNumber}** into **${destRound.name}**!\n\n` +
-      (newlyQualifiedNames.length > 0 ? `• **Newly Qualified & Allocated:** ${newlyQualifiedNames.map(n => `**${n}**`).join(', ')}\n` : '') +
-      (alreadyQualifiedNames.length > 0 ? `• **Already Qualified:** ${alreadyQualifiedNames.map(n => `*${n}*`).join(', ')}\n` : '') +
-      `• **Destination Round:** **${destRound.name}** (\`${destRound.roundId}\` — Status: **${destRound.status}**)\n` +
+      `Successfully updated qualification for **${newlyQualifiedNames.length + alreadyQualifiedNames.length}** team(s) from **Group ${group.groupNumber}**!\n\n` +
+      (newlyQualifiedNames.length > 0 ? `• **Newly Qualified:** ${newlyQualifiedNames.map((n) => `**${n}**`).join(', ')}\n` : '') +
+      (alreadyQualifiedNames.length > 0 ? `• **Already Qualified:** ${alreadyQualifiedNames.map((n) => `*${n}*`).join(', ')}\n` : '') +
+      `\n• **Progression Status:** Teams are saved in MongoDB and will be eligible when creating and starting the next round.\n` +
       `• The group slot list and bot-commands summaries have been updated in place.`
     )
     .setFooter({ text: `Admin: ${member.user?.tag || member.id}` })
     .setTimestamp();
 
+  const successRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`md_round_qualify:${tournamentId}:${round.roundId}`)
+      .setLabel('Back to Groups')
+      .setEmoji('⬅️')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`md_round_back_to_menu:${tournamentId}:${round.roundId}`)
+      .setLabel('Back to Round')
+      .setEmoji('⚔️')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`md_tour_back_to_panel:${tournamentId}`)
+      .setLabel('Back to Dashboard')
+      .setEmoji('🏠')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
   if (interaction.deferred) {
-    await interaction.editReply({
-      content: null,
-      embeds: [successEmbed],
-      components: [],
-    }).catch(() => {});
+    await interaction.editReply({ content: null, embeds: [successEmbed], components: [successRow] }).catch(() => {});
   } else if (typeof interaction.update === 'function') {
-    await interaction.update({
-      content: null,
-      embeds: [successEmbed],
-      components: [],
-    }).catch(() => {});
+    await interaction.update({ content: null, embeds: [successEmbed], components: [successRow] }).catch(() => {});
+  } else if (typeof interaction.reply === 'function') {
+    await interaction.reply({ embeds: [successEmbed], components: [successRow], ephemeral: true }).catch(() => {});
   }
+}
+
+/**
+ * Handles the "Qualify Team" button click in an ID/PWD channel (delegates to slot selection).
+ */
+export async function handleQualifyTeamButton(interaction, tournamentId, roundId, groupId) {
+  return handleRoundQualifySlotSelection(interaction, tournamentId, roundId, groupId);
+}
+
+/**
+ * Handles confirmation of team qualification from select menu (delegates to prompt confirmation).
+ */
+export async function handleConfirmQualifyTeams(interaction, tournamentId, roundId, groupId, selectedTeamValues) {
+  return handleQualifyPromptConfirmation(interaction, tournamentId, roundId, groupId, selectedTeamValues);
 }
 
 /**
