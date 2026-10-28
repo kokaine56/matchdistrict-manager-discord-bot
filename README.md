@@ -17,6 +17,9 @@ Standalone Discord Bot for the MatchDistrict gaming community.
 | Command | Permission | Description |
 | :--- | :--- | :--- |
 | `.setup` | Administrator / Manage Server | Creates or configures `#bot-preview`, `#dm-log`, `#msg-log`, `#ban-unban-log` idempotently. |
+| `.setup remove` | Administrator / Manage Server | Initiates permanent deletion of bot management channels with a 30s confirmation prompt. |
+| `.setup confirm` | Administrator / Manage Server | Explicitly confirms channel deletion initiated by `.setup remove`. |
+| `.setup cancel` | Administrator / Manage Server | Aborts pending channel deletion request. |
 | `.dm welcome on` | Administrator / Manage Server | Enables welcome DMs for new members joining the server. |
 | `.dm welcome off` | Administrator / Manage Server | Disables welcome DMs for new members. |
 | `.ban @user [reason]` | Ban Members / Administrator | Bans a user by mention or ID with role-hierarchy checks and logs to `#ban-unban-log`. |

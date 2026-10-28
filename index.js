@@ -12,6 +12,9 @@ import {
   PermissionFlagsBits,
   ChannelType,
   AuditLogEvent,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } from 'discord.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -152,7 +155,7 @@ export function getGuildChannels(guildId) {
 export function getGuildChannelId(guildId, key) {
   if (!guildId) return null;
   const settings = guildSettingsCache[guildId];
-  if (!settings) return null;
+  if (!settings || settings.setupActive === false) return null;
   if (settings.channels && settings.channels[key]) {
     return settings.channels[key];
   }
@@ -164,10 +167,25 @@ export function getGuildChannelId(guildId, key) {
 }
 
 /**
- * Deduplication caches to prevent duplicate actions/logs
+ * Check whether server management channels are actively setup
+ */
+export function isSetupActive(guildId) {
+  if (!guildId) return false;
+  const settings = guildSettingsCache[guildId];
+  if (!settings) return false;
+  if (settings.setupActive === false) return false;
+  if (settings.channels && Object.values(settings.channels).some((id) => Boolean(id))) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Deduplication & Pending Confirmation caches
  */
 export const recentBans = new Map(); // Key: `${guildId}:${userId}`, Value: { moderatorId, reason, logged: boolean, timestamp }
 export const recentJoins = new Map(); // Key: `${guildId}:${userId}`, Value: timestamp
+export const pendingSetupRemovals = new Map(); // Key: guildId, Value: { adminId, timestamp, timer }
 
 /**
  * Helper to redact sensitive tokens, passwords, and secrets from logged messages
@@ -199,19 +217,21 @@ export function redactSecrets(text) {
 export function isAuditOrLogChannel(channel, guildId) {
   if (!channel) return false;
   const channelId = channel.id;
-  const channelName = channel.name?.toLowerCase();
 
-  if (channelName && RESERVED_LOG_CHANNEL_NAMES.has(channelName)) {
-    return true;
-  }
-
-  if (guildId) {
+  if (guildId && isSetupActive(guildId)) {
     const configuredChannels = getGuildChannels(guildId);
-    if (Object.values(configuredChannels).includes(channelId)) {
+    if (Object.values(configuredChannels).filter(Boolean).includes(channelId)) {
       return true;
     }
     const legacyLogId = guildSettingsCache[guildId]?.logChannelId;
     if (legacyLogId && legacyLogId === channelId) {
+      return true;
+    }
+  }
+
+  const channelName = channel.name?.toLowerCase();
+  if (channelName && RESERVED_LOG_CHANNEL_NAMES.has(channelName)) {
+    if (guildId && isSetupActive(guildId)) {
       return true;
     }
   }
@@ -295,6 +315,7 @@ export function getHelpResponse(prefix = PREFIX) {
     `Prefix: \`${prefix}\`\n\n` +
     `**🛡️ Administrator & Moderation:**\n` +
     `• \`${prefix}setup\` — *(Admin Only)* Create/configure private audit channels & initialize bot\n` +
+    `• \`${prefix}setup remove\` — *(Admin Only)* Safely remove and delete management channels (requires confirmation)\n` +
     `• \`${prefix}dm welcome on\` — *(Admin Only)* Enable welcome DMs for new members\n` +
     `• \`${prefix}dm welcome off\` — *(Admin Only)* Disable welcome DMs for new members\n` +
     `• \`${prefix}ban @user [reason]\` — *(Mod Only)* Ban a user with audit logging\n` +
@@ -416,6 +437,7 @@ export async function handleSetupCommand(guild, member, replyFn) {
   const welcomeCurrentlyEnabled = currentSettings.welcomeEnabled !== undefined ? currentSettings.welcomeEnabled : true;
   guildSettingsCache[guild.id] = {
     ...currentSettings,
+    setupActive: true,
     welcomeEnabled: welcomeCurrentlyEnabled,
     channels: {
       botPreviewId: channelMap.botPreviewId || savedChannels.botPreviewId || null,
@@ -463,6 +485,294 @@ export async function handleSetupCommand(guild, member, replyFn) {
   summary += `Use \`${PREFIX}dm welcome on\` or \`${PREFIX}dm welcome off\` to control welcome DMs.\nUse \`${PREFIX}help\` to view all commands.`;
 
   await replyFn(summary);
+}
+
+/**
+ * Handles .setup remove: Initiates confirmation prompt for administrator to delete management channels
+ */
+export async function handleSetupRemoveCommand(guild, member, replyFn) {
+  if (!guild) {
+    await replyFn('❌ **Error:** This command must be executed within a Discord server.');
+    return;
+  }
+
+  // 1. Authorization check
+  if (!isAdmin(member)) {
+    await replyFn('❌ **Permission Denied:** Only server Administrators or members with `Manage Server` permission can remove the setup.');
+    return;
+  }
+
+  // 2. Idempotency check: if setup is already removed or no channels are configured
+  if (!isSetupActive(guild.id)) {
+    await replyFn(`ℹ️ **Setup Already Removed:** There are no active management channels configured for this server. Run \`${PREFIX}setup\` to set them up.`);
+    return;
+  }
+
+  // 3. Bot permissions check
+  const botMember = guild.members.me;
+  if (!botMember?.permissions?.has(PermissionFlagsBits.ManageChannels)) {
+    await replyFn('❌ **Bot Permission Missing:** I need the `Manage Channels` permission to remove the configured management channels.');
+    return;
+  }
+
+  // 4. List channels to be deleted
+  const savedChannels = getGuildChannels(guild.id);
+  const channelsList = REQUIRED_CHANNELS
+    .map((r) => {
+      const id = savedChannels[r.key];
+      return id ? `• <#${id}> (\`#${r.name}\`)` : `• \`#${r.name}\` *(unlinked)*`;
+    })
+    .join('\n');
+
+  // 5. Store pending removal state with 30s timeout
+  if (pendingSetupRemovals.has(guild.id)) {
+    const existing = pendingSetupRemovals.get(guild.id);
+    if (existing?.timer) clearTimeout(existing.timer);
+  }
+
+  const promptText = (
+    `⚠️ **Confirmation Required: Remove Management Channels**\n\n` +
+    `You are about to permanently delete the following channels configured by \`${PREFIX}setup\`:\n` +
+    `${channelsList}\n\n` +
+    `**⚠️ WARNING:** All channel messages, logs, and audit records within these channels will be permanently deleted.\n` +
+    `• To proceed, administrator <@${member.id}> must type **\`${PREFIX}setup confirm\`** within **30 seconds**.\n` +
+    `• To cancel, type **\`${PREFIX}setup cancel\`** or wait 30 seconds.`
+  );
+
+  const timer = setTimeout(() => {
+    if (pendingSetupRemovals.has(guild.id)) {
+      pendingSetupRemovals.delete(guild.id);
+      replyFn(`⏱️ **Setup Removal Cancelled:** Confirmation was not received within 30 seconds. No channels were deleted.`);
+    }
+  }, 30000);
+  if (timer.unref) timer.unref();
+
+  pendingSetupRemovals.set(guild.id, {
+    adminId: member.id,
+    timestamp: Date.now(),
+    timer,
+  });
+
+  // Build optional buttons
+  let components = [];
+  try {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('md_confirm_setup_remove')
+        .setLabel('Confirm Channel Deletion')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId('md_cancel_setup_remove')
+        .setLabel('Cancel')
+        .setStyle(ButtonStyle.Secondary)
+    );
+    components = [row];
+  } catch {
+    // Buttons unsupported in current context
+  }
+
+  let sent = null;
+  try {
+    if (components.length > 0) {
+      sent = await replyFn({ content: promptText, components });
+    } else {
+      sent = await replyFn(promptText);
+    }
+  } catch {
+    sent = await replyFn(promptText);
+  }
+
+  // If interactive collector available
+  if (sent?.createMessageComponentCollector) {
+    const collector = sent.createMessageComponentCollector({ time: 30000 });
+    collector.on('collect', async (interaction) => {
+      if (interaction.user.id !== member.id) {
+        await interaction.reply({
+          content: `❌ **Unauthorized:** Only the administrator who initiated the removal request (<@${member.id}>) can confirm it.`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (!isAdmin(interaction.member)) {
+        await interaction.reply({
+          content: '❌ **Permission Denied:** Only administrators can confirm channel deletion.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (interaction.customId === 'md_confirm_setup_remove') {
+        collector.stop('confirmed');
+        await interaction.deferUpdate().catch(() => {});
+        await handleSetupConfirmCommand(guild, interaction.member, (text) => interaction.followUp(text));
+      } else if (interaction.customId === 'md_cancel_setup_remove') {
+        collector.stop('cancelled');
+        await interaction.deferUpdate().catch(() => {});
+        await handleSetupCancelCommand(guild, interaction.member, (text) => interaction.followUp(text));
+      }
+    });
+
+    collector.on('end', (collected, reason) => {
+      if (reason !== 'confirmed' && reason !== 'cancelled') {
+        if (pendingSetupRemovals.has(guild.id)) {
+          pendingSetupRemovals.delete(guild.id);
+          sent.edit?.({
+            content: `⏱️ **Setup Removal Cancelled:** Confirmation was not received within 30 seconds. No channels were deleted.`,
+            components: [],
+          })?.catch(() => {});
+        }
+      }
+    });
+  }
+}
+
+/**
+ * Handles confirmation of setup removal
+ */
+export async function handleSetupConfirmCommand(guild, member, replyFn) {
+  if (!guild) {
+    await replyFn('❌ **Error:** This command must be executed within a Discord server.');
+    return;
+  }
+
+  // 1. Revalidate administrator permissions
+  if (!isAdmin(member)) {
+    await replyFn('❌ **Permission Denied:** Only administrators can confirm channel deletion.');
+    return;
+  }
+
+  // 2. Verify pending confirmation
+  const pending = pendingSetupRemovals.get(guild.id);
+  if (!pending) {
+    await replyFn(`ℹ️ **No Pending Request:** There is no pending setup removal to confirm. Run \`${PREFIX}setup remove\` first.`);
+    return;
+  }
+
+  // 3. Prevent unauthorized users from confirming another administrator's request
+  if (member.id !== pending.adminId) {
+    await replyFn(`❌ **Unauthorized:** Only the administrator who requested removal (<@${pending.adminId}>) can confirm this operation.`);
+    return;
+  }
+
+  // 4. Verify timeout
+  if (Date.now() - pending.timestamp > 30000) {
+    pendingSetupRemovals.delete(guild.id);
+    await replyFn(`⏱️ **Confirmation Expired:** The 30-second window has expired. Please run \`${PREFIX}setup remove\` again.`);
+    return;
+  }
+
+  // Clear timer and pending state
+  if (pending.timer) clearTimeout(pending.timer);
+  pendingSetupRemovals.delete(guild.id);
+
+  // 5. Check bot permissions
+  const botMember = guild.members.me;
+  if (!botMember?.permissions?.has(PermissionFlagsBits.ManageChannels)) {
+    await replyFn('❌ **Bot Permission Missing:** I need the `Manage Channels` permission to delete the management channels.');
+    return;
+  }
+
+  // 6. Delete only channels managed by this bot's setup
+  const deleted = [];
+  const skipped = [];
+  const failed = [];
+
+  const currentSettings = getGuildSettings(guild.id) || {};
+  const savedChannels = currentSettings.channels || {};
+
+  for (const req of REQUIRED_CHANNELS) {
+    const channelId = savedChannels[req.key];
+    if (!channelId) {
+      continue;
+    }
+
+    // Only lookup by stored ID - never by channel name
+    const channel = guild.channels.cache.get(channelId);
+    if (!channel) {
+      skipped.push({ name: req.name, reason: 'Already deleted or not found' });
+      continue;
+    }
+
+    // Strict validation: channel belongs to current guild and matches stored ID
+    const chGuildId = channel.guildId || channel.guild?.id;
+    if (chGuildId !== guild.id || channel.id !== channelId) {
+      failed.push({ name: req.name, error: 'Channel does not belong to this server configuration' });
+      continue;
+    }
+
+    try {
+      await channel.delete(`MatchDistrict .setup remove confirmed by ${member.user?.tag || member.id} (${member.id})`);
+      deleted.push({ id: channelId, name: channel.name });
+    } catch (err) {
+      failed.push({ name: req.name, error: err.message });
+    }
+  }
+
+  // 7. Clear stored channel IDs and mark setup as inactive
+  guildSettingsCache[guild.id] = {
+    ...currentSettings,
+    setupActive: false,
+    channels: {
+      botPreviewId: null,
+      dmLogId: null,
+      msgLogId: null,
+      banUnbanLogId: null,
+    },
+    logChannelId: null,
+    removedBy: member.id,
+    removedAt: new Date().toISOString(),
+  };
+  saveGuildSettings(guildSettingsCache);
+
+  // 8. Build clear response summary
+  let summary = '🗑️ **MatchDistrict Setup Removal Complete**\n\n';
+  if (deleted.length > 0) {
+    summary += `✨ **Deleted Channels:**\n` + deleted.map((c) => `• \`#${c.name}\` (\`${c.id}\`)`).join('\n') + '\n\n';
+  }
+  if (skipped.length > 0) {
+    summary += `⏭️ **Skipped:**\n` + skipped.map((s) => `• \`#${s.name}\`: ${s.reason}`).join('\n') + '\n\n';
+  }
+  if (failed.length > 0) {
+    summary += `❌ **Failed to Delete:**\n` + failed.map((f) => `• \`#${f.name}\`: ${f.error}`).join('\n') + '\n\n';
+  }
+
+  summary += `• **Setup Status:** 🔴 **Inactive** (Management & audit logging channels unlinked)\n`;
+  summary += `• **Welcome DM Configuration:** Preserved (${isWelcomeEnabled(guild.id) ? '🟢 **Enabled**' : '🔴 **Disabled**'})\n\n`;
+  summary += `Run \`${PREFIX}setup\` at any time to re-initialize server channels.`;
+
+  await replyFn(summary);
+}
+
+/**
+ * Handles .setup cancel
+ */
+export async function handleSetupCancelCommand(guild, member, replyFn) {
+  if (!guild) {
+    await replyFn('❌ **Error:** This command must be executed within a Discord server.');
+    return;
+  }
+
+  if (!isAdmin(member)) {
+    await replyFn('❌ **Permission Denied:** Only administrators can cancel this operation.');
+    return;
+  }
+
+  const pending = pendingSetupRemovals.get(guild.id);
+  if (!pending) {
+    await replyFn('ℹ️ **No Pending Request:** There is no pending setup removal to cancel.');
+    return;
+  }
+
+  if (member.id !== pending.adminId) {
+    await replyFn(`❌ **Unauthorized:** Only <@${pending.adminId}> can cancel their pending removal request.`);
+    return;
+  }
+
+  if (pending.timer) clearTimeout(pending.timer);
+  pendingSetupRemovals.delete(guild.id);
+
+  await replyFn('🛑 **Setup Removal Cancelled:** The pending removal operation was cancelled. No channels were deleted.');
 }
 
 /**
@@ -736,18 +1046,30 @@ export async function handleStatusCommand(guild, replyFn) {
   }
 
   const enabled = isWelcomeEnabled(guild.id);
+  const active = isSetupActive(guild.id);
   const channels = getGuildChannels(guild.id);
 
-  await replyFn(
-    `📊 **MatchDistrict Server Status**\n` +
-    `• **Welcome DMs:** ${enabled ? '🟢 **Active / Enabled**' : '🔴 **Disabled**'}\n` +
-    `• **Configured Channels:**\n` +
-    `  - 📋 Preview: ${channels.botPreviewId ? `<#${channels.botPreviewId}>` : 'Not configured'}\n` +
-    `  - 📬 DM Logs: ${channels.dmLogId ? `<#${channels.dmLogId}>` : 'Not configured'}\n` +
-    `  - 💬 Message Logs: ${channels.msgLogId ? `<#${channels.msgLogId}>` : 'Not configured'}\n` +
-    `  - 🔨 Moderation Logs: ${channels.banUnbanLogId ? `<#${channels.banUnbanLogId}>` : 'Not configured'}\n\n` +
-    `• **Website:** https://matchdistrict.in`
-  );
+  if (active) {
+    await replyFn(
+      `📊 **MatchDistrict Server Status**\n` +
+      `• **Setup Status:** 🟢 **Active**\n` +
+      `• **Welcome DMs:** ${enabled ? '🟢 **Active / Enabled**' : '🔴 **Disabled**'}\n` +
+      `• **Configured Channels:**\n` +
+      `  - 📋 Preview: ${channels.botPreviewId ? `<#${channels.botPreviewId}>` : 'Not configured'}\n` +
+      `  - 📬 DM Logs: ${channels.dmLogId ? `<#${channels.dmLogId}>` : 'Not configured'}\n` +
+      `  - 💬 Message Logs: ${channels.msgLogId ? `<#${channels.msgLogId}>` : 'Not configured'}\n` +
+      `  - 🔨 Moderation Logs: ${channels.banUnbanLogId ? `<#${channels.banUnbanLogId}>` : 'Not configured'}\n\n` +
+      `• **Website:** https://matchdistrict.in`
+    );
+  } else {
+    await replyFn(
+      `📊 **MatchDistrict Server Status**\n` +
+      `• **Setup Status:** 🔴 **Inactive / Removed**\n` +
+      `• **Welcome DMs:** ${enabled ? '🟢 **Active / Enabled**' : '🔴 **Disabled**'}\n` +
+      `• **Configured Channels:** None (Run \`${PREFIX}setup\` to configure management channels)\n\n` +
+      `• **Website:** https://matchdistrict.in`
+    );
+  }
 }
 
 /**
@@ -755,7 +1077,7 @@ export async function handleStatusCommand(guild, replyFn) {
  */
 export async function handleMessageCreateLog(message) {
   try {
-    if (!message || !message.guild) return;
+    if (!message || !message.guild || !isSetupActive(message.guild.id)) return;
     if (message.author?.bot) return;
 
     // Exclude authorized administrators
@@ -810,7 +1132,7 @@ export async function handleMessageCreateLog(message) {
  */
 export async function handleMessageUpdateLog(oldMessage, newMessage) {
   try {
-    if (!newMessage || !newMessage.guild) return;
+    if (!newMessage || !newMessage.guild || !isSetupActive(newMessage.guild.id)) return;
     if (newMessage.author?.bot) return;
 
     if (newMessage.member && isAdmin(newMessage.member)) return;
@@ -855,7 +1177,7 @@ export async function handleMessageUpdateLog(oldMessage, newMessage) {
  */
 export async function handleMessageDeleteLog(message) {
   try {
-    if (!message || !message.guild) return;
+    if (!message || !message.guild || !isSetupActive(message.guild.id)) return;
     if (message.author?.bot) return;
     if (message.member && isAdmin(message.member)) return;
     if (isAuditOrLogChannel(message.channel, message.guild.id)) return;
@@ -904,6 +1226,11 @@ export async function handleGuildBanAdd(ban) {
     // Deduplication check: if logged by .ban command, skip
     const cached = recentBans.get(banKey);
     if (cached?.logged) {
+      recentBans.delete(banKey);
+      return;
+    }
+
+    if (!isSetupActive(guild.id)) {
       recentBans.delete(banKey);
       return;
     }
@@ -970,7 +1297,7 @@ export async function handleGuildBanAdd(ban) {
  */
 export async function handleGuildBanRemove(ban) {
   try {
-    if (!ban || !ban.guild) return;
+    if (!ban || !ban.guild || !isSetupActive(ban.guild.id)) return;
     const guild = ban.guild;
     const user = ban.user;
 
@@ -1082,8 +1409,8 @@ export async function handleGuildMemberAdd(member) {
       }
     }
 
-    // Log to #dm-log
-    if (logChannel && logChannel.permissionsFor(member.guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
+    // Log to #dm-log if setup channels are active
+    if (isSetupActive(guildId) && logChannel && logChannel.permissionsFor(member.guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
       const accountAge = Math.floor(member.user.createdTimestamp / 1000);
       const nowTs = Math.floor(Date.now() / 1000);
 
@@ -1152,6 +1479,17 @@ client.on(Events.MessageCreate, async (message) => {
       const cmd = (args.shift() || '').toLowerCase();
 
       if (cmd === 'setup') {
+        const subCmd = (args[0] || '').toLowerCase();
+        if (subCmd === 'remove') {
+          await handleSetupRemoveCommand(message.guild, message.member, (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }));
+          return;
+        } else if (subCmd === 'confirm') {
+          await handleSetupConfirmCommand(message.guild, message.member, (text) => message.reply(text));
+          return;
+        } else if (subCmd === 'cancel') {
+          await handleSetupCancelCommand(message.guild, message.member, (text) => message.reply(text));
+          return;
+        }
         await handleSetupCommand(message.guild, message.member, (text) => message.reply(text));
         return;
       } else if (cmd === 'dm') {
