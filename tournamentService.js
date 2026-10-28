@@ -3,6 +3,9 @@ import {
   ChannelType,
   PermissionFlagsBits,
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
 } from 'discord.js';
@@ -19,7 +22,7 @@ export const REQUIRED_TOURNAMENT_CHANNELS = [
   {
     key: 'botCommandsId',
     name: 'bot-commands',
-    topic: 'Tournament Management & Bot Commands (Admin Only)',
+    topic: 'Tournament Management & Control Panel (Admin Only)',
     participantAccess: 'none', // Strictly admins only
   },
   {
@@ -311,7 +314,8 @@ export function formatTournamentListPages(tournaments, { page = 1, pageSize = 5,
   }).join('\n\n');
 
   const footer = `\n\n📌 **Next Steps:**\n` +
-    `• To select a tournament & setup channels: \`.fetch teams <tournament_id>\` (or use the menu below)\n` +
+    `• Select a tournament from the menu below to open its **Control Panel** in \`#bot-commands\`\n` +
+    `• Or manage directly: \`.fetch teams <tournament_id>\`\n` +
     (totalPages > 1 ? `• View other pages: \`.list tournament page <1-${totalPages}>\`` : '');
 
   return [header + itemsText + footer];
@@ -327,7 +331,7 @@ export function buildTournamentSelectMenu(tournaments, maxOptions = 25) {
   try {
     const menu = new StringSelectMenuBuilder()
       .setCustomId('md_select_tournament')
-      .setPlaceholder('Select a tournament to setup category & channels...')
+      .setPlaceholder('Select a tournament to open its Control Panel in #bot-commands...')
       .addOptions(
         slice.map((t) => {
           const opt = new StringSelectMenuOptionBuilder()
@@ -341,6 +345,78 @@ export function buildTournamentSelectMenu(tournaments, maxOptions = 25) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Builds the Tournament Control Panel Discord Embed.
+ */
+export function buildTournamentControlPanelEmbed(tournament, summary, channelsStatus) {
+  const isConfigured = Boolean(channelsStatus?.isConfigured);
+  const statusColor = isConfigured ? 0x22c55e : 0xeab308; // Green or Gold
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🏆 Tournament Control Panel: ${tournament.title}`)
+    .setColor(statusColor)
+    .setDescription(
+      `Welcome to the administration control panel for **${tournament.title}**.\n` +
+      `Use the action buttons below to provision participant channels, synchronize live teams, or manage Discord configuration.`
+    )
+    .addFields(
+      {
+        name: '🎮 Tournament Details',
+        value:
+          `• **Name:** **${tournament.title}**\n` +
+          `• **Tournament ID:** \`${tournament.id}\`\n` +
+          `• **Game:** ${tournament.game || 'Esports'}\n` +
+          `• **Tournament Status:** ${tournament.status ? tournament.status.toUpperCase() : 'PUBLISHED'}\n` +
+          `• **Registration Window:** ${tournament.registration_status ? tournament.registration_status.toUpperCase() : 'OPEN'}`,
+        inline: false,
+      },
+      {
+        name: '👥 Registration Statistics',
+        value:
+          `• **Total Registered Teams:** **${summary.total_registered_teams}** (` +
+          `🟢 **${summary.eligible_teams_count}** eligible, 🔴 **${summary.ineligible_teams_count}** ineligible)\n` +
+          `• **Linked Discord Accounts:** **${summary.eligible_linked_members_count}** member(s) verified\n` +
+          `• **Unlinked Participants:** **${summary.unlinked_members_count}** account(s) pending Discord link\n` +
+          `• **Duplicate Discord IDs:** **${summary.duplicate_discord_ids_count || 0}** safely deduplicated`,
+        inline: false,
+      },
+      {
+        name: '📁 Discord Channels Setup Status',
+        value: channelsStatus.statusText,
+        inline: false,
+      }
+    )
+    .setFooter({ text: `MatchDistrict Tournament Management • ID: ${tournament.id}` })
+    .setTimestamp();
+
+  return embed;
+}
+
+/**
+ * Builds the Interactive Action Buttons for the Tournament Control Panel.
+ */
+export function buildTournamentControlPanelButtons(tournamentId) {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`md_tour_create_channels:${tournamentId}`)
+      .setLabel('Create Channels')
+      .setEmoji('📁')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`md_tour_refresh:${tournamentId}`)
+      .setLabel('Refresh Tournament Data')
+      .setEmoji('🔄')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`md_tour_delete_channels:${tournamentId}`)
+      .setLabel('Delete All Channels')
+      .setEmoji('🗑️')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  return [row];
 }
 
 /**
@@ -389,6 +465,226 @@ export function formatTeamsChannelRoster(tournament, teams = []) {
   }
 
   return chunks;
+}
+
+/**
+ * Sets up or refreshes the Tournament Control Panel inside #bot-commands.
+ */
+export async function setupTournamentControlPanel(guild, tournament, summary, botMember) {
+  const tournamentId = tournament.id;
+  const currentSettings = guildSettingsCache[guild.id] || {};
+  if (!currentSettings.tournaments) {
+    currentSettings.tournaments = {};
+  }
+  const savedTournament = currentSettings.tournaments[tournamentId] || {
+    tournamentId,
+    tournamentTitle: tournament.title,
+    guildId: guild.id,
+    categoryId: null,
+    channels: {},
+    allEligibleMemberIds: [],
+    setupStatus: 'pending_channels',
+    controlPanelMessageId: null,
+  };
+
+  if (!savedTournament.channels) {
+    savedTournament.channels = {};
+  }
+
+  // 1. Locate or create Category
+  let category = null;
+  if (savedTournament.categoryId) {
+    category = guild.channels.cache.get(savedTournament.categoryId) ||
+      await guild.channels.fetch(savedTournament.categoryId).catch(() => null);
+  }
+
+  if (!category || category.type !== ChannelType.GuildCategory) {
+    const categoryName = sanitizeCategoryName(tournament.title);
+    const overwrites = [
+      {
+        id: guild.roles.everyone.id,
+        deny: [PermissionFlagsBits.ViewChannel],
+      },
+      {
+        id: botMember.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.ManageChannels,
+          PermissionFlagsBits.ManageRoles,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+        ],
+      },
+    ];
+
+    category = await guild.channels.create({
+      name: categoryName,
+      type: ChannelType.GuildCategory,
+      permissionOverwrites: overwrites,
+    });
+    savedTournament.categoryId = category.id;
+  }
+
+  // 2. Locate or create #bot-commands channel inside category
+  let botCommandsChannel = null;
+  if (savedTournament.channels.botCommandsId) {
+    botCommandsChannel = guild.channels.cache.get(savedTournament.channels.botCommandsId) ||
+      await guild.channels.fetch(savedTournament.channels.botCommandsId).catch(() => null);
+  }
+
+  if (!botCommandsChannel || botCommandsChannel.parentId !== category.id) {
+    botCommandsChannel = Array.from(guild.channels.cache.values()).find(
+      (c) => c.parentId === category.id && c.name === 'bot-commands'
+    );
+  }
+
+  if (!botCommandsChannel || botCommandsChannel.parentId !== category.id) {
+    botCommandsChannel = await guild.channels.create({
+      name: 'bot-commands',
+      type: ChannelType.GuildText,
+      parent: category.id,
+      topic: `Tournament Management & Control Panel (Admin Only) — ${tournament.title} (ID: ${tournamentId})`,
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone.id,
+          deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages],
+        },
+        {
+          id: botMember.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.ManageChannels,
+            PermissionFlagsBits.ManageRoles,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.EmbedLinks,
+          ],
+        },
+      ],
+    });
+    savedTournament.channels.botCommandsId = botCommandsChannel.id;
+  }
+
+  // 3. Compute Channel Setup Status
+  const updateId = savedTournament.channels.tournamentUpdateId;
+  const teamsId = savedTournament.channels.tournamentTeamsId;
+  const helpdeskId = savedTournament.channels.tournamentHelpdeskId;
+
+  const updateCh = updateId ? (guild.channels.cache.get(updateId) || await guild.channels.fetch(updateId).catch(() => null)) : null;
+  const teamsCh = teamsId ? (guild.channels.cache.get(teamsId) || await guild.channels.fetch(teamsId).catch(() => null)) : null;
+  const helpdeskCh = helpdeskId ? (guild.channels.cache.get(helpdeskId) || await guild.channels.fetch(helpdeskId).catch(() => null)) : null;
+
+  const activeParticipantChannelCount = [updateCh, teamsCh, helpdeskCh].filter(Boolean).length;
+  const isConfigured = activeParticipantChannelCount === 3;
+
+  let statusText = '';
+  if (isConfigured) {
+    statusText = `🟢 **Active** — All 4 channels configured:\n` +
+      `  • 🤖 <#${botCommandsChannel.id}>\n` +
+      `  • 📢 <#${updateCh.id}>\n` +
+      `  • 📋 <#${teamsCh.id}>\n` +
+      `  • 💬 <#${helpdeskCh.id}>`;
+  } else if (activeParticipantChannelCount === 0) {
+    statusText = `🟡 **Pending Creation** — Participant channels not created yet.\n` +
+      `*Click **Create Channels** below to provision announcements, registered teams, and helpdesk channels.*`;
+  } else {
+    statusText = `⚠️ **Needs Repair** — Only ${activeParticipantChannelCount}/3 participant channels active.\n` +
+      `*Click **Create Channels** below to repair missing channels.*`;
+  }
+
+  const channelsStatus = {
+    isConfigured,
+    activeCount: activeParticipantChannelCount + 1,
+    statusText,
+  };
+
+  // 4. Construct Embed and Action Buttons
+  const embed = buildTournamentControlPanelEmbed(tournament, summary, channelsStatus);
+  const buttons = buildTournamentControlPanelButtons(tournamentId);
+
+  // 5. Update or Send Control Panel Message in #bot-commands
+  let panelMessage = null;
+  if (savedTournament.controlPanelMessageId && typeof botCommandsChannel.messages?.fetch === 'function') {
+    try {
+      panelMessage = await botCommandsChannel.messages.fetch(savedTournament.controlPanelMessageId);
+      if (panelMessage && typeof panelMessage.edit === 'function') {
+        await panelMessage.edit({ embeds: [embed], components: buttons });
+      }
+    } catch {
+      panelMessage = null;
+    }
+  }
+
+  if (!panelMessage && typeof botCommandsChannel.send === 'function') {
+    panelMessage = await botCommandsChannel.send({ embeds: [embed], components: buttons });
+  }
+
+  // 6. Persist mapping
+  savedTournament.tournamentId = tournamentId;
+  savedTournament.tournamentTitle = tournament.title;
+  savedTournament.guildId = guild.id;
+  savedTournament.categoryId = category.id;
+  savedTournament.channels.botCommandsId = botCommandsChannel.id;
+  savedTournament.setupStatus = isConfigured ? 'active' : 'pending_channels';
+  savedTournament.controlPanelMessageId = panelMessage ? panelMessage.id : null;
+  savedTournament.lastSyncedAt = new Date().toISOString();
+
+  currentSettings.tournaments[tournamentId] = savedTournament;
+  guildSettingsCache[guild.id] = currentSettings;
+  saveGuildSettings(guildSettingsCache);
+
+  return {
+    category,
+    botCommandsChannel,
+    controlPanelMessageId: panelMessage ? panelMessage.id : null,
+    isConfigured,
+  };
+}
+
+/**
+ * Handles selecting a tournament from .list tournament or .select tournament <id>.
+ */
+export async function handleSelectTournamentCommand(guild, member, tournamentId, replyFn) {
+  const access = checkTournamentAccess(guild, member);
+  if (!access.allowed) {
+    await replyFn(access.reason);
+    return;
+  }
+
+  if (!tournamentId || typeof tournamentId !== 'string') {
+    await replyFn('⚠️ **Missing Tournament ID:** Please specify a tournament ID: `.select tournament <tournament_id>`');
+    return;
+  }
+
+  const botMember = guild.members.me;
+  if (!botMember?.permissions?.has(PermissionFlagsBits.ManageChannels)) {
+    await replyFn(
+      '❌ **Missing Bot Permissions:** The bot requires the **Manage Channels** permission in this server to initialize tournament categories and channels.'
+    );
+    return;
+  }
+
+  let backendData;
+  try {
+    backendData = await fetchTournamentRegistrationsFromBackend(tournamentId);
+  } catch (err) {
+    await replyFn(`❌ **Failed to retrieve tournament details for \`${tournamentId}\`:**\n> ${err.message}`);
+    return;
+  }
+
+  const { tournament, summary } = backendData;
+  if (!tournament) {
+    await replyFn(`❌ **Error:** No tournament metadata returned for ID \`${tournamentId}\`.`);
+    return;
+  }
+
+  const panelResult = await setupTournamentControlPanel(guild, tournament, summary, botMember);
+
+  await replyFn(
+    `✅ **Tournament Selected:** **${tournament.title}** (ID: \`${tournament.id}\`)\n` +
+    `• Control panel initialized in <#${panelResult.botCommandsChannel.id}>.\n` +
+    `• Use the action buttons in <#${panelResult.botCommandsChannel.id}> to provision participant channels, refresh stats, or manage the tournament.`
+  );
 }
 
 /**
@@ -466,7 +762,7 @@ export async function handleListTournamentCommand(guild, member, args = [], repl
           const selectedTournamentId = interaction.values[0];
           collector.stop('selected');
           await interaction.deferUpdate().catch(() => {});
-          await handleFetchTeamsCommand(guild, interaction.member, [selectedTournamentId], (text) => interaction.followUp(text));
+          await handleSelectTournamentCommand(guild, interaction.member, selectedTournamentId, (text) => interaction.followUp(text));
         });
       }
     }
@@ -554,6 +850,9 @@ export async function handleFetchTeamsCommand(guild, member, args = [], replyFn,
   // Synchronize category, exactly the four shared channels, and member permissions
   const syncResult = await syncTournamentDiscordChannels(guild, tournament, teams, botMember);
 
+  // Refresh or setup control panel embed in #bot-commands
+  await setupTournamentControlPanel(guild, tournament, summary, botMember);
+
   // Format final summary report
   const summaryMessage = formatSyncSummaryMessage(tournament, summary, syncResult);
   await replyFn(summaryMessage);
@@ -588,9 +887,13 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     currentSettings.tournaments = {};
   }
   const savedTournament = currentSettings.tournaments[tournamentId] || {
+    tournamentId,
+    tournamentTitle: tournament.title,
+    guildId: guild.id,
     categoryId: null,
     channels: {},
     allEligibleMemberIds: [],
+    setupStatus: 'pending_channels',
   };
 
   if (!savedTournament.channels) {
@@ -754,7 +1057,6 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
   // 5. Synchronize Permissions across the four channels
   const previousMemberIds = new Set(savedTournament.allEligibleMemberIds || []);
 
-  // Channels that eligible participants should be granted access to
   const participantChannels = [
     {
       channel: activeChannels.tournamentUpdateId,
@@ -838,14 +1140,297 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
   }
 
   // 7. Persist tournament mapping to guild settings
-  savedTournament.allEligibleMemberIds = Array.from(currentEligibleMemberIds);
+  savedTournament.tournamentId = tournamentId;
   savedTournament.tournamentTitle = tournament.title;
+  savedTournament.guildId = guild.id;
+  savedTournament.categoryId = category.id;
+  savedTournament.allEligibleMemberIds = Array.from(currentEligibleMemberIds);
+  savedTournament.setupStatus = syncResult.channelsCreated.length + syncResult.channelsReused.length === 4 ? 'active' : 'pending_channels';
   savedTournament.lastSyncedAt = new Date().toISOString();
+
   currentSettings.tournaments[tournamentId] = savedTournament;
   guildSettingsCache[guild.id] = currentSettings;
   saveGuildSettings(guildSettingsCache);
 
   return syncResult;
+}
+
+/**
+ * Safely deletes all managed Discord channels and category for a tournament.
+ */
+export async function deleteTournamentDiscordChannels(guild, tournamentId) {
+  const currentSettings = guildSettingsCache[guild.id] || {};
+  const savedTournament = currentSettings.tournaments?.[tournamentId];
+
+  const summary = {
+    deletedChannels: [],
+    categoryDeleted: false,
+    failures: [],
+  };
+
+  if (!savedTournament) return summary;
+
+  // 1. Delete all verified channels in savedTournament.channels
+  const channelIds = Object.values(savedTournament.channels || {});
+  for (const chId of channelIds) {
+    if (!chId) continue;
+    try {
+      const channel = guild.channels.cache.get(chId) || await guild.channels.fetch(chId).catch(() => null);
+      if (channel) {
+        // Verify channel belongs to the tournament's category
+        if (!savedTournament.categoryId || channel.parentId === savedTournament.categoryId) {
+          const chName = channel.name;
+          await channel.delete('Tournament management: deleted all tournament channels').catch(() => {});
+          summary.deletedChannels.push(chName);
+        }
+      }
+    } catch (err) {
+      summary.failures.push(`Failed to delete channel ${chId}: ${err.message}`);
+    }
+  }
+
+  // 2. Also delete any legacy squad channels if recorded
+  if (savedTournament.teamChannels && typeof savedTournament.teamChannels === 'object') {
+    for (const chId of Object.values(savedTournament.teamChannels)) {
+      if (!chId) continue;
+      try {
+        const channel = guild.channels.cache.get(chId) || await guild.channels.fetch(chId).catch(() => null);
+        if (channel && (!savedTournament.categoryId || channel.parentId === savedTournament.categoryId)) {
+          const chName = channel.name;
+          await channel.delete('Tournament management: deleted legacy squad channel').catch(() => {});
+          summary.deletedChannels.push(chName);
+        }
+      } catch {}
+    }
+  }
+
+  // 3. Delete the category if it exists
+  if (savedTournament.categoryId) {
+    try {
+      const cat = guild.channels.cache.get(savedTournament.categoryId) ||
+        await guild.channels.fetch(savedTournament.categoryId).catch(() => null);
+      if (cat && cat.type === ChannelType.GuildCategory) {
+        await cat.delete('Tournament management: deleted tournament category').catch(() => {});
+        summary.categoryDeleted = true;
+      }
+    } catch (err) {
+      summary.failures.push(`Failed to delete category: ${err.message}`);
+    }
+  }
+
+  return summary;
+}
+
+/**
+ * Handles all tournament button interactions:
+ * - md_tour_create_channels:<tournamentId>
+ * - md_tour_refresh:<tournamentId>
+ * - md_tour_delete_channels:<tournamentId>
+ * - md_tour_confirm_delete:<tournamentId>
+ * - md_tour_cancel_delete:<tournamentId>
+ */
+export async function handleTournamentButtonInteraction(interaction) {
+  const customId = interaction.customId || '';
+  if (!customId.startsWith('md_tour_')) return;
+
+  const colonIdx = customId.indexOf(':');
+  const actionPart = colonIdx !== -1 ? customId.slice(0, colonIdx) : customId;
+  const tournamentId = colonIdx !== -1 ? customId.slice(colonIdx + 1) : '';
+  const action = actionPart.replace('md_tour_', '');
+
+  const guild = interaction.guild;
+  const member = interaction.member;
+
+  // 1. Authorization & Official Server check
+  const access = checkTournamentAccess(guild, member);
+  if (!access.allowed) {
+    if (typeof interaction.reply === 'function') {
+      await interaction.reply({ content: access.reason, ephemeral: true }).catch(() => {});
+    }
+    return;
+  }
+
+  const botMember = guild.members.me;
+
+  // Action: Create Channels
+  if (action === 'create_channels') {
+    if (typeof interaction.deferReply === 'function') {
+      await interaction.deferReply({ ephemeral: true }).catch(() => {});
+    }
+
+    try {
+      const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId);
+      const { tournament, teams, summary } = backendData;
+
+      const syncResult = await syncTournamentDiscordChannels(guild, tournament, teams, botMember);
+      const summaryMsg = formatSyncSummaryMessage(tournament, summary, syncResult);
+
+      // Refresh Control Panel embed
+      await setupTournamentControlPanel(guild, tournament, summary, botMember);
+
+      const resp = `✅ **Participant channels provisioned & synchronized.**\n\n${summaryMsg}`;
+      if (typeof interaction.editReply === 'function') {
+        await interaction.editReply({ content: resp });
+      } else if (typeof interaction.reply === 'function') {
+        await interaction.reply({ content: resp, ephemeral: true });
+      }
+    } catch (err) {
+      const errorMsg = `❌ **Failed to create channels:** ${err.message}`;
+      if (typeof interaction.editReply === 'function') {
+        await interaction.editReply({ content: errorMsg });
+      } else if (typeof interaction.reply === 'function') {
+        await interaction.reply({ content: errorMsg, ephemeral: true });
+      }
+    }
+    return;
+  }
+
+  // Action: Refresh Tournament Data
+  if (action === 'refresh') {
+    if (typeof interaction.deferReply === 'function') {
+      await interaction.deferReply({ ephemeral: true }).catch(() => {});
+    }
+
+    try {
+      const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId);
+      const { tournament, teams, summary } = backendData;
+
+      // Update #tournament-teams roster if channel exists
+      const saved = guildSettingsCache[guild.id]?.tournaments?.[tournamentId];
+      if (saved?.channels?.tournamentTeamsId) {
+        const teamsCh = guild.channels.cache.get(saved.channels.tournamentTeamsId) ||
+          await guild.channels.fetch(saved.channels.tournamentTeamsId).catch(() => null);
+        if (teamsCh && typeof teamsCh.send === 'function') {
+          const rosterChunks = formatTeamsChannelRoster(tournament, teams);
+          for (const chunk of rosterChunks) {
+            await teamsCh.send(chunk).catch(() => {});
+          }
+        }
+      }
+
+      // Refresh Control Panel embed
+      await setupTournamentControlPanel(guild, tournament, summary, botMember);
+
+      const replyContent = `✅ **Tournament Data Refreshed:** Live registrations, stats, and roster updated.`;
+      if (typeof interaction.editReply === 'function') {
+        await interaction.editReply({ content: replyContent });
+      } else if (typeof interaction.reply === 'function') {
+        await interaction.reply({ content: replyContent, ephemeral: true });
+      }
+    } catch (err) {
+      const errorMsg = `❌ **Failed to refresh tournament data:** ${err.message}`;
+      if (typeof interaction.editReply === 'function') {
+        await interaction.editReply({ content: errorMsg });
+      } else if (typeof interaction.reply === 'function') {
+        await interaction.reply({ content: errorMsg, ephemeral: true });
+      }
+    }
+    return;
+  }
+
+  // Action: Prompt Delete All Channels
+  if (action === 'delete_channels') {
+    const confirmRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`md_tour_confirm_delete:${tournamentId}`)
+        .setLabel('Yes, Delete All Channels')
+        .setEmoji('⚠️')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId(`md_tour_cancel_delete:${tournamentId}`)
+        .setLabel('Cancel')
+        .setStyle(ButtonStyle.Secondary)
+    );
+
+    const promptText = `⚠️ **Confirm Permanent Channel Deletion**\n` +
+      `Are you sure you want to delete all Discord channels for tournament \`${tournamentId}\`?\n\n` +
+      `**This will permanently delete:**\n` +
+      `• \`#bot-commands\`\n` +
+      `• \`#tournament-update\`\n` +
+      `• \`#tournament-teams\`\n` +
+      `• \`#tournament-helpdesk\`\n` +
+      `• The tournament category\n\n` +
+      `*(The website tournament and database registrations will NOT be deleted).*\n` +
+      `⏱️ **This confirmation prompt will expire in 30 seconds.**`;
+
+    if (typeof interaction.reply === 'function') {
+      const sent = await interaction.reply({
+        content: promptText,
+        components: [confirmRow],
+        ephemeral: true,
+      });
+
+      if (sent?.createMessageComponentCollector) {
+        const collector = sent.createMessageComponentCollector({ time: 30000 });
+        collector.on('end', (collected, reason) => {
+          if (reason === 'time') {
+            interaction.editReply({
+              content: '⏱️ **Confirmation Timed Out:** Tournament channel deletion was cancelled.',
+              components: [],
+            }).catch(() => {});
+          }
+        });
+      }
+    }
+    return;
+  }
+
+  // Action: Cancel Delete
+  if (action === 'cancel_delete') {
+    if (typeof interaction.update === 'function') {
+      await interaction.update({
+        content: 'ℹ️ **Deletion Cancelled:** All tournament channels and configuration remain intact.',
+        components: [],
+      });
+    } else if (typeof interaction.reply === 'function') {
+      await interaction.reply({
+        content: 'ℹ️ **Deletion Cancelled:** All tournament channels and configuration remain intact.',
+        ephemeral: true,
+      });
+    }
+    return;
+  }
+
+  // Action: Confirm Delete
+  if (action === 'confirm_delete') {
+    const saved = guildSettingsCache[guild.id]?.tournaments?.[tournamentId];
+    if (!saved || saved.setupStatus === 'deleted') {
+      const msg = '⚠️ **Notice:** This tournament has no active Discord channels or they were already deleted.';
+      if (typeof interaction.update === 'function') {
+        await interaction.update({ content: msg, components: [] });
+      } else if (typeof interaction.reply === 'function') {
+        await interaction.reply({ content: msg, ephemeral: true });
+      }
+      return;
+    }
+
+    if (typeof interaction.update === 'function') {
+      await interaction.update({ content: '⏳ **Deleting tournament channels...**', components: [] });
+    }
+
+    const deletionSummary = await deleteTournamentDiscordChannels(guild, tournamentId);
+
+    // Update persistent state to mark deleted
+    saved.setupStatus = 'deleted';
+    saved.channels = {};
+    saved.categoryId = null;
+    saved.controlPanelMessageId = null;
+    saved.deletedAt = new Date().toISOString();
+    guildSettingsCache[guild.id].tournaments[tournamentId] = saved;
+    saveGuildSettings(guildSettingsCache);
+
+    const resultMsg = `🗑️ **Tournament Channels Deleted:**\n` +
+      `• **Deleted Channels:** ${deletionSummary.deletedChannels.length > 0 ? deletionSummary.deletedChannels.map(n => `\`#${n}\``).join(', ') : 'None'}\n` +
+      `• **Category Deleted:** ${deletionSummary.categoryDeleted ? 'Yes' : 'No'}\n` +
+      `• Website tournament data and database registrations remain completely untouched.`;
+
+    if (typeof interaction.followUp === 'function') {
+      await interaction.followUp({ content: resultMsg, ephemeral: true });
+    } else if (typeof interaction.editReply === 'function') {
+      await interaction.editReply({ content: resultMsg });
+    }
+    return;
+  }
 }
 
 /**

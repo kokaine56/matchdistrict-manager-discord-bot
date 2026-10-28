@@ -24,6 +24,12 @@ import {
   formatSyncSummaryMessage,
   guildTournamentSessions,
   REQUIRED_TOURNAMENT_CHANNELS,
+  buildTournamentControlPanelEmbed,
+  buildTournamentControlPanelButtons,
+  setupTournamentControlPanel,
+  handleSelectTournamentCommand,
+  handleTournamentButtonInteraction,
+  deleteTournamentDiscordChannels,
 } from '../tournamentService.js';
 import {
   guildSettingsCache,
@@ -42,6 +48,7 @@ function createMockGuild(id = 'official-guild-12345', name = 'MatchDistrict Offi
     return res;
   };
   let channelIdCounter = 1;
+  let messageCounter = 1;
 
   const guild = {
     id,
@@ -67,6 +74,7 @@ function createMockGuild(id = 'official-guild-12345', name = 'MatchDistrict Offi
         }
 
         const sentMessages = [];
+        const messagesMap = new Map();
         const channel = {
           id: newId,
           name: data.name,
@@ -74,9 +82,19 @@ function createMockGuild(id = 'official-guild-12345', name = 'MatchDistrict Offi
           parentId: data.parent || null,
           topic: data.topic || null,
           sentMessages,
+          messages: {
+            cache: messagesMap,
+            fetch: async (msgId) => messagesMap.get(msgId) || null,
+          },
           send: async (msg) => {
-            const m = typeof msg === 'object' ? msg : { content: msg };
+            const msgId = `msg-${messageCounter++}`;
+            const m = typeof msg === 'object' ? { ...msg, id: msgId } : { content: msg, id: msgId };
+            m.edit = async (newContent) => {
+              Object.assign(m, typeof newContent === 'object' ? newContent : { content: newContent });
+              return m;
+            };
             sentMessages.push(m);
+            messagesMap.set(msgId, m);
             return m;
           },
           delete: async () => {
@@ -115,6 +133,56 @@ function createMockGuild(id = 'official-guild-12345', name = 'MatchDistrict Offi
   };
 
   return guild;
+}
+
+function createMockButtonInteraction(options = {}) {
+  const {
+    customId = 'md_tour_create_channels:test-tour',
+    guild = createMockGuild(),
+    member = createMockMember({ isAdmin: true }),
+  } = options;
+
+  let replied = null;
+  let updated = null;
+  let followedUp = null;
+  let deferred = false;
+
+  const interaction = {
+    customId,
+    guild,
+    member,
+    isButton: () => true,
+    deferReply: async (opts) => {
+      deferred = true;
+      return opts;
+    },
+    reply: async (msg) => {
+      replied = msg;
+      return {
+        createMessageComponentCollector: (collectorOpts) => ({
+          on: (event, handler) => {},
+        }),
+      };
+    },
+    editReply: async (msg) => {
+      replied = msg;
+      return msg;
+    },
+    update: async (msg) => {
+      updated = msg;
+      return msg;
+    },
+    followUp: async (msg) => {
+      followedUp = msg;
+      return msg;
+    },
+    getReplied: () => replied,
+    getUpdated: () => updated,
+    getFollowedUp: () => followedUp,
+    isDeferred: () => deferred,
+  };
+
+  return interaction;
 }
 
 function createMockMember(options = {}) {
@@ -742,5 +810,420 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     assert.match(message, /Registered Teams Roster:/);
     assert.match(message, /Helpdesk & Support:/);
     assert.match(message, /Published to #tournament-teams/);
+  });
+
+  // --- Requirement: Tournament Management Control Panel & Action Buttons ---
+
+  test('16. Control Panel Embed & Buttons builder: produces required fields and interactive components', () => {
+    const tournament = {
+      id: 'tour-cp-1',
+      title: 'Apex Legends Winter Championship',
+      game: 'Apex Legends',
+      status: 'published',
+      registration_status: 'open',
+    };
+    const summary = {
+      total_registered_teams: 20,
+      eligible_teams_count: 18,
+      ineligible_teams_count: 2,
+      eligible_linked_members_count: 54,
+      unlinked_members_count: 6,
+    };
+    const channelsStatus = {
+      isConfigured: true,
+      activeCount: 4,
+      statusText: '🟢 **Active** — All 4 channels configured',
+    };
+
+    const embed = buildTournamentControlPanelEmbed(tournament, summary, channelsStatus);
+    const data = embed.data || embed;
+
+    assert.match(data.title, /Tournament Control Panel/);
+    assert.match(data.title, /Apex Legends Winter Championship/);
+    assert.match(data.description, /Apex Legends Winter Championship/);
+
+    const fields = data.fields;
+    assert.ok(fields.some((f) => f.value.includes('tour-cp-1')));
+    assert.ok(fields.some((f) => f.value.includes('Apex Legends')));
+    assert.ok(fields.some((f) => f.value.includes('PUBLISHED')));
+    assert.ok(fields.some((f) => f.value.includes('OPEN')));
+    assert.ok(fields.some((f) => f.name.includes('Registration Statistics') && f.value.includes('20')));
+    assert.ok(fields.some((f) => f.name.includes('Registration Statistics') && f.value.includes('54')));
+    assert.ok(fields.some((f) => f.name.includes('Registration Statistics') && f.value.includes('6')));
+    assert.ok(fields.some((f) => f.name.includes('Discord Channels Setup Status')));
+
+    const actionRows = buildTournamentControlPanelButtons('tour-cp-1');
+    assert.equal(actionRows.length, 1);
+    const row = actionRows[0];
+    const buttons = row.components;
+    assert.equal(buttons.length, 3);
+
+    const btn1 = buttons[0].data || buttons[0];
+    const btn2 = buttons[1].data || buttons[1];
+    const btn3 = buttons[2].data || buttons[2];
+
+    assert.equal(btn1.custom_id, 'md_tour_create_channels:tour-cp-1');
+    assert.equal(btn1.label, 'Create Channels');
+
+    assert.equal(btn2.custom_id, 'md_tour_refresh:tour-cp-1');
+    assert.equal(btn2.label, 'Refresh Tournament Data');
+
+    assert.equal(btn3.custom_id, 'md_tour_delete_channels:tour-cp-1');
+    assert.equal(btn3.label, 'Delete All Channels');
+  });
+
+  test('17. setupTournamentControlPanel: creates category and #bot-commands with embed and buttons idempotently', async () => {
+    const guild = createMockGuild(OFFICIAL_GUILD_ID);
+    const botMember = guild.members.me;
+    const tournament = {
+      id: 'tour-setup-cp',
+      title: 'Valorant Championship',
+      game: 'Valorant',
+      status: 'published',
+      registration_status: 'open',
+    };
+    const summary = {
+      total_registered_teams: 8,
+      eligible_linked_members_count: 24,
+      unlinked_members_count: 0,
+    };
+
+    // First setup: provisions category & #bot-commands
+    const result1 = await setupTournamentControlPanel(guild, tournament, summary, botMember);
+    assert.ok(result1.category);
+    assert.ok(result1.botCommandsChannel);
+    assert.ok(result1.controlPanelMessageId);
+
+    const botCmds = result1.botCommandsChannel;
+    assert.equal(botCmds.sentMessages.length, 1);
+    assert.ok(botCmds.sentMessages[0].embeds);
+    assert.ok(botCmds.sentMessages[0].components);
+
+    const saved = guildSettingsCache[guild.id]?.tournaments?.['tour-setup-cp'];
+    assert.ok(saved);
+    assert.equal(saved.tournamentId, 'tour-setup-cp');
+    assert.equal(saved.tournamentTitle, 'Valorant Championship');
+    assert.equal(saved.categoryId, result1.category.id);
+    assert.equal(saved.channels.botCommandsId, botCmds.id);
+    assert.equal(saved.controlPanelMessageId, result1.controlPanelMessageId);
+
+    // Second setup: idempotent, edits message instead of posting duplicate
+    const result2 = await setupTournamentControlPanel(guild, tournament, summary, botMember);
+    assert.equal(result2.category.id, result1.category.id);
+    assert.equal(result2.botCommandsChannel.id, botCmds.id);
+    assert.equal(botCmds.sentMessages.length, 1); // No new message posted; edited existing
+  });
+
+  test('18. handleSelectTournamentCommand: sets up control panel and notifies admin', async () => {
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        tournament: {
+          id: 'tour-select-1',
+          title: 'PUBG Mobile Cup',
+          game: 'PUBG Mobile',
+          status: 'published',
+          registration_status: 'open',
+        },
+        summary: {
+          total_registered_teams: 4,
+          eligible_teams_count: 4,
+          eligible_linked_members_count: 16,
+          unlinked_members_count: 0,
+        },
+        teams: [],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const adminMember = createMockMember({ isAdmin: true });
+
+      let replyMsg = '';
+      await handleSelectTournamentCommand(guild, adminMember, 'tour-select-1', async (msg) => {
+        replyMsg = typeof msg === 'object' ? msg.content : msg;
+      });
+
+      assert.match(replyMsg, /Tournament Selected/);
+      assert.match(replyMsg, /PUBG Mobile Cup/);
+      assert.match(replyMsg, /tour-select-1/);
+      assert.match(replyMsg, /Control panel initialized in/i);
+
+      const saved = guildSettingsCache[guild.id]?.tournaments?.['tour-select-1'];
+      assert.ok(saved);
+      assert.ok(saved.channels.botCommandsId);
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('19. Button Interaction: Create Channels provisions 3 participant channels and updates embed', async () => {
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        tournament: {
+          id: 'tour-btn-1',
+          title: 'Call of Duty Masters',
+          game: 'Call of Duty',
+          status: 'published',
+          registration_status: 'open',
+        },
+        summary: {
+          total_registered_teams: 2,
+          eligible_teams_count: 2,
+          ineligible_teams_count: 0,
+          eligible_linked_members_count: 8,
+          unlinked_members_count: 0,
+        },
+        teams: [
+          {
+            id: 't-1',
+            team_name: 'Delta Squad',
+            status: 'approved',
+            is_eligible: true,
+            linked_members: [{ discord_id: '111111111111111111', is_linked: true }],
+            unlinked_count: 0,
+          },
+        ],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const adminMember = createMockMember({ isAdmin: true });
+
+      // Initialize control panel first
+      await setupTournamentControlPanel(guild, {
+        id: 'tour-btn-1',
+        title: 'Call of Duty Masters',
+        game: 'Call of Duty',
+        status: 'published',
+        registration_status: 'open',
+      }, {
+        total_registered_teams: 2,
+        eligible_linked_members_count: 8,
+        unlinked_members_count: 0,
+      }, guild.members.me);
+
+      const interaction = createMockButtonInteraction({
+        customId: 'md_tour_create_channels:tour-btn-1',
+        guild,
+        member: adminMember,
+      });
+
+      await handleTournamentButtonInteraction(interaction);
+
+      const saved = guildSettingsCache[guild.id]?.tournaments?.['tour-btn-1'];
+      assert.ok(saved);
+      assert.ok(saved.channels.botCommandsId);
+      assert.ok(saved.channels.tournamentUpdateId);
+      assert.ok(saved.channels.tournamentTeamsId);
+      assert.ok(saved.channels.tournamentHelpdeskId);
+      assert.equal(saved.setupStatus, 'active');
+
+      const replied = interaction.getReplied();
+      assert.ok(replied);
+      assert.match(replied.content, /Participant channels provisioned & synchronized/);
+      assert.match(replied.content, /Announcements & Updates/);
+      assert.match(replied.content, /Registered Teams Roster/);
+      assert.match(replied.content, /Helpdesk & Support/);
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('20. Button Interaction: Refresh Tournament Data updates roster and control panel', async () => {
+    let callCount = 0;
+    const mockServer = http.createServer((req, res) => {
+      callCount++;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        tournament: {
+          id: 'tour-refresh-1',
+          title: 'CS:GO Clash',
+          game: 'Counter-Strike',
+          status: 'published',
+          registration_status: 'open',
+        },
+        summary: {
+          total_registered_teams: callCount,
+          eligible_teams_count: callCount,
+          ineligible_teams_count: 0,
+          eligible_linked_members_count: callCount * 5,
+          unlinked_members_count: 0,
+        },
+        teams: [
+          {
+            id: 'team-cs-1',
+            team_name: `CS Squad ${callCount}`,
+            status: 'approved',
+            is_eligible: true,
+            linked_members: [{ discord_id: '222222222222222222', is_linked: true }],
+            unlinked_count: 0,
+          },
+        ],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const adminMember = createMockMember({ isAdmin: true });
+
+      // Create full channel setup
+      const backendData = await fetchTournamentRegistrationsFromBackend('tour-refresh-1');
+      await syncTournamentDiscordChannels(guild, backendData.tournament, backendData.teams, guild.members.me);
+      await setupTournamentControlPanel(guild, backendData.tournament, backendData.summary, guild.members.me);
+
+      const interaction = createMockButtonInteraction({
+        customId: 'md_tour_refresh:tour-refresh-1',
+        guild,
+        member: adminMember,
+      });
+
+      await handleTournamentButtonInteraction(interaction);
+
+      const replied = interaction.getReplied();
+      assert.ok(replied);
+      assert.match(replied.content, /Tournament Data Refreshed/);
+      assert.match(replied.content, /Live registrations, stats, and roster updated/);
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('21. Button Interaction: Delete All Channels prompt creates 30s confirmation dialog', async () => {
+    const guild = createMockGuild(OFFICIAL_GUILD_ID);
+    const adminMember = createMockMember({ isAdmin: true });
+
+    const interaction = createMockButtonInteraction({
+      customId: 'md_tour_delete_channels:tour-del-prompt',
+      guild,
+      member: adminMember,
+    });
+
+    await handleTournamentButtonInteraction(interaction);
+
+    const replied = interaction.getReplied();
+    assert.ok(replied);
+    assert.match(replied.content, /Confirm Permanent Channel Deletion/);
+    assert.match(replied.content, /#bot-commands/);
+    assert.match(replied.content, /30 seconds/);
+
+    assert.ok(replied.components && replied.components.length > 0);
+    const buttons = replied.components[0].components;
+    assert.equal(buttons.length, 2);
+    assert.equal((buttons[0].data || buttons[0]).custom_id, 'md_tour_confirm_delete:tour-del-prompt');
+    assert.equal((buttons[1].data || buttons[1]).custom_id, 'md_tour_cancel_delete:tour-del-prompt');
+  });
+
+  test('22. Button Interaction: Confirm Delete removes all 4 channels and category and updates storage', async () => {
+    const guild = createMockGuild(OFFICIAL_GUILD_ID);
+    const adminMember = createMockMember({ isAdmin: true });
+
+    const tournament = {
+      id: 'tour-del-confirm',
+      title: 'Overwatch Cup',
+      game: 'Overwatch',
+      status: 'published',
+      registration_status: 'open',
+    };
+    const summary = { total_registered_teams: 2, eligible_linked_members_count: 10, unlinked_members_count: 0 };
+
+    await setupTournamentControlPanel(guild, tournament, summary, guild.members.me);
+    await syncTournamentDiscordChannels(guild, tournament, [], guild.members.me);
+
+    const savedBefore = guildSettingsCache[guild.id]?.tournaments?.['tour-del-confirm'];
+    assert.ok(savedBefore);
+    assert.equal(savedBefore.setupStatus, 'active');
+    const catId = savedBefore.categoryId;
+    const botCmdId = savedBefore.channels.botCommandsId;
+
+    assert.ok(guild.channels.cache.get(catId));
+    assert.ok(guild.channels.cache.get(botCmdId));
+
+    const interaction = createMockButtonInteraction({
+      customId: 'md_tour_confirm_delete:tour-del-confirm',
+      guild,
+      member: adminMember,
+    });
+
+    await handleTournamentButtonInteraction(interaction);
+
+    const updated = interaction.getUpdated();
+    assert.ok(updated);
+    assert.match(updated.content, /Deleting tournament channels/);
+
+    const followedUp = interaction.getFollowedUp();
+    assert.ok(followedUp);
+    assert.match(followedUp.content, /Tournament Channels Deleted/);
+
+    // Verify channels and category were removed from guild cache
+    assert.equal(guild.channels.cache.get(catId), undefined);
+    assert.equal(guild.channels.cache.get(botCmdId), undefined);
+
+    // Verify persistent storage marked as deleted
+    const savedAfter = guildSettingsCache[guild.id]?.tournaments?.['tour-del-confirm'];
+    assert.equal(savedAfter.setupStatus, 'deleted');
+    assert.deepEqual(savedAfter.channels, {});
+    assert.equal(savedAfter.categoryId, null);
+    assert.ok(savedAfter.deletedAt);
+  });
+
+  test('23. Button Interaction: Cancel Delete leaves channels intact', async () => {
+    const guild = createMockGuild(OFFICIAL_GUILD_ID);
+    const adminMember = createMockMember({ isAdmin: true });
+
+    const interaction = createMockButtonInteraction({
+      customId: 'md_tour_cancel_delete:tour-cancel-test',
+      guild,
+      member: adminMember,
+    });
+
+    await handleTournamentButtonInteraction(interaction);
+
+    const updated = interaction.getUpdated();
+    assert.ok(updated);
+    assert.match(updated.content, /Deletion Cancelled/);
+    assert.match(updated.content, /channels and configuration remain intact/);
+  });
+
+  test('24. Button Interaction: Security & Authorization restricts to admins in official guild', async () => {
+    const officialGuild = createMockGuild(OFFICIAL_GUILD_ID);
+    const rogueGuild = createMockGuild('rogue-server-666');
+    const adminMember = createMockMember({ isAdmin: true });
+    const nonAdminMember = createMockMember({ isAdmin: false });
+
+    // Unauthorized guild
+    const rogueInteraction = createMockButtonInteraction({
+      customId: 'md_tour_create_channels:tour-sec-1',
+      guild: rogueGuild,
+      member: adminMember,
+    });
+    await handleTournamentButtonInteraction(rogueInteraction);
+    assert.match(rogueInteraction.getReplied().content, /official MatchDistrict Discord server/i);
+
+    // Non-admin user
+    const nonAdminInteraction = createMockButtonInteraction({
+      customId: 'md_tour_create_channels:tour-sec-1',
+      guild: officialGuild,
+      member: nonAdminMember,
+    });
+    await handleTournamentButtonInteraction(nonAdminInteraction);
+    assert.match(nonAdminInteraction.getReplied().content, /Administrator/i);
   });
 });

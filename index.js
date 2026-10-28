@@ -25,6 +25,12 @@ import {
   syncTournamentDiscordChannels,
   formatTournamentListPages,
   guildTournamentSessions,
+  buildTournamentControlPanelEmbed,
+  buildTournamentControlPanelButtons,
+  setupTournamentControlPanel,
+  handleSelectTournamentCommand,
+  handleTournamentButtonInteraction,
+  deleteTournamentDiscordChannels,
 } from './tournamentService.js';
 
 export {
@@ -36,6 +42,12 @@ export {
   syncTournamentDiscordChannels,
   formatTournamentListPages,
   guildTournamentSessions,
+  buildTournamentControlPanelEmbed,
+  buildTournamentControlPanelButtons,
+  setupTournamentControlPanel,
+  handleSelectTournamentCommand,
+  handleTournamentButtonInteraction,
+  deleteTournamentDiscordChannels,
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -342,8 +354,9 @@ export function getHelpResponse(prefix = PREFIX) {
     `• \`${prefix}ban @user [reason]\` — *(Mod Only)* Ban a user with audit logging\n` +
     `• \`${prefix}clear <1-100>\` — *(Mod Only)* Bulk delete recent messages\n\n` +
     `**🏆 Tournament Management (Official Server Only):**\n` +
-    `• \`${prefix}list tournament [all]\` — *(Admin Only)* List website tournaments (status, slots, IDs)\n` +
-    `• \`${prefix}fetch teams <tournament_id>\` — *(Admin Only)* Fetch registered teams, validate Discord links & sync channels\n\n` +
+    `• \`${prefix}list tournament [all]\` — *(Admin Only)* List tournaments & open control panel via selection\n` +
+    `• \`${prefix}select tournament <id>\` — *(Admin Only)* Open or refresh control panel in #bot-commands\n` +
+    `• \`${prefix}fetch teams [id]\` — *(Admin Only)* Provision tournament channels & sync live registered roster\n\n` +
     `**ℹ️ General Information:**\n` +
     `• \`${prefix}status\` — Check server configuration & welcome status\n` +
     `• \`${prefix}website\` — Get the official MatchDistrict platform link\n` +
@@ -1546,6 +1559,14 @@ client.on(Events.MessageCreate, async (message) => {
         }
         await message.reply(`ℹ️ **Usage:** \`${PREFIX}fetch teams <tournament_id>\` — Fetch registered teams & sync Discord channels.`);
         return;
+      } else if (cmd === 'select' || cmd === 'manage') {
+        const sub = (args[0] || '').toLowerCase();
+        let targetId = args[0];
+        if (sub === 'tournament' || sub === 'tournaments') {
+          targetId = args[1];
+        }
+        await handleSelectTournamentCommand(message.guild, message.member, targetId, (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }));
+        return;
       } else if (cmd === 'status') {
         await handleStatusCommand(message.guild, (text) => message.reply(text));
         return;
@@ -1568,6 +1589,18 @@ client.on(Events.MessageCreate, async (message) => {
     await handleMessageCreateLog(message);
   } catch (error) {
     console.warn('[Discord Bot] ⚠️ Error in MessageCreate handler:', error.message);
+  }
+});
+
+// Persistent interaction listener (ensures tournament control panel buttons work across bot restarts)
+client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+    if (interaction.isButton() && interaction.customId?.startsWith('md_tour_')) {
+      await handleTournamentButtonInteraction(interaction);
+      return;
+    }
+  } catch (error) {
+    console.warn('[Discord Bot] ⚠️ Error in InteractionCreate handler:', error.message);
   }
 });
 
