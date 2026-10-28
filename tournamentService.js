@@ -669,25 +669,37 @@ export async function getOrCreateTournamentRole(guild, tournament) {
   if (savedTournament.roleId && guild.roles) {
     role = guild.roles.cache?.get(savedTournament.roleId) ||
       await guild.roles.fetch?.(savedTournament.roleId).catch(() => null);
+    if (!role) {
+      console.warn(`[Discord Bot] ⚠️ Mapped tournament role with ID "${savedTournament.roleId}" for "${tournament.title}" was not found or was deleted from server. Triggering safe role recreation.`);
+    }
   }
 
-  // 2. Fallback: match by normalized name if roleId wasn't stored
+  // 2. Fallback: match by normalized name if roleId wasn't stored or role was deleted
   if (!role && guild.roles?.cache) {
     role = Array.from(guild.roles.cache.values()).find(
       (r) => r.name.toLowerCase() === expectedRoleName.toLowerCase()
     );
   }
 
-  // 3. Create role if not found
+  // 3. Create role if not found (strictly no admin permissions)
   if (!role && typeof guild.roles?.create === 'function') {
     role = await guild.roles.create({
       name: expectedRoleName,
+      permissions: [],
       mentionable: true,
       reason: `Tournament role for ${tournament.title} (ID: ${tournamentId})`,
     });
   }
 
   if (role) {
+    // Security check: ensure tournament role strictly avoids granting Administrator permission
+    if (role.permissions?.has && role.permissions.has(PermissionFlagsBits.Administrator)) {
+      console.warn(`[Discord Bot] 🚨 Security Warning: Tournament role @${role.name} has Administrator permission. Removing elevated permissions.`);
+      if (typeof role.setPermissions === 'function') {
+        await role.setPermissions([], 'Enforce unprivileged tournament role').catch(() => {});
+      }
+    }
+
     savedTournament.roleId = role.id;
     savedTournament.roleName = role.name;
     currentSettings.tournaments[tournamentId] = savedTournament;
@@ -764,6 +776,10 @@ export async function syncTournamentRoles(guild, tournamentId, preloadedData = n
     membersWithRole: 0,
   };
 
+  // Check bot permissions and hierarchy
+  const botMember = guild.members?.me || (guild.members?.cache ? guild.members.cache.get(guild.client?.user?.id) : null);
+  const botHasManageRoles = !botMember?.permissions || (typeof botMember.permissions.has === 'function' ? botMember.permissions.has(PermissionFlagsBits.ManageRoles) : true);
+
   // Assign role to eligible members in guild
   for (const discordId of currentEligibleDiscordIds) {
     let member = null;
@@ -782,6 +798,18 @@ export async function syncTournamentRoles(guild, tournamentId, preloadedData = n
     if (member.roles?.cache?.has(role.id)) {
       stats.alreadyAssigned++;
     } else if (typeof member.roles?.add === 'function') {
+      if (!botHasManageRoles) {
+        stats.failed++;
+        console.warn(`[Discord Bot] ⚠️ Cannot assign role @${role.name} to member ${discordId}: Bot lacks 'Manage Roles' permission.`);
+        continue;
+      }
+      if (botMember?.roles?.highest && typeof botMember.roles.highest.comparePositionTo === 'function') {
+        if (botMember.roles.highest.comparePositionTo(role) <= 0) {
+          stats.failed++;
+          console.warn(`[Discord Bot] ⚠️ Cannot assign role @${role.name} to member ${discordId}: Bot's highest role is not positioned higher than @${role.name} in role hierarchy.`);
+          continue;
+        }
+      }
       try {
         await member.roles.add(role.id, `Eligible tournament registration for ${tournament.title}`);
         stats.assigned++;
@@ -797,6 +825,16 @@ export async function syncTournamentRoles(guild, tournamentId, preloadedData = n
     for (const member of guild.members.cache.values()) {
       if (member.roles?.cache?.has(role.id) && !currentEligibleDiscordIds.has(member.id)) {
         if (typeof member.roles?.remove === 'function') {
+          if (!botHasManageRoles) {
+            stats.failed++;
+            continue;
+          }
+          if (botMember?.roles?.highest && typeof botMember.roles.highest.comparePositionTo === 'function') {
+            if (botMember.roles.highest.comparePositionTo(role) <= 0) {
+              stats.failed++;
+              continue;
+            }
+          }
           try {
             await member.roles.remove(role.id, `Registration cancelled or ineligible for ${tournament.title}`);
             stats.removed++;
@@ -833,8 +871,113 @@ export async function syncTournamentRoles(guild, tournamentId, preloadedData = n
 }
 
 /**
+ * Retry constants & bounded persistent retry queue for member tournament role synchronization.
+ */
+export const MAX_ROLE_SYNC_RETRIES = 3;
+export const ROLE_SYNC_RETRY_INTERVAL_MS = 5000;
+
+export function enqueueRoleSyncRetry(guildId, discordId, errorMessage = '') {
+  if (!guildId || !discordId) return false;
+  const currentSettings = guildSettingsCache[guildId] || {};
+  if (!Array.isArray(currentSettings.pendingRoleSync)) {
+    currentSettings.pendingRoleSync = [];
+  }
+
+  const existingIdx = currentSettings.pendingRoleSync.findIndex((item) => item.discordId === discordId);
+  const now = Date.now();
+
+  if (existingIdx >= 0) {
+    const existing = currentSettings.pendingRoleSync[existingIdx];
+    if (existing.attempts >= MAX_ROLE_SYNC_RETRIES) {
+      console.warn(`[Discord Bot] ⚠️ Member ${discordId} already reached max retry attempts (${MAX_ROLE_SYNC_RETRIES}). Skipping enqueue.`);
+      return false;
+    }
+    existing.attempts += 1;
+    existing.lastError = errorMessage;
+    existing.nextRetryTimestamp = now + (existing.attempts * ROLE_SYNC_RETRY_INTERVAL_MS);
+    currentSettings.pendingRoleSync[existingIdx] = existing;
+  } else {
+    currentSettings.pendingRoleSync.push({
+      discordId,
+      attempts: 1,
+      nextRetryTimestamp: now + ROLE_SYNC_RETRY_INTERVAL_MS,
+      lastError: errorMessage,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  guildSettingsCache[guildId] = currentSettings;
+  saveGuildSettings(guildSettingsCache);
+  return true;
+}
+
+export function removeRoleSyncRetry(guildId, discordId) {
+  if (!guildId || !discordId) return;
+  const currentSettings = guildSettingsCache[guildId];
+  if (!currentSettings || !Array.isArray(currentSettings.pendingRoleSync)) return;
+
+  const initialLen = currentSettings.pendingRoleSync.length;
+  currentSettings.pendingRoleSync = currentSettings.pendingRoleSync.filter((item) => item.discordId !== discordId);
+  if (currentSettings.pendingRoleSync.length !== initialLen) {
+    saveGuildSettings(guildSettingsCache);
+  }
+}
+
+export async function processPendingRoleSyncQueue(guild) {
+  if (!guild || !isOfficialGuild(guild)) return { processed: 0, succeeded: 0, dropped: 0 };
+  const currentSettings = guildSettingsCache[guild.id];
+  if (!currentSettings || !Array.isArray(currentSettings.pendingRoleSync) || currentSettings.pendingRoleSync.length === 0) {
+    return { processed: 0, succeeded: 0, dropped: 0 };
+  }
+
+  const now = Date.now();
+  const queue = [...currentSettings.pendingRoleSync];
+  let processed = 0;
+  let succeeded = 0;
+  let dropped = 0;
+
+  for (const item of queue) {
+    if (item.nextRetryTimestamp > now) {
+      continue;
+    }
+    processed++;
+
+    let member = null;
+    try {
+      member = guild.members.cache?.get(item.discordId) ||
+        await guild.members.fetch?.(item.discordId).catch(() => null);
+    } catch {
+      member = null;
+    }
+
+    if (!member) {
+      // Member is no longer in the guild, drop from queue
+      removeRoleSyncRetry(guild.id, item.discordId);
+      dropped++;
+      continue;
+    }
+
+    const syncRes = await syncMemberTournamentRoles(member);
+    if (syncRes.success) {
+      succeeded++;
+      removeRoleSyncRetry(guild.id, item.discordId);
+      console.log(`[Discord Bot] ✅ Successfully resolved tournament roles on retry for member ${item.discordId}`);
+    } else {
+      if (item.attempts >= MAX_ROLE_SYNC_RETRIES) {
+        removeRoleSyncRetry(guild.id, item.discordId);
+        dropped++;
+        console.warn(`[Discord Bot] ❌ Dropping member ${item.discordId} from role sync queue: reached max attempts (${MAX_ROLE_SYNC_RETRIES}).`);
+      }
+    }
+  }
+
+  return { processed, succeeded, dropped };
+}
+
+/**
  * Synchronizes applicable tournament roles for a single member across all eligible tournaments.
  * Runs on guildMemberAdd and on post-link webhooks.
+ * Strictly verifies official server and verified linked Discord user ID.
  */
 export async function syncMemberTournamentRoles(member) {
   if (!member || !member.guild || !isOfficialGuild(member.guild)) {
@@ -848,7 +991,8 @@ export async function syncMemberTournamentRoles(member) {
   try {
     const backendData = await fetchUserEligibleTournamentsFromBackend(discordId);
     if (!backendData || !Array.isArray(backendData.eligible_tournaments)) {
-      return { success: true, assignedCount: 0, reason: 'no_eligible_tournaments' };
+      removeRoleSyncRetry(member.guild.id, discordId);
+      return { success: true, assignedCount: 0, alreadyAssignedCount: 0, removedCount: 0, reason: 'no_eligible_tournaments' };
     }
 
     const currentSettings = guildSettingsCache[member.guild.id] || {};
@@ -856,7 +1000,12 @@ export async function syncMemberTournamentRoles(member) {
     const eligibleTourIds = new Set(backendData.eligible_tournaments.map((t) => t.id));
 
     let assignedCount = 0;
+    let alreadyAssignedCount = 0;
     let removedCount = 0;
+    let skippedCount = 0;
+
+    const botMember = member.guild.members?.me || (member.guild.members?.cache ? member.guild.members.cache.get(member.guild.client?.user?.id) : null);
+    const botHasManageRoles = !botMember?.permissions || (typeof botMember.permissions.has === 'function' ? botMember.permissions.has(PermissionFlagsBits.ManageRoles) : true);
 
     // 1. Assign roles for eligible active tournaments
     for (const tour of backendData.eligible_tournaments) {
@@ -864,12 +1013,41 @@ export async function syncMemberTournamentRoles(member) {
       if (!saved || saved.setupStatus === 'deleted') continue;
 
       const role = await getOrCreateTournamentRole(member.guild, tour);
-      if (role && !member.roles?.cache?.has(role.id) && typeof member.roles?.add === 'function') {
+      if (!role) {
+        skippedCount++;
+        continue;
+      }
+
+      // Check if member already has role (idempotent, avoids redundant Discord API calls)
+      if (member.roles?.cache?.has(role.id)) {
+        alreadyAssignedCount++;
+        continue;
+      }
+
+      // Check bot permissions
+      if (!botHasManageRoles) {
+        skippedCount++;
+        console.warn(`[Discord Bot] ⚠️ Cannot assign role @${role.name} to member ${member.id}: Bot lacks 'Manage Roles' permission.`);
+        continue;
+      }
+
+      // Check role hierarchy
+      if (botMember?.roles?.highest && typeof botMember.roles.highest.comparePositionTo === 'function') {
+        const comparison = botMember.roles.highest.comparePositionTo(role);
+        if (comparison <= 0) {
+          skippedCount++;
+          console.warn(`[Discord Bot] ⚠️ Cannot assign role @${role.name} to member ${member.id}: Bot's highest role is not positioned higher than @${role.name} in role hierarchy.`);
+          continue;
+        }
+      }
+
+      if (typeof member.roles?.add === 'function') {
         try {
           await member.roles.add(role.id, `Eligible registration for tournament ${tour.title}`);
           assignedCount++;
           console.log(`[Discord Bot] 🏷️ Assigned tournament role @${role.name} to ${member.user?.tag || member.id} for "${tour.title}"`);
         } catch (err) {
+          skippedCount++;
           console.warn(`[Discord Bot] Failed to assign role ${role.name} to member ${member.id}:`, err.message);
         }
       }
@@ -880,21 +1058,30 @@ export async function syncMemberTournamentRoles(member) {
       if (!saved || saved.setupStatus === 'deleted' || !saved.roleId) continue;
       if (!eligibleTourIds.has(tourId)) {
         if (member.roles?.cache?.has(saved.roleId) && typeof member.roles?.remove === 'function') {
-          try {
-            await member.roles.remove(saved.roleId, 'Member no longer eligible for tournament');
-            removedCount++;
-            console.log(`[Discord Bot] 🏷️ Removed tournament role @${saved.roleName} from ${member.user?.tag || member.id}`);
-          } catch (err) {
-            console.warn(`[Discord Bot] Failed to remove role ${saved.roleName} from member ${member.id}:`, err.message);
+          if (botHasManageRoles) {
+            const roleObj = member.guild.roles?.cache?.get(saved.roleId);
+            if (!roleObj || !botMember?.roles?.highest || typeof botMember.roles.highest.comparePositionTo !== 'function' || botMember.roles.highest.comparePositionTo(roleObj) > 0) {
+              try {
+                await member.roles.remove(saved.roleId, 'Member no longer eligible for tournament');
+                removedCount++;
+                console.log(`[Discord Bot] 🏷️ Removed tournament role @${saved.roleName} from ${member.user?.tag || member.id}`);
+              } catch (err) {
+                console.warn(`[Discord Bot] Failed to remove role ${saved.roleName} from member ${member.id}:`, err.message);
+              }
+            }
           }
         }
       }
     }
 
-    return { success: true, assignedCount, removedCount };
+    // Successful sync: clear retry state for member
+    removeRoleSyncRetry(member.guild.id, discordId);
+
+    return { success: true, assignedCount, alreadyAssignedCount, removedCount, skippedCount };
   } catch (err) {
     console.warn(`[Discord Bot] Failed to sync tournament roles for member ${discordId}:`, err.message);
-    return { success: false, error: err.message };
+    const queued = enqueueRoleSyncRetry(member.guild.id, discordId, err.message);
+    return { success: false, queuedForRetry: queued, error: err.message };
   }
 }
 

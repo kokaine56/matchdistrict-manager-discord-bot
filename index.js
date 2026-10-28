@@ -44,6 +44,11 @@ import {
   syncMemberTournamentRoles,
   reconcileAllTournamentRoles,
   handleSyncRolesCommand,
+  enqueueRoleSyncRetry,
+  removeRoleSyncRetry,
+  processPendingRoleSyncQueue,
+  MAX_ROLE_SYNC_RETRIES,
+  ROLE_SYNC_RETRY_INTERVAL_MS,
 } from './tournamentService.js';
 
 export {
@@ -74,6 +79,11 @@ export {
   syncMemberTournamentRoles,
   reconcileAllTournamentRoles,
   handleSyncRolesCommand,
+  enqueueRoleSyncRetry,
+  removeRoleSyncRetry,
+  processPendingRoleSyncQueue,
+  MAX_ROLE_SYNC_RETRIES,
+  ROLE_SYNC_RETRY_INTERVAL_MS,
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1597,11 +1607,39 @@ export const client = new Client({
   partials: [Partials.GuildMember, Partials.User, Partials.Channel, Partials.Message],
 });
 
+let roleSyncInterval = null;
+
+export function startRoleSyncScheduler(targetClient = client) {
+  if (roleSyncInterval) return;
+  roleSyncInterval = setInterval(async () => {
+    try {
+      const officialGuildId = getOfficialGuildId();
+      if (!officialGuildId || !targetClient?.guilds) return;
+      const guild = targetClient.guilds.cache?.get(officialGuildId) ||
+        await targetClient.guilds.fetch?.(officialGuildId).catch(() => null);
+      if (guild) {
+        await processPendingRoleSyncQueue(guild);
+      }
+    } catch (schedErr) {
+      console.warn('[Discord Bot] ⚠️ Error in role sync retry scheduler:', schedErr.message);
+    }
+  }, 30000);
+  if (roleSyncInterval.unref) roleSyncInterval.unref();
+}
+
+export function stopRoleSyncScheduler() {
+  if (roleSyncInterval) {
+    clearInterval(roleSyncInterval);
+    roleSyncInterval = null;
+  }
+}
+
 // Bot ready event listener
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`[Discord Bot] 🚀 Logged in as ${readyClient.user.tag} (ID: ${readyClient.user.id})`);
   console.log(`[Discord Bot] 🎮 MatchDistrict Bot is active across ${readyClient.guilds.cache.size} server(s).`);
   console.log(`[Discord Bot] ⚡ Command prefix: "${PREFIX}"`);
+  startRoleSyncScheduler(readyClient);
 });
 
 // Handle prefix commands and message create logging
@@ -1743,10 +1781,23 @@ client.on(Events.GuildBanRemove, async (ban) => {
 
 // Member join listener
 client.on(Events.GuildMemberAdd, async (member) => {
-  await handleGuildMemberAdd(member);
-  if (isOfficialGuild(member.guild)) {
-    await syncMemberTournamentRoles(member).catch(() => {});
-    await syncMemberTournamentAccess(member).catch(() => {});
+  try {
+    await handleGuildMemberAdd(member);
+  } catch (welcErr) {
+    console.warn(`[Discord Bot] ⚠️ Error in welcome handler for member ${member?.id}:`, welcErr.message);
+  }
+
+  try {
+    if (member?.guild && isOfficialGuild(member.guild)) {
+      await syncMemberTournamentRoles(member).catch((roleErr) => {
+        console.warn(`[Discord Bot] ⚠️ Error syncing roles on join for member ${member?.id}:`, roleErr.message);
+      });
+      await syncMemberTournamentAccess(member).catch((accessErr) => {
+        console.warn(`[Discord Bot] ⚠️ Error syncing access on join for member ${member?.id}:`, accessErr.message);
+      });
+    }
+  } catch (tourErr) {
+    console.warn(`[Discord Bot] ⚠️ Error in tournament join handler for member ${member?.id}:`, tourErr.message);
   }
 });
 
@@ -1797,6 +1848,7 @@ export async function gracefulShutdown(signal) {
   isShuttingDown = true;
   console.log(`\n[Discord Bot] Received ${signal}. Shutting down bot gracefully...`);
   try {
+    stopRoleSyncScheduler();
     if (healthServer) {
       healthServer.close();
     }

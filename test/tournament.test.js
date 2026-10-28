@@ -43,6 +43,11 @@ import {
   syncMemberTournamentRoles,
   reconcileAllTournamentRoles,
   handleSyncRolesCommand,
+  enqueueRoleSyncRetry,
+  removeRoleSyncRetry,
+  processPendingRoleSyncQueue,
+  MAX_ROLE_SYNC_RETRIES,
+  ROLE_SYNC_RETRY_INTERVAL_MS,
 } from '../tournamentService.js';
 import {
   guildSettingsCache,
@@ -93,12 +98,16 @@ function createMockGuild(id = 'official-guild-12345', name = 'MatchDistrict Offi
       user: { id: memberId, tag: `User${memberId}#0001` },
       roles: {
         cache: memberRoles,
-        add: async (roleId) => {
+        addCalls: [],
+        removeCalls: [],
+        add: async (roleId, reason) => {
+          newMember.roles.addCalls.push({ roleId, reason });
           const r = rolesMap.get(roleId) || { id: roleId, name: roleId };
           memberRoles.set(roleId, r);
           return newMember;
         },
-        remove: async (roleId) => {
+        remove: async (roleId, reason) => {
+          newMember.roles.removeCalls.push({ roleId, reason });
           memberRoles.delete(roleId);
           return newMember;
         },
@@ -121,6 +130,10 @@ function createMockGuild(id = 'official-guild-12345', name = 'MatchDistrict Offi
           id: newRoleId,
           name: data.name,
           mentionable: Boolean(data.mentionable),
+          permissions: {
+            has: (perm) => false,
+          },
+          setPermissions: async (perms) => {},
           members: {
             get size() {
               let count = 0;
@@ -1965,5 +1978,431 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     // Verify stored roleId is cleared
     assert.equal(saved.roleId, null);
     assert.equal(saved.roleName, null);
+  });
+
+  // --- Automated Join Scenarios 1 through 9 ---
+
+  test('Scenario 1: A newly joined member who is registered for a tournament receives the correct role automatically upon joining', async () => {
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        discord_id: '100000000000000001',
+        user_id: 'usr-registered-1',
+        eligible_tournaments: [
+          { id: 'tour-single-reg', title: 'Single Reg Cup' },
+        ],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const botMember = guild.members.me;
+
+      // Setup tournament
+      await syncTournamentDiscordChannels(guild, { id: 'tour-single-reg', title: 'Single Reg Cup' }, [], botMember);
+      const saved = guildSettingsCache[guild.id]?.tournaments?.['tour-single-reg'];
+      assert.ok(saved.roleId);
+
+      // Member joins
+      const member = guild.members.getOrCreate('100000000000000001');
+      member.guild = guild;
+
+      const result = await syncMemberTournamentRoles(member);
+      assert.equal(result.success, true);
+      assert.equal(result.assignedCount, 1);
+      assert.ok(member.roles.cache.has(saved.roleId));
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Scenario 2: A newly joined member registered for multiple tournaments receives all applicable tournament roles in a single join event', async () => {
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        discord_id: '200000000000000002',
+        user_id: 'usr-multi-reg-2',
+        eligible_tournaments: [
+          { id: 'tour-multi-1', title: 'Grand Tourney 1' },
+          { id: 'tour-multi-2', title: 'Grand Tourney 2' },
+          { id: 'tour-multi-3', title: 'Grand Tourney 3' },
+        ],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const botMember = guild.members.me;
+
+      // Setup 3 tournaments
+      await syncTournamentDiscordChannels(guild, { id: 'tour-multi-1', title: 'Grand Tourney 1' }, [], botMember);
+      await syncTournamentDiscordChannels(guild, { id: 'tour-multi-2', title: 'Grand Tourney 2' }, [], botMember);
+      await syncTournamentDiscordChannels(guild, { id: 'tour-multi-3', title: 'Grand Tourney 3' }, [], botMember);
+
+      const saved1 = guildSettingsCache[guild.id]?.tournaments?.['tour-multi-1'];
+      const saved2 = guildSettingsCache[guild.id]?.tournaments?.['tour-multi-2'];
+      const saved3 = guildSettingsCache[guild.id]?.tournaments?.['tour-multi-3'];
+
+      const member = guild.members.getOrCreate('200000000000000002');
+      member.guild = guild;
+
+      const result = await syncMemberTournamentRoles(member);
+      assert.equal(result.success, true);
+      assert.equal(result.assignedCount, 3);
+      assert.ok(member.roles.cache.has(saved1.roleId));
+      assert.ok(member.roles.cache.has(saved2.roleId));
+      assert.ok(member.roles.cache.has(saved3.roleId));
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Scenario 3: A newly joined member who is not registered receives no tournament roles', async () => {
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        discord_id: '300000000000000003',
+        user_id: 'usr-unregistered-3',
+        eligible_tournaments: [],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const botMember = guild.members.me;
+
+      await syncTournamentDiscordChannels(guild, { id: 'tour-existing', title: 'Existing Cup' }, [], botMember);
+
+      const member = guild.members.getOrCreate('300000000000000003');
+      member.guild = guild;
+
+      const result = await syncMemberTournamentRoles(member);
+      assert.equal(result.success, true);
+      assert.equal(result.assignedCount, 0);
+      assert.equal(member.roles.cache.size, 0);
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Scenario 4: A newly joined member whose Discord account is not linked receives no tournament roles', async () => {
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        discord_id: '400000000000000004',
+        user_id: null,
+        eligible_tournaments: [],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const botMember = guild.members.me;
+
+      await syncTournamentDiscordChannels(guild, { id: 'tour-unlinked', title: 'Unlinked Cup' }, [], botMember);
+
+      const member = guild.members.getOrCreate('400000000000000004');
+      member.guild = guild;
+
+      const result = await syncMemberTournamentRoles(member);
+      assert.equal(result.success, true);
+      assert.equal(result.assignedCount, 0);
+      assert.equal(member.roles.cache.size, 0);
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Scenario 5: A member who already has the tournament role does not trigger redundant API assignments or errors', async () => {
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        discord_id: '500000000000000005',
+        user_id: 'usr-idempotent-5',
+        eligible_tournaments: [
+          { id: 'tour-idempotent', title: 'Idempotent Championship' },
+        ],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const botMember = guild.members.me;
+
+      await syncTournamentDiscordChannels(guild, { id: 'tour-idempotent', title: 'Idempotent Championship' }, [], botMember);
+      const saved = guildSettingsCache[guild.id]?.tournaments?.['tour-idempotent'];
+
+      const member = guild.members.getOrCreate('500000000000000005');
+      member.guild = guild;
+
+      // First join/assignment
+      const result1 = await syncMemberTournamentRoles(member);
+      assert.equal(result1.success, true);
+      assert.equal(result1.assignedCount, 1);
+      assert.equal(member.roles.addCalls.length, 1);
+
+      // Second sync: already has role -> skip redundant API call
+      const result2 = await syncMemberTournamentRoles(member);
+      assert.equal(result2.success, true);
+      assert.equal(result2.assignedCount, 0);
+      assert.equal(result2.alreadyAssignedCount, 1);
+      assert.equal(member.roles.addCalls.length, 1); // add was not called again!
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Scenario 6: Temporary backend failures during the join event are handled gracefully and retried safely', async () => {
+    let failureCount = 0;
+    const mockServer = http.createServer((req, res) => {
+      if (failureCount < 1) {
+        failureCount++;
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'DATABASE_TIMEOUT' }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        discord_id: '600000000000000006',
+        user_id: 'usr-retry-6',
+        eligible_tournaments: [
+          { id: 'tour-retry-test', title: 'Retry Cup' },
+        ],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const botMember = guild.members.me;
+
+      await syncTournamentDiscordChannels(guild, { id: 'tour-retry-test', title: 'Retry Cup' }, [], botMember);
+      const saved = guildSettingsCache[guild.id]?.tournaments?.['tour-retry-test'];
+
+      const member = guild.members.getOrCreate('600000000000000006');
+      member.guild = guild;
+
+      // Join event when backend fails
+      const result1 = await syncMemberTournamentRoles(member);
+      assert.equal(result1.success, false);
+      assert.equal(result1.queuedForRetry, true);
+
+      // Verify member is in pendingRoleSync queue
+      const queueBefore = guildSettingsCache[guild.id]?.pendingRoleSync || [];
+      const queueItem = queueBefore.find((item) => item.discordId === '600000000000000006');
+      assert.ok(queueItem);
+      assert.equal(queueItem.attempts, 1);
+
+      // Advance retry timestamp so queue processor picks it up
+      queueItem.nextRetryTimestamp = Date.now() - 1000;
+
+      // Run retry processor
+      const retryResults = await processPendingRoleSyncQueue(guild);
+      assert.equal(retryResults.processed, 1);
+      assert.equal(retryResults.succeeded, 1);
+
+      // Role is now successfully assigned
+      assert.ok(member.roles.cache.has(saved.roleId));
+
+      // Member removed from retry queue
+      const queueAfter = guildSettingsCache[guild.id]?.pendingRoleSync || [];
+      assert.equal(queueAfter.some((item) => item.discordId === '600000000000000006'), false);
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Scenario 7: A user joining an unauthorized Discord server (different guild ID) is ignored and receives no tournament roles', async () => {
+    const unauthorizedGuild = createMockGuild('unauthorized-guild-99999');
+    const member = unauthorizedGuild.members.getOrCreate('700000000000000007');
+    member.guild = unauthorizedGuild;
+
+    const result = await syncMemberTournamentRoles(member);
+    assert.equal(result.success, false);
+    assert.equal(result.reason, 'unauthorized_guild');
+    assert.equal(member.roles.cache.size, 0);
+  });
+
+  test('Scenario 8: Event listener survives bot restarts and works consistently for subsequent joins', async () => {
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        discord_id: '800000000000000008',
+        user_id: 'usr-restart-8',
+        eligible_tournaments: [
+          { id: 'tour-restart-persisted', title: 'Restart Persisted Cup' },
+        ],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const botMember = guild.members.me;
+
+      // 1. Initial tournament setup before restart
+      await syncTournamentDiscordChannels(guild, { id: 'tour-restart-persisted', title: 'Restart Persisted Cup' }, [], botMember);
+      const initialRole = guildSettingsCache[guild.id]?.tournaments?.['tour-restart-persisted'];
+      const storedRoleId = initialRole.roleId;
+      assert.ok(storedRoleId);
+
+      // 2. Simulate bot restart by serializing & deserializing cache
+      const reloadedCache = JSON.parse(JSON.stringify(guildSettingsCache));
+      guildSettingsCache[guild.id] = reloadedCache[guild.id];
+
+      // 3. Subsequent member joins after restart
+      const member = guild.members.getOrCreate('800000000000000008');
+      member.guild = guild;
+
+      const result = await syncMemberTournamentRoles(member);
+      assert.equal(result.success, true);
+      assert.equal(result.assignedCount, 1);
+      // Ensures the reloaded role ID was reused without recreating another role
+      assert.ok(member.roles.cache.has(storedRoleId));
+      assert.equal(guildSettingsCache[guild.id].tournaments['tour-restart-persisted'].roleId, storedRoleId);
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Scenario 9: Existing tournament commands (.list tournament, .fetch teams, etc.) continue to function without regression', async () => {
+    const mockServer = http.createServer((req, res) => {
+      const url = new URL(req.url, 'http://localhost');
+      if (url.pathname === '/api/bot/tournaments') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: true,
+          tournaments: [
+            { id: 'tour-cmd-regres', title: 'Command Regression Cup', game: 'BGMI', status: 'published', registration_count: 5 },
+          ],
+        }));
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'NOT_FOUND' }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const guild = createMockGuild(OFFICIAL_GUILD_ID);
+      const adminMember = createMockMember({ isAdmin: true, guild });
+
+      let listOutput = null;
+      await handleListTournamentCommand(guild, adminMember, [], (payload) => {
+        listOutput = payload;
+      });
+
+      assert.ok(listOutput);
+      const text = typeof listOutput === 'string' ? listOutput : listOutput.content;
+      assert.match(text, /MatchDistrict Tournaments/);
+      assert.match(text, /Command Regression Cup/);
+      assert.ok(listOutput.components?.length > 0);
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
+  });
+
+  test('Role Security & Missing Role: Re-creates missing/deleted role with warning and respects bot hierarchy and permissions', async () => {
+    const guild = createMockGuild(OFFICIAL_GUILD_ID);
+    const tournament = { id: 'tour-sec-test', title: 'Security Cup' };
+
+    // 1. Create role initially
+    const role1 = await getOrCreateTournamentRole(guild, tournament);
+    assert.ok(role1);
+    const initialRoleId = role1.id;
+
+    // Simulate moderator deleting the role from server
+    await role1.delete();
+    assert.equal(guild.roles.cache.has(initialRoleId), false);
+
+    // 2. Safe recreation on missing role
+    const role2 = await getOrCreateTournamentRole(guild, tournament);
+    assert.ok(role2);
+    assert.notEqual(role2.id, initialRoleId);
+    assert.equal(role2.name, 'securitycup');
+
+    // 3. Permission failure handling: Bot lacks Manage Roles permission
+    const member = guild.members.getOrCreate('900000000000000009');
+    member.guild = guild;
+
+    // Temporarily disable ManageRoles permission on bot
+    guild.members.me.permissions.has = () => false;
+
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        discord_id: '900000000000000009',
+        user_id: 'usr-sec-9',
+        eligible_tournaments: [{ id: 'tour-sec-test', title: 'Security Cup' }],
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const resPerm = await syncMemberTournamentRoles(member);
+      assert.equal(resPerm.success, true);
+      assert.equal(resPerm.assignedCount, 0); // skipped safely due to missing bot permission
+      assert.equal(resPerm.skippedCount, 1);
+      assert.equal(member.roles.cache.has(role2.id), false);
+
+      // Restore permission but simulate lower hierarchy
+      guild.members.me.permissions.has = () => true;
+      guild.members.me.roles.highest.comparePositionTo = () => -1; // Lower hierarchy
+
+      const resHier = await syncMemberTournamentRoles(member);
+      assert.equal(resHier.success, true);
+      assert.equal(resHier.assignedCount, 0); // skipped safely due to hierarchy
+      assert.equal(resHier.skippedCount, 1);
+      assert.equal(member.roles.cache.has(role2.id), false);
+
+      // Restore normal hierarchy -> successfully assigns
+      guild.members.me.roles.highest.comparePositionTo = () => 1;
+      const resNormal = await syncMemberTournamentRoles(member);
+      assert.equal(resNormal.success, true);
+      assert.equal(resNormal.assignedCount, 1);
+      assert.ok(member.roles.cache.has(role2.id));
+    } finally {
+      await new Promise((resolve) => mockServer.close(resolve));
+    }
   });
 });
