@@ -801,6 +801,35 @@ export async function handleDashboardNavigationInteraction(interaction) {
     }
     return true;
   }
+  if (screen === 'round' && action === 'submit-results') {
+    await handleToggleRoundGroupMessages(interaction, tournamentId, idParts[3]);
+    return true;
+  }
+  if (screen === 'round' && action === 'announcement') {
+    const roundId = idParts[3];
+    const round = savedTournament.rounds?.[roundId];
+    if (!round) {
+      await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, `❌ Round \`${roundId}\` was not found.`);
+      return true;
+    }
+    const modal = new ModalBuilder()
+      .setCustomId(`dash:round:announcement-submit:${roundId}`)
+      .setTitle(`Announce to ${round.name}`)
+      .addComponents(new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('announcement_text')
+          .setLabel('Announcement message')
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setMaxLength(1800)
+      ));
+    await interaction.showModal(modal);
+    return true;
+  }
+  if (screen === 'round' && action === 'announcement-submit') {
+    await handleRoundAnnouncementSubmit(interaction, tournamentId, idParts[3]);
+    return true;
+  }
   if (screen === 'round' && action === 'back') {
     updateDashboardNavigation(interaction.guild, tournamentId, 'back');
     const prior = savedTournament.dashboardNavigationStack?.at(-1);
@@ -2470,26 +2499,23 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     }
   }
 
+  const voiceAllowedBits = [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.Connect,
+    PermissionFlagsBits.Speak,
+  ];
+  const voiceDeniedBits = [...new Set(Object.values(PermissionFlagsBits))]
+    .filter((permission) => !voiceAllowedBits.includes(permission));
+  const registeredVoiceOverwrites = tournamentRole
+    ? [{ id: tournamentRole.id, allow: voiceAllowedBits, deny: voiceDeniedBits }]
+    : Array.from(currentEligibleMemberIds, (memberId) => ({
+      id: memberId,
+      allow: voiceAllowedBits,
+      deny: voiceDeniedBits,
+    }));
   const voiceOverwrites = [
-    {
-      id: guild.roles.everyone.id,
-      deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect],
-    },
-    ...(tournamentRole ? [{
-      id: tournamentRole.id,
-      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak],
-    }] : []),
-    {
-      id: botMember.id,
-      allow: [
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.ManageChannels,
-        PermissionFlagsBits.Connect,
-        PermissionFlagsBits.MuteMembers,
-        PermissionFlagsBits.DeafenMembers,
-        PermissionFlagsBits.MoveMembers,
-      ],
-    },
+    { id: guild.roles.everyone.id, deny: [...new Set(Object.values(PermissionFlagsBits))] },
+    ...registeredVoiceOverwrites,
   ];
 
   if (voiceChannelInstance) {
@@ -2786,7 +2812,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
           if (grpChannel) {
             group.channelId = grpChannel.id;
             group.channelName = grpChannel.name;
-            await applyStrictGroupChannelPermissions(guild, grpChannel, grpRole, tournamentRole, botMember);
+            await applyStrictGroupChannelPermissions(guild, grpChannel, grpRole, tournamentRole, botMember, round.groupMessagesOpen);
             await removeGroupResultControlMessage(guild, group, grpChannel);
             await updateGroupSlotListMessage(guild, tournament, round, group, grpChannel);
           }
@@ -3981,12 +4007,114 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
       .setStyle(ButtonStyle.Secondary)
   );
 
+  const groupMessagesOpen = round.groupMessagesOpen === true;
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`dash:round:submit-results:${round.roundId}`)
+      .setLabel(`Submit Results: ${groupMessagesOpen ? 'ON' : 'OFF'}`)
+      .setEmoji(groupMessagesOpen ? '🟢' : '🔴')
+      .setStyle(groupMessagesOpen ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`dash:round:announcement:${round.roundId}`)
+      .setLabel('Announcement Message')
+      .setEmoji('📢')
+      .setStyle(ButtonStyle.Primary)
+  );
+
   if (interaction.deferred) {
-    await interaction.editReply({ content: notice, embeds: [embed], components: [row1, row2] }).catch(() => {});
+    await interaction.editReply({ content: notice, embeds: [embed], components: [row1, row2, row3] }).catch(() => {});
   } else if (typeof interaction.update === 'function') {
-    await interaction.update({ content: notice, embeds: [embed], components: [row1, row2] }).catch(() => {});
+    await interaction.update({ content: notice, embeds: [embed], components: [row1, row2, row3] }).catch(() => {});
   } else if (typeof interaction.reply === 'function') {
-    await interaction.reply({ embeds: [embed], components: [row1, row2], ephemeral: true }).catch(() => {});
+    await interaction.reply({ embeds: [embed], components: [row1, row2, row3], ephemeral: true }).catch(() => {});
+  }
+}
+
+async function handleToggleRoundGroupMessages(interaction, tournamentId, roundId) {
+  if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate().catch(() => {});
+  try {
+    const guild = interaction.guild;
+    const access = checkTournamentAccess(guild, interaction.member);
+    const savedTournament = guildSettingsCache[guild.id]?.tournaments?.[tournamentId];
+    const round = savedTournament?.rounds?.[roundId];
+    if (!access.allowed) throw new Error(access.reason);
+    if (!round) throw new Error(`Round \`${roundId}\` was not found.`);
+    if (!Array.isArray(round.groups) || round.groups.length === 0) throw new Error('No groups are allocated in this round.');
+
+    const wasOpen = round.groupMessagesOpen === true;
+    const shouldOpen = !wasOpen;
+    const changedGroups = [];
+    try {
+      for (const group of round.groups) {
+        if (!group.roleId || !group.channelId) throw new Error(`Group ${group.groupNumber} is missing its role or channel.`);
+        const channel = guild.channels.cache.get(group.channelId) || await guild.channels.fetch(group.channelId).catch(() => null);
+        if (!channel?.permissionOverwrites?.edit) throw new Error(`The channel for Group ${group.groupNumber} could not be found.`);
+        await channel.permissionOverwrites.edit(group.roleId, { SendMessages: shouldOpen });
+        changedGroups.push({ channel, roleId: group.roleId });
+      }
+    } catch (error) {
+      await Promise.allSettled(changedGroups.map(({ channel, roleId }) => channel.permissionOverwrites.edit(roleId, { SendMessages: wasOpen })));
+      throw error;
+    }
+
+    round.groupMessagesOpen = shouldOpen;
+    guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
+    saveGuildSettings(guildSettingsCache);
+    try {
+      await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+    } catch (error) {
+      round.groupMessagesOpen = wasOpen;
+      saveGuildSettings(guildSettingsCache);
+      await Promise.allSettled(changedGroups.map(({ channel, roleId }) => channel.permissionOverwrites.edit(roleId, { SendMessages: wasOpen })));
+      throw error;
+    }
+    await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, `✅ Group messaging is now **${shouldOpen ? 'ON' : 'OFF'}** for this round.`);
+  } catch (error) {
+    console.error(`[Discord Bot] Failed to toggle group messaging for ${tournamentId}/${roundId}:`, error);
+    await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, `❌ Could not update Submit Results: ${error.message}`);
+  }
+}
+
+async function handleRoundAnnouncementSubmit(interaction, tournamentId, roundId) {
+  if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate().catch(() => {});
+  try {
+    const guild = interaction.guild;
+    const access = checkTournamentAccess(guild, interaction.member);
+    if (!access.allowed) throw new Error(access.reason);
+    const savedTournament = guildSettingsCache[guild.id]?.tournaments?.[tournamentId];
+    const round = savedTournament?.rounds?.[roundId];
+    if (!round) throw new Error(`Round \`${roundId}\` was not found.`);
+    if (!Array.isArray(round.groups) || round.groups.length === 0) throw new Error('No groups are allocated in this round.');
+    const announcement = interaction.fields?.getTextInputValue('announcement_text')?.trim();
+    if (!announcement) throw new Error('Announcement text cannot be empty.');
+
+    const failures = [];
+    for (const group of round.groups) {
+      if (!group.channelId || !group.roleId) {
+        failures.push(`Group ${group.groupNumber} is missing its channel or role.`);
+        continue;
+      }
+      const channel = guild.channels.cache.get(group.channelId) || await guild.channels.fetch(group.channelId).catch(() => null);
+      if (!channel?.send) {
+        failures.push(`The channel for Group ${group.groupNumber} could not be found.`);
+        continue;
+      }
+      try {
+        await channel.send({
+          content: `${announcement}\n\n<@&${group.roleId}>`,
+          allowedMentions: { parse: [], roles: [group.roleId] },
+        });
+      } catch (error) {
+        failures.push(`Group ${group.groupNumber}: ${error.message}`);
+      }
+    }
+    const notice = failures.length
+      ? `⚠️ Announcement sent with errors: ${failures.join(' • ')}`
+      : `✅ Announcement sent to all ${round.groups.length} group channels.`;
+    await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, notice);
+  } catch (error) {
+    console.error(`[Discord Bot] Failed to send round announcement for ${tournamentId}/${roundId}:`, error);
+    await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, `❌ Could not send announcement: ${error.message}`);
   }
 }
 
@@ -5150,7 +5278,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
         groups.push(groupObj);
 
         if (groupChannel) {
-          await applyStrictGroupChannelPermissions(guild, groupChannel, groupRole, tourRole, botMember);
+          await applyStrictGroupChannelPermissions(guild, groupChannel, groupRole, tourRole, botMember, round.groupMessagesOpen);
           await removeGroupResultControlMessage(guild, groupObj, groupChannel);
           await updateGroupSlotListMessage(guild, tournament, round, groupObj, groupChannel);
         }
@@ -5448,7 +5576,7 @@ export const pendingResultSubmissions = new Map();
  * - Mention everyone/here
  * Also audits and purges any unauthorized active or archived threads under the channel.
  */
-export async function applyStrictGroupChannelPermissions(guild, groupChannel, groupRole, tourRole, botMember) {
+export async function applyStrictGroupChannelPermissions(guild, groupChannel, groupRole, tourRole, botMember, groupMessagesOpen = false) {
   if (!groupChannel || typeof groupChannel.permissionOverwrites?.set !== 'function') return;
 
   const overwrites = [
@@ -5475,9 +5603,10 @@ export async function applyStrictGroupChannelPermissions(guild, groupChannel, gr
       allow: [
         PermissionFlagsBits.ViewChannel,
         PermissionFlagsBits.ReadMessageHistory,
+        ...(groupMessagesOpen ? [PermissionFlagsBits.SendMessages] : []),
       ],
       deny: [
-        PermissionFlagsBits.SendMessages,
+        ...(!groupMessagesOpen ? [PermissionFlagsBits.SendMessages] : []),
         PermissionFlagsBits.SendMessagesInThreads,
         PermissionFlagsBits.CreatePublicThreads,
         PermissionFlagsBits.CreatePrivateThreads,
@@ -5595,15 +5724,12 @@ export async function removeGroupResultControlMessage(guild, group, channel) {
 export async function updateGroupSlotListMessage(guild, tournament, round, group, channel) {
   if (!channel || typeof channel.send !== 'function') return null;
 
-  const roleMention = group.roleId ? `<@&${group.roleId}>` : `@${group.roleName}`;
-
-  // Credential info
-  let credentialsText = '🔒 **Match ID & Password:** *Not published yet. Room details will appear here once published by tournament officials.*';
-  if (group.credentials?.roomId && group.credentials?.password) {
-    credentialsText = `🎮 **Room ID / Name:** \`${group.credentials.roomId}\`\n` +
-      `🔑 **Password:** \`${group.credentials.password}\`\n` +
-      `⏰ **Published:** <t:${Math.floor(new Date(group.credentials.publishedAt || Date.now()).getTime() / 1000)}:R>`;
-  }
+  const credentials = group.credentials || {};
+  const credentialParts = [
+    ['room', `🎮 **Room ID / Name:** ${credentials.roomId ? `\`${credentials.roomId}\`` : '*Not published yet*'}`],
+    ['password', `🔑 **Password:** ${credentials.password ? `\`${credentials.password}\`` : '*Not published yet*'}`],
+    ['published', `⏰ **Published:** ${credentials.publishedAt ? `<t:${Math.floor(new Date(credentials.publishedAt).getTime() / 1000)}:f>` : '*Not published yet*'}`],
+  ];
 
   // Display only locked and filled slots in the agreed format.
   let slotsText = '';
@@ -5615,23 +5741,16 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
     else if (slotData?.status === 'OCCUPIED' && slotData.teamName) slotsText += `Slot ${slotNum} → ${slotData.teamName}\n`;
   }
 
-  const embed = new EmbedBuilder()
-    .setTitle(`📋 ${tournament.title || tournament.id} — ${round.name} (Group ${group.groupNumber})`)
-    .setColor(0x3b82f6)
-    .setDescription(
-      `Official Slot Allocation & Match Hub for **${round.name} — Group ${group.groupNumber}** (${roleMention})\n\n` +
-      `📢 **Instructions:** Be in the lobby at least 10 minutes prior to match start. Ensure you occupy your assigned slot number.\n\n` +
-      `────────────────────────────────────────\n` +
-      `### 🔑 Match Credentials\n${credentialsText}\n` +
-      `────────────────────────────────────────\n` +
-      `### ⚔️ Group Slot Assignments\n${slotsText.trim()}`
-    )
-    .setFooter({ text: `${tournament.title || 'MatchDistrict'} • Group ${group.groupNumber}` })
-    .setTimestamp();
-
   const logicalKey = `guild:${guild.id}:tournament:${tournament.id}:round:${round.roundId}:group:${group.groupId}:slot_list`;
 
   try {
+    await deleteManagedMessages(guild.client, {
+      guildId: guild.id,
+      tournamentId: tournament.id,
+      roundId: round.roundId,
+      groupId: group.groupId,
+      logicalKey: `${logicalKey}:credentials`,
+    }).catch(() => {});
     const result = await upsertManagedMessage(guild.client, {
       guildId: guild.id,
       channelId: channel.id,
@@ -5640,9 +5759,31 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
       tournamentId: tournament.id,
       roundId: round.roundId,
       groupId: group.groupId,
-      payload: { embeds: [embed], components: [] },
+      payload: { content: slotsText.trim() || 'No occupied slots.', embeds: [], components: [] },
     });
     group.slotListMessageId = result.messageId;
+    const credentialMessageIds = [];
+    for (const [part, content] of credentialParts) {
+      const credentialResult = await upsertManagedMessage(guild.client, {
+        guildId: guild.id,
+        channelId: channel.id,
+        logicalKey: `${logicalKey}:credential:${part}`,
+        messageType: 'group_match_credential_part',
+        tournamentId: tournament.id,
+        roundId: round.roundId,
+        groupId: group.groupId,
+        payload: { content, components: [] },
+      });
+      credentialMessageIds.push(credentialResult.messageId);
+    }
+    group.credentialMessageIds = credentialMessageIds;
+    group.credentialsMessageId = credentialMessageIds[0] || null;
+    const oldCredentialMessages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+    for (const message of oldCredentialMessages?.values?.() || []) {
+      if ((message.author.id === guild.client.user?.id || message.author.bot) && message.embeds?.some((embed) => embed.title?.includes('Match Credentials'))) {
+        await message.delete().catch(() => {});
+      }
+    }
     return result.messageId;
   } catch (err) {
     console.warn('[Discord Bot] ⚠️ Error in upsertManagedMessage for group slot list:', err.message);
@@ -5651,12 +5792,31 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
       msg = await channel.messages.fetch(group.slotListMessageId).catch(() => null);
     }
     if (msg && typeof msg.edit === 'function') {
-      await msg.edit({ embeds: [embed], components: [] }).catch(() => {});
+      await msg.edit({ content: slotsText.trim() || 'No occupied slots.', embeds: [], components: [] }).catch(() => {});
       group.slotListMessageId = msg.id;
     } else {
-      const newMsg = await channel.send({ embeds: [embed], components: [] }).catch(() => null);
+      const newMsg = await channel.send({ content: slotsText.trim() || 'No occupied slots.', components: [] }).catch(() => null);
       if (newMsg) group.slotListMessageId = newMsg.id;
     }
+    const credentialMessageIds = [];
+    for (const [part, content] of credentialParts) {
+      await upsertManagedMessage(guild.client, {
+        guildId: guild.id,
+        channelId: channel.id,
+        logicalKey: `${logicalKey}:credential:${part}`,
+        messageType: 'group_match_credential_part',
+        tournamentId: tournament.id,
+        roundId: round.roundId,
+        groupId: group.groupId,
+        payload: { content, components: [] },
+      }).then((result) => {
+        credentialMessageIds.push(result.messageId);
+      }).catch((credentialError) => {
+        console.warn('[Discord Bot] Could not update separate group credential message:', credentialError.message);
+      });
+    }
+    group.credentialMessageIds = credentialMessageIds;
+    group.credentialsMessageId = credentialMessageIds[0] || null;
     return group.slotListMessageId;
   }
 }
@@ -7487,49 +7647,6 @@ export async function publishGroupCredentials(guild, tournamentId, roundId, grou
     return { success: false, reason: `Private channel for Group ${group.groupNumber} not found.` };
   }
 
-  const embed = new EmbedBuilder()
-    .setTitle(`🔑 Match Credentials — ${targetRound.name} (Group ${group.groupNumber})`)
-    .setColor(0x3b82f6)
-    .setDescription(`Official Room Details for **${targetRound.name} — Group ${group.groupNumber}**\n*Only members of this group and administrators can view this channel.*`)
-    .addFields(
-      { name: '🎮 Room ID / Name', value: `\`${roomId}\``, inline: true },
-      { name: '🔒 Password', value: `\`${password}\``, inline: true },
-      { name: '⏰ Published At', value: `<t:${Math.floor(Date.now() / 1000)}:f>`, inline: false }
-    )
-    .setFooter({ text: `${savedTournament.tournamentTitle || 'MatchDistrict'} • Do NOT share credentials outside your squad!` })
-    .setTimestamp();
-
-  let credMsg = null;
-  if (group.credentialsMessageId && typeof channel.messages?.fetch === 'function') {
-    try {
-      credMsg = await channel.messages.fetch(group.credentialsMessageId).catch(() => null);
-    } catch {
-      credMsg = null;
-    }
-  }
-
-  // Duplicate prevention: search channel for existing bot credentials message
-  if (!credMsg && typeof channel.messages?.fetch === 'function') {
-    try {
-      const recentMsgs = await channel.messages.fetch({ limit: 50 }).catch(() => null);
-      if (recentMsgs && recentMsgs.size > 0) {
-        credMsg = Array.from(recentMsgs.values()).find(
-          (m) =>
-            (m.author.id === guild.client.user?.id || m.author.bot) &&
-            m.embeds?.some((e) => e.title?.includes('Match Credentials'))
-        ) || null;
-      }
-    } catch {}
-  }
-
-  if (credMsg && typeof credMsg.edit === 'function') {
-    await credMsg.edit({ embeds: [embed] });
-    group.credentialsMessageId = credMsg.id;
-  } else {
-    const newMsg = await channel.send({ embeds: [embed] });
-    group.credentialsMessageId = newMsg.id;
-  }
-
   group.credentials = {
     roomId,
     password,
@@ -7539,7 +7656,7 @@ export async function publishGroupCredentials(guild, tournamentId, roundId, grou
   // Ensure strict read-only permissions and update slot list with credentials
   const groupRole = group.roleId ? (guild.roles.cache.get(group.roleId) || await guild.roles.fetch(group.roleId).catch(() => null)) : null;
   const tourRole = savedTournament.roleId ? (guild.roles.cache.get(savedTournament.roleId) || await guild.roles.fetch(savedTournament.roleId).catch(() => null)) : null;
-  await applyStrictGroupChannelPermissions(guild, channel, groupRole, tourRole, guild.members.me);
+  await applyStrictGroupChannelPermissions(guild, channel, groupRole, tourRole, guild.members.me, targetRound.groupMessagesOpen);
   await removeGroupResultControlMessage(guild, group, channel);
   await updateGroupSlotListMessage(guild, savedTournament, targetRound, group, channel);
 

@@ -2404,18 +2404,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   let dashboardContext = null;
   try {
-    if (interaction.isButton?.() && interaction.guild && interaction.channelId) {
+    const roundAnnouncementModal = interaction.isModalSubmit?.() && interaction.customId?.startsWith('dash:round:announcement-submit:');
+    if ((interaction.isButton?.() || roundAnnouncementModal) && interaction.guild && interaction.channelId) {
       const savedTournaments = guildSettingsCache[interaction.guild.id]?.tournaments || {};
       const match = Object.entries(savedTournaments).find(([, saved]) => saved?.channels?.botCommandsId === interaction.channelId);
       if (match) {
         dashboardContext = { tournamentId: match[0], savedTournament: match[1] };
-        const isCanonicalDashboard = interaction.message?.id === match[1]?.controlPanelMessageId;
-        const opensModal = isCanonicalDashboard && (
+        const isButtonInteraction = interaction.isButton?.();
+        const isCanonicalDashboard = !isButtonInteraction || interaction.message?.id === match[1]?.controlPanelMessageId;
+        const opensModal = isButtonInteraction && isCanonicalDashboard && (
           interaction.customId?.startsWith('md_tour_create_round:') ||
-          interaction.customId?.startsWith('md_round_edit:')
+          interaction.customId?.startsWith('md_round_edit:') ||
+          interaction.customId?.startsWith('dash:round:announcement:')
         );
-        if (!opensModal && !interaction.deferred && !interaction.replied) await interaction.deferUpdate();
-        if (!isCanonicalDashboard) {
+        if (isButtonInteraction && !opensModal && !interaction.deferred && !interaction.replied) await interaction.deferUpdate();
+        if (isButtonInteraction && !isCanonicalDashboard) {
           const backendData = await fetchTournamentRegistrationsFromBackend(match[0]);
           await setupTournamentControlPanel(interaction.guild, backendData.tournament, backendData.summary, interaction.guild.members.me);
           return;
@@ -2430,6 +2433,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleTournamentSelectionButton(interaction);
         return;
       }
+      const handled = await handleDashboardNavigationInteraction(interaction);
+      if (handled) return;
+    }
+    if (roundAnnouncementModal) {
       const handled = await handleDashboardNavigationInteraction(interaction);
       if (handled) return;
     }
@@ -2487,6 +2494,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     console.warn('[Discord Bot] ⚠️ Error in InteractionCreate handler:', error.message);
     try {
       if (dashboardContext && interaction.guild) {
+        if (!interaction.deferred && !interaction.replied) {
+          await interaction.reply({ content: `❌ **Dashboard interaction failed:** ${error.message}`, ephemeral: true }).catch(() => {});
+        }
         const backendData = await fetchTournamentRegistrationsFromBackend(dashboardContext.tournamentId);
         await setupTournamentControlPanel(interaction.guild, backendData.tournament, backendData.summary, interaction.guild.members.me);
         return;
