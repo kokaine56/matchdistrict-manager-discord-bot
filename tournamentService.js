@@ -5733,7 +5733,7 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
     if (s <= 2) slotsText += `Slot ${slotNum} → 🔒 LOCKED\n`;
     else if (slotData?.status === 'OCCUPIED' && slotData.teamName) slotsText += `Slot ${slotNum} → ${slotData.teamName}\n`;
   }
-  const slotListContent = `\`\`\`text\n${slotsText.trim()}\n\`\`\``;
+  const slotListContent = `\`\`\`\n${slotsText.trim()}\n\`\`\``;
 
   const logicalKey = `guild:${guild.id}:tournament:${tournament.id}:round:${round.roundId}:group:${group.groupId}:slot_list`;
 
