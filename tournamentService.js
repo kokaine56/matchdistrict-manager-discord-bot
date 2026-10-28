@@ -3803,7 +3803,9 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     // 1. Authorization & Official Server check (for administrative actions)
     const access = checkTournamentAccess(guild, member);
     if (!access.allowed) {
-      if (typeof interaction.reply === 'function') {
+      if ((interaction.deferred || interaction.replied) && typeof interaction.editReply === 'function') {
+        await interaction.editReply({ content: access.reason, components: [] }).catch(() => {});
+      } else if (typeof interaction.reply === 'function') {
         await interaction.reply({ content: access.reason, ephemeral: true }).catch(() => { });
       }
       return;
@@ -3828,7 +3830,9 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
     if (process.env.MONGODB_URI && !isMongoConnected() && stateModifyingActions.some((a) => action.includes(a) || actionPart.includes(a))) {
       const dbErr = '⚠️ **Database Unavailable:** MongoDB persistence is currently disconnected. State-changing operations requiring persistence are disabled. Please verify database connectivity or contact an administrator.';
-      if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
+      if ((interaction.deferred || interaction.replied) && typeof interaction.editReply === 'function') {
+        await interaction.editReply({ content: dbErr, components: [] }).catch(() => {});
+      } else if (typeof interaction.reply === 'function') {
         await interaction.reply({ content: dbErr, ephemeral: true }).catch(() => {});
       } else if (typeof interaction.followUp === 'function') {
         await interaction.followUp({ content: dbErr, ephemeral: true }).catch(() => {});
@@ -3841,7 +3845,9 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     if (currentTourSaved && (currentTourSaved.deletionStatus === 'deletion_pending' || currentTourSaved.deletionStatus === 'deleting')) {
       if (action !== 'cancel_delete_permanent' && action !== 'confirm_delete_permanent') {
         const delMsg = '⚠️ **Action Blocked:** This tournament is currently undergoing permanent deletion.';
-        if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
+        if ((interaction.deferred || interaction.replied) && typeof interaction.editReply === 'function') {
+          await interaction.editReply({ content: delMsg, components: [] }).catch(() => {});
+        } else if (typeof interaction.reply === 'function') {
           await interaction.reply({ content: delMsg, ephemeral: true }).catch(() => {});
         } else if (typeof interaction.followUp === 'function') {
           await interaction.followUp({ content: delMsg, ephemeral: true }).catch(() => {});
@@ -4021,8 +4027,8 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
     // Action: Create Channels
     if (action === 'create_channels') {
-      if (typeof interaction.deferReply === 'function') {
-        await interaction.deferReply({ ephemeral: true }).catch(() => { });
+      if (typeof interaction.deferReply === 'function' && !interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
       }
 
       try {
@@ -4056,8 +4062,8 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
     // Action: Sync & Refresh (combines registration/channel sync + role sync + statistics refresh)
     if (action === 'sync_refresh' || action === 'refresh' || action === 'sync_roles') {
-      if (typeof interaction.deferReply === 'function') {
-        await interaction.deferReply({ ephemeral: true }).catch(() => { });
+      if (typeof interaction.deferReply === 'function' && !interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
       }
 
       try {
@@ -4207,7 +4213,9 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
       if (!saved || (saved.setupStatus === 'pending_channels' && !saved.categoryId && Object.values(saved.channels || {}).every(c => !c))) {
         const msg = '⚠️ **Notice:** This tournament has no active Discord channels or they were already deleted.';
-        if (typeof interaction.update === 'function') {
+        if (typeof interaction.editReply === 'function' && (interaction.deferred || interaction.replied)) {
+          await interaction.editReply({ content: msg, components: [] });
+        } else if (typeof interaction.update === 'function') {
           await interaction.update({ content: msg, components: [] });
         } else if (typeof interaction.reply === 'function') {
           await interaction.reply({ content: msg, ephemeral: true });
@@ -4258,7 +4266,12 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
     // Action: Cancel Delete Tournament (Permanent)
     if (action === 'cancel_delete_permanent') {
-      if (typeof interaction.update === 'function') {
+      if (typeof interaction.editReply === 'function' && (interaction.deferred || interaction.replied)) {
+        await interaction.editReply({
+          content: 'ℹ️ **Permanent Deletion Cancelled:** Tournament and all associated channels remain intact.',
+          components: [],
+        });
+      } else if (typeof interaction.update === 'function') {
         await interaction.update({
           content: 'ℹ️ **Permanent Deletion Cancelled:** Tournament and all associated channels remain intact.',
           components: [],
@@ -8729,7 +8742,9 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
     const member = interaction.member;
     const access = checkTournamentAccess(guild, member);
     if (!access.allowed) {
-      if (typeof interaction.reply === 'function') {
+      if ((interaction.deferred || interaction.replied) && typeof interaction.editReply === 'function') {
+        await interaction.editReply({ content: access.reason, components: [] }).catch(() => {});
+      } else if (typeof interaction.reply === 'function') {
         await interaction.reply({ content: access.reason, ephemeral: true }).catch(() => {});
       }
       return;

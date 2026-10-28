@@ -112,6 +112,7 @@ import {
   deleteManagedMessages,
   saveGuildSettingsToDb,
   saveTournamentToDb,
+  findTournamentByBotCommandsChannel,
   getGuildSettingsFromDb,
   loadAllGuildSettingsFromDb,
   loadAllTournamentsFromDb,
@@ -2410,36 +2411,47 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     const roundAnnouncementModal = interaction.isModalSubmit?.() && interaction.customId?.startsWith('dash:round:announcement-submit:');
     const isUserSelectInteraction = interaction.isUserSelectMenu?.() === true;
+    const interactionCustomId = String(interaction.customId || '');
+    const isDashboardComponent = (interaction.isButton?.() || isUserSelectInteraction) && interactionCustomId.startsWith('dash:');
+    const opensDashboardModal = interaction.isButton?.() && (
+      interactionCustomId.startsWith('md_tour_create_round:') ||
+      interactionCustomId.startsWith('md_round_edit:') ||
+      interactionCustomId.startsWith('dash:round:announcement:')
+    );
+
+    // Acknowledge before any Mongo lookup or dashboard recovery work. Main actions
+    // are delegated to established handlers that use editReply, so acknowledge them
+    // as an ephemeral reply. Navigation/select actions edit the dashboard message.
+    if (isDashboardComponent && !opensDashboardModal && !interaction.deferred && !interaction.replied) {
+      if (interactionCustomId.startsWith('dash:main:')) await interaction.deferReply({ ephemeral: true });
+      else await interaction.deferUpdate();
+    }
     if ((interaction.isButton?.() || isUserSelectInteraction || roundAnnouncementModal) && interaction.guild && interaction.channelId) {
-      const savedTournaments = guildSettingsCache[interaction.guild.id]?.tournaments || {};
-      const match = Object.entries(savedTournaments).find(([, saved]) => saved?.channels?.botCommandsId === interaction.channelId);
+      const guildId = interaction.guild.id;
+      const savedTournaments = guildSettingsCache[guildId]?.tournaments || {};
+      let match = Object.entries(savedTournaments).find(([, saved]) => saved?.channels?.botCommandsId === interaction.channelId);
+      if (!match) {
+        // Mongo is authoritative for dashboard routing; hydrate by stored channel ID if the local cache is stale.
+        const persistedTournament = await findTournamentByBotCommandsChannel(guildId, interaction.channelId);
+        if (persistedTournament?.tournamentId) {
+          guildSettingsCache[guildId] ||= {};
+          guildSettingsCache[guildId].tournaments ||= {};
+          guildSettingsCache[guildId].tournaments[persistedTournament.tournamentId] = persistedTournament;
+          match = [persistedTournament.tournamentId, persistedTournament];
+        }
+      }
       if (match) {
         dashboardContext = { tournamentId: match[0], savedTournament: match[1] };
         const isButtonInteraction = interaction.isButton?.();
-        const isDashboardComponent = isButtonInteraction || isUserSelectInteraction;
         const isCanonicalDashboard = !isDashboardComponent || interaction.message?.id === match[1]?.controlPanelMessageId;
-        const opensModal = isButtonInteraction && isCanonicalDashboard && (
-          interaction.customId?.startsWith('md_tour_create_round:') ||
-          interaction.customId?.startsWith('md_round_edit:') ||
-          interaction.customId?.startsWith('dash:round:announcement:')
-        );
-        if (isDashboardComponent && !opensModal && !interaction.deferred && !interaction.replied) await interaction.deferUpdate();
-        const isManagementRoleFlow = String(interaction.customId || '').startsWith('dash:management-roles:') ||
-          String(interaction.customId || '').startsWith('dash:management-role-choice:') ||
-          String(interaction.customId || '').startsWith('dash:management-users:') ||
-          String(interaction.customId || '').startsWith('dash:management-confirm:') ||
-          String(interaction.customId || '').startsWith('dash:management-result:');
-        if (isDashboardComponent && !isCanonicalDashboard && isManagementRoleFlow && interaction.message?.id) {
-          // A recreated dashboard may be visible while Mongo still has the previous message ID.
-          // Adopt this clicked dashboard and execute the action in this interaction, so the first click is never wasted.
+        if (isDashboardComponent && !isCanonicalDashboard && interaction.message?.id && String(interaction.customId || '').startsWith('dash:')) {
+          // The channel is kept to one dashboard message. If Mongo's message ID is stale,
+          // adopt the clicked dashboard and route this same interaction instead of consuming a click on refresh.
           match[1].controlPanelMessageId = interaction.message.id;
           guildSettingsCache[interaction.guild.id].tournaments[match[0]] = match[1];
           saveGuildSettings(guildSettingsCache);
-          await saveTournamentToDb(interaction.guild.id, match[0], match[1]);
-        } else if (isDashboardComponent && !isCanonicalDashboard) {
-          const backendData = await fetchTournamentRegistrationsFromBackend(match[0]);
-          await setupTournamentControlPanel(interaction.guild, backendData.tournament, backendData.summary, interaction.guild.members.me);
-          return;
+          const saved = await saveTournamentToDb(interaction.guild.id, match[0], match[1]);
+          if (!saved) console.warn(`[Discord Bot] Could not persist the recovered dashboard message ID for ${match[0]}.`);
         }
       }
     }
@@ -2500,21 +2512,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleTournamentSelectMenuInteraction(interaction);
       return;
     }
-    if (interaction.isButton() && dashboardContext) {
-      // Unknown or stale dashboard buttons recover to the canonical Home screen.
+    if ((interaction.isButton() || isUserSelectInteraction) && dashboardContext) {
+      // Unknown or stale dashboard controls recover to the canonical Home screen.
       const backendData = await fetchTournamentRegistrationsFromBackend(dashboardContext.tournamentId);
       await setupTournamentControlPanel(interaction.guild, backendData.tournament, backendData.summary, interaction.guild.members.me);
+      if (interaction.deferred && String(interaction.customId || '').startsWith('dash:main:')) {
+        await interaction.editReply({ content: 'This dashboard action is no longer available. The dashboard has been refreshed.', components: [] });
+      }
+      return;
+    }
+    if ((interaction.isButton() || isUserSelectInteraction) && String(interaction.customId || '').startsWith('dash:')) {
+      const missingDashboard = 'The dashboard configuration for this channel could not be found. Use `.dash` to restore it, then try again.';
+      if (interaction.deferred || interaction.replied) await interaction.editReply({ content: missingDashboard, components: [] });
+      else await interaction.reply({ content: missingDashboard, ephemeral: true });
       return;
     }
   } catch (error) {
-    console.warn('[Discord Bot] ⚠️ Error in InteractionCreate handler:', error.message);
+    console.error('[Discord Bot] ⚠️ Error in InteractionCreate handler:', error);
     try {
       if (dashboardContext && interaction.guild) {
         if (!interaction.deferred && !interaction.replied) {
           await interaction.reply({ content: `❌ **Dashboard interaction failed:** ${error.message}`, ephemeral: true }).catch(() => {});
         }
-        const backendData = await fetchTournamentRegistrationsFromBackend(dashboardContext.tournamentId);
-        await setupTournamentControlPanel(interaction.guild, backendData.tournament, backendData.summary, interaction.guild.members.me);
+        try {
+          const backendData = await fetchTournamentRegistrationsFromBackend(dashboardContext.tournamentId);
+          await setupTournamentControlPanel(interaction.guild, backendData.tournament, backendData.summary, interaction.guild.members.me);
+          if (interaction.deferred && String(interaction.customId || '').startsWith('dash:main:')) {
+            await interaction.editReply({ content: `❌ Dashboard action failed: ${error.message}. The dashboard was refreshed.`, components: [] }).catch(() => {});
+          }
+        } catch (refreshError) {
+          console.error(`[Discord Bot] Dashboard recovery failed for ${dashboardContext.tournamentId}:`, refreshError);
+          if (interaction.deferred || interaction.replied) {
+            await interaction.editReply({ content: `⚠️ Dashboard action failed: ${error.message}. Refresh the dashboard and try again.` }).catch((editError) => {
+              console.error('[Discord Bot] Could not report dashboard recovery failure:', editError);
+            });
+          }
+        }
         return;
       }
       if (!interaction.isModalSubmit()) {
