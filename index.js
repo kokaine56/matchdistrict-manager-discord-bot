@@ -19,6 +19,7 @@ import {
 } from 'discord.js';
 import {
   handleListTournamentCommand,
+  handleTournamentSelectionButton,
   handleFetchTeamsCommand,
   checkTournamentAccess,
   isOfficialGuild,
@@ -145,6 +146,7 @@ import {
 
 export {
   handleListTournamentCommand,
+  handleTournamentSelectionButton,
   handleFetchTeamsCommand,
   checkTournamentAccess,
   isOfficialGuild,
@@ -430,6 +432,11 @@ export const REQUIRED_CHANNELS = [
     name: 'role-delete-log',
     topic: 'Private MatchDistrict Role Deletion Logs',
   },
+  {
+    key: 'tournamentLogId',
+    name: 'tournament-log',
+    topic: 'Private MatchDistrict Tournament Management Logs',
+  },
 ];
 
 export const RESERVED_LOG_CHANNEL_NAMES = new Set([
@@ -441,6 +448,7 @@ export const RESERVED_LOG_CHANNEL_NAMES = new Set([
   'channel-delete-log',
   'role-create-log',
   'role-delete-log',
+  'tournament-log',
   'matchdistrict-logs',
   'md-welcome-logs',
 ]);
@@ -2418,6 +2426,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isButton() && (
       interaction.customId?.startsWith('dash:')
     )) {
+      if (interaction.customId?.startsWith('dash:tournament:select:')) {
+        await handleTournamentSelectionButton(interaction);
+        return;
+      }
       const handled = await handleDashboardNavigationInteraction(interaction);
       if (handled) return;
     }

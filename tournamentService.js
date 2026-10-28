@@ -32,6 +32,7 @@ import {
   saveTournamentToDb,
   deleteTournamentFromDb,
   getTournamentFromDb,
+  getAllTournamentsFromDb,
   recordAuditLog,
   enforceSingleActiveRoundInDb,
   findTournamentByBotCommandsChannel,
@@ -67,6 +68,12 @@ export const REQUIRED_TOURNAMENT_CHANNELS = [
     participantAccess: 'none', // Strictly admins only! Ordinary participants must not be granted access
   },
   {
+    key: 'tournamentLogId',
+    name: 'tournament-log',
+    topic: 'Tournament Management Activity Log',
+    participantAccess: 'none',
+  },
+  {
     key: 'tournamentHelpdeskId',
     name: 'tournament-helpdesk',
     topic: 'Participant Questions & Tournament Support Desk',
@@ -79,6 +86,33 @@ export const REQUIRED_TOURNAMENT_CHANNELS = [
     participantAccess: 'read_only', // Participants view-only
   },
 ];
+
+async function sendTournamentManagementLog(guild, tournament, round, action, actor, details = []) {
+  try {
+    const saved = guildSettingsCache[guild.id]?.tournaments?.[tournament?.id || tournament?.tournamentId];
+    const channelIds = [...new Set([
+      saved?.channels?.tournamentLogId,
+      guildSettingsCache[guild.id]?.channels?.tournamentLogId,
+    ].filter(Boolean))];
+    if (channelIds.length === 0) return;
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle(action)
+      .addFields(
+        { name: 'Tournament', value: String(tournament?.title || saved?.tournamentTitle || tournament?.id || 'Unknown'), inline: true },
+        { name: 'Round', value: String(round?.name || round?.roundId || 'N/A'), inline: true },
+        { name: 'Action by', value: String(actor?.user?.tag || actor?.tag || actor?.id || 'Unknown'), inline: true },
+        ...details.filter((field) => field?.value).map((field) => ({ name: field.name, value: String(field.value).slice(0, 1024), inline: false })),
+      )
+      .setTimestamp();
+    for (const channelId of channelIds) {
+      const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+      if (channel?.send) await channel.send({ embeds: [embed] });
+    }
+  } catch (err) {
+    console.warn('[Discord Bot] Could not send tournament management log:', err.message);
+  }
+}
 
 /**
  * Concurrency locks for ongoing tournament refreshes/synchronizations.
@@ -410,7 +444,7 @@ export function formatTournamentListPages(tournaments, { page = 1, pageSize = 5,
   }).join('\n\n');
 
   const footer = `\n\n📌 **Next Steps:**\n` +
-    `• Select a tournament from the menu below to open its **Control Panel** in \`#bot-commands\`\n` +
+    `• Select a tournament button below to open its **Control Panel** in \`#bot-commands\`\n` +
     `• Or manage directly: \`.fetch teams <tournament_id>\`\n` +
     (totalPages > 1 ? `• View other pages: \`.list tournament page <1-${totalPages}>\`` : '');
 
@@ -440,6 +474,62 @@ export function buildTournamentSelectMenu(tournaments, maxOptions = 25) {
     return new ActionRowBuilder().addComponents(menu);
   } catch {
     return null;
+  }
+}
+
+function buildTournamentSelectionRows(tournaments) {
+  const rows = [];
+  for (let i = 0; i < tournaments.length && rows.length < 5; i += 5) {
+    const row = new ActionRowBuilder();
+    for (const tournament of tournaments.slice(i, i + 5)) {
+      row.addComponents(new ButtonBuilder()
+        .setCustomId(`dash:tournament:select:${tournament.id}`)
+        .setLabel(String(tournament.title || tournament.id).slice(0, 80))
+        .setStyle(ButtonStyle.Primary));
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+async function getCurrentMongoTournamentList(guildId, showAll = false) {
+  const records = await getAllTournamentsFromDb(guildId);
+  return records
+    .filter((record) => record?.tournamentId && !['deleted', 'deletion_pending', 'deleting'].includes(record.deletionStatus) && record.setupStatus !== 'deleted')
+    .map((record) => ({
+      id: record.tournamentId,
+      title: record.tournamentTitle || record.title || record.tournamentId,
+      game: record.game || 'Esports',
+      status: record.status || (record.setupStatus === 'active' ? 'active' : 'draft'),
+      is_draft: record.is_draft ?? record.setupStatus !== 'active',
+      registration_status: record.registration_status || 'open',
+      slots_filled: record.slots_filled || 0,
+      slots_total: record.slots_total || 'Unlimited',
+    }))
+    .filter((record) => showAll || !record.is_draft);
+}
+
+export async function handleTournamentSelectionButton(interaction) {
+  const tournamentId = String(interaction.customId || '').split(':')[3];
+  if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate().catch(() => {});
+  try {
+    const access = checkTournamentAccess(interaction.guild, interaction.member);
+    if (!access.allowed) {
+      await interaction.followUp({ content: access.reason, ephemeral: true }).catch(() => {});
+      return;
+    }
+    const tournaments = await getCurrentMongoTournamentList(interaction.guild.id, true);
+    if (!tournaments.some((tournament) => String(tournament.id) === String(tournamentId))) {
+      await interaction.editReply({
+        content: tournaments.length ? formatTournamentListPages(tournaments, { pageSize: 25, showAll: true })[0] : 'ℹ️ No current tournaments found in MongoDB.',
+        components: buildTournamentSelectionRows(tournaments),
+      });
+      return;
+    }
+    await handleSelectTournamentCommand(interaction.guild, interaction.member, tournamentId, (text) => interaction.editReply({ content: typeof text === 'string' ? text : text.content }));
+  } catch (error) {
+    console.error('[Discord Bot] Tournament selection failed:', error);
+    await interaction.editReply({ content: `❌ Could not load the current tournament list: ${error.message}`, components: [] }).catch(() => {});
   }
 }
 
@@ -1718,11 +1808,12 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   // 3. Compute Channel Setup Status (Parallel channel resolution)
   const updateId = savedTournament.channels.tournamentUpdateId;
   const teamsId = savedTournament.channels.tournamentTeamsId;
+  const logId = savedTournament.channels.tournamentLogId;
   const helpdeskId = savedTournament.channels.tournamentHelpdeskId;
   const registerId = savedTournament.channels.tournamentRegisterId;
   const voiceId = savedTournament.channels.roomMakerVcId;
 
-  const chIds = [updateId, teamsId, helpdeskId, registerId, voiceId].filter(Boolean);
+  const chIds = [updateId, teamsId, logId, helpdeskId, registerId, voiceId].filter(Boolean);
   const uncachedChIds = chIds.filter((id) => !guild.channels.cache.has(id));
   if (uncachedChIds.length > 0) {
     await Promise.allSettled(uncachedChIds.map((id) => guild.channels.fetch(id).catch(() => null)));
@@ -1730,27 +1821,29 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
 
   const updateCh = updateId ? guild.channels.cache.get(updateId) || null : null;
   const teamsCh = teamsId ? guild.channels.cache.get(teamsId) || null : null;
+  const logCh = logId ? guild.channels.cache.get(logId) || null : null;
   const helpdeskCh = helpdeskId ? guild.channels.cache.get(helpdeskId) || null : null;
   const registerCh = registerId ? guild.channels.cache.get(registerId) || null : null;
   const voiceCh = voiceId ? guild.channels.cache.get(voiceId) || null : null;
 
-  const activeParticipantChannelCount = [updateCh, teamsCh, helpdeskCh, registerCh, voiceCh].filter(Boolean).length;
-  const isConfigured = activeParticipantChannelCount === 5;
+  const activeParticipantChannelCount = [updateCh, teamsCh, logCh, helpdeskCh, registerCh, voiceCh].filter(Boolean).length;
+  const isConfigured = activeParticipantChannelCount === 6;
 
   let statusText = '';
   if (isConfigured) {
-    statusText = `🟢 **Active** — All 6 tournament channels configured:\n` +
+    statusText = `🟢 **Active** — All 7 tournament channels configured:\n` +
       `  • 🤖 <#${botCommandsChannel.id}>\n` +
       `  • 📢 <#${updateCh.id}>\n` +
       `  • 📋 <#${teamsCh.id}>\n` +
+      `  • 🧾 <#${logCh.id}>\n` +
       `  • 💬 <#${helpdeskCh.id}>\n` +
       `  • 🔗 <#${registerCh.id}>\n` +
       `  • 🔊 <#${voiceCh.id}> (\`room-maker-vc\` [Limit: ${voiceCh.userLimit || 15}])`;
   } else if (activeParticipantChannelCount === 0) {
     statusText = `🟡 **Pending Creation** — Participant channels not created yet.\n` +
-      `*Click **Create Channels** below to provision announcements, registered teams, helpdesk, registration, and room-maker voice channels.*`;
+      `*Click **Create Channels** below to provision announcements, registered teams, tournament logs, helpdesk, registration, and room-maker voice channels.*`;
   } else {
-    statusText = `⚠️ **Needs Repair** — Only ${activeParticipantChannelCount}/5 channels active.\n` +
+    statusText = `⚠️ **Needs Repair** — Only ${activeParticipantChannelCount}/6 channels active (plus bot-commands).\n` +
       `*Click **Create Channels** below to repair missing channels.*`;
   }
 
@@ -1930,10 +2023,7 @@ export async function handleListTournamentCommand(guild, member, args = [], repl
   }
 
   try {
-    const tournaments = await fetchTournamentsFromBackend({
-      status: showAll ? 'all' : 'published',
-      organizerId: access.organiserId || null,
-    });
+    const tournaments = await getCurrentMongoTournamentList(guild.id, showAll);
 
     if (tournaments.length === 0) {
       if (access.organiserId) {
@@ -1944,60 +2034,16 @@ export async function handleListTournamentCommand(guild, member, args = [], repl
       return;
     }
 
-    // Store in guild session
-    guildTournamentSessions.set(guild.id, {
-      lastTournaments: tournaments.map((t) => ({ id: t.id, title: t.title })),
-      lastListedTournamentId: tournaments.length === 1 ? tournaments[0].id : null,
-      timestamp: Date.now(),
-    });
-
     const pages = formatTournamentListPages(tournaments, {
       page: requestedPage,
-      pageSize: 5,
+      pageSize: 25,
       showAll,
     });
-
-    const selectRow = tournaments.length > 0 && tournaments.length <= 25
-      ? buildTournamentSelectMenu(tournaments)
-      : null;
-
-    for (let i = 0; i < pages.length; i++) {
-      const isLast = i === pages.length - 1;
-      const opts = isLast && selectRow ? { components: [selectRow] } : {};
-      const sent = await replyFn(typeof opts.components !== 'undefined' ? { content: pages[i], ...opts } : pages[i]);
-
-      // If interactive collector is supported, handle select menu clicks
-      if (isLast && selectRow && sent?.createMessageComponentCollector) {
-        const collector = sent.createMessageComponentCollector({
-          time: 60000,
-        });
-
-        collector.on('collect', async (interaction) => {
-          if (!interaction.isStringSelectMenu() || interaction.customId !== 'md_select_tournament') return;
-
-          if (interaction.user.id !== member.id) {
-            await interaction.reply({
-              content: '❌ **Unauthorized:** Only the administrator who requested the tournament list can make a selection.',
-              ephemeral: true,
-            });
-            return;
-          }
-
-          if (!isAdmin(interaction.member)) {
-            await interaction.reply({
-              content: '❌ **Permission Denied:** You must be an administrator to manage tournaments.',
-              ephemeral: true,
-            });
-            return;
-          }
-
-          const selectedTournamentId = interaction.values[0];
-          collector.stop('selected');
-          await interaction.deferUpdate().catch(() => { });
-          await handleSelectTournamentCommand(guild, interaction.member, selectedTournamentId, (text) => interaction.followUp(text));
-        });
-      }
-    }
+    const pageSize = 25;
+    const pageCount = Math.max(1, Math.ceil(tournaments.length / pageSize));
+    const currentPage = Math.max(1, Math.min(requestedPage, pageCount));
+    const pageItems = tournaments.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+    await replyFn({ content: pages[0], components: buildTournamentSelectionRows(pageItems) });
   } catch (err) {
     await replyFn(`❌ **Error retrieving tournaments from MatchDistrict:**\n> ${err.message}`);
   }
@@ -3776,7 +3822,8 @@ export async function handleCreateSequentialRound(interaction, tournamentId) {
   savedTournament.rounds[candidateRoundId] = newRound;
   guildSettingsCache[guild.id] = currentSettings;
   saveGuildSettings(guildSettingsCache);
-  saveTournamentToDb(guild.id, tournamentId, savedTournament);
+  await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+  await sendTournamentManagementLog(guild, savedTournament, newRound, 'Round created', interaction.member);
 
   // Update View Rounds Screen in place immediately
   await handleViewRoundsScreen(interaction, tournamentId);
@@ -4335,7 +4382,7 @@ export async function handleConfirmDeleteRound(interaction, tournamentId, roundI
   delete savedTournament.rounds[roundId];
   guildSettingsCache[guild.id] = currentSettings;
   saveGuildSettings(guildSettingsCache);
-  saveTournamentToDb(guild.id, tournamentId, savedTournament);
+  await saveTournamentToDb(guild.id, tournamentId, savedTournament);
 
   await recordAuditLog(guild.id, 'ROUND_DELETED', {
     tournamentId,
@@ -4344,6 +4391,7 @@ export async function handleConfirmDeleteRound(interaction, tournamentId, roundI
     adminId: interaction.member?.id,
     adminTag: interaction.member?.user?.tag,
   }).catch(() => {});
+  await sendTournamentManagementLog(guild, savedTournament, round, 'Round deleted', interaction.member);
 
   // Navigate back to View Rounds screen immediately
   await handleViewRoundsScreen(interaction, tournamentId);
@@ -4406,25 +4454,16 @@ export async function handleViewRoundAllocation(interaction, tournamentId, round
     .setColor(0x3b82f6)
     .setDescription(
       `**Tournament:** ${savedTournament.tournamentTitle || tournamentId}\n` +
-      `**Status:** **${round.status}** | **Groups:** ${round.groups.length}\n` +
-      `**Slot Policy:** 25 slots per group (Slots 01-02 LOCKED, Slots 03-18 Teams [max 16], Slots 19-25 UNUSED)`
+      `**Status:** **${round.status}** | **Groups:** ${round.groups.length}`
     )
     .setTimestamp();
 
   for (const group of round.groups.slice(0, 5)) {
     let groupText = '';
-    for (const slot of group.slots || []) {
-      const slotNumStr = String(slot.slotNumber).padStart(2, '0');
-      if (slot.status === 'LOCKED') {
-        groupText += `🔒 **Slot ${slotNumStr}:** \`LOCKED\`\n`;
-      } else if (slot.status === 'OCCUPIED') {
-        const memberCount = Array.isArray(slot.members) ? slot.members.length : 0;
-        groupText += `🎮 **Slot ${slotNumStr}:** **${slot.teamName}** (${memberCount} linked)\n`;
-      } else if (slot.status === 'UNUSED' || slot.status === 'RESERVED') {
-        groupText += `⛔ **Slot ${slotNumStr}:** \`UNUSED\`\n`;
-      } else {
-        groupText += `⚪ **Slot ${slotNumStr}:** *EMPTY*\n`;
-      }
+    for (let slotNumber = 1; slotNumber <= 25; slotNumber++) {
+      const slot = (group.slots || []).find((item) => Number(item.slotNumber) === slotNumber);
+      if (slotNumber <= 2 || slot?.status === 'LOCKED') groupText += `Slot ${String(slotNumber).padStart(2, '0')} → 🔒 LOCKED\n`;
+      else if (slot?.status === 'OCCUPIED' && slot.teamName) groupText += `Slot ${String(slotNumber).padStart(2, '0')} → ${slot.teamName}\n`;
     }
     const chMention = group.channelId ? `<#${group.channelId}>` : `#${group.channelName}`;
     const roleMention = group.roleId ? `<@&${group.roleId}>` : `@${group.roleName}`;
@@ -4489,6 +4528,7 @@ export async function handleBackToTournamentPanel(interaction, tournamentId) {
           savedTournament.categoryId,
           savedTournament.channels?.tournamentUpdateId,
           savedTournament.channels?.tournamentTeamsId,
+          savedTournament.channels?.tournamentLogId,
           savedTournament.channels?.tournamentHelpdeskId,
           savedTournament.channels?.tournamentRegisterId,
           savedTournament.channels?.roomMakerVcId,
@@ -4511,6 +4551,7 @@ export async function handleBackToTournamentPanel(interaction, tournamentId) {
     const expectedChannels = [
       channels.tournamentUpdateId,
       channels.tournamentTeamsId,
+      channels.tournamentLogId,
       channels.tournamentHelpdeskId,
       channels.tournamentRegisterId,
       channels.roomMakerVcId,
@@ -4522,12 +4563,12 @@ export async function handleBackToTournamentPanel(interaction, tournamentId) {
       if (ch) activeParticipantChannelCount++;
     }
 
-    const isConfigured = Boolean(category && activeParticipantChannelCount >= 5);
+    const isConfigured = Boolean(category && activeParticipantChannelCount >= 6);
     const channelsStatus = {
       isConfigured,
       activeCount: activeParticipantChannelCount + 1,
       statusText: isConfigured
-        ? `🟢 **Active & Configured** — All 5 channels & category operational.`
+        ? `🟢 **Active & Configured** — All 6 channels & category operational.`
         : `🟡 **Pending Creation** — Participant channels not created yet.`,
     };
 
@@ -5191,6 +5232,10 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
         groupsCount: groups.length,
         teamsAllocatedCount: eligibleTeams.length,
       }).catch(() => {});
+      await sendTournamentManagementLog(guild, tournament, round, 'Round started', member, [
+        { name: 'Groups', value: String(groups.length) },
+        { name: 'Teams allocated', value: String(eligibleTeams.length) },
+      ]);
 
       // Publish or update allocation summary & global submission panel in #bot-commands
       const botCommandsChannel = savedTournament.channels?.botCommandsId
@@ -6480,6 +6525,11 @@ export async function handleExecuteQualifyCommit(interaction, tournamentId, roun
     adminId: member.id,
     adminTag: member.user?.tag,
   }).catch(() => {});
+  const qualifiedTeamNames = [...newlyQualifiedNames, ...alreadyQualifiedNames];
+  await sendTournamentManagementLog(guild, savedTournament, round, 'Teams qualified', member, [
+    { name: 'Group', value: `Group ${group.groupNumber}` },
+    { name: 'Qualified for next round', value: qualifiedTeamNames.join(', ') || 'No teams selected' },
+  ]);
 
   const successEmbed = new EmbedBuilder()
     .setTitle(`🏆 Qualification Confirmed — Group ${group.groupNumber}`)
