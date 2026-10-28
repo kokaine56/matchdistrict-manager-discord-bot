@@ -49,6 +49,11 @@ import {
   processPendingRoleSyncQueue,
   MAX_ROLE_SYNC_RETRIES,
   ROLE_SYNC_RETRY_INTERVAL_MS,
+  handleTournamentModalSubmit,
+  handleTournamentSelectMenuInteraction,
+  publishGroupCredentials,
+  handlePublishCredentialsCommand,
+  publishRoundAllocationSummary,
 } from './tournamentService.js';
 
 export {
@@ -84,6 +89,11 @@ export {
   processPendingRoleSyncQueue,
   MAX_ROLE_SYNC_RETRIES,
   ROLE_SYNC_RETRY_INTERVAL_MS,
+  handleTournamentModalSubmit,
+  handleTournamentSelectMenuInteraction,
+  publishGroupCredentials,
+  handlePublishCredentialsCommand,
+  publishRoundAllocationSummary,
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -499,7 +509,8 @@ export function getHelpResponse(prefix = PREFIX) {
     `**🏆 Tournament Management (Official Server Only):**\n` +
     `• \`${prefix}list tournament [all]\` — *(Admin Only)* List tournaments & open control panel via selection\n` +
     `• \`${prefix}select tournament <id>\` — *(Admin Only)* Open or refresh control panel in #bot-commands\n` +
-    `• \`${prefix}fetch teams [id]\` — *(Admin Only)* Provision tournament channels & sync live registered roster\n\n` +
+    `• \`${prefix}fetch teams [id]\` — *(Admin Only)* Provision tournament channels & sync live registered roster\n` +
+    `• \`${prefix}cred <room_id> <password>\` — *(Admin Only)* Publish match credentials inside a private group channel\n\n` +
     `**ℹ️ General Information:**\n` +
     `• \`${prefix}status\` — Check server configuration & welcome status\n` +
     `• \`${prefix}website\` — Get the official MatchDistrict platform link\n` +
@@ -2093,6 +2104,16 @@ client.on(Events.MessageCreate, async (message) => {
           (results.failures.length > 0 ? `\n⚠️ Warnings: ${results.failures.join(', ')}` : '')
         );
         return;
+      } else if (cmd === 'cred' || cmd === 'credentials' || cmd === 'room') {
+        await handlePublishCredentialsCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          args,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+          message
+        );
+        return;
       } else if (cmd === 'status') {
         await handleStatusCommand(message.guild, (text) => message.reply(text));
         return;
@@ -2123,6 +2144,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isButton() && interaction.customId?.startsWith('md_tour_')) {
       await handleTournamentButtonInteraction(interaction);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId?.startsWith('md_modal_')) {
+      await handleTournamentModalSubmit(interaction);
+      return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId?.startsWith('md_tour_')) {
+      await handleTournamentSelectMenuInteraction(interaction);
       return;
     }
   } catch (error) {
