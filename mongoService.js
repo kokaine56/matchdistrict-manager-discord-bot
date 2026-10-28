@@ -1,8 +1,8 @@
 import crypto from 'crypto';
 import { MongoClient } from 'mongodb';
-import { logTournamentAction } from './auditLogger.js';
 
 let discordAuditClient = null;
+let logTournamentActionFn = null;
 
 export function setDiscordAuditClient(client) {
   discordAuditClient = client;
@@ -48,6 +48,14 @@ export function isMongoConnected() {
  * @returns {import('mongodb').Db|null}
  */
 export function getMongoDb() {
+  return mongoDb;
+}
+
+/**
+ * Alias for getMongoDb to support callers expecting getDb.
+ * @returns {import('mongodb').Db|null}
+ */
+export function getDb() {
   return mongoDb;
 }
 
@@ -676,11 +684,17 @@ export async function recordAuditLog(guildId, action, details, adminUser = null)
     try {
       const guild = discordAuditClient.guilds?.cache?.get(guildId);
       if (guild) {
-        await logTournamentAction(guild, action, {
-          ...details,
-          adminId: adminUser?.id || details?.adminId,
-          adminTag: adminUser?.tag || details?.adminTag,
-        });
+        if (!logTournamentActionFn) {
+          const auditMod = await import('./auditLogger.js');
+          logTournamentActionFn = auditMod.logTournamentAction;
+        }
+        if (typeof logTournamentActionFn === 'function') {
+          await logTournamentActionFn(guild, action, {
+            ...details,
+            adminId: adminUser?.id || details?.adminId,
+            adminTag: adminUser?.tag || details?.adminTag,
+          });
+        }
       }
     } catch (auditErr) {
       console.warn('[Audit Logger] ⚠️ Error dispatching tournament audit embed:', auditErr.message);
