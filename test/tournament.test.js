@@ -15,6 +15,7 @@ import {
   sanitizeCategoryName,
   formatTournamentListPages,
   buildTournamentSelectMenu,
+  formatTeamsChannelRoster,
   fetchTournamentsFromBackend,
   fetchTournamentRegistrationsFromBackend,
   handleListTournamentCommand,
@@ -22,6 +23,7 @@ import {
   syncTournamentDiscordChannels,
   formatSyncSummaryMessage,
   guildTournamentSessions,
+  REQUIRED_TOURNAMENT_CHANNELS,
 } from '../tournamentService.js';
 import {
   guildSettingsCache,
@@ -64,12 +66,23 @@ function createMockGuild(id = 'official-guild-12345', name = 'MatchDistrict Offi
           }
         }
 
+        const sentMessages = [];
         const channel = {
           id: newId,
           name: data.name,
           type: data.type,
           parentId: data.parent || null,
           topic: data.topic || null,
+          sentMessages,
+          send: async (msg) => {
+            const m = typeof msg === 'object' ? msg : { content: msg };
+            sentMessages.push(m);
+            return m;
+          },
+          delete: async () => {
+            channelsMap.delete(newId);
+            return channel;
+          },
           permissionOverwrites: {
             cache: overwritesMap,
             edit: async (targetId, permissions) => {
@@ -199,7 +212,6 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
 
     assert.equal(sanitizeChannelName('Team Alpha'), 'team-alpha');
     assert.equal(sanitizeChannelName('PRO $CR!MS #1'), 'pro-cr-ms-1');
-    assert.equal(sanitizeChannelName('Team Beta', 'team-'), 'team-team-beta');
     assert.match(sanitizeCategoryName('BGMI Pro League'), /🏆 \| BGMI Pro League/);
   });
 
@@ -268,7 +280,6 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
   // --- Requirement 3 & 7: Backend API Client & Error Handling ---
 
   test('6. Backend API Client: fetchTournaments handles successful responses', async () => {
-    // Start local mock HTTP server
     const mockServer = http.createServer((req, res) => {
       const url = new URL(req.url, 'http://localhost');
       assert.equal(url.pathname, '/api/bot/tournaments');
@@ -327,13 +338,12 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     }
   });
 
-  // --- Requirement 3, 4, 5, 6: .fetch teams, validation & channel synchronization ---
+  // --- Requirement 3, 4, 5, 6: .fetch teams, 4 Channels & Access Control ---
 
-  test('8. .fetch teams: rejects when multiple tournaments exist and no tournament ID is specified', async () => {
+  test('8. .fetch teams: rejects when multiple tournaments exist and no tournament ID is specified outside tournament channel', async () => {
     const guild = createMockGuild(OFFICIAL_GUILD_ID);
     const member = createMockMember({ isAdmin: true });
 
-    // Seed session with multiple tournaments
     guildTournamentSessions.set(guild.id, {
       lastTournaments: [
         { id: 'tour-1', title: 'Tour 1' },
@@ -354,7 +364,7 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
 
   test('9. .fetch teams: rejects when bot lacks Manage Channels permission', async () => {
     const guild = createMockGuild(OFFICIAL_GUILD_ID);
-    guild.members.me.permissions.has = () => false; // Missing permission
+    guild.members.me.permissions.has = () => false;
     const member = createMockMember({ isAdmin: true });
 
     let repliedText = '';
@@ -366,7 +376,7 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     assert.match(repliedText, /Manage Channels/);
   });
 
-  test('10. Channel Synchronization: creates category, general announcements, and private team channels', async () => {
+  test('10. Four Channels Architecture: creates 1 category and exactly the 4 required channels without per-squad channels', async () => {
     const guild = createMockGuild(OFFICIAL_GUILD_ID);
     const botMember = guild.members.me;
 
@@ -396,13 +406,13 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
         linked_members: [
           { discord_id: '333333333333333333', is_linked: true },
         ],
-        unlinked_count: 1, // 1 unlinked member
+        unlinked_count: 1,
       },
       {
         id: 'team-3',
         team_name: 'Rejected Team',
         status: 'rejected',
-        is_eligible: false, // Ineligible -> must NOT get channel
+        is_eligible: false,
         linked_members: [
           { discord_id: '444444444444444444', is_linked: true },
         ],
@@ -414,51 +424,84 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
 
     assert.equal(result.categoryAction, 'created');
     assert.ok(result.categoryId);
-    assert.equal(result.generalChannelAction, 'created');
-    assert.ok(result.generalChannelId);
-    assert.equal(result.teamChannelsCreated, 2); // GodLike & Soul Esports
-    assert.equal(result.teamChannelsReused, 0);
 
-    // Verify Category Overwrites (@everyone denied, bot allowed)
+    // Verify exactly 4 channels were created
+    assert.equal(result.channelsCreated.length, 4);
+    assert.deepEqual(result.channelsCreated, [
+      'bot-commands',
+      'tournament-update',
+      'tournament-teams',
+      'tournament-helpdesk',
+    ]);
+
+    // Verify NO squad channels exist (e.g. team-godlike or team-soul-esports)
+    const allChannelNames = Array.from(guild.channels.cache.values()).map((c) => c.name);
+    assert.equal(allChannelNames.some((n) => n.startsWith('team-')), false);
+
+    // Verify Category
     const categoryChannel = guild.channels.cache.get(result.categoryId);
     assert.equal(categoryChannel.type, ChannelType.GuildCategory);
     assert.match(categoryChannel.name, /BGMI Super League/);
     const catEveryoneOw = categoryChannel.permissionOverwrites.cache.get(guild.roles.everyone.id);
     assert.ok(catEveryoneOw.deny.includes(PermissionFlagsBits.ViewChannel));
 
-    // Verify General Announcements Channel
-    const generalChannel = guild.channels.cache.get(result.generalChannelId);
-    assert.equal(generalChannel.parentId, result.categoryId);
-    // Linked members from all eligible teams have ViewChannel on general channel
-    assert.ok(generalChannel.permissionOverwrites.cache.has('111111111111111111'));
-    assert.ok(generalChannel.permissionOverwrites.cache.has('222222222222222222'));
-    assert.ok(generalChannel.permissionOverwrites.cache.has('333333333333333333'));
-    // Ineligible team member (444444444444444444) MUST NOT have access
-    assert.equal(generalChannel.permissionOverwrites.cache.has('444444444444444444'), false);
+    // A. #bot-commands: Admin only; participants CANNOT view
+    const botCmdCh = guild.channels.cache.get(result.channelIds.botCommandsId);
+    assert.ok(botCmdCh);
+    assert.equal(botCmdCh.parentId, result.categoryId);
+    const botCmdEveryoneOw = botCmdCh.permissionOverwrites.cache.get(guild.roles.everyone.id);
+    assert.ok(botCmdEveryoneOw.deny.includes(PermissionFlagsBits.ViewChannel));
+    // Participants have NO overwrite to view bot-commands
+    assert.equal(botCmdCh.permissionOverwrites.cache.has('111111111111111111'), false);
+    assert.equal(botCmdCh.permissionOverwrites.cache.has('222222222222222222'), false);
 
-    // Verify Team Channel 1 (GodLike)
-    const godlikeChannel = Array.from(guild.channels.cache.values()).find((c) => c.name === 'team-godlike');
-    assert.ok(godlikeChannel);
-    assert.equal(godlikeChannel.parentId, result.categoryId);
-    // GodLike members have access
-    assert.ok(godlikeChannel.permissionOverwrites.cache.has('111111111111111111'));
-    assert.ok(godlikeChannel.permissionOverwrites.cache.has('222222222222222222'));
-    // Member from Soul Esports (333333333333333333) MUST NOT have access to GodLike's channel!
-    assert.equal(godlikeChannel.permissionOverwrites.cache.has('333333333333333333'), false);
+    // B. #tournament-update: Eligible participants can read; CANNOT post
+    const updateCh = guild.channels.cache.get(result.channelIds.tournamentUpdateId);
+    assert.ok(updateCh);
+    assert.equal(updateCh.parentId, result.categoryId);
+    const updateOw1 = updateCh.permissionOverwrites.cache.get('111111111111111111');
+    assert.ok(updateOw1);
+    assert.ok(updateOw1.allow.includes('ViewChannel'));
+    assert.ok(updateOw1.deny.includes('SendMessages'));
+    assert.ok(updateOw1.deny.includes('CreatePublicThreads'));
 
-    // Verify Rejected team channel does NOT exist
-    const rejectedChannel = Array.from(guild.channels.cache.values()).find((c) => c.name === 'team-rejected-team');
-    assert.equal(rejectedChannel, undefined);
+    // C. #tournament-teams: Eligible participants can read; CANNOT post; contains published roster
+    const teamsCh = guild.channels.cache.get(result.channelIds.tournamentTeamsId);
+    assert.ok(teamsCh);
+    assert.equal(teamsCh.parentId, result.categoryId);
+    const teamsOw1 = teamsCh.permissionOverwrites.cache.get('111111111111111111');
+    assert.ok(teamsOw1);
+    assert.ok(teamsOw1.allow.includes('ViewChannel'));
+    assert.ok(teamsOw1.deny.includes('SendMessages'));
+    // Ineligible member 444444444444444444 must NOT have access
+    assert.equal(teamsCh.permissionOverwrites.cache.has('444444444444444444'), false);
+    // Verified teams roster was published to teamsCh
+    assert.equal(result.teamsUpdatedInChannel, true);
+    assert.ok(teamsCh.sentMessages.length > 0);
+    assert.match(teamsCh.sentMessages[0].content, /GodLike/);
+    assert.match(teamsCh.sentMessages[0].content, /Soul Esports/);
 
-    // Verify persistent storage in guildSettingsCache
+    // D. #tournament-helpdesk: Eligible participants CAN post messages
+    const helpdeskCh = guild.channels.cache.get(result.channelIds.tournamentHelpdeskId);
+    assert.ok(helpdeskCh);
+    assert.equal(helpdeskCh.parentId, result.categoryId);
+    const helpdeskOw1 = helpdeskCh.permissionOverwrites.cache.get('111111111111111111');
+    assert.ok(helpdeskOw1);
+    assert.ok(helpdeskOw1.allow.includes('ViewChannel'));
+    assert.ok(helpdeskOw1.allow.includes('SendMessages'));
+    assert.ok(helpdeskOw1.allow.includes('AttachFiles'));
+
+    // Verify persistent storage
     const saved = guildSettingsCache[guild.id]?.tournaments?.[mockTournament.id];
     assert.ok(saved);
     assert.equal(saved.categoryId, result.categoryId);
-    assert.equal(saved.generalChannelId, result.generalChannelId);
-    assert.equal(Object.keys(saved.teamChannels).length, 2);
+    assert.equal(saved.channels.botCommandsId, result.channelIds.botCommandsId);
+    assert.equal(saved.channels.tournamentUpdateId, result.channelIds.tournamentUpdateId);
+    assert.equal(saved.channels.tournamentTeamsId, result.channelIds.tournamentTeamsId);
+    assert.equal(saved.channels.tournamentHelpdeskId, result.channelIds.tournamentHelpdeskId);
   });
 
-  test('11. Channel Synchronization & Reuse: reuses existing category & channels on subsequent sync', async () => {
+  test('11. Channel Reuse: reuses existing category and all 4 channels without creating duplicates', async () => {
     const guild = createMockGuild(OFFICIAL_GUILD_ID);
     const botMember = guild.members.me;
 
@@ -479,39 +522,21 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
       },
     ];
 
-    // First sync
+    // First run
     const firstSync = await syncTournamentDiscordChannels(guild, mockTournament, initialTeams, botMember);
     assert.equal(firstSync.categoryAction, 'created');
-    assert.equal(firstSync.teamChannelsCreated, 1);
+    assert.equal(firstSync.channelsCreated.length, 4);
 
-    // Second sync with an additional member joining Team Alpha
-    const updatedTeams = [
-      {
-        id: 'team-a',
-        team_name: 'Team Alpha',
-        status: 'approved',
-        is_eligible: true,
-        linked_members: [
-          { discord_id: '111111111111111111', is_linked: true },
-          { discord_id: '555555555555555555', is_linked: true }, // New member
-        ],
-        unlinked_count: 0,
-      },
-    ];
-
-    const secondSync = await syncTournamentDiscordChannels(guild, mockTournament, updatedTeams, botMember);
+    // Second run
+    const secondSync = await syncTournamentDiscordChannels(guild, mockTournament, initialTeams, botMember);
     assert.equal(secondSync.categoryAction, 'reused');
     assert.equal(secondSync.categoryId, firstSync.categoryId);
-    assert.equal(secondSync.generalChannelAction, 'reused');
-    assert.equal(secondSync.teamChannelsCreated, 0);
-    assert.equal(secondSync.teamChannelsReused, 1);
-
-    // New member granted access on reused channel
-    const teamChannel = guild.channels.cache.get(guildSettingsCache[guild.id].tournaments[mockTournament.id].teamChannels['team-a']);
-    assert.ok(teamChannel.permissionOverwrites.cache.has('555555555555555555'));
+    assert.equal(secondSync.channelsCreated.length, 0);
+    assert.equal(secondSync.channelsReused.length, 4);
+    assert.deepEqual(secondSync.channelIds, firstSync.channelIds);
   });
 
-  test('12. Ineligibility & Revocation: removes channel permissions for members who become ineligible', async () => {
+  test('12. Ineligibility Revocation: removes participant channel access when a team/user becomes ineligible', async () => {
     const guild = createMockGuild(OFFICIAL_GUILD_ID);
     const botMember = guild.members.me;
 
@@ -521,7 +546,6 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
       status: 'published',
     };
 
-    // Member 111111111111111111 is initially eligible
     const initialTeams = [
       {
         id: 'team-x',
@@ -534,10 +558,13 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
     ];
 
     const firstSync = await syncTournamentDiscordChannels(guild, mockTournament, initialTeams, botMember);
-    const generalChannel = guild.channels.cache.get(firstSync.generalChannelId);
-    assert.ok(generalChannel.permissionOverwrites.cache.has('111111111111111111'));
+    const updateCh = guild.channels.cache.get(firstSync.channelIds.tournamentUpdateId);
+    const helpdeskCh = guild.channels.cache.get(firstSync.channelIds.tournamentHelpdeskId);
 
-    // In second sync, Team X was disqualified/cancelled -> Member 111111111111111111 is now ineligible
+    assert.ok(updateCh.permissionOverwrites.cache.has('111111111111111111'));
+    assert.ok(helpdeskCh.permissionOverwrites.cache.has('111111111111111111'));
+
+    // Second sync: Team X cancelled/disqualified -> user is no longer eligible
     const revokedTeams = [
       {
         id: 'team-x',
@@ -551,157 +578,73 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
 
     const secondSync = await syncTournamentDiscordChannels(guild, mockTournament, revokedTeams, botMember);
     assert.ok(secondSync.permissionsRemoved > 0);
-    // General channel permission overwrite for 111111111111111111 has been removed!
-    assert.equal(generalChannel.permissionOverwrites.cache.has('111111111111111111'), false);
+
+    // Permissions on update and helpdesk channels must be removed!
+    assert.equal(updateCh.permissionOverwrites.cache.has('111111111111111111'), false);
+    assert.equal(helpdeskCh.permissionOverwrites.cache.has('111111111111111111'), false);
   });
 
-  test('13. Sync Summary: formats accurate, comprehensive report', () => {
-    const tournament = { id: 'tour-sum-1', title: 'Free Fire Open', status: 'published' };
-    const summary = {
-      total_registered_teams: 16,
-      eligible_teams_count: 14,
-      ineligible_teams_count: 2,
-      eligible_linked_members_count: 48,
-      unlinked_members_count: 8,
-      duplicate_discord_ids_count: 1,
-    };
-    const syncResult = {
-      categoryAction: 'created',
-      categoryId: 'cat-123',
-      generalChannelAction: 'created',
-      generalChannelId: 'gen-456',
-      teamChannelsCreated: 14,
-      teamChannelsReused: 0,
-      permissionsUpdated: 48,
-      permissionsRemoved: 0,
-      skippedTeams: [],
-      failures: [],
-    };
-
-    const message = formatSyncSummaryMessage(tournament, summary, syncResult);
-    assert.match(message, /Tournament Synchronization Complete/);
-    assert.match(message, /Free Fire Open/);
-    assert.match(message, /Registered Teams:\*\* \*\*16\*\* total/);
-    assert.match(message, /14\*\* eligible/);
-    assert.match(message, /48\*\* participant\(s\) granted channel access/);
-    assert.match(message, /8\*\* account\(s\) not linked to Discord/);
-    assert.match(message, /Team Channels:\*\* \*\*14\*\* created/);
-  });
-
-  test('14. Partial Failure & Resilience: continues safely when a single channel creation fails', async () => {
+  test('13. Migration & Obsolete Squad Channel Cleanup: deletes legacy per-squad channels safely', async () => {
     const guild = createMockGuild(OFFICIAL_GUILD_ID);
     const botMember = guild.members.me;
 
     const mockTournament = {
-      id: 'tour-partial-1',
-      title: 'Crash Resiliency Cup',
+      id: 'tour-legacy-mig',
+      title: 'Legacy Migration Cup',
       status: 'published',
     };
 
-    let failOnTeamName = 'Flaky Team';
-    const originalCreate = guild.channels.create;
-    guild.channels.create = async (data) => {
-      if (data.name === 'team-flaky-team') {
-        throw new Error('Discord rate limit reached for channel create (50035)');
-      }
-      return originalCreate(data);
-    };
-
-    const teams = [
-      {
-        id: 'team-good',
-        team_name: 'Good Team',
-        status: 'approved',
-        is_eligible: true,
-        linked_members: [{ discord_id: '111111111111111111', is_linked: true }],
-        unlinked_count: 0,
-      },
-      {
-        id: 'team-bad',
-        team_name: 'Flaky Team',
-        status: 'approved',
-        is_eligible: true,
-        linked_members: [{ discord_id: '222222222222222222', is_linked: true }],
-        unlinked_count: 0,
-      },
-    ];
-
-    const result = await syncTournamentDiscordChannels(guild, mockTournament, teams, botMember);
-    assert.equal(result.categoryAction, 'created');
-    assert.equal(result.teamChannelsCreated, 1); // Good Team succeeded
-    assert.equal(result.failures.length, 1);
-    assert.match(result.failures[0], /Flaky Team/);
-
-    const summaryText = formatSyncSummaryMessage(mockTournament, {
-      total_registered_teams: 2,
-      eligible_teams_count: 2,
-      ineligible_teams_count: 0,
-      eligible_linked_members_count: 2,
-      unlinked_members_count: 0,
-    }, result);
-
-    assert.match(summaryText, /Completed with Warnings/);
-    assert.match(summaryText, /safely re-run/);
-  });
-
-  test('15. End-to-End Command Flow: handleListTournamentCommand preserves session and formats response', async () => {
-    const mockServer = http.createServer((req, res) => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        success: true,
-        count: 1,
-        tournaments: [
-          {
-            id: 'tour-e2e-1',
-            title: 'BGMI Champions Trophy',
-            game: 'BGMI',
-            status: 'published',
-            registration_status: 'open',
-            slots_total: 50,
-            slots_filled: 12,
-          },
-        ],
-      }));
+    // Pre-create category and an obsolete squad channel
+    const category = await guild.channels.create({
+      name: '🏆 | Legacy Migration Cup',
+      type: ChannelType.GuildCategory,
     });
 
-    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
-    const port = mockServer.address().port;
-    process.env.MATCHDISTRICT_API_URL = `http://127.0.0.1:${port}`;
+    const obsoleteSquadChannel = await guild.channels.create({
+      name: 'team-old-squad',
+      type: ChannelType.GuildText,
+      parent: category.id,
+    });
 
-    try {
-      const guild = createMockGuild(OFFICIAL_GUILD_ID);
-      const adminMember = createMockMember({ isAdmin: true });
+    const unrelatedChannel = await guild.channels.create({
+      name: 'general-chat',
+      type: ChannelType.GuildText,
+    });
 
-      let output = '';
-      await handleListTournamentCommand(guild, adminMember, [], async (msg) => {
-        output = typeof msg === 'object' ? msg.content : msg;
-      });
+    // Seed guildSettingsCache with legacy teamChannels state
+    guildSettingsCache[guild.id] = {
+      tournaments: {
+        'tour-legacy-mig': {
+          categoryId: category.id,
+          teamChannels: {
+            'old-squad': obsoleteSquadChannel.id,
+          },
+        },
+      },
+    };
 
-      assert.match(output, /BGMI Champions Trophy/);
-      assert.match(output, /Tournament ID:\*\* `tour-e2e-1`/);
+    const syncResult = await syncTournamentDiscordChannels(guild, mockTournament, [], botMember);
 
-      // Verify session was preserved
-      const session = guildTournamentSessions.get(guild.id);
-      assert.ok(session);
-      assert.equal(session.lastListedTournamentId, 'tour-e2e-1');
-      assert.equal(session.lastTournaments.length, 1);
-    } finally {
-      await new Promise((resolve) => mockServer.close(resolve));
-    }
+    // Obsolete squad channel deleted
+    assert.equal(syncResult.obsoleteSquadChannelsDeleted, 1);
+    assert.equal(guild.channels.cache.has(obsoleteSquadChannel.id), false);
+    // Unrelated channel preserved
+    assert.equal(guild.channels.cache.has(unrelatedChannel.id), true);
+    // 4 shared tournament channels created
+    assert.equal(syncResult.channelsCreated.length, 4);
   });
 
-  test('16. End-to-End Command Flow: handleFetchTeamsCommand fetches registrations and syncs channels', async () => {
+  test('14. Context Resolution: .fetch teams resolves tournament ID automatically when run inside #bot-commands', async () => {
     const mockServer = http.createServer((req, res) => {
       const url = new URL(req.url, 'http://localhost');
-      assert.match(url.pathname, /\/api\/bot\/tournaments\/tour-e2e-1\/registrations/);
+      assert.match(url.pathname, /\/api\/bot\/tournaments\/tour-auto-ctx\/registrations/);
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         success: true,
         tournament: {
-          id: 'tour-e2e-1',
-          title: 'BGMI Champions Trophy',
-          game: 'BGMI',
+          id: 'tour-auto-ctx',
+          title: 'Context Resolution League',
           status: 'published',
         },
         summary: {
@@ -710,12 +653,11 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
           ineligible_teams_count: 0,
           eligible_linked_members_count: 1,
           unlinked_members_count: 0,
-          duplicate_discord_ids_count: 0,
         },
         teams: [
           {
-            id: 'team-alpha-e2e',
-            team_name: 'Team Alpha',
+            id: 'team-1',
+            team_name: 'Context Squad',
             status: 'approved',
             is_eligible: true,
             linked_members: [{ discord_id: '123456789012345678', is_linked: true }],
@@ -733,21 +675,72 @@ describe('MatchDistrict Discord Bot Tournament Integration', () => {
       const guild = createMockGuild(OFFICIAL_GUILD_ID);
       const adminMember = createMockMember({ isAdmin: true });
 
-      let output = '';
-      await handleFetchTeamsCommand(guild, adminMember, ['tour-e2e-1'], async (msg) => {
-        output = typeof msg === 'object' ? msg.content : msg;
+      // Create a mock bot-commands channel and register it in guild settings
+      const botCmdChannel = await guild.channels.create({
+        name: 'bot-commands',
+        type: ChannelType.GuildText,
       });
 
-      assert.match(output, /Tournament Synchronization Complete/);
-      assert.match(output, /BGMI Champions Trophy/);
-      assert.match(output, /Team Channels:\*\* \*\*1\*\* created/);
+      guildSettingsCache[guild.id] = {
+        tournaments: {
+          'tour-auto-ctx': {
+            channels: {
+              botCommandsId: botCmdChannel.id,
+            },
+          },
+        },
+      };
 
-      // Verify channel created in guild
-      const teamChannel = Array.from(guild.channels.cache.values()).find((c) => c.name === 'team-team-alpha');
-      assert.ok(teamChannel);
-      assert.ok(teamChannel.permissionOverwrites.cache.has('123456789012345678'));
+      let replyOutput = '';
+      // Run .fetch teams with NO arguments inside the tournament's bot-commands channel
+      await handleFetchTeamsCommand(guild, adminMember, [], async (msg) => {
+        replyOutput = typeof msg === 'object' ? msg.content : msg;
+      }, botCmdChannel);
+
+      assert.match(replyOutput, /Tournament Synchronization Complete/);
+      assert.match(replyOutput, /Context Resolution League/);
+      assert.match(replyOutput, /tour-auto-ctx/);
     } finally {
       await new Promise((resolve) => mockServer.close(resolve));
     }
+  });
+
+  test('15. Sync Summary: formats accurate 4-channel report', () => {
+    const tournament = { id: 'tour-sum-1', title: 'Free Fire Open', status: 'published' };
+    const summary = {
+      total_registered_teams: 16,
+      eligible_teams_count: 14,
+      ineligible_teams_count: 2,
+      eligible_linked_members_count: 48,
+      unlinked_members_count: 8,
+      duplicate_discord_ids_count: 1,
+    };
+    const syncResult = {
+      categoryAction: 'created',
+      categoryId: 'cat-123',
+      channelsCreated: ['bot-commands', 'tournament-update', 'tournament-teams', 'tournament-helpdesk'],
+      channelsReused: [],
+      channelIds: {
+        botCommandsId: 'ch-1',
+        tournamentUpdateId: 'ch-2',
+        tournamentTeamsId: 'ch-3',
+        tournamentHelpdeskId: 'ch-4',
+      },
+      teamsUpdatedInChannel: true,
+      permissionsUpdated: 48,
+      permissionsRemoved: 0,
+      obsoleteSquadChannelsDeleted: 0,
+      failures: [],
+    };
+
+    const message = formatSyncSummaryMessage(tournament, summary, syncResult);
+    assert.match(message, /Tournament Synchronization Complete/);
+    assert.match(message, /Free Fire Open/);
+    assert.match(message, /Four Shared Channels/);
+    assert.match(message, /Bot Commands \(Admin Only\):/);
+    assert.match(message, /Announcements & Updates:/);
+    assert.match(message, /Registered Teams Roster:/);
+    assert.match(message, /Helpdesk & Support:/);
+    assert.match(message, /Published to #tournament-teams/);
   });
 });

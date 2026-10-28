@@ -1541,7 +1541,7 @@ client.on(Events.MessageCreate, async (message) => {
       } else if (cmd === 'fetch') {
         const sub = (args[0] || '').toLowerCase();
         if (sub === 'teams' || sub === 'team') {
-          await handleFetchTeamsCommand(message.guild, message.member, args.slice(1), (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }));
+          await handleFetchTeamsCommand(message.guild, message.member, args.slice(1), (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }), message.channel);
           return;
         }
         await message.reply(`ℹ️ **Usage:** \`${PREFIX}fetch teams <tournament_id>\` — Fetch registered teams & sync Discord channels.`);

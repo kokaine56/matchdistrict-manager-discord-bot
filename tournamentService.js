@@ -13,6 +13,36 @@ import {
 } from './index.js';
 
 /**
+ * Required 4 shared tournament channels structure
+ */
+export const REQUIRED_TOURNAMENT_CHANNELS = [
+  {
+    key: 'botCommandsId',
+    name: 'bot-commands',
+    topic: 'Tournament Management & Bot Commands (Admin Only)',
+    participantAccess: 'none', // Strictly admins only
+  },
+  {
+    key: 'tournamentUpdateId',
+    name: 'tournament-update',
+    topic: 'Official Announcements & Tournament Updates',
+    participantAccess: 'read_only', // Participants read-only
+  },
+  {
+    key: 'tournamentTeamsId',
+    name: 'tournament-teams',
+    topic: 'Registered Teams & Tournament Roster',
+    participantAccess: 'read_only', // Participants read-only
+  },
+  {
+    key: 'tournamentHelpdeskId',
+    name: 'tournament-helpdesk',
+    topic: 'Participant Questions & Tournament Support Desk',
+    participantAccess: 'read_write', // Participants can send messages
+  },
+];
+
+/**
  * Session storage for tournament listings per guild.
  * Maps guildId -> { lastTournaments: Array<{id, title}>, lastListedTournamentId: string|null, timestamp: number }
  */
@@ -281,7 +311,7 @@ export function formatTournamentListPages(tournaments, { page = 1, pageSize = 5,
   }).join('\n\n');
 
   const footer = `\n\n📌 **Next Steps:**\n` +
-    `• To fetch teams and sync Discord channels: \`.fetch teams <tournament_id>\`\n` +
+    `• To select a tournament & setup channels: \`.fetch teams <tournament_id>\` (or use the menu below)\n` +
     (totalPages > 1 ? `• View other pages: \`.list tournament page <1-${totalPages}>\`` : '');
 
   return [header + itemsText + footer];
@@ -297,7 +327,7 @@ export function buildTournamentSelectMenu(tournaments, maxOptions = 25) {
   try {
     const menu = new StringSelectMenuBuilder()
       .setCustomId('md_select_tournament')
-      .setPlaceholder('Select a tournament to fetch teams & sync channels...')
+      .setPlaceholder('Select a tournament to setup category & channels...')
       .addOptions(
         slice.map((t) => {
           const opt = new StringSelectMenuOptionBuilder()
@@ -311,6 +341,54 @@ export function buildTournamentSelectMenu(tournaments, maxOptions = 25) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Formats the registered teams list to be published into the shared #tournament-teams channel.
+ */
+export function formatTeamsChannelRoster(tournament, teams = []) {
+  const eligibleTeams = teams.filter((t) => t.is_eligible);
+  if (eligibleTeams.length === 0) {
+    return [
+      `📋 **Tournament Registered Teams** — **${tournament.title}** (ID: \`${tournament.id}\`)\n\n` +
+      `*No confirmed or approved teams have been registered yet.*`,
+    ];
+  }
+
+  const chunks = [];
+  let currentChunk = `📋 **Tournament Registered Teams** — **${tournament.title}** (ID: \`${tournament.id}\`)\n` +
+    `• **Total Confirmed Teams:** **${eligibleTeams.length}**\n` +
+    `• **Last Updated:** <t:${Math.floor(Date.now() / 1000)}:R>\n` +
+    `────────────────────────────────────────\n\n`;
+
+  for (let i = 0; i < eligibleTeams.length; i++) {
+    const team = eligibleTeams[i];
+    const leaderMention = team.leader?.discord_id ? `<@${team.leader.discord_id}>` : (team.captain || 'Leader');
+    let teamText = `**${i + 1}. ${team.team_name}**\n` +
+      `  • **Captain:** ${leaderMention}\n`;
+
+    if (Array.isArray(team.members) && team.members.length > 0) {
+      const memberList = team.members.map((m) => {
+        if (m.discord_id) return `<@${m.discord_id}>`;
+        return m.name || 'Member';
+      }).join(', ');
+      teamText += `  • **Roster:** ${memberList}\n`;
+    }
+    teamText += '\n';
+
+    if (currentChunk.length + teamText.length > 1850) {
+      chunks.push(currentChunk);
+      currentChunk = teamText;
+    } else {
+      currentChunk += teamText;
+    }
+  }
+
+  if (currentChunk.trim()) {
+    chunks.push(currentChunk);
+  }
+
+  return chunks;
 }
 
 /**
@@ -399,20 +477,33 @@ export async function handleListTournamentCommand(guild, member, args = [], repl
 
 /**
  * Handles the ".fetch teams" command.
+ * Can be executed with an explicit tournament ID or from inside a tournament's #bot-commands channel.
  */
-export async function handleFetchTeamsCommand(guild, member, args = [], replyFn) {
+export async function handleFetchTeamsCommand(guild, member, args = [], replyFn, messageChannel = null) {
   const access = checkTournamentAccess(guild, member);
   if (!access.allowed) {
     await replyFn(access.reason);
     return;
   }
 
-  // 1. Identify tournament ID from arguments or guild session
+  // 1. Identify tournament ID from arguments, active channel, or guild session
   let tournamentId = (args[0] || '').trim();
   if (tournamentId.toLowerCase() === 'teams' || tournamentId.toLowerCase() === 'team') {
     tournamentId = (args[1] || '').trim();
   }
 
+  // If not provided in args, check if executed inside a tournament's #bot-commands channel
+  if (!tournamentId && messageChannel && guildSettingsCache[guild.id]?.tournaments) {
+    for (const [tId, tData] of Object.entries(guildSettingsCache[guild.id].tournaments)) {
+      const bCmdId = tData.channels?.botCommandsId || tData.botCommandsId;
+      if (bCmdId && bCmdId === messageChannel.id) {
+        tournamentId = tId;
+        break;
+      }
+    }
+  }
+
+  // Fallback to session if unambiguous
   if (!tournamentId) {
     const session = guildTournamentSessions.get(guild.id);
     if (session && session.lastListedTournamentId) {
@@ -420,7 +511,7 @@ export async function handleFetchTeamsCommand(guild, member, args = [], replyFn)
     } else if (session && Array.isArray(session.lastTournaments) && session.lastTournaments.length > 1) {
       await replyFn(
         `⚠️ **Multiple Tournaments Available:**\n` +
-        `Please specify the target tournament ID:\n` +
+        `Please specify the target tournament ID or run this command inside the tournament's **#bot-commands** channel:\n` +
         `> \`.fetch teams <tournament_id>\`\n\n` +
         `*(Run \`.list tournament\` to view all tournament IDs)*`
       );
@@ -428,7 +519,7 @@ export async function handleFetchTeamsCommand(guild, member, args = [], replyFn)
     } else {
       await replyFn(
         `⚠️ **Missing Tournament ID:**\n` +
-        `Please provide a tournament ID to fetch registrations:\n` +
+        `Please provide a tournament ID or run this command inside a tournament's **#bot-commands** channel:\n` +
         `> \`.fetch teams <tournament_id>\`\n\n` +
         `*(Run \`.list tournament\` first to see available tournaments)*`
       );
@@ -440,7 +531,7 @@ export async function handleFetchTeamsCommand(guild, member, args = [], replyFn)
   const botMember = guild.members.me;
   if (!botMember?.permissions?.has(PermissionFlagsBits.ManageChannels)) {
     await replyFn(
-      '❌ **Missing Bot Permissions:** The bot requires the **Manage Channels** permission in this server to create tournament categories and team channels.'
+      '❌ **Missing Bot Permissions:** The bot requires the **Manage Channels** permission in this server to create tournament categories and configure channels.'
     );
     return;
   }
@@ -460,17 +551,35 @@ export async function handleFetchTeamsCommand(guild, member, args = [], replyFn)
     return;
   }
 
-  // Synchronize category, channels, and member permissions
+  // Synchronize category, exactly the four shared channels, and member permissions
   const syncResult = await syncTournamentDiscordChannels(guild, tournament, teams, botMember);
 
   // Format final summary report
   const summaryMessage = formatSyncSummaryMessage(tournament, summary, syncResult);
   await replyFn(summaryMessage);
+
+  // If command was executed outside the tournament's #bot-commands channel, post a copy to #bot-commands
+  const botCmdId = syncResult.channelIds?.botCommandsId;
+  if (botCmdId && (!messageChannel || messageChannel.id !== botCmdId)) {
+    try {
+      const bChannel = guild.channels.cache.get(botCmdId) || await guild.channels.fetch(botCmdId).catch(() => null);
+      if (bChannel && typeof bChannel.send === 'function') {
+        await bChannel.send(summaryMessage).catch(() => {});
+      }
+    } catch {
+      // Ignore notification mirror errors
+    }
+  }
 }
 
 /**
- * Synchronize tournament Discord category, general channel, and team channels.
- * Reuses existing category & channels mapped to tournament ID in persistent storage.
+ * Synchronize tournament Discord category and exactly four shared channels:
+ * 1. #bot-commands (Admin only)
+ * 2. #tournament-update (Admin post, participants read-only)
+ * 3. #tournament-teams (Admin post / bot roster, participants read-only)
+ * 4. #tournament-helpdesk (Participants can chat, admins/mods respond)
+ *
+ * Removes per-squad channel creation completely and migrates away from obsolete squad channels.
  */
 export async function syncTournamentDiscordChannels(guild, tournament, teams = [], botMember) {
   const tournamentId = tournament.id;
@@ -480,21 +589,24 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
   }
   const savedTournament = currentSettings.tournaments[tournamentId] || {
     categoryId: null,
-    generalChannelId: null,
-    teamChannels: {},
+    channels: {},
     allEligibleMemberIds: [],
   };
+
+  if (!savedTournament.channels) {
+    savedTournament.channels = {};
+  }
 
   const syncResult = {
     categoryAction: 'none', // created, reused, failed
     categoryId: null,
-    generalChannelAction: 'none', // created, reused, failed
-    generalChannelId: null,
-    teamChannelsCreated: 0,
-    teamChannelsReused: 0,
+    channelsCreated: [],
+    channelsReused: [],
+    channelIds: {},
+    teamsUpdatedInChannel: false,
     permissionsUpdated: 0,
     permissionsRemoved: 0,
-    skippedTeams: [],
+    obsoleteSquadChannelsDeleted: 0,
     failures: [],
   };
 
@@ -509,7 +621,6 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     syncResult.categoryAction = 'reused';
     syncResult.categoryId = category.id;
   } else {
-    // Create new category
     try {
       const categoryName = sanitizeCategoryName(tournament.title);
       const overwrites = [
@@ -545,47 +656,22 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     }
   }
 
-  // 2. Locate or create General Text Channel
-  let generalChannel = null;
-  if (savedTournament.generalChannelId) {
-    generalChannel = guild.channels.cache.get(savedTournament.generalChannelId) ||
-      await guild.channels.fetch(savedTournament.generalChannelId).catch(() => null);
-  }
-
-  if (generalChannel && generalChannel.parentId === category.id) {
-    syncResult.generalChannelAction = 'reused';
-    syncResult.generalChannelId = generalChannel.id;
-  } else {
-    try {
-      generalChannel = await guild.channels.create({
-        name: '📢-announcements',
-        type: ChannelType.GuildText,
-        parent: category.id,
-        topic: `Official announcements & general information for ${tournament.title} (ID: ${tournamentId})`,
-        permissionOverwrites: [
-          {
-            id: guild.roles.everyone.id,
-            deny: [PermissionFlagsBits.ViewChannel],
-          },
-          {
-            id: botMember.id,
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.ManageChannels,
-              PermissionFlagsBits.ManageRoles,
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.ReadMessageHistory,
-            ],
-          },
-        ],
-      });
-      syncResult.generalChannelAction = 'created';
-      syncResult.generalChannelId = generalChannel.id;
-      savedTournament.generalChannelId = generalChannel.id;
-    } catch (err) {
-      syncResult.generalChannelAction = 'failed';
-      syncResult.failures.push(`Failed to create general channel: ${err.message}`);
+  // 2. Migration: Safely clean up any obsolete per-squad channels from older bot versions
+  if (savedTournament.teamChannels && typeof savedTournament.teamChannels === 'object') {
+    const obsoleteIds = Object.values(savedTournament.teamChannels);
+    for (const chId of obsoleteIds) {
+      if (!chId) continue;
+      try {
+        const ch = guild.channels.cache.get(chId) || await guild.channels.fetch(chId).catch(() => null);
+        if (ch && ch.parentId === category.id && ch.name.startsWith('team-')) {
+          await ch.delete('Migrating away from obsolete per-squad channels to shared tournament channels').catch(() => {});
+          syncResult.obsoleteSquadChannelsDeleted++;
+        }
+      } catch {
+        // Ignore deletion failures for non-existent channels
+      }
     }
+    delete savedTournament.teamChannels;
   }
 
   // 3. Collect all currently eligible linked member Discord IDs
@@ -602,94 +688,33 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     }
   }
 
-  // 4. Synchronize General Channel Permissions (grant access to all eligible participants, revoke for removed)
-  if (generalChannel) {
-    const previousMemberIds = new Set(savedTournament.allEligibleMemberIds || []);
+  // 4. Create or reuse exactly the four required channels
+  const activeChannels = {};
 
-    // Grant access to new eligible members
-    for (const discordId of currentEligibleMemberIds) {
-      try {
-        await generalChannel.permissionOverwrites.edit(discordId, {
-          ViewChannel: true,
-          ReadMessageHistory: true,
-        });
-        syncResult.permissionsUpdated++;
-      } catch (err) {
-        // Individual permission overwrite failure (e.g. member left guild or invalid)
-        syncResult.failures.push(`General channel permission error for user ${discordId}: ${err.message}`);
-      }
+  for (const channelDef of REQUIRED_TOURNAMENT_CHANNELS) {
+    const existingId = savedTournament.channels[channelDef.key];
+    let channelInstance = null;
+
+    if (existingId) {
+      channelInstance = guild.channels.cache.get(existingId) ||
+        await guild.channels.fetch(existingId).catch(() => null);
     }
 
-    // Revoke access for members who are no longer eligible
-    for (const oldId of previousMemberIds) {
-      if (!currentEligibleMemberIds.has(oldId)) {
-        try {
-          await generalChannel.permissionOverwrites.delete(oldId);
-          syncResult.permissionsRemoved++;
-        } catch {
-          // Ignore if overwrite already deleted
-        }
-      }
-    }
-  }
-
-  // 5. Synchronize Private Team Channels
-  if (!savedTournament.teamChannels) {
-    savedTournament.teamChannels = {};
-  }
-
-  for (const team of eligibleTeams) {
-    const teamKey = team.id || sanitizeChannelName(team.team_name);
-    const channelName = sanitizeChannelName(team.team_name, 'team-');
-    const existingChannelId = savedTournament.teamChannels[teamKey];
-
-    let teamChannel = null;
-    if (existingChannelId) {
-      teamChannel = guild.channels.cache.get(existingChannelId) ||
-        await guild.channels.fetch(existingChannelId).catch(() => null);
+    // Fallback: search by name inside the category if mapping was missing
+    if (!channelInstance) {
+      channelInstance = Array.from(guild.channels.cache.values()).find(
+        (c) => c.parentId === category.id && c.name === channelDef.name
+      );
     }
 
-    // Get valid linked Discord members for this team
-    const teamLinkedDiscordIds = (team.linked_members || [])
-      .map((m) => m.discord_id)
-      .filter(isValidDiscordSnowflake);
-
-    if (teamChannel && teamChannel.parentId === category.id) {
-      syncResult.teamChannelsReused++;
-      // Update permissions on reused team channel
-      for (const discordId of teamLinkedDiscordIds) {
-        try {
-          await teamChannel.permissionOverwrites.edit(discordId, {
-            ViewChannel: true,
-            SendMessages: true,
-            ReadMessageHistory: true,
-            AttachFiles: true,
-          });
-          syncResult.permissionsUpdated++;
-        } catch (err) {
-          syncResult.failures.push(`Permission error on #${teamChannel.name} for ${discordId}: ${err.message}`);
-        }
-      }
+    if (channelInstance && channelInstance.parentId === category.id) {
+      syncResult.channelsReused.push(channelDef.name);
+      savedTournament.channels[channelDef.key] = channelInstance.id;
+      activeChannels[channelDef.key] = channelInstance;
     } else {
-      // Check category channel limit (Discord limit: 50 channels per category)
-      let currentCategoryChannelCount = 0;
-      if (typeof guild.channels.cache?.filter === 'function') {
-        currentCategoryChannelCount = guild.channels.cache.filter((c) => c.parentId === category.id).size;
-      } else if (guild.channels.cache?.values) {
-        for (const c of guild.channels.cache.values()) {
-          if (c.parentId === category.id) currentCategoryChannelCount++;
-        }
-      }
-      if (currentCategoryChannelCount >= 50) {
-        syncResult.skippedTeams.push({
-          teamName: team.team_name,
-          reason: 'Discord category limit of 50 channels reached.',
-        });
-        continue;
-      }
-
+      // Create channel
       try {
-        const overwrites = [
+        const initialOverwrites = [
           {
             id: guild.roles.everyone.id,
             deny: [PermissionFlagsBits.ViewChannel],
@@ -702,39 +727,117 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
               PermissionFlagsBits.ManageRoles,
               PermissionFlagsBits.SendMessages,
               PermissionFlagsBits.ReadMessageHistory,
+              PermissionFlagsBits.EmbedLinks,
             ],
           },
         ];
 
-        for (const discordId of teamLinkedDiscordIds) {
-          overwrites.push({
-            id: discordId,
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.ReadMessageHistory,
-              PermissionFlagsBits.AttachFiles,
-            ],
-          });
-        }
-
-        teamChannel = await guild.channels.create({
-          name: channelName,
+        channelInstance = await guild.channels.create({
+          name: channelDef.name,
           type: ChannelType.GuildText,
           parent: category.id,
-          topic: `Private team channel for ${team.team_name} — ${tournament.title}`,
-          permissionOverwrites: overwrites,
+          topic: `${channelDef.topic} — ${tournament.title}`,
+          permissionOverwrites: initialOverwrites,
         });
 
-        syncResult.teamChannelsCreated++;
-        savedTournament.teamChannels[teamKey] = teamChannel.id;
+        syncResult.channelsCreated.push(channelDef.name);
+        savedTournament.channels[channelDef.key] = channelInstance.id;
+        activeChannels[channelDef.key] = channelInstance;
       } catch (err) {
-        syncResult.failures.push(`Failed to create channel for team "${team.team_name}": ${err.message}`);
+        syncResult.failures.push(`Failed to create #${channelDef.name}: ${err.message}`);
       }
     }
   }
 
-  // 6. Persist association to guild settings
+  syncResult.channelIds = { ...savedTournament.channels };
+
+  // 5. Synchronize Permissions across the four channels
+  const previousMemberIds = new Set(savedTournament.allEligibleMemberIds || []);
+
+  // Channels that eligible participants should be granted access to
+  const participantChannels = [
+    {
+      channel: activeChannels.tournamentUpdateId,
+      permissions: {
+        ViewChannel: true,
+        ReadMessageHistory: true,
+        SendMessages: false,
+        CreatePublicThreads: false,
+        CreatePrivateThreads: false,
+        AddReactions: false,
+      },
+    },
+    {
+      channel: activeChannels.tournamentTeamsId,
+      permissions: {
+        ViewChannel: true,
+        ReadMessageHistory: true,
+        SendMessages: false,
+        CreatePublicThreads: false,
+        CreatePrivateThreads: false,
+        AddReactions: false,
+      },
+    },
+    {
+      channel: activeChannels.tournamentHelpdeskId,
+      permissions: {
+        ViewChannel: true,
+        SendMessages: true,
+        ReadMessageHistory: true,
+        AttachFiles: true,
+        EmbedLinks: true,
+      },
+    },
+  ];
+
+  // A. Grant or update permissions for currently eligible linked members
+  for (const discordId of currentEligibleMemberIds) {
+    for (const { channel, permissions } of participantChannels) {
+      if (!channel) continue;
+      try {
+        await channel.permissionOverwrites.edit(discordId, permissions);
+        syncResult.permissionsUpdated++;
+      } catch (err) {
+        syncResult.failures.push(`Permission error on #${channel.name} for user ${discordId}: ${err.message}`);
+      }
+    }
+
+    // Ensure eligible participants do NOT have view access to #bot-commands
+    if (activeChannels.botCommandsId) {
+      try {
+        await activeChannels.botCommandsId.permissionOverwrites.delete(discordId).catch(() => {});
+      } catch {}
+    }
+  }
+
+  // B. Revoke access from members who are no longer eligible
+  for (const oldId of previousMemberIds) {
+    if (!currentEligibleMemberIds.has(oldId)) {
+      for (const { channel } of participantChannels) {
+        if (!channel) continue;
+        try {
+          await channel.permissionOverwrites.delete(oldId);
+          syncResult.permissionsRemoved++;
+        } catch {}
+      }
+    }
+  }
+
+  // 6. Update the shared #tournament-teams channel with the latest registered team roster
+  const teamsChannel = activeChannels.tournamentTeamsId;
+  if (teamsChannel && typeof teamsChannel.send === 'function') {
+    try {
+      const rosterChunks = formatTeamsChannelRoster(tournament, teams);
+      for (const chunk of rosterChunks) {
+        await teamsChannel.send(chunk);
+      }
+      syncResult.teamsUpdatedInChannel = true;
+    } catch (err) {
+      syncResult.failures.push(`Failed to update roster in #tournament-teams: ${err.message}`);
+    }
+  }
+
+  // 7. Persist tournament mapping to guild settings
   savedTournament.allEligibleMemberIds = Array.from(currentEligibleMemberIds);
   savedTournament.tournamentTitle = tournament.title;
   savedTournament.lastSyncedAt = new Date().toISOString();
@@ -749,7 +852,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
  * Format synchronization completion summary message.
  */
 export function formatSyncSummaryMessage(tournament, summary, syncResult) {
-  const isPartial = syncResult.failures.length > 0 || syncResult.skippedTeams.length > 0;
+  const isPartial = syncResult.failures.length > 0;
   const statusEmoji = isPartial ? '⚠️' : '✅';
   const statusTitle = isPartial
     ? '**Tournament Synchronization Completed with Warnings**'
@@ -761,12 +864,6 @@ export function formatSyncSummaryMessage(tournament, summary, syncResult) {
       ? `Reused (<#${syncResult.categoryId}>)`
       : 'Failed';
 
-  const genActionText = syncResult.generalChannelAction === 'created'
-    ? `Created (<#${syncResult.generalChannelId}>)`
-    : syncResult.generalChannelAction === 'reused'
-      ? `Reused (<#${syncResult.generalChannelId}>)`
-      : 'Failed';
-
   let msg = `${statusEmoji} ${statusTitle}\n\n` +
     `• 🏆 **Tournament:** **${tournament.title}** (ID: \`${tournament.id}\`)\n` +
     `• 🎮 **Status:** ${tournament.status?.toUpperCase() || 'PUBLISHED'}\n` +
@@ -775,31 +872,25 @@ export function formatSyncSummaryMessage(tournament, summary, syncResult) {
     `• 🔗 **Eligible Linked Discord Members:** **${summary.eligible_linked_members_count}** participant(s) granted channel access\n` +
     `• ⚠️ **Unlinked Participants:** **${summary.unlinked_members_count}** account(s) not linked to Discord on website\n` +
     `• 🛡️ **Duplicate Discord IDs:** **${summary.duplicate_discord_ids_count || 0}** safely deduplicated\n\n` +
-    `📁 **Discord Category & Channels:**\n` +
+    `📁 **Tournament Category & Channels:**\n` +
     `• **Category:** ${catActionText}\n` +
-    `• **General Announcements:** ${genActionText}\n` +
-    `• **Team Channels:** **${syncResult.teamChannelsCreated}** created, **${syncResult.teamChannelsReused}** reused\n` +
+    `• **Four Shared Channels:**\n` +
+    `  - 🤖 **Bot Commands (Admin Only):** ${syncResult.channelIds?.botCommandsId ? `<#${syncResult.channelIds.botCommandsId}>` : '#bot-commands'}\n` +
+    `  - 📢 **Announcements & Updates:** ${syncResult.channelIds?.tournamentUpdateId ? `<#${syncResult.channelIds.tournamentUpdateId}>` : '#tournament-update'}\n` +
+    `  - 📋 **Registered Teams Roster:** ${syncResult.channelIds?.tournamentTeamsId ? `<#${syncResult.channelIds.tournamentTeamsId}>` : '#tournament-teams'}\n` +
+    `  - 💬 **Helpdesk & Support:** ${syncResult.channelIds?.tournamentHelpdeskId ? `<#${syncResult.channelIds.tournamentHelpdeskId}>` : '#tournament-helpdesk'}\n` +
+    `• **Roster Status:** ${syncResult.teamsUpdatedInChannel ? '🟢 **Published to #tournament-teams**' : '⚪ **Roster ready**'}\n` +
     `• **Permission Overwrites:** **${syncResult.permissionsUpdated}** applied, **${syncResult.permissionsRemoved}** removed\n`;
 
-  if (syncResult.skippedTeams.length > 0) {
-    msg += `\n⚠️ **Skipped Teams (${syncResult.skippedTeams.length}):**\n`;
-    for (const st of syncResult.skippedTeams.slice(0, 5)) {
-      msg += `  • *${st.teamName}:* ${st.reason}\n`;
-    }
-    if (syncResult.skippedTeams.length > 5) {
-      msg += `  • ...and ${syncResult.skippedTeams.length - 5} more\n`;
-    }
+  if (syncResult.obsoleteSquadChannelsDeleted > 0) {
+    msg += `• 🧹 **Migration:** Safely deleted **${syncResult.obsoleteSquadChannelsDeleted}** obsolete squad channel(s)\n`;
   }
 
   if (syncResult.failures.length > 0) {
-    msg += `\n⚠️ **Warnings & Notice:**\n`;
+    msg += `\n⚠️ **Warnings:**\n`;
     for (const f of syncResult.failures.slice(0, 5)) {
       msg += `  • ${f}\n`;
     }
-    if (syncResult.failures.length > 5) {
-      msg += `  • ...and ${syncResult.failures.length - 5} more\n`;
-    }
-    msg += `\n*You can safely re-run \`.fetch teams ${tournament.id}\` to retry partial channel creations.*`;
   }
 
   return msg;
