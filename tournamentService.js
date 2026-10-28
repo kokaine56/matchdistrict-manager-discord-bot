@@ -1112,6 +1112,20 @@ export async function getOrCreateTournamentRole(guild, tournament) {
   }
 
   if (role) {
+    const botMember = guild.members?.me || (guild.members?.cache ? guild.members.cache.get(guild.client?.user?.id) : null);
+    if (botMember?.permissions?.has && !botMember.permissions.has(PermissionFlagsBits.ManageRoles)) {
+      throw new Error(`Cannot manage @${role.name}: the bot needs the Manage Roles permission.`);
+    }
+    if (botMember?.roles?.highest && role.position >= botMember.roles.highest.position) {
+      const targetPosition = Math.max(1, botMember.roles.highest.position - 1);
+      try {
+        await role.setPosition(targetPosition, { reason: `Place ${role.name} below the bot's highest role for tournament member sync` });
+        role = guild.roles.cache.get(role.id) || role;
+      } catch (err) {
+        throw new Error(`Cannot manage @${role.name}: its position is not below the bot's highest role and could not be moved (${err.message}).`);
+      }
+    }
+
     // Security check: ensure tournament role strictly avoids granting Administrator permission
     if (role.permissions?.has && role.permissions.has(PermissionFlagsBits.Administrator)) {
       console.warn(`[Discord Bot] 🚨 Security Warning: Tournament role @${role.name} has Administrator permission. Removing elevated permissions.`);
@@ -1137,9 +1151,7 @@ export async function getOrCreateTournamentRole(guild, tournament) {
  * skips unlinked or missing server members, and tracks stats.
  */
 export async function syncTournamentRoles(guild, tournamentId, preloadedData = null) {
-  if (!guild || !isOfficialGuild(guild)) {
-    throw new Error('Tournament roles can only be synchronized in the official MatchDistrict Discord server.');
-  }
+  if (!guild) throw new Error('A Discord server is required to synchronize tournament roles.');
 
   let tournament = preloadedData?.tournament;
   let teams = preloadedData?.teams;
@@ -1154,7 +1166,22 @@ export async function syncTournamentRoles(guild, tournamentId, preloadedData = n
     throw new Error(`No tournament metadata found for ID "${tournamentId}".`);
   }
 
-  const role = await getOrCreateTournamentRole(guild, tournament);
+  let role;
+  try {
+    role = await getOrCreateTournamentRole(guild, tournament);
+  } catch (err) {
+    const failedSettings = guildSettingsCache[guild.id] || {};
+    const failedTournament = failedSettings.tournaments?.[tournamentId] || { tournamentId, guildId: guild.id, tournamentTitle: tournament.title };
+    failedTournament.roleLastSyncedAt = new Date().toISOString();
+    failedTournament.roleSyncStats = { status: 'failed', error: err.message, assigned: 0, removed: 0, skipped: 0, failed: 1, membersWithRole: 0 };
+    failedSettings.tournaments ||= {};
+    failedSettings.tournaments[tournamentId] = failedTournament;
+    guildSettingsCache[guild.id] = failedSettings;
+    saveGuildSettings(guildSettingsCache);
+    await saveTournamentToDb(guild.id, tournamentId, failedTournament);
+    console.error(`[Discord Bot] Tournament role setup failed for ${tournament.title}:`, err);
+    throw err;
+  }
   if (!role) {
     throw new Error(`Failed to create or resolve tournament role for "${tournament.title}".`);
   }
@@ -1186,6 +1213,7 @@ export async function syncTournamentRoles(guild, tournamentId, preloadedData = n
 
   const newlyAssignedMembers = [];
   const newlyRemovedMembers = [];
+  const failureReasons = [];
 
   const stats = {
     assigned: 0,
@@ -1197,20 +1225,37 @@ export async function syncTournamentRoles(guild, tournamentId, preloadedData = n
     roleName: role.name,
     totalEligible: currentEligibleDiscordIds.size,
     membersWithRole: 0,
+    status: 'syncing',
+    error: null,
   };
 
   // Check bot permissions and hierarchy
   const botMember = guild.members?.me || (guild.members?.cache ? guild.members.cache.get(guild.client?.user?.id) : null);
-  const botHasManageRoles = !botMember?.permissions || (typeof botMember.permissions.has === 'function' ? botMember.permissions.has(PermissionFlagsBits.ManageRoles) : true);
+  const botHasManageRoles = Boolean(botMember?.permissions?.has?.(PermissionFlagsBits.ManageRoles));
+  let memberFetchError = null;
+  if (!botHasManageRoles) {
+    memberFetchError = 'The bot is missing the Manage Roles permission.';
+    console.error(`[Discord Bot] Tournament role sync failed for ${tournament.title}: ${memberFetchError}`);
+  } else if (botMember?.roles?.highest && role.position >= botMember.roles.highest.position) {
+    memberFetchError = `Tournament role @${role.name} is not below the bot's highest role.`;
+    console.error(`[Discord Bot] Tournament role sync failed for ${tournament.title}: ${memberFetchError}`);
+  }
 
   // Assign role to eligible members in guild
-  for (const discordId of currentEligibleDiscordIds) {
+  for (const discordId of botHasManageRoles && !memberFetchError ? currentEligibleDiscordIds : []) {
     let member = null;
     try {
-      member = guild.members?.cache?.get(discordId) ||
-        await guild.members?.fetch?.(discordId).catch(() => null);
-    } catch {
-      member = null;
+      member = await guild.members.fetch(discordId);
+    } catch (err) {
+      if (err.code === 10007 || err.code === 10013) {
+        stats.skipped++;
+        console.log(`[Discord Bot] Skipping tournament role for ${discordId}: member is not in guild ${guild.id}.`);
+        continue;
+      }
+      stats.failed++;
+      failureReasons.push(`Fetch ${discordId}: ${err.message}`);
+      console.warn(`[Discord Bot] Could not fetch registered Discord member ${discordId} for ${tournament.title}:`, err.message);
+      continue;
     }
 
     if (!member) {
@@ -1221,14 +1266,10 @@ export async function syncTournamentRoles(guild, tournamentId, preloadedData = n
     if (member.roles?.cache?.has(role.id)) {
       stats.alreadyAssigned++;
     } else if (typeof member.roles?.add === 'function') {
-      if (!botHasManageRoles) {
-        stats.failed++;
-        console.warn(`[Discord Bot] ⚠️ Cannot assign role @${role.name} to member ${discordId}: Bot lacks 'Manage Roles' permission.`);
-        continue;
-      }
       if (botMember?.roles?.highest && typeof botMember.roles.highest.comparePositionTo === 'function') {
         if (botMember.roles.highest.comparePositionTo(role) <= 0) {
           stats.failed++;
+          failureReasons.push(`Assign ${discordId}: bot role hierarchy is too low.`);
           console.warn(`[Discord Bot] ⚠️ Cannot assign role @${role.name} to member ${discordId}: Bot's highest role is not positioned higher than @${role.name} in role hierarchy.`);
           continue;
         }
@@ -1239,23 +1280,23 @@ export async function syncTournamentRoles(guild, tournamentId, preloadedData = n
         newlyAssignedMembers.push(member);
       } catch (err) {
         stats.failed++;
+        failureReasons.push(`Assign ${discordId}: ${err.message}`);
         console.warn(`[Discord Bot] Failed to assign role ${role.name} to member ${discordId}:`, err.message);
       }
     }
   }
 
   // Revoke role from members no longer eligible/registered for this tournament
-  if (guild.members?.cache) {
-    for (const member of guild.members.cache.values()) {
+  if (botHasManageRoles && !memberFetchError) {
+    try {
+      const allGuildMembers = await guild.members.fetch();
+      for (const member of allGuildMembers.values()) {
       if (member.roles?.cache?.has(role.id) && !currentEligibleDiscordIds.has(member.id)) {
         if (typeof member.roles?.remove === 'function') {
-          if (!botHasManageRoles) {
-            stats.failed++;
-            continue;
-          }
           if (botMember?.roles?.highest && typeof botMember.roles.highest.comparePositionTo === 'function') {
             if (botMember.roles.highest.comparePositionTo(role) <= 0) {
               stats.failed++;
+              failureReasons.push(`Remove ${member.id}: bot role hierarchy is too low.`);
               continue;
             }
           }
@@ -1265,21 +1306,34 @@ export async function syncTournamentRoles(guild, tournamentId, preloadedData = n
             newlyRemovedMembers.push(member);
           } catch (err) {
             stats.failed++;
+            failureReasons.push(`Remove ${member.id}: ${err.message}`);
             console.warn(`[Discord Bot] Failed to remove role ${role.name} from member ${member.id}:`, err.message);
           }
         }
       }
+      }
+    } catch (err) {
+      stats.failed++;
+      memberFetchError = `Could not fetch guild members to remove stale role assignments: ${err.message}`;
+      failureReasons.push(memberFetchError);
+      console.error(`[Discord Bot] ${memberFetchError}`);
     }
   }
 
   // Count members holding role
   let membersWithRoleCount = 0;
-  if (role.members?.size !== undefined) {
-    membersWithRoleCount = role.members.size;
-  } else if (guild.members?.cache) {
-    membersWithRoleCount = Array.from(guild.members.cache.values()).filter((m) => m.roles?.cache?.has(role.id)).length;
+  try {
+    const currentGuildMembers = await guild.members.fetch();
+    membersWithRoleCount = Array.from(currentGuildMembers.values()).filter((member) => member.roles?.cache?.has(role.id)).length;
+  } catch (err) {
+    stats.failed++;
+    memberFetchError ||= `Could not count members holding the role: ${err.message}`;
+    failureReasons.push(memberFetchError);
+    console.error(`[Discord Bot] ${memberFetchError}`);
   }
   stats.membersWithRole = membersWithRoleCount;
+  stats.status = stats.failed > 0 || Boolean(memberFetchError) ? 'failed' : 'successful';
+  stats.error = memberFetchError || (failureReasons.length ? failureReasons.slice(0, 5).join(' ') : null);
 
   // Persist role sync state
   savedTournament.roleId = role.id;
@@ -1291,6 +1345,13 @@ export async function syncTournamentRoles(guild, tournamentId, preloadedData = n
   currentSettings.tournaments[tournamentId] = savedTournament;
   guildSettingsCache[guild.id] = currentSettings;
   saveGuildSettings(guildSettingsCache);
+  const saved = await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+  if (!saved) {
+    stats.status = 'failed';
+    stats.error = 'Role sync results could not be saved to MongoDB.';
+    savedTournament.roleSyncStats = stats;
+    console.error(`[Discord Bot] ${stats.error} for tournament ${tournamentId}.`);
+  }
 
   // Dispatch unified audit logs
   if (newlyAssignedMembers.length > 0) {
@@ -1702,19 +1763,28 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
 
   // Ensure tournament role exists or is fetched
   let role = null;
+  const previousRoleId = savedTournament.roleId || null;
   try {
     role = await getOrCreateTournamentRole(guild, tournament);
   } catch (err) {
     console.warn('[Discord Bot] Role creation error in control panel setup:', err.message);
   }
 
+  if (role && (!savedTournament.roleLastSyncedAt || previousRoleId !== role.id)) {
+    try {
+      await syncTournamentRoles(guild, tournamentId);
+    } catch (err) {
+      console.error(`[Discord Bot] Initial tournament role sync failed for ${tournamentId}:`, err.message);
+    }
+  }
+
   let membersWithRoleCount = 0;
   if (role) {
-    if (role.members?.size !== undefined) {
-      membersWithRoleCount = role.members.size;
-    } else if (guild.members?.cache) {
-      membersWithRoleCount = Array.from(guild.members.cache.values()).filter((m) => m.roles?.cache?.has(role.id)).length;
-    }
+    const members = await guild.members.fetch().catch((err) => {
+      console.warn(`[Discord Bot] Could not refresh member count for tournament role ${role.name}:`, err.message);
+      return null;
+    });
+    if (members) membersWithRoleCount = Array.from(members.values()).filter((member) => member.roles?.cache?.has(role.id)).length;
   }
 
   const roleStats = savedTournament.roleSyncStats || {};
@@ -1722,8 +1792,10 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
     roleId: role.id,
     roleName: role.name,
     membersWithRole: membersWithRoleCount,
-    statusText: savedTournament.roleLastSyncedAt
-      ? `🟢 Synchronized (${roleStats.assigned ?? 0} assigned, ${roleStats.removed ?? 0} removed, ${roleStats.skipped ?? 0} skipped)`
+    statusText: roleStats.status === 'failed'
+      ? `🔴 Failed: ${roleStats.error || 'See bot logs for details.'}`
+      : savedTournament.roleLastSyncedAt && roleStats.status === 'successful'
+        ? `🟢 Synchronized (${roleStats.assigned ?? 0} assigned, ${roleStats.removed ?? 0} removed, ${roleStats.skipped ?? 0} skipped)`
       : '🟡 Pending Sync',
     lastSyncedAt: savedTournament.roleLastSyncedAt || null,
   } : null;
@@ -4712,10 +4784,20 @@ export async function handleBackToTournamentPanel(interaction, tournamentId) {
       const role = guild.roles.cache.get(savedTournament.roleId) ||
         await guild.roles.fetch(savedTournament.roleId).catch(() => null);
       if (role) {
+        const members = await guild.members.fetch().catch((err) => {
+          console.warn(`[Discord Bot] Could not refresh tournament role member count:`, err.message);
+          return null;
+        });
+        const roleStats = savedTournament.roleSyncStats || {};
         roleInfo = {
           roleId: role.id,
           roleName: role.name,
-          membersWithRole: role.members.size,
+          membersWithRole: members ? Array.from(members.values()).filter((member) => member.roles?.cache?.has(role.id)).length : 0,
+          statusText: roleStats.status === 'failed'
+            ? `🔴 Failed: ${roleStats.error || 'See bot logs for details.'}`
+            : roleStats.status === 'successful'
+              ? `🟢 Synchronized (${roleStats.assigned ?? 0} assigned, ${roleStats.removed ?? 0} removed, ${roleStats.skipped ?? 0} skipped)`
+              : '🟡 Pending Sync',
           lastSyncedAt: savedTournament.roleLastSyncedAt || null,
         };
       }

@@ -774,7 +774,7 @@ export async function recordAuditLog(guildId, action, details, adminUser = null)
  * @param {object} tournamentData
  */
 export async function saveTournamentToDb(guildId, tournamentId, tournamentData) {
-  if (!isMongoConnected() || !guildId || !tournamentId) return;
+  if (!isMongoConnected() || !guildId || !tournamentId) return false;
   try {
     const tourCol = mongoDb.collection('discord_tournaments');
     await tourCol.updateOne(
@@ -792,8 +792,10 @@ export async function saveTournamentToDb(guildId, tournamentId, tournamentData) 
       },
       { upsert: true }
     );
+    return true;
   } catch (err) {
     console.warn(`[MongoDB] Error saving tournament ${tournamentId} to MongoDB:`, err.message);
+    return false;
   }
 }
 
