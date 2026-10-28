@@ -84,15 +84,6 @@ export {
   processPendingRoleSyncQueue,
   MAX_ROLE_SYNC_RETRIES,
   ROLE_SYNC_RETRY_INTERVAL_MS,
-  handleChannelCreateAuditLog,
-  handleChannelDeleteAuditLog,
-  handleRoleCreateAuditLog,
-  handleRoleDeleteAuditLog,
-  formatChannelTypeName,
-  recentChannelCreates,
-  recentChannelDeletes,
-  recentRoleCreates,
-  recentRoleDeletes,
 };
 
 const __filename = fileURLToPath(import.meta.url);
