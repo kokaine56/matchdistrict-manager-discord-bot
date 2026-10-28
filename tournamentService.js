@@ -3185,7 +3185,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     // Action: Start Round (from Individual Round Menu or legacy button)
     if (action === 'start_round' || action === 'start') {
       if (extraParam) {
-        await handlePromptStartRound(interaction, tournamentId, extraParam);
+        await handleConfirmStartRound(interaction, tournamentId, extraParam);
       } else {
         await handleViewRoundsScreen(interaction, tournamentId);
       }
@@ -3764,7 +3764,7 @@ export async function handleCreateSequentialRound(interaction, tournamentId) {
 /**
  * Opens the dedicated management view for an individual selected round.
  */
-export async function handleOpenIndividualRoundMenu(interaction, tournamentId, roundId) {
+export async function handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, notice = null) {
   const guild = interaction.guild;
   const access = checkTournamentAccess(guild, interaction.member);
   if (!access.allowed) {
@@ -3786,9 +3786,13 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
   const round = savedTournament?.rounds?.[roundId];
 
   if (!round) {
-    const errText = `❌ Round \`${roundId}\` was not found.`;
+    const errText = notice || `❌ Round \`${roundId}\` was not found.`;
     if (interaction.deferred) {
-      await interaction.editReply({ content: errText, embeds: [], components: [] }).catch(() => {});
+      const navRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('dash:round:refresh').setLabel('Refresh').setEmoji('🔄').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('dash:round:back').setLabel('Back to Rounds').setEmoji('📋').setStyle(ButtonStyle.Secondary)
+      );
+      await interaction.editReply({ content: errText, embeds: [], components: [navRow] }).catch(() => {});
     } else if (typeof interaction.update === 'function') {
       await interaction.update({ content: errText, embeds: [], components: [] }).catch(() => {});
     } else {
@@ -3905,9 +3909,9 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
   );
 
   if (interaction.deferred) {
-    await interaction.editReply({ content: null, embeds: [embed], components: [row1, row2] }).catch(() => {});
+    await interaction.editReply({ content: notice, embeds: [embed], components: [row1, row2] }).catch(() => {});
   } else if (typeof interaction.update === 'function') {
-    await interaction.update({ content: null, embeds: [embed], components: [row1, row2] }).catch(() => {});
+    await interaction.update({ content: notice, embeds: [embed], components: [row1, row2] }).catch(() => {});
   } else if (typeof interaction.reply === 'function') {
     await interaction.reply({ embeds: [embed], components: [row1, row2], ephemeral: true }).catch(() => {});
   }
@@ -4740,18 +4744,20 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
   const member = interaction.member;
   const botMember = guild.members.me;
 
-  const access = checkTournamentAccess(guild, member);
-  if (!access.allowed) {
-    if (typeof interaction.reply === 'function') {
-      await interaction.reply({ content: access.reason, ephemeral: true }).catch(() => {});
-    }
-    return;
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferUpdate().catch((ackError) => {
+      console.warn(`[Discord Bot] Could not acknowledge start-round interaction ${interaction.id}:`, ackError.message);
+    });
   }
 
-  if (typeof interaction.deferReply === 'function') {
-    await interaction.deferReply({ ephemeral: true }).catch(() => {});
-  } else if (typeof interaction.update === 'function') {
-    await interaction.update({ content: '⏳ **Allocating groups and slots...**', components: [] }).catch(() => {});
+  const access = checkTournamentAccess(guild, member);
+  if (!access.allowed) {
+    if (typeof interaction.followUp === 'function') {
+      await interaction.followUp({ content: access.reason, ephemeral: true }).catch(() => {});
+    } else if (typeof interaction.editReply === 'function') {
+      await interaction.editReply({ content: access.reason });
+    }
+    return;
   }
 
   try {
@@ -4771,11 +4777,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       if (round.status === 'Active' || round.status === 'Started') {
         const msg = `⚠️ **${round.name}** has already been started with **${round.groups?.length || 0}** groups.\n` +
           `Automatic duplicate allocation was prevented. Use **Refresh Tournament Data** if you need to reconcile participant roles.`;
-        if (typeof interaction.editReply === 'function') {
-          await interaction.editReply({ content: msg, components: [] });
-        } else if (typeof interaction.followUp === 'function') {
-          await interaction.followUp({ content: msg, ephemeral: true });
-        }
+        await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, msg);
         return;
       }
 
@@ -4809,7 +4811,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
           });
         }
       } else {
-        eligibleTeams = teams.filter((t) => t.is_eligible);
+        eligibleTeams = (Array.isArray(teams) ? teams : []).filter((t) => t.is_eligible);
       }
 
       if (eligibleTeams.length === 0) {
@@ -5142,7 +5144,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       }
 
       // Update round status & metadata (submissions Closed by default until explicitly opened by admin)
-      round.status = 'Active';
+      round.status = 'Started';
       round.startedAt = new Date().toISOString();
       round.groups = groups;
       round.globalSubmissionStatus = 'Closed';
@@ -5176,47 +5178,11 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
 
       // Refresh Control Panel embed
       await setupTournamentControlPanel(guild, tournament, summary, botMember);
-
-      const maxAssignableSlot = 2 + ASSIGNABLE_SLOTS_PER_GROUP;
-      const successMsg = `✅ **${round.name} Started Successfully!**\n` +
-        `• **Eligible Teams Allocated:** **${eligibleTeams.length}** across **${groupCount}** group(s)\n` +
-        `• **Capacity Policy:** Configured **${ASSIGNABLE_SLOTS_PER_GROUP}** teams/group across 25 slots (Slots 01-02 LOCKED, Slots 03 to ${maxAssignableSlot} Teams, Slots ${maxAssignableSlot + 1}-25 UNUSED)\n` +
-        `• **Group Roles & Channels:** **${groups.length}** private text channel(s) and role(s) configured\n` +
-        `• **Group Roles Assigned:** **${totalAssignedMembers}** verified member(s)\n` +
-        (unlinkedTeamsCount > 0 ? `• ⚠️ **Pending Links:** **${unlinkedTeamsCount}** team(s) have unlinked Discord accounts\n` : '') +
-        `• **Allocation Summary:** Published in <#${savedTournament.channels?.botCommandsId || 'bot-commands'}>.`;
-
-      const navRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`md_round_back_to_menu:${tournamentId}:${round.roundId}`)
-          .setLabel(`Manage ${round.name}`)
-          .setEmoji('⚔️')
-          .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder()
-          .setCustomId(`md_round_back_to_rounds:${tournamentId}`)
-          .setLabel('Back to Rounds')
-          .setEmoji('📋')
-          .setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId(`md_tour_back_to_panel:${tournamentId}`)
-          .setLabel('Back to Dashboard')
-          .setEmoji('⬅️')
-          .setStyle(ButtonStyle.Secondary)
-      );
-
-      if (typeof interaction.editReply === 'function') {
-        await interaction.editReply({ content: successMsg, embeds: [], components: [navRow] });
-      } else if (typeof interaction.followUp === 'function') {
-        await interaction.followUp({ content: successMsg, components: [navRow], ephemeral: true });
-      }
+      await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId);
     });
   } catch (err) {
-    const errorMsg = `❌ **Failed to start round:** ${err.message}`;
-    if (typeof interaction.editReply === 'function') {
-      await interaction.editReply({ content: errorMsg, embeds: [], components: [] });
-    } else if (typeof interaction.followUp === 'function') {
-      await interaction.followUp({ content: errorMsg, ephemeral: true });
-    }
+    console.error(`[Discord Bot] Failed to start round ${roundId} for tournament ${tournamentId}:`, err);
+    await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, `❌ Failed to start round: ${err.message}`);
   }
 }
 
