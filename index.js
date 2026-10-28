@@ -86,6 +86,15 @@ import {
   handleConfirmQualifyTeams,
   handleSubmitResultPromptCommand,
   generateEmptyRoundGroups,
+  handleDashCommand,
+  handlePermanentTournamentDeleteCommand,
+  executeTournamentPermanentDeletion,
+  resumePendingTournamentDeletions,
+  handleOrganiserCommand,
+  handleOrganiserModalSubmit,
+  handleOrganiserButtonInteraction,
+  initOrganiserLinksCache,
+  isAuthorizedGuild,
 } from './tournamentService.js';
 import {
   initMongo,
@@ -101,7 +110,32 @@ import {
   migrateJsonToMongo,
   reconcileManagedBotState,
   closeMongo,
+  setDiscordAuditClient,
 } from './mongoService.js';
+import {
+  createAuditEmbed,
+  sendAuditLog,
+  AUDIT_COLORS,
+  AUDIT_FOOTER_TEXT,
+  logRoleCreated,
+  logRoleBatchCreated,
+  handleRoleCreateWithBatching,
+  logRoleDeleted,
+  logRoleUpdated,
+  logRolesGiven,
+  logRolesRemoved,
+  logChannelCreated,
+  logChannelDeleted,
+  logChannelUpdated,
+  logMemberJoined,
+  logMemberLeft,
+  logMemberBanned,
+  logMemberUnbanned,
+  logMessageSent,
+  logMessageEdited,
+  logMessageDeleted,
+  logTournamentAction,
+} from './auditLogger.js';
 
 export {
   handleListTournamentCommand,
@@ -173,6 +207,15 @@ export {
   handleConfirmQualifyTeams,
   handleSubmitResultPromptCommand,
   generateEmptyRoundGroups,
+  handleDashCommand,
+  handlePermanentTournamentDeleteCommand,
+  executeTournamentPermanentDeletion,
+  resumePendingTournamentDeletions,
+  handleOrganiserCommand,
+  handleOrganiserModalSubmit,
+  handleOrganiserButtonInteraction,
+  initOrganiserLinksCache,
+  isAuthorizedGuild,
   initMongo,
   isMongoConnected,
   ensurePersistenceAvailable,
@@ -186,6 +229,28 @@ export {
   migrateJsonToMongo,
   reconcileManagedBotState,
   closeMongo,
+  createAuditEmbed,
+  sendAuditLog,
+  AUDIT_COLORS,
+  AUDIT_FOOTER_TEXT,
+  logRoleCreated,
+  logRoleBatchCreated,
+  handleRoleCreateWithBatching,
+  logRoleDeleted,
+  logRoleUpdated,
+  logRolesGiven,
+  logRolesRemoved,
+  logChannelCreated,
+  logChannelDeleted,
+  logChannelUpdated,
+  logMemberJoined,
+  logMemberLeft,
+  logMemberBanned,
+  logMemberUnbanned,
+  logMessageSent,
+  logMessageEdited,
+  logMessageDeleted,
+  logTournamentAction,
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -605,9 +670,13 @@ export function getHelpResponse(prefix = PREFIX) {
     `• \`${prefix}dm welcome off\` — *(Admin Only)* Disable welcome DMs for new members\n` +
     `• \`${prefix}ban @user [reason]\` — *(Mod Only)* Ban a user with audit logging\n` +
     `• \`${prefix}clear <1-100>\` — *(Mod Only)* Bulk delete recent messages\n\n` +
-    `**🏆 Tournament Management (Official Server Only):**\n` +
+    `**🏆 Tournament & Organiser Management:**\n` +
+    `• \`${prefix}organiser\` — *(Admin Only)* Connect this Discord server to your MatchDistrict organiser account\n` +
+    `• \`${prefix}organiser unlink\` — *(Admin Only)* Disconnect this Discord server from the organiser account\n` +
     `• \`${prefix}list tournament [all]\` — *(Admin Only)* List tournaments & open control panel via selection\n` +
     `• \`${prefix}select tournament <id>\` — *(Admin Only)* Open or refresh control panel in #bot-commands\n` +
+    `• \`${prefix}dash\` — *(Admin Only)* Restore/resynchronize the tournament control panel in #bot-commands\n` +
+    `• \`${prefix}delete tournament <id>\` — *(Admin Only)* Permanently delete tournament, channels, roles, and database records\n` +
     `• \`${prefix}fetch teams [id]\` — *(Admin Only)* Provision tournament channels & sync live registered roster\n` +
     `• \`${prefix}cred <room_id> <password>\` — *(Admin Only)* Publish match credentials inside a private group channel\n\n` +
     `**ℹ️ General Information:**\n` +
@@ -1237,29 +1306,11 @@ export async function handleBanCommand(guild, member, args, replyFn) {
     return;
   }
 
-  // 7. Log to #ban-unban-log
-  const banLogId = getGuildChannelId(guild.id, 'banUnbanLogId');
-  let banLogChannel = banLogId ? guild.channels.cache.get(banLogId) : null;
-  if (!banLogChannel) {
-    banLogChannel = guild.channels.cache.find(
-      (c) => c.type === ChannelType.GuildText && c.name === 'ban-unban-log'
-    );
-  }
-
-  if (banLogChannel && banLogChannel.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
-    const nowTs = Math.floor(Date.now() / 1000);
-    try {
-      await banLogChannel.send(
-        `🔨 **Member Banned**\n` +
-        `• **Target User:** <@${targetUser.id}> (\`${targetUser.tag || targetUser.username}\` | ID: \`${targetUser.id}\`)\n` +
-        `• **Moderator:** <@${member.id}> (\`${member.user?.tag || member.id}\`)\n` +
-        `• **Reason:** ${reason}\n` +
-        `• **Initiated Via:** Bot Command (\`${PREFIX}ban\`)\n` +
-        `• **Timestamp:** <t:${nowTs}:F>`
-      );
-    } catch (logErr) {
-      console.warn('[Discord Bot] ⚠️ Could not write to #ban-unban-log:', logErr.message);
-    }
+  // 7. Log to #ban-unban-log with standardized audit embed
+  try {
+    await logMemberBanned(guild, targetUser, member, reason, `Bot Command (${PREFIX}ban)`);
+  } catch (logErr) {
+    console.warn('[Discord Bot] ⚠️ Could not write to #ban-unban-log:', logErr.message);
   }
 
   // Mark recentBan as already logged so GuildBanAdd won't duplicate
@@ -1434,42 +1485,7 @@ export async function handleMessageCreateLog(message) {
     // Never log messages from private audit channels
     if (isAuditOrLogChannel(message.channel, message.guild.id)) return;
 
-    // Locate msg-log channel
-    const msgLogId = getGuildChannelId(message.guild.id, 'msgLogId');
-    let logChannel = msgLogId ? message.guild.channels.cache.get(msgLogId) : null;
-    if (!logChannel) {
-      logChannel = message.guild.channels.cache.find(
-        (c) => c.type === ChannelType.GuildText && c.name === 'msg-log'
-      );
-    }
-
-    if (!logChannel || !logChannel.permissionsFor(message.guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
-      return;
-    }
-
-    const content = redactSecrets(message.content || '');
-    const nowTs = Math.floor(message.createdTimestamp / 1000);
-    const authorTag = message.author.tag || message.author.username;
-
-    let attachmentInfo = '';
-    if (message.attachments?.size > 0) {
-      attachmentInfo = `\n• **Attachments:** ${message.attachments.map((a) => `[${a.name || 'file'}](${a.url})`).join(', ')}`;
-    }
-
-    let embedInfo = '';
-    if (message.embeds?.length > 0) {
-      embedInfo = `\n• **Embeds:** ${message.embeds.length} embed(s) attached`;
-    }
-
-    const displayContent = content ? `\n• **Content:** ${content}` : '\n• **Content:** *[Empty or non-text message]*';
-
-    await logChannel.send(
-      `💬 **Message Sent**\n` +
-      `• **Author:** <@${message.author.id}> (\`${authorTag}\` | ID: \`${message.author.id}\`)\n` +
-      `• **Channel:** <#${message.channel.id}>\n` +
-      `• **Message ID:** \`${message.id}\`\n` +
-      `• **Timestamp:** <t:${nowTs}:F>${displayContent}${attachmentInfo}${embedInfo}`
-    );
+    await logMessageSent(message);
   } catch (err) {
     console.warn('[Discord Bot] ⚠️ Message create logging error:', err.message);
   }
@@ -1489,32 +1505,7 @@ export async function handleMessageUpdateLog(oldMessage, newMessage) {
     // If content did not change (e.g. embed preview generated), skip
     if (oldMessage.content === newMessage.content) return;
 
-    const msgLogId = getGuildChannelId(newMessage.guild.id, 'msgLogId');
-    let logChannel = msgLogId ? newMessage.guild.channels.cache.get(msgLogId) : null;
-    if (!logChannel) {
-      logChannel = newMessage.guild.channels.cache.find(
-        (c) => c.type === ChannelType.GuildText && c.name === 'msg-log'
-      );
-    }
-
-    if (!logChannel || !logChannel.permissionsFor(newMessage.guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
-      return;
-    }
-
-    const oldContent = redactSecrets(oldMessage.content || '[Content unavailable or uncached]');
-    const newContent = redactSecrets(newMessage.content || '[Empty message]');
-    const nowTs = Math.floor(Date.now() / 1000);
-    const authorTag = newMessage.author?.tag || newMessage.author?.username || 'Unknown';
-
-    await logChannel.send(
-      `✏️ **Message Edited**\n` +
-      `• **Author:** <@${newMessage.author?.id}> (\`${authorTag}\` | ID: \`${newMessage.author?.id}\`)\n` +
-      `• **Channel:** <#${newMessage.channel.id}>\n` +
-      `• **Message ID:** \`${newMessage.id}\`\n` +
-      `• **Before:** ${oldContent}\n` +
-      `• **After:** ${newContent}\n` +
-      `• **Edited At:** <t:${nowTs}:F>`
-    );
+    await logMessageEdited(oldMessage, newMessage);
   } catch (err) {
     console.warn('[Discord Bot] ⚠️ Message edit logging error:', err.message);
   }
@@ -1530,32 +1521,7 @@ export async function handleMessageDeleteLog(message) {
     if (message.member && isAdmin(message.member)) return;
     if (isAuditOrLogChannel(message.channel, message.guild.id)) return;
 
-    const msgLogId = getGuildChannelId(message.guild.id, 'msgLogId');
-    let logChannel = msgLogId ? message.guild.channels.cache.get(msgLogId) : null;
-    if (!logChannel) {
-      logChannel = message.guild.channels.cache.find(
-        (c) => c.type === ChannelType.GuildText && c.name === 'msg-log'
-      );
-    }
-
-    if (!logChannel || !logChannel.permissionsFor(message.guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
-      return;
-    }
-
-    const content = message.content ? redactSecrets(message.content) : '[Content unavailable or uncached]';
-    const nowTs = Math.floor(Date.now() / 1000);
-    const authorDisplay = message.author
-      ? `<@${message.author.id}> (\`${message.author.tag || message.author.username}\` | ID: \`${message.author.id}\`)`
-      : 'Unknown User (Uncached)';
-
-    await logChannel.send(
-      `🗑️ **Message Deleted**\n` +
-      `• **Author:** ${authorDisplay}\n` +
-      `• **Channel:** <#${message.channel.id}>\n` +
-      `• **Message ID:** \`${message.id}\`\n` +
-      `• **Content:** ${content}\n` +
-      `• **Deleted At:** <t:${nowTs}:F>`
-    );
+    await logMessageDeleted(message);
   } catch (err) {
     console.warn('[Discord Bot] ⚠️ Message delete logging error:', err.message);
   }
@@ -1623,15 +1589,12 @@ export async function handleGuildBanAdd(ban) {
       ? `<@${moderator.id}> (\`${moderator.tag || moderator.username}\` | ID: \`${moderator.id}\`)`
       : (cached?.moderatorId ? `<@${cached.moderatorId}> (\`${cached.moderatorTag}\`)` : 'Unavailable (Audit Log permission required or entry missing)');
 
-    const nowTs = Math.floor(Date.now() / 1000);
-
-    await logChannel.send(
-      `🔨 **Member Banned**\n` +
-      `• **Target User:** <@${user.id}> (\`${user.tag || user.username}\` | ID: \`${user.id}\`)\n` +
-      `• **Moderator:** ${modDisplay}\n` +
-      `• **Reason:** ${reason || 'No reason provided'}\n` +
-      `• **Initiated Via:** ${cached ? 'Bot Command' : 'Discord Native / External'}\n` +
-      `• **Timestamp:** <t:${nowTs}:F>`
+    await logMemberBanned(
+      guild,
+      user,
+      moderator || (cached?.moderatorId ? { id: cached.moderatorId, tag: cached.moderatorTag } : null),
+      reason,
+      cached ? 'Bot Command' : 'Discord Native / External'
     );
 
     recentBans.delete(banKey);
@@ -1686,15 +1649,7 @@ export async function handleGuildBanRemove(ban) {
       ? `<@${moderator.id}> (\`${moderator.tag || moderator.username}\` | ID: \`${moderator.id}\`)`
       : 'Unavailable (Audit Log permission required or entry missing)';
 
-    const nowTs = Math.floor(Date.now() / 1000);
-
-    await logChannel.send(
-      `🔓 **Member Unbanned**\n` +
-      `• **Target User:** <@${user.id}> (\`${user.tag || user.username}\` | ID: \`${user.id}\`)\n` +
-      `• **Moderator:** ${modDisplay}\n` +
-      `• **Reason:** ${reason || 'No reason provided'}\n` +
-      `• **Timestamp:** <t:${nowTs}:F>`
-    );
+    await logMemberUnbanned(guild, user, moderator, reason);
   } catch (err) {
     console.warn('[Discord Bot] ⚠️ Error in GuildBanRemove handler:', err.message);
   }
@@ -1787,17 +1742,7 @@ export async function handleChannelCreateAuditLog(channel) {
       ? `📁 **${channel.name}** (Category | ID: \`${channel.id}\`)`
       : `<#${channel.id}> (\`#${channel.name}\` | ID: \`${channel.id}\`)`;
 
-    const nowTs = Math.floor(Date.now() / 1000);
-
-    await logChannel.send(
-      `📁 **Channel Created**\n` +
-      `• **Channel:** ${channelDisplay}\n` +
-      `• **Type:** ${formatChannelTypeName(channel.type)}\n` +
-      `• **Parent Category:** ${parentDisplay}\n` +
-      `• **Created By:** ${creatorDisplay}\n` +
-      `• **Initiated Via:** ${sourceDisplay}\n` +
-      `• **Timestamp:** <t:${nowTs}:F>`
-    );
+    await logChannelCreated(channel, creator, sourceDisplay);
   } catch (err) {
     console.warn('[Discord Bot] ⚠️ Error in ChannelCreate audit logger:', err.message);
   }
@@ -1867,18 +1812,7 @@ export async function handleChannelDeleteAuditLog(channel) {
       parentDisplay = parentCat ? `📁 **${parentCat.name}** (ID: \`${channel.parentId}\`)` : `ID: \`${channel.parentId}\``;
     }
 
-    const nowTs = Math.floor(Date.now() / 1000);
-
-    await logChannel.send(
-      `🗑️ **Channel Deleted**\n` +
-      `• **Channel:** \`#${channel.name || 'Unknown'}\` (ID: \`${channel.id}\`)\n` +
-      `• **Type:** ${formatChannelTypeName(channel.type)}\n` +
-      `• **Parent Category:** ${parentDisplay}\n` +
-      `• **Deleted By:** ${actorDisplay}\n` +
-      `• **Reason:** ${reason || 'No reason provided'}\n` +
-      `• **Initiated Via:** ${sourceDisplay}\n` +
-      `• **Timestamp:** <t:${nowTs}:F>`
-    );
+    await logChannelDeleted(channel, actor, reason, sourceDisplay);
   } catch (err) {
     console.warn('[Discord Bot] ⚠️ Error in ChannelDelete audit logger:', err.message);
   }
@@ -1940,19 +1874,7 @@ export async function handleRoleCreateAuditLog(role) {
       ? `<@${creator.id}> (\`${creator.tag || creator.username}\` | ID: \`${creator.id}\`)`
       : 'Unavailable (Audit Log permission required or entry missing)';
 
-    const mentionable = role.mentionable ? 'Yes' : 'No';
-    const color = role.hexColor && role.hexColor !== '#000000' ? role.hexColor : 'Default';
-    const nowTs = Math.floor(Date.now() / 1000);
-
-    await logChannel.send(
-      `🏷️ **Role Created**\n` +
-      `• **Role:** <@&${role.id}> (\`@${role.name}\` | ID: \`${role.id}\`)\n` +
-      `• **Color:** \`${color}\`\n` +
-      `• **Mentionable:** ${mentionable}\n` +
-      `• **Created By:** ${creatorDisplay}\n` +
-      `• **Initiated Via:** ${sourceDisplay}\n` +
-      `• **Timestamp:** <t:${nowTs}:F>`
-    );
+    await handleRoleCreateWithBatching(role, creator, sourceDisplay);
   } catch (err) {
     console.warn('[Discord Bot] ⚠️ Error in RoleCreate audit logger:', err.message);
   }
@@ -2016,18 +1938,48 @@ export async function handleRoleDeleteAuditLog(role) {
       ? `<@${actor.id}> (\`${actor.tag || actor.username}\` | ID: \`${actor.id}\`)`
       : 'Unavailable (Audit Log permission required or entry missing)';
 
-    const nowTs = Math.floor(Date.now() / 1000);
-
-    await logChannel.send(
-      `❌ **Role Deleted**\n` +
-      `• **Role:** \`@${role.name || 'Unknown Role'}\` (ID: \`${role.id}\`)\n` +
-      `• **Deleted By:** ${actorDisplay}\n` +
-      `• **Reason:** ${reason || 'No reason provided'}\n` +
-      `• **Initiated Via:** ${sourceDisplay}\n` +
-      `• **Timestamp:** <t:${nowTs}:F>`
-    );
+    await logRoleDeleted(role, actor, reason, sourceDisplay);
   } catch (err) {
     console.warn('[Discord Bot] ⚠️ Error in RoleDelete audit logger:', err.message);
+  }
+}
+
+/**
+ * Handles GuildRoleUpdate audit logging
+ */
+export async function handleRoleUpdateAuditLog(oldRole, newRole) {
+  try {
+    if (!newRole || !newRole.guild) return;
+    if (!isOfficialGuild(newRole.guild) && !isSetupActive(newRole.guild.id)) return;
+    await logRoleUpdated(oldRole, newRole);
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error in RoleUpdate audit logger:', err.message);
+  }
+}
+
+/**
+ * Handles ChannelUpdate audit logging
+ */
+export async function handleChannelUpdateAuditLog(oldChannel, newChannel) {
+  try {
+    if (!newChannel || !newChannel.guild) return;
+    if (!isOfficialGuild(newChannel.guild) && !isSetupActive(newChannel.guild.id)) return;
+    await logChannelUpdated(oldChannel, newChannel);
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error in ChannelUpdate audit logger:', err.message);
+  }
+}
+
+/**
+ * Handles member departure event
+ */
+export async function handleGuildMemberRemove(member) {
+  try {
+    if (!member || !member.guild) return;
+    if (!isOfficialGuild(member.guild) && !isSetupActive(member.guild.id)) return;
+    await logMemberLeft(member);
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error in GuildMemberRemove audit logger:', err.message);
   }
 }
 
@@ -2089,30 +2041,11 @@ export async function handleGuildMemberAdd(member) {
     }
 
     // Log to #dm-log if setup channels are active
-    if (isSetupActive(guildId) && logChannel && logChannel.permissionsFor(member.guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
-      const accountAge = Math.floor(member.user.createdTimestamp / 1000);
-      const nowTs = Math.floor(Date.now() / 1000);
-
-      if (dmDelivered) {
-        await logChannel.send(
-          `📬 **Welcome DM Delivered**\n` +
-          `• **Recipient:** <@${member.id}> (\`${userTag}\` | ID: \`${member.id}\`)\n` +
-          `• **Event:** Member Join Welcome DM\n` +
-          `• **Status:** ✅ **Delivered via Direct Message**\n` +
-          `• **Account Created:** <t:${accountAge}:R>\n` +
-          `• **Timestamp:** <t:${nowTs}:F>`
-        );
-      } else {
-        await logChannel.send(
-          `⚠️ **Welcome DM Delivery Failed**\n` +
-          `• **Recipient:** <@${member.id}> (\`${userTag}\` | ID: \`${member.id}\`)\n` +
-          `• **Event:** Member Join Welcome DM\n` +
-          `• **Status:** ❌ **Failed (${failReason})**\n` +
-          `• **Notice:** User does not accept direct messages from server members.\n` +
-          `• **Account Created:** <t:${accountAge}:R>\n` +
-          `• **Timestamp:** <t:${nowTs}:F>`
-        );
-      }
+    if (isSetupActive(guildId)) {
+      await logMemberJoined(
+        member,
+        dmDelivered ? { delivered: true } : { delivered: false, reason: failReason }
+      );
     }
   } catch (err) {
     console.warn('[Discord Bot] ⚠️ Error in GuildMemberAdd handler:', err.message);
@@ -2134,6 +2067,8 @@ export const client = new Client({
   ],
   partials: [Partials.GuildMember, Partials.User, Partials.Channel, Partials.Message],
 });
+
+setDiscordAuditClient(client);
 
 let roleSyncInterval = null;
 
@@ -2169,14 +2104,16 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log(`[Discord Bot] ⚡ Command prefix: "${PREFIX}"`);
   startRoleSyncScheduler(readyClient);
 
-  // Startup reconciliation for managed Discord resources across MongoDB and Discord
+  // Startup reconciliation and deletion recovery for managed Discord resources across MongoDB and Discord
   try {
+    await initOrganiserLinksCache();
     const officialGuildId = getOfficialGuildId();
     if (officialGuildId) {
+      await resumePendingTournamentDeletions(readyClient, officialGuildId);
       await reconcileManagedBotState(readyClient, officialGuildId);
     }
   } catch (recErr) {
-    console.warn('[MongoDB] ⚠️ Error in startup reconciliation:', recErr.message);
+    console.warn('[MongoDB] ⚠️ Error in startup recovery and reconciliation:', recErr.message);
   }
 });
 
@@ -2221,6 +2158,39 @@ client.on(Events.MessageCreate, async (message) => {
         return;
       } else if (cmd === 'deletemsg' || cmd === 'deletemessage') {
         await handleDeleteManagedMessageCommand(message.guild, message.member, args, (text) => message.reply(text));
+        return;
+      } else if (cmd === 'organiser' || cmd === 'organizer') {
+        await handleOrganiserCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          args,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts })
+        );
+        return;
+      } else if (cmd === 'dash' || cmd === 'dashboard') {
+        await handleDashCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+          message
+        );
+        return;
+      } else if (cmd === 'delete') {
+        const sub = (args[0] || '').toLowerCase();
+        if (sub === 'tournament' || sub === 'tournaments') {
+          const targetId = args[1];
+          await handlePermanentTournamentDeleteCommand(
+            message.guild,
+            message.member,
+            message.channel,
+            targetId,
+            (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts })
+          );
+          return;
+        }
+        await message.reply(`ℹ️ **Usage:** \`${PREFIX}delete tournament <tournament_id>\` — Permanently delete a tournament.`);
         return;
       } else if (cmd === 'clear') {
         // Delete command message invocation where practical
@@ -2312,8 +2282,32 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
+// Interaction deduplication cache (prevents duplicate execution of identical interaction IDs)
+const processedInteractionIds = new Map();
+
+export function checkAndTrackInteraction(interactionId) {
+  if (!interactionId) return true;
+  const now = Date.now();
+  if (processedInteractionIds.size > 1000) {
+    for (const [id, ts] of processedInteractionIds.entries()) {
+      if (now - ts > 60000) processedInteractionIds.delete(id);
+    }
+  }
+  if (processedInteractionIds.has(interactionId)) {
+    return false; // Duplicate interaction event
+  }
+  processedInteractionIds.set(interactionId, now);
+  return true;
+}
+
 // Persistent interaction listener (ensures tournament control panel buttons work across bot restarts)
 client.on(Events.InteractionCreate, async (interaction) => {
+  // Deduplicate rapid double clicks or repeated event deliveries
+  if (!checkAndTrackInteraction(interaction.id)) {
+    console.log(`[Discord Bot] ⚡ Ignored duplicate interaction ${interaction.id} (${interaction.customId || 'unnamed'})`);
+    return;
+  }
+
   try {
     if (interaction.isButton() && (
       interaction.customId?.startsWith('md_tour_') ||
@@ -2326,6 +2320,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleTournamentButtonInteraction(interaction);
       return;
     }
+    if (interaction.isButton() && (
+      interaction.customId?.startsWith('md_btn_enter_org_code') ||
+      interaction.customId?.startsWith('md_btn_unlink_org') ||
+      interaction.customId?.startsWith('md_btn_confirm_unlink_org') ||
+      interaction.customId?.startsWith('md_btn_cancel_unlink_org')
+    )) {
+      await handleOrganiserButtonInteraction(interaction);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId === 'md_modal_organiser_link') {
+      await handleOrganiserModalSubmit(interaction);
+      return;
+    }
     if (interaction.isModalSubmit() && interaction.customId?.startsWith('md_modal_')) {
       await handleTournamentModalSubmit(interaction);
       return;
@@ -2335,13 +2342,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
       interaction.customId?.startsWith('md_round_') ||
       interaction.customId?.startsWith('md_group_') ||
       interaction.customId?.startsWith('md_result_') ||
-      interaction.customId?.startsWith('md_select_qualify_teams')
+      interaction.customId?.startsWith('md_select_qualify_teams') ||
+      interaction.customId === 'md_select_tournament'
     )) {
       await handleTournamentSelectMenuInteraction(interaction);
       return;
     }
   } catch (error) {
     console.warn('[Discord Bot] ⚠️ Error in InteractionCreate handler:', error.message);
+    try {
+      if (!interaction.isModalSubmit()) {
+        const errorMsg = `❌ **Interaction Error:** ${error.message}`;
+        if (interaction.deferred) {
+          await interaction.editReply({ content: errorMsg }).catch(() => {});
+        } else if (!interaction.replied) {
+          await interaction.reply({ content: errorMsg, ephemeral: true }).catch(() => {});
+        }
+      }
+    } catch {}
   }
 });
 
@@ -2379,6 +2397,18 @@ client.on(Events.GuildRoleCreate, async (role) => {
 
 client.on(Events.GuildRoleDelete, async (role) => {
   await handleRoleDeleteAuditLog(role);
+});
+
+client.on(Events.GuildRoleUpdate, async (oldRole, newRole) => {
+  await handleRoleUpdateAuditLog(oldRole, newRole);
+});
+
+client.on(Events.ChannelUpdate, async (oldChannel, newChannel) => {
+  await handleChannelUpdateAuditLog(oldChannel, newChannel);
+});
+
+client.on(Events.GuildMemberRemove, async (member) => {
+  await handleGuildMemberRemove(member);
 });
 
 // Member join listener

@@ -1,5 +1,12 @@
 import crypto from 'crypto';
 import { MongoClient } from 'mongodb';
+import { logTournamentAction } from './auditLogger.js';
+
+let discordAuditClient = null;
+
+export function setDiscordAuditClient(client) {
+  discordAuditClient = client;
+}
 
 /**
  * MongoDB Service for MatchDistrict Discord Bot
@@ -155,6 +162,7 @@ async function ensureMongoIndexes() {
     const msgCol = mongoDb.collection('discord_managed_messages');
     await msgCol.createIndex({ guildId: 1, logicalKey: 1 }, { unique: true });
     await msgCol.createIndex({ guildId: 1, messageType: 1 });
+    await msgCol.createIndex({ guildId: 1, tournamentId: 1 });
     await msgCol.createIndex({ tournamentId: 1 });
     await msgCol.createIndex({ roundId: 1 });
     await msgCol.createIndex({ groupId: 1 });
@@ -164,6 +172,8 @@ async function ensureMongoIndexes() {
     const tourCol = mongoDb.collection('discord_tournaments');
     await tourCol.createIndex({ guildId: 1, tournamentId: 1 }, { unique: true });
     await tourCol.createIndex({ tournamentId: 1 });
+    await tourCol.createIndex({ 'channels.botCommandsId': 1 });
+    await tourCol.createIndex({ deletionStatus: 1 });
     await tourCol.createIndex({ "rounds.roundId": 1 });
 
     const guildCol = mongoDb.collection('discord_guild_settings');
@@ -177,6 +187,11 @@ async function ensureMongoIndexes() {
     await auditCol.createIndex({ guildId: 1, timestamp: -1 });
     await auditCol.createIndex({ tournamentId: 1, timestamp: -1 });
     await auditCol.createIndex({ action: 1 });
+
+    const orgLinkCol = mongoDb.collection('discord_organiser_links');
+    await orgLinkCol.createIndex({ guildId: 1 }, { unique: true });
+    await orgLinkCol.createIndex({ organiserId: 1 });
+    await orgLinkCol.createIndex({ status: 1 });
 
     console.log('[MongoDB] 🔒 Indexes verified across managed collections.');
   } catch (err) {
@@ -640,19 +655,36 @@ export async function deleteManagedMessages(client, filter, adminUser = null) {
  * @param {object} [adminUser]
  */
 export async function recordAuditLog(guildId, action, details, adminUser = null) {
-  if (!isMongoConnected()) return;
-  try {
-    const auditCol = mongoDb.collection('discord_audit_logs');
-    await auditCol.insertOne({
-      guildId,
-      action,
-      details,
-      tournamentId: details?.tournamentId || null,
-      adminId: adminUser?.id || details?.adminId || 'system',
-      timestamp: new Date(),
-    });
-  } catch (err) {
-    console.warn('[MongoDB] Error recording audit log:', err.message);
+  if (isMongoConnected()) {
+    try {
+      const auditCol = mongoDb.collection('discord_audit_logs');
+      await auditCol.insertOne({
+        guildId,
+        action,
+        details,
+        tournamentId: details?.tournamentId || null,
+        adminId: adminUser?.id || details?.adminId || 'system',
+        timestamp: new Date(),
+      });
+    } catch (err) {
+      console.warn('[MongoDB] Error recording audit log:', err.message);
+    }
+  }
+
+  // Unified Discord Embed Dispatch
+  if (discordAuditClient && guildId && guildId !== 'system' && !details?.skipDiscordLog) {
+    try {
+      const guild = discordAuditClient.guilds?.cache?.get(guildId);
+      if (guild) {
+        await logTournamentAction(guild, action, {
+          ...details,
+          adminId: adminUser?.id || details?.adminId,
+          adminTag: adminUser?.tag || details?.adminTag,
+        });
+      }
+    } catch (auditErr) {
+      console.warn('[Audit Logger] ⚠️ Error dispatching tournament audit embed:', auditErr.message);
+    }
   }
 }
 
@@ -731,6 +763,66 @@ export async function deleteTournamentFromDb(guildId, tournamentId) {
     await tourCol.deleteOne({ guildId, tournamentId });
   } catch (err) {
     console.warn(`[MongoDB] Error deleting tournament ${tournamentId}:`, err.message);
+  }
+}
+
+/**
+ * Resolves a tournament associated with a specific #bot-commands channel from MongoDB.
+ * @param {string} guildId
+ * @param {string} channelId
+ * @returns {Promise<object|null>}
+ */
+export async function findTournamentByBotCommandsChannel(guildId, channelId) {
+  if (!isMongoConnected() || !guildId || !channelId) return null;
+  try {
+    const tourCol = mongoDb.collection('discord_tournaments');
+    return await tourCol.findOne({
+      guildId,
+      'channels.botCommandsId': channelId,
+    });
+  } catch (err) {
+    console.warn(`[MongoDB] Error looking up tournament for channel ${channelId}:`, err.message);
+    return null;
+  }
+}
+
+/**
+ * Permanently deletes all database records belonging to a tournament across all collections.
+ * @param {string} guildId
+ * @param {string} tournamentId
+ */
+export async function purgeAllTournamentDataFromDb(guildId, tournamentId) {
+  if (!isMongoConnected() || !guildId || !tournamentId) return;
+  try {
+    const tourCol = mongoDb.collection('discord_tournaments');
+    await tourCol.deleteOne({ guildId, tournamentId });
+
+    const msgCol = mongoDb.collection('discord_managed_messages');
+    await msgCol.deleteMany({ guildId, tournamentId });
+
+    console.log(`[MongoDB] 🗑️ Purged all records for tournament ${tournamentId} from MongoDB.`);
+  } catch (err) {
+    console.warn(`[MongoDB] Error purging tournament ${tournamentId} from database:`, err.message);
+  }
+}
+
+/**
+ * Retrieves all tournaments with pending or active deletion status for resume on restart.
+ * @param {string} [guildId]
+ * @returns {Promise<Array<object>>}
+ */
+export async function getPendingTournamentDeletions(guildId) {
+  if (!isMongoConnected()) return [];
+  try {
+    const tourCol = mongoDb.collection('discord_tournaments');
+    const query = {
+      deletionStatus: { $in: ['deletion_pending', 'deleting'] },
+    };
+    if (guildId) query.guildId = guildId;
+    return await tourCol.find(query).toArray();
+  } catch (err) {
+    console.warn('[MongoDB] Error querying pending tournament deletions:', err.message);
+    return [];
   }
 }
 
@@ -1106,6 +1198,135 @@ export async function reconcileManagedBotState(client, officialGuildId) {
     console.log(`[MongoDB] ✅ Reconciliation complete: ${verifiedCount} messages verified active, ${missingCount} missing/cleaned up.`);
   } catch (err) {
     console.warn('[MongoDB] ⚠️ Error during startup reconciliation:', err.message);
+  }
+}
+
+/**
+ * Saves or updates an active organiser-to-guild link in MongoDB.
+ *
+ * @param {string} guildId
+ * @param {object} linkData
+ * @returns {Promise<boolean>}
+ */
+export async function saveOrganiserLink(guildId, linkData) {
+  if (!isMongoConnected() || !guildId || !linkData) return false;
+  try {
+    const orgLinkCol = mongoDb.collection('discord_organiser_links');
+    const now = new Date().toISOString();
+    await orgLinkCol.updateOne(
+      { guildId },
+      {
+        $set: {
+          guildId,
+          organiserId: linkData.organiserId || linkData.organizerId,
+          organiserName: linkData.organiserName || linkData.organizerName || 'Organiser',
+          organiserHandle: linkData.organiserHandle || linkData.organizerHandle || '',
+          guildName: linkData.guildName || 'Discord Server',
+          status: 'linked',
+          linkedBy: linkData.linkedBy || null,
+          linkedAt: linkData.linkedAt || now,
+          updatedAt: now,
+          unlinkedAt: null,
+          unlinkedBy: null,
+        },
+      },
+      { upsert: true }
+    );
+    return true;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error saving organiser link for guild ${guildId}:`, err.message);
+    return false;
+  }
+}
+
+/**
+ * Retrieves an active organiser link for a Discord guild from MongoDB.
+ *
+ * @param {string} guildId
+ * @returns {Promise<object|null>}
+ */
+export async function getOrganiserLinkForGuild(guildId) {
+  if (!isMongoConnected() || !guildId) return null;
+  try {
+    const orgLinkCol = mongoDb.collection('discord_organiser_links');
+    const doc = await orgLinkCol.findOne({ guildId, status: 'linked' });
+    if (!doc) return null;
+    const { _id, ...cleanDoc } = doc;
+    return cleanDoc;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error fetching organiser link for guild ${guildId}:`, err.message);
+    return null;
+  }
+}
+
+/**
+ * Unlinks a Discord guild from an organiser in MongoDB.
+ *
+ * @param {string} guildId
+ * @param {string} unlinkedBy Discord user ID
+ * @returns {Promise<boolean>}
+ */
+export async function unlinkOrganiserGuild(guildId, unlinkedBy = null) {
+  if (!isMongoConnected() || !guildId) return false;
+  try {
+    const orgLinkCol = mongoDb.collection('discord_organiser_links');
+    const now = new Date().toISOString();
+    await orgLinkCol.updateOne(
+      { guildId },
+      {
+        $set: {
+          status: 'unlinked',
+          unlinkedAt: now,
+          unlinkedBy,
+          updatedAt: now,
+        },
+      }
+    );
+    return true;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error unlinking guild ${guildId}:`, err.message);
+    return false;
+  }
+}
+
+/**
+ * Loads all active organiser links from MongoDB into a keyed map (by guildId).
+ *
+ * @returns {Promise<Record<string, object>>}
+ */
+export async function loadAllOrganiserLinksFromDb() {
+  if (!isMongoConnected()) return {};
+  try {
+    const orgLinkCol = mongoDb.collection('discord_organiser_links');
+    const records = await orgLinkCol.find({ status: 'linked' }).toArray();
+    const result = {};
+    for (const rec of records) {
+      if (rec.guildId) {
+        const { _id, ...cleanRec } = rec;
+        result[rec.guildId] = cleanRec;
+      }
+    }
+    return result;
+  } catch (err) {
+    console.warn('[MongoDB] ⚠️ Error loading all organiser links:', err.message);
+    return {};
+  }
+}
+
+/**
+ * Checks whether a guild has an active organiser link in MongoDB.
+ *
+ * @param {string} guildId
+ * @returns {Promise<boolean>}
+ */
+export async function isGuildLinkedToOrganiser(guildId) {
+  if (!isMongoConnected() || !guildId) return false;
+  try {
+    const orgLinkCol = mongoDb.collection('discord_organiser_links');
+    const count = await orgLinkCol.countDocuments({ guildId, status: 'linked' });
+    return count > 0;
+  } catch {
+    return false;
   }
 }
 

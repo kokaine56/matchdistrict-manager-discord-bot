@@ -83,7 +83,18 @@ function createMockGuild(options = {}) {
             has: (perm) => true,
           }),
           send: async (msg) => {
-            channelMessages.push(typeof msg === 'object' ? msg.content : msg);
+            let text = typeof msg === 'string' ? msg : (msg?.content || '');
+            if (msg?.embeds && Array.isArray(msg.embeds)) {
+              for (const e of msg.embeds) {
+                const parts = [e.data?.title || e.title || '', e.data?.description || e.description || ''];
+                const flds = e.data?.fields || e.fields || [];
+                for (const f of flds) {
+                  parts.push(`${f.name}: ${f.value}`);
+                }
+                text = (text ? text + '\n' : '') + parts.filter(Boolean).join('\n');
+              }
+            }
+            channelMessages.push(text);
             return { id: 'msg-' + Date.now(), content: msg, delete: async () => {} };
           },
           bulkDelete: async (amount, filterOld) => {
