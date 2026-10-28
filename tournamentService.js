@@ -724,6 +724,80 @@ export async function handleTournamentSelectionButton(interaction) {
 }
 
 /**
+ * Verify a registered Discord-linked user from a message in the tournament's verification channel.
+ * Verification is persisted locally in Mongo and synced to the website through the bot API.
+ */
+export async function handleTournamentVerificationMessage(message) {
+  if (!message?.guild || !message.channel || message.author?.bot) return false;
+  const tournaments = guildSettingsCache[message.guild.id]?.tournaments || {};
+  const match = Object.entries(tournaments).find(([, tournament]) =>
+    tournament?.channels?.tournamentVerificationId === message.channel.id
+  );
+  if (!match) return false;
+
+  const [tournamentId, savedTournament] = match;
+  try {
+    const backend = await fetchTournamentRegistrationsFromBackend(tournamentId);
+    const team = (backend.teams || []).find((entry) => {
+      const status = String(entry.status || '').toLowerCase();
+      if (['rejected', 'cancelled', 'expired', 'payment_rejected'].includes(status)) return false;
+      return (entry.linked_members || []).some((member) => String(member.discord_id) === String(message.author.id));
+    });
+    if (!team?.registration_id) {
+      await message.reply('This Discord account is not linked to a registered team in this tournament.').catch(() => {});
+      return true;
+    }
+
+    const candidateIds = [...new Set([...message.mentions.users.values()]
+      .filter((user) => user && user.id !== message.author.id && !user.bot)
+      .map((user) => user.id))];
+    const validIds = [];
+    for (const userId of candidateIds) {
+      const member = await message.guild.members.fetch(userId).catch(() => null);
+      if (member && !member.user.bot && userId !== message.author.id) validIds.push(userId);
+    }
+    if (validIds.length < 3) {
+      await message.reply(`Verification needs 3 different real members of this server (excluding you). I found ${validIds.length} valid mention${validIds.length === 1 ? '' : 's'}.`).catch(() => {});
+      return true;
+    }
+
+    const verifiedAt = new Date().toISOString();
+    savedTournament.verifiedRegistrations ||= {};
+    savedTournament.verifiedRegistrations[String(team.registration_id)] = {
+      registrationId: String(team.registration_id),
+      teamId: String(team.id || team.registration_id),
+      teamName: team.team_name || 'Registered team',
+      discordId: String(message.author.id),
+      verifiedAt,
+      mentionedMemberIds: validIds.slice(0, 3),
+    };
+    guildSettingsCache[message.guild.id].tournaments[tournamentId] = savedTournament;
+    await saveTournamentToDb(message.guild.id, tournamentId, savedTournament);
+
+    const apiUrl = getBackendApiUrl();
+    const secret = getBackendBotSecret();
+    const response = await fetch(`${apiUrl}/api/bot/tournaments/${encodeURIComponent(tournamentId)}/registrations/${encodeURIComponent(team.registration_id)}/verification`, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        ...(secret ? { Authorization: `Bearer ${secret}`, 'x-bot-secret': secret } : {}),
+      },
+      body: JSON.stringify({ discord_id: String(message.author.id) }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success) {
+      throw new Error(result.message || result.error || `Website verification sync failed (HTTP ${response.status}).`);
+    }
+    await message.reply(`✅ **${team.team_name || 'Your team'} is verified** for ${backend.tournament?.title || savedTournament.tournamentTitle || 'this tournament'}.`).catch(() => {});
+  } catch (error) {
+    console.error(`[Discord Bot] Verification processing failed for tournament ${tournamentId}, user ${message.author.id}:`, error);
+    await message.reply(`Verification could not be completed: ${error.message}`).catch(() => {});
+  }
+  return true;
+}
+
+/**
  * Builds the Tournament Control Panel Discord Embed.
  */
 export function buildTournamentControlPanelEmbed(tournament, summary, channelsStatus, roleInfo = null, roundsData = {}) {
@@ -8253,6 +8327,21 @@ export async function publishGroupCredentials(guild, tournamentId, roundId, grou
 
   if (!channel) {
     return { success: false, reason: `Private channel for Group ${group.groupNumber} not found.` };
+  }
+
+  const occupiedSlots = (group.slots || []).filter((slot) => slot?.status === 'OCCUPIED' && slot.teamName);
+  const verifiedEntries = Object.values(savedTournament.verifiedRegistrations || {});
+  const verifiedTeamIds = new Set(verifiedEntries.flatMap((entry) => [String(entry.registrationId || ''), String(entry.teamId || '')]));
+  const verifiedTeamNames = new Set(verifiedEntries.map((entry) => String(entry.teamName || '').trim().toLowerCase()).filter(Boolean));
+  const unverifiedTeams = occupiedSlots.filter((slot) =>
+    !verifiedTeamIds.has(String(slot.teamId || '')) &&
+    !verifiedTeamNames.has(String(slot.teamName || '').trim().toLowerCase())
+  );
+  if (unverifiedTeams.length > 0) {
+    return {
+      success: false,
+      reason: `Room ID and password are locked until every registered team in Group ${group.groupNumber} completes verification in #verification.`,
+    };
   }
 
   group.credentials = {

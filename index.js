@@ -92,6 +92,7 @@ import {
   handleDashboardNavigationInteraction,
   handleDashboardQualifySelection,
   fetchTournamentRegistrationsFromBackend,
+  handleTournamentVerificationMessage,
   handlePermanentTournamentDeleteCommand,
   executeTournamentPermanentDeletion,
   resumePendingTournamentDeletions,
@@ -2179,6 +2180,8 @@ client.on(Events.MessageCreate, async (message) => {
       }
     }
     if (message.author?.bot) return;
+
+    if (message.guild && await handleTournamentVerificationMessage(message)) return;
 
     const corrId = crypto.randomBytes(4).toString('hex');
     console.log(`[Discord Bot] [corr:${corrId}] 1. Message event received: guildId=${message.guild?.id || 'DM'}, authorId=${message.author?.id}, hasContent=${Boolean(message.content)}`);
