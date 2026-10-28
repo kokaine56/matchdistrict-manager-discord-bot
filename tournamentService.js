@@ -1539,6 +1539,12 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   saveGuildSettings(guildSettingsCache);
   saveTournamentToDb(guild.id, tournamentId, savedTournament);
 
+  // If an active round exists, ensure global submission control panel is kept updated in #bot-commands
+  const activeRound = Object.values(savedTournament.rounds || {}).find((r) => r.status === 'Active' || r.status === 'Started');
+  if (activeRound) {
+    await updateGlobalSubmissionControlPanel(guild, tournament, activeRound, botCommandsChannel);
+  }
+
   return {
     category,
     botCommandsChannel,
@@ -2280,7 +2286,8 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
             if (grpChannel) {
               const grpRole = group.roleId ? (guild.roles.cache.get(group.roleId) || await guild.roles.fetch(group.roleId).catch(() => null)) : null;
               await applyStrictGroupChannelPermissions(guild, grpChannel, grpRole, tournamentRole, botMember);
-              await updateGroupControlMessage(guild, tournament, round, group, grpChannel);
+              await removeGroupResultControlMessage(guild, group, grpChannel);
+              await updateGroupSlotListMessage(guild, tournament, round, group, grpChannel);
             }
           }
         }
@@ -2303,6 +2310,20 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
   currentSettings.tournaments[tournamentId] = savedTournament;
   guildSettingsCache[guild.id] = currentSettings;
   saveGuildSettings(guildSettingsCache);
+  await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+
+  // If bot-commands exists and active round is present, update summary and global submission control
+  if (savedTournament.channels?.botCommandsId) {
+    const botCommandsChannel = guild.channels.cache.get(savedTournament.channels.botCommandsId) ||
+      await guild.channels.fetch(savedTournament.channels.botCommandsId).catch(() => null);
+    if (botCommandsChannel) {
+      const activeRound = Object.values(savedTournament.rounds || {}).find((r) => r.status === 'Active' || r.status === 'Started');
+      if (activeRound) {
+        await publishRoundAllocationSummary(guild, tournament, activeRound, botCommandsChannel, savedTournament);
+        await updateGlobalSubmissionControlPanel(guild, tournament, activeRound, botCommandsChannel);
+      }
+    }
+  }
 
   return syncResult;
 }
@@ -2448,12 +2469,50 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
    */
   export async function handleTournamentButtonInteraction(interaction) {
     const customId = interaction.customId || '';
-    if (!customId.startsWith('md_tour_') && !customId.startsWith('md_round_') && !customId.startsWith('md_group_') && !customId.startsWith('md_result_')) return;
+    if (
+      !customId.startsWith('md_tour_') &&
+      !customId.startsWith('md_round_') &&
+      !customId.startsWith('md_group_') &&
+      !customId.startsWith('md_result_') &&
+      !customId.startsWith('md_qualify_') &&
+      customId !== 'md_cancel_qualify'
+    ) return;
 
     // Direct routing for group result submission (accessible by eligible group participants without requiring server admin role)
     if (customId.startsWith('md_group_submit_result:')) {
       const [, tourId, rId, gId] = customId.split(':');
       await handleGroupSubmitResultButton(interaction, tourId, rId, gId);
+      return;
+    }
+
+    // Qualify team button in ID/PWD channel
+    if (customId.startsWith('md_qualify_team:')) {
+      const [, tourId, rId, gId] = customId.split(':');
+      await handleQualifyTeamButton(interaction, tourId, rId, gId);
+      return;
+    }
+
+    if (customId === 'md_cancel_qualify') {
+      await interaction.update({ content: '🛑 Qualification cancelled.', embeds: [], components: [] }).catch(() => {});
+      return;
+    }
+
+    // Global result submission control buttons in #bot-commands
+    if (customId.startsWith('md_tour_open_submissions:')) {
+      const [, tourId, rId] = customId.split(':');
+      await handleOpenSubmissionsButton(interaction, tourId, rId);
+      return;
+    }
+
+    if (customId.startsWith('md_tour_close_submissions:')) {
+      const [, tourId, rId] = customId.split(':');
+      await handleCloseSubmissionsButton(interaction, tourId, rId);
+      return;
+    }
+
+    if (customId.startsWith('md_tour_refresh_submissions:')) {
+      const [, tourId, rId] = customId.split(':');
+      await handleRefreshSubmissionsButton(interaction, tourId, rId);
       return;
     }
 
@@ -4176,7 +4235,8 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
 
         if (groupChannel) {
           await applyStrictGroupChannelPermissions(guild, groupChannel, groupRole, tourRole, botMember);
-          await updateGroupControlMessage(guild, tournament, round, groupObj, groupChannel);
+          await removeGroupResultControlMessage(guild, groupObj, groupChannel);
+          await updateGroupSlotListMessage(guild, tournament, round, groupObj, groupChannel);
         }
       }
 
@@ -4188,10 +4248,11 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
         }
       }
 
-      // Update round status & metadata
+      // Update round status & metadata (submissions Closed by default until explicitly opened by admin)
       round.status = 'Active';
       round.startedAt = new Date().toISOString();
       round.groups = groups;
+      round.globalSubmissionStatus = 'Closed';
 
       savedTournament.rounds[round.roundId] = round;
       guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
@@ -4199,13 +4260,14 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       await enforceSingleActiveRoundInDb(guild.id, tournamentId, round.roundId);
       await saveTournamentToDb(guild.id, tournamentId, savedTournament);
 
-      // Publish or update allocation summary in #bot-commands
+      // Publish or update allocation summary & global submission panel in #bot-commands
       const botCommandsChannel = savedTournament.channels?.botCommandsId
         ? (guild.channels.cache.get(savedTournament.channels.botCommandsId) || await guild.channels.fetch(savedTournament.channels.botCommandsId).catch(() => null))
         : null;
 
       if (botCommandsChannel) {
         await publishRoundAllocationSummary(guild, tournament, round, botCommandsChannel, savedTournament);
+        await updateGlobalSubmissionControlPanel(guild, tournament, round, botCommandsChannel);
       }
 
       // Refresh Control Panel embed
@@ -4258,7 +4320,17 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
  */
 export async function handleTournamentSelectMenuInteraction(interaction) {
   const customId = interaction.customId || '';
-  if (!customId.startsWith('md_tour_select_') && !customId.startsWith('md_round_select_')) return;
+  if (
+    !customId.startsWith('md_tour_select_') &&
+    !customId.startsWith('md_round_select_') &&
+    !customId.startsWith('md_select_qualify_teams:')
+  ) return;
+
+  if (customId.startsWith('md_select_qualify_teams:')) {
+    const [, tourId, rId, gId] = customId.split(':');
+    await handleConfirmQualifyTeams(interaction, tourId, rId, gId, interaction.values || []);
+    return;
+  }
 
   if (customId.startsWith('md_tour_select_round_menu:')) {
     const tournamentId = customId.split(':')[1];
@@ -4324,51 +4396,31 @@ export async function handleTournamentModalSubmit(interaction) {
 export async function publishRoundAllocationSummary(guild, tournament, round, botCommandsChannel, savedTournament) {
   if (!botCommandsChannel || typeof botCommandsChannel.send !== 'function') return false;
 
-  const header = `📊 **Round Allocation Summary — ${round.name}** (ID: \`${round.roundId}\`)\n` +
-    `• **Tournament:** **${tournament.title}** (\`${tournament.id}\`)\n` +
+  const isOpen = round.globalSubmissionStatus === 'Open';
+  const header = `📊 **Round Allocation & Qualification Summary — ${round.name}** (ID: \`${round.roundId}\`)\n` +
+    `• **Tournament:** **${tournament.title || tournament.id}** (\`${tournament.id}\`)\n` +
     `• **Round Status:** 🟢 **${round.status}**\n` +
-    `• **Groups:** **${round.groups.length}** | **Capacity:** 25 slots per group (Slots 01-02 LOCKED, Slots 03–18 Teams [max 16], Slots 19-25 UNUSED)\n` +
+    `• **Global Result Submissions:** ${isOpen ? '🟢 **OPEN**' : '🔴 **CLOSED**'}\n` +
     `• **Allocated At:** <t:${Math.floor(new Date(round.startedAt || Date.now()).getTime() / 1000)}:f>\n` +
     `────────────────────────────────────────\n\n`;
 
-  const chunks = [];
-  let currentChunk = header;
-
-  for (const group of round.groups) {
+  let groupsOverview = '';
+  for (const group of round.groups || []) {
     const channelMention = group.channelId ? `<#${group.channelId}>` : `#${group.channelName}`;
     const roleMention = group.roleId ? `<@&${group.roleId}>` : `@${group.roleName}`;
+    const assignedSlots = (group.slots || []).filter((s) => s.status === 'OCCUPIED' && s.teamName);
+    const qualifiedSlots = assignedSlots.filter((s) => s.qualificationStatus === 'Qualified');
 
-    let groupText = `⚔️ **${round.name} — Group ${group.groupNumber}** (${channelMention} | ${roleMention})\n`;
-
-    for (const slot of group.slots) {
-      const slotNumStr = String(slot.slotNumber).padStart(2, '0');
-      if (slot.status === 'LOCKED') {
-        groupText += `  • 🔒 **Slot ${slotNumStr}:** \`LOCKED\`\n`;
-      } else if (slot.status === 'OCCUPIED') {
-        const linkedCount = Array.isArray(slot.members) ? slot.members.length : 0;
-        groupText += `  • 🎮 **Slot ${slotNumStr}:** **${slot.teamName}** (${linkedCount} linked member${linkedCount === 1 ? '' : 's'})\n`;
-      } else if (slot.status === 'UNUSED' || slot.status === 'RESERVED') {
-        groupText += `  • ⛔ **Slot ${slotNumStr}:** \`UNUSED\`\n`;
-      } else {
-        groupText += `  • ⚪ **Slot ${slotNumStr}:** *EMPTY*\n`;
-      }
-    }
-    groupText += '\n';
-
-    if (currentChunk.length + groupText.length > 1900) {
-      chunks.push(currentChunk.trim());
-      currentChunk = groupText;
-    } else {
-      currentChunk += groupText;
-    }
+    groupsOverview += `⚔️ **Group ${group.groupNumber}** (${channelMention} | ${roleMention})\n` +
+      `  • Teams Allocated: **${assignedSlots.length}/16**\n` +
+      `  • Qualified: **${qualifiedSlots.length}** 🏆\n` +
+      `  • Match Credentials: ${group.credentials?.roomId ? '✅ Published' : '⏳ Pending'}\n\n`;
   }
 
-  if (currentChunk.trim()) {
-    chunks.push(currentChunk.trim());
-  }
+  groupsOverview += `📌 *Note: Complete 25-slot lists and match credentials are sent directly to each group's private ID/PWD channel.*`;
 
+  const fullContent = header + groupsOverview;
   const logicalKeyPrefix = `guild:${guild.id}:tournament:${tournament.id}:round:${round.roundId}:allocation_summary`;
-  const pagesPayloads = chunks.map((chunk) => ({ content: chunk }));
 
   try {
     const updatedIds = await upsertManagedMessageBatch(guild.client, {
@@ -4378,63 +4430,33 @@ export async function publishRoundAllocationSummary(guild, tournament, round, bo
       messageType: 'round_allocation_summary',
       tournamentId: tournament.id,
       roundId: round.roundId,
-      pagesPayloads,
+      pagesPayloads: [{ content: fullContent }],
     });
     round.summaryMessageIds = updatedIds;
-    return true;
   } catch (upsertErr) {
     console.warn('[Discord Bot] ⚠️ Error in upsertManagedMessageBatch for round allocation summary:', upsertErr.message);
-
-    let existingIds = Array.isArray(round.summaryMessageIds) ? [...round.summaryMessageIds] : [];
-    const updatedIds = [];
-
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      const existingId = existingIds[i];
-      let msg = null;
-
-      if (existingId && typeof botCommandsChannel.messages?.fetch === 'function') {
-        try {
-          msg = await botCommandsChannel.messages.fetch(existingId).catch(() => null);
-        } catch {
-          msg = null;
-        }
-      }
-
-      if (msg && typeof msg.edit === 'function') {
-        try {
-          await msg.edit(chunk);
-          updatedIds.push(msg.id);
-        } catch (err) {
-          if (err.code === 10008 || String(err.message).includes('Unknown Message')) {
-            msg = null;
-          } else {
-            throw err;
-          }
-        }
-      }
-
-      if (!msg) {
-        const newMsg = await botCommandsChannel.send(chunk);
-        updatedIds.push(newMsg.id);
-      }
-    }
-
-    if (existingIds.length > chunks.length && typeof botCommandsChannel.messages?.fetch === 'function') {
-      for (let j = chunks.length; j < existingIds.length; j++) {
-        const surplusId = existingIds[j];
-        try {
-          const surplusMsg = await botCommandsChannel.messages.fetch(surplusId).catch(() => null);
-          if (surplusMsg && typeof surplusMsg.delete === 'function') {
-            await surplusMsg.delete().catch(() => {});
-          }
-        } catch {}
-      }
-    }
-
-    round.summaryMessageIds = updatedIds;
-    return true;
   }
+
+  // Prune any legacy detailed slot dump messages in botCommandsChannel
+  try {
+    const recentMsgs = await botCommandsChannel.messages.fetch({ limit: 40 }).catch(() => null);
+    if (recentMsgs && recentMsgs.size > 0) {
+      for (const m of recentMsgs.values()) {
+        if (
+          (m.author.id === guild.client.user?.id || m.author.bot) &&
+          !round.summaryMessageIds?.includes(m.id) &&
+          m.id !== savedTournament?.controlPanelMessageId &&
+          m.id !== round.globalSubmissionControlMessageId &&
+          m.content?.includes('Capacity: 25 slots per group') &&
+          m.content?.includes('Group 1')
+        ) {
+          await m.delete().catch(() => {});
+        }
+      }
+    }
+  } catch {}
+
+  return true;
 }
 
 /**
@@ -4557,133 +4579,758 @@ export async function applyStrictGroupChannelPermissions(guild, groupChannel, gr
 }
 
 /**
- * Publishes or updates the bot-managed Result Submission control message in an ID/PWD channel.
+ * Removes legacy result-submission controls from an ID/PWD channel to ensure
+ * the channel remains strictly read-only for ordinary group members.
+ * Preserves match ID/password messages and slot lists.
  */
-export async function updateGroupControlMessage(guild, tournament, round, group, channel) {
+export async function removeGroupResultControlMessage(guild, group, channel) {
+  if (!channel) return;
+
+  // 1. If stored message ID exists, delete it
+  if (group.submissionControlMessageId) {
+    try {
+      const msg = await channel.messages.fetch(group.submissionControlMessageId).catch(() => null);
+      if (msg) await msg.delete().catch(() => {});
+    } catch {}
+    await deleteManagedMessages(guild.client, {
+      guildId: guild.id,
+      messageId: group.submissionControlMessageId,
+    }).catch(() => {});
+    group.submissionControlMessageId = null;
+  }
+
+  // 2. Search for any legacy "Match Results & Verification" bot messages in the channel
+  try {
+    const recentMsgs = await channel.messages.fetch({ limit: 40 }).catch(() => null);
+    if (recentMsgs && recentMsgs.size > 0) {
+      for (const m of recentMsgs.values()) {
+        if (
+          (m.author.id === guild.client.user?.id || m.author.bot) &&
+          m.embeds?.some((e) => e.title?.includes('Match Results & Verification'))
+        ) {
+          await m.delete().catch(() => {});
+        }
+      }
+    }
+  } catch {}
+}
+
+/**
+ * Sends or updates a group's persistent 25-slot list and match ID/password information
+ * inside that group's private ID/PWD channel.
+ * Includes the administrative "Qualify Team" button.
+ */
+export async function updateGroupSlotListMessage(guild, tournament, round, group, channel) {
   if (!channel || typeof channel.send !== 'function') return null;
 
-  const currentStatus = group.submissionStatus || 'Awaiting submission';
-  const submissions = Array.isArray(group.submissions) ? group.submissions : [];
-  const latestSub = submissions[submissions.length - 1] || null;
+  const roleMention = group.roleId ? `<@&${group.roleId}>` : `@${group.roleName}`;
 
-  let statusEmoji = '🔵';
-  let embedColor = 0x3b82f6; // Blue
+  // Credential info
+  let credentialsText = '🔒 **Match ID & Password:** *Not published yet. Room details will appear here once published by tournament officials.*';
+  if (group.credentials?.roomId && group.credentials?.password) {
+    credentialsText = `🎮 **Room ID / Name:** \`${group.credentials.roomId}\`\n` +
+      `🔑 **Password:** \`${group.credentials.password}\`\n` +
+      `⏰ **Published:** <t:${Math.floor(new Date(group.credentials.publishedAt || Date.now()).getTime() / 1000)}:R>`;
+  }
 
-  if (currentStatus === 'Submitted' || currentStatus === 'Under review') {
-    statusEmoji = '🟡';
-    embedColor = 0xeab308; // Gold
-  } else if (currentStatus === 'Accepted') {
-    statusEmoji = '🟢';
-    embedColor = 0x22c55e; // Green
-  } else if (currentStatus === 'Rejected') {
-    statusEmoji = '🔴';
-    embedColor = 0xef4444; // Red
-  } else if (currentStatus === 'Submission Closed') {
-    statusEmoji = '🔒';
-    embedColor = 0x64748b; // Slate
+  // All 25 slots representation
+  let slotsText = '';
+  const slots = Array.isArray(group.slots) ? group.slots : [];
+
+  for (let s = 1; s <= 25; s++) {
+    const slotNum = String(s).padStart(2, '0');
+    const slotData = slots.find((sl) => sl.slotNumber === s);
+
+    if (s >= 1 && s <= 2) {
+      slotsText += `🔒 **Slot ${slotNum}:** \`LOCKED\`\n`;
+    } else if (s >= 3 && s <= 18) {
+      if (slotData && (slotData.status === 'OCCUPIED' || slotData.teamName)) {
+        const isQualified = slotData.qualificationStatus === 'Qualified';
+        const qualTag = isQualified ? ' **[QUALIFIED 🏆]**' : ' *[Pending ⏳]*';
+        slotsText += `🎮 **Slot ${slotNum}:** **${slotData.teamName}**${qualTag}\n`;
+      } else {
+        slotsText += `⚪ **Slot ${slotNum}:** *EMPTY*\n`;
+      }
+    } else {
+      slotsText += `⛔ **Slot ${slotNum}:** \`UNUSED / RESERVED\`\n`;
+    }
   }
 
   const embed = new EmbedBuilder()
-    .setTitle(`📊 Match Results & Verification — ${round.name} (Group ${group.groupNumber})`)
-    .setColor(embedColor)
+    .setTitle(`📋 ${tournament.title || tournament.id} — ${round.name} (Group ${group.groupNumber})`)
+    .setColor(0x3b82f6)
     .setDescription(
-      `Official match result submission portal for **${round.name} — Group ${group.groupNumber}**.\n\n` +
-      `• **Result Status:** ${statusEmoji} **${currentStatus}**\n` +
-      `*Only verified players registered in this group may submit official results.*`
+      `Official Slot Allocation & Match Hub for **${round.name} — Group ${group.groupNumber}** (${roleMention})\n\n` +
+      `📢 **Instructions:** Be in the lobby at least 10 minutes prior to match start. Ensure you occupy your assigned slot number.\n\n` +
+      `────────────────────────────────────────\n` +
+      `### 🔑 Match Credentials\n${credentialsText}\n` +
+      `────────────────────────────────────────\n` +
+      `### ⚔️ Group Slot Assignments (1–25)\n${slotsText}`
     )
+    .setFooter({ text: `${tournament.title || 'MatchDistrict'} • Group ${group.groupNumber} • Admin: Qualify Team below` })
     .setTimestamp();
 
-  if (latestSub) {
-    let subDetails = `• **Team:** **${latestSub.teamName}**\n` +
-      `• **Placement / Rank:** **#${latestSub.placementRank}**\n` +
-      `• **Total Kills:** **${latestSub.totalKills}**\n` +
-      `• **Submitted By:** <@${latestSub.submitterDiscordId}>\n` +
-      `• **Submitted:** <t:${Math.floor(new Date(latestSub.submittedAt).getTime() / 1000)}:R>`;
-
-    if (latestSub.reviewNotes) {
-      subDetails += `\n• **Review Notes:** *${latestSub.reviewNotes}*`;
-    }
-
-    embed.addFields({
-      name: '📝 Latest Submission Record',
-      value: subDetails,
-      inline: false,
-    });
-  }
-
-  const isRoundActive = round.status === 'Active' || round.status === 'Started';
-  const isSubmissionAllowed = isRoundActive && currentStatus !== 'Submission Closed' && currentStatus !== 'Accepted';
-
-  const actionRow = new ActionRowBuilder();
-
-  // Button 1: Submit Result
-  actionRow.addComponents(
+  // "Qualify Team" button for administrators
+  const actionRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`md_group_submit_result:${tournament.id}:${round.roundId}:${group.groupId}`)
-      .setLabel('Submit Result')
-      .setEmoji('📤')
+      .setCustomId(`md_qualify_team:${tournament.id}:${round.roundId}:${group.groupId}`)
+      .setLabel('Qualify Team')
+      .setEmoji('🏆')
       .setStyle(ButtonStyle.Success)
-      .setDisabled(!isSubmissionAllowed)
   );
 
-  // Button 2: Revoke / Reopen Submission (Admins only)
-  if (currentStatus === 'Submission Closed' || currentStatus === 'Rejected') {
-    actionRow.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`md_group_reopen_sub:${tournament.id}:${round.roundId}:${group.groupId}`)
-        .setLabel('Reopen Submissions')
-        .setEmoji('🔓')
-        .setStyle(ButtonStyle.Secondary)
-    );
-  } else {
-    actionRow.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`md_group_revoke_sub:${tournament.id}:${round.roundId}:${group.groupId}`)
-        .setLabel('Revoke Submission')
-        .setEmoji('🔒')
-        .setStyle(ButtonStyle.Danger)
-    );
-  }
-
-  const logicalKey = `guild:${guild.id}:tournament:${tournament.id}:round:${round.roundId}:group:${group.groupId}:submission_control`;
+  const logicalKey = `guild:${guild.id}:tournament:${tournament.id}:round:${round.roundId}:group:${group.groupId}:slot_list`;
 
   try {
     const result = await upsertManagedMessage(guild.client, {
       guildId: guild.id,
       channelId: channel.id,
       logicalKey,
-      messageType: 'group_submission_control',
+      messageType: 'group_slot_list',
       tournamentId: tournament.id,
       roundId: round.roundId,
       groupId: group.groupId,
       payload: { embeds: [embed], components: [actionRow] },
     });
-    group.submissionControlMessageId = result.messageId;
-    return group.submissionControlMessageId;
-  } catch (upsertErr) {
-    console.warn('[Discord Bot] ⚠️ Error in upsertManagedMessage for group control:', upsertErr.message);
-
-    let ctrlMsg = null;
-    if (group.submissionControlMessageId && typeof channel.messages?.fetch === 'function') {
-      try {
-        ctrlMsg = await channel.messages.fetch(group.submissionControlMessageId).catch(() => null);
-      } catch {
-        ctrlMsg = null;
-      }
+    group.slotListMessageId = result.messageId;
+    return result.messageId;
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error in upsertManagedMessage for group slot list:', err.message);
+    let msg = null;
+    if (group.slotListMessageId && typeof channel.messages?.fetch === 'function') {
+      msg = await channel.messages.fetch(group.slotListMessageId).catch(() => null);
     }
-
-    if (ctrlMsg && typeof ctrlMsg.edit === 'function') {
-      await ctrlMsg.edit({ embeds: [embed], components: [actionRow] }).catch(() => {});
-      group.submissionControlMessageId = ctrlMsg.id;
+    if (msg && typeof msg.edit === 'function') {
+      await msg.edit({ embeds: [embed], components: [actionRow] }).catch(() => {});
+      group.slotListMessageId = msg.id;
     } else {
       const newMsg = await channel.send({ embeds: [embed], components: [actionRow] }).catch(() => null);
-      if (newMsg) {
-        group.submissionControlMessageId = newMsg.id;
+      if (newMsg) group.slotListMessageId = newMsg.id;
+    }
+    return group.slotListMessageId;
+  }
+}
+
+/**
+ * Backward compatibility wrapper for updateGroupControlMessage.
+ * Cleans up legacy result controls and keeps slot list updated.
+ */
+export async function updateGroupControlMessage(guild, tournament, round, group, channel) {
+  await removeGroupResultControlMessage(guild, group, channel);
+  return await updateGroupSlotListMessage(guild, tournament, round, group, channel);
+}
+
+/**
+ * Publishes or updates the Global Result Submission control panel in #bot-commands.
+ * Controlled by a global switch for every group simultaneously.
+ */
+export async function updateGlobalSubmissionControlPanel(guild, tournament, round, botCommandsChannel) {
+  if (!botCommandsChannel || typeof botCommandsChannel.send !== 'function') return null;
+
+  const isOpen = round.globalSubmissionStatus === 'Open';
+  const statusEmoji = isOpen ? '🟢' : '🔴';
+  const statusText = isOpen ? 'OPEN (Accepting Submissions)' : 'CLOSED (Submissions Locked)';
+  const groupCount = Array.isArray(round.groups) ? round.groups.length : 0;
+
+  let totalSubmissions = 0;
+  let acceptedSubmissions = 0;
+  if (Array.isArray(round.groups)) {
+    for (const g of round.groups) {
+      if (Array.isArray(g.submissions)) {
+        totalSubmissions += g.submissions.length;
+        acceptedSubmissions += g.submissions.filter((s) => s.status === 'Accepted').length;
       }
     }
-
-    return group.submissionControlMessageId;
   }
+
+  const embed = new EmbedBuilder()
+    .setTitle(`⚖️ Global Result Submissions — ${round.name}`)
+    .setColor(isOpen ? 0x22c55e : 0xef4444)
+    .setDescription(
+      `Centralized Match Result Submission Control for **${tournament.title || tournament.id}**.\n\n` +
+      `• **Tournament:** **${tournament.title || tournament.id}**\n` +
+      `• **Current Round:** **${round.name}** (\`${round.roundId}\`)\n` +
+      `• **Submission Status:** ${statusEmoji} **${statusText}**\n` +
+      `• **Eligible Groups Allowed:** **${groupCount}** group(s) (${round.groups?.map(g => `Group ${g.groupNumber}`).join(', ') || 'None'})\n` +
+      `• **Submissions Received:** **${totalSubmissions}** (${acceptedSubmissions} Accepted)\n\n` +
+      `*Use the buttons below to open or close result submission for all groups simultaneously.*`
+    )
+    .setFooter({ text: `Round ID: ${round.roundId} • MatchDistrict Control Panel` })
+    .setTimestamp();
+
+  const actionRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`md_tour_open_submissions:${tournament.id}:${round.roundId}`)
+      .setLabel('Open Result Submission')
+      .setEmoji('🟢')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(isOpen),
+    new ButtonBuilder()
+      .setCustomId(`md_tour_close_submissions:${tournament.id}:${round.roundId}`)
+      .setLabel('Close Result Submission')
+      .setEmoji('🔴')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(!isOpen),
+    new ButtonBuilder()
+      .setCustomId(`md_tour_refresh_submissions:${tournament.id}:${round.roundId}`)
+      .setLabel('Refresh Status')
+      .setEmoji('🔄')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const logicalKey = `guild:${guild.id}:tournament:${tournament.id}:round:${round.roundId}:global_submission_control`;
+
+  try {
+    const result = await upsertManagedMessage(guild.client, {
+      guildId: guild.id,
+      channelId: botCommandsChannel.id,
+      logicalKey,
+      messageType: 'global_submission_control',
+      tournamentId: tournament.id,
+      roundId: round.roundId,
+      payload: { embeds: [embed], components: [actionRow] },
+    });
+    round.globalSubmissionControlMessageId = result.messageId;
+    return result.messageId;
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error in upsertManagedMessage for global submission panel:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Handles the "Open Result Submission" button in #bot-commands.
+ */
+export async function handleOpenSubmissionsButton(interaction, tournamentId, roundId) {
+  const guild = interaction.guild;
+  const member = interaction.member;
+
+  const access = checkTournamentAccess(guild, member);
+  if (!access.allowed) {
+    await interaction.reply({ content: access.reason, ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  const currentSettings = guildSettingsCache[guild.id] || {};
+  const savedTournament = currentSettings.tournaments?.[tournamentId];
+  if (!savedTournament) {
+    await interaction.reply({ content: '❌ Tournament configuration not found.', ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  const round = savedTournament.rounds?.[roundId];
+  if (!round) {
+    await interaction.reply({ content: '❌ Round not found.', ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  round.globalSubmissionStatus = 'Open';
+
+  for (const group of round.groups || []) {
+    if (group.submissionStatus !== 'Accepted') {
+      group.submissionStatus = 'Awaiting submission';
+    }
+  }
+
+  guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
+  saveGuildSettings(guildSettingsCache);
+  await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+  await recordAuditLog(guild.id, 'OPEN_GLOBAL_SUBMISSIONS', {
+    tournamentId,
+    roundId,
+    adminId: member.id,
+  });
+
+  const botCommandsChannel = savedTournament.channels?.botCommandsId
+    ? (guild.channels.cache.get(savedTournament.channels.botCommandsId) || await guild.channels.fetch(savedTournament.channels.botCommandsId).catch(() => null))
+    : null;
+
+  if (botCommandsChannel) {
+    await updateGlobalSubmissionControlPanel(guild, savedTournament, round, botCommandsChannel);
+    await publishRoundAllocationSummary(guild, savedTournament, round, botCommandsChannel, savedTournament);
+  }
+
+  await interaction.reply({
+    content: `🟢 **Result Submissions Opened:** Result submissions are now **OPEN** for all groups in **${round.name}**! Eligible verified players may now submit results.`,
+    ephemeral: true,
+  }).catch(() => {});
+}
+
+/**
+ * Handles the "Close Result Submission" button in #bot-commands.
+ */
+export async function handleCloseSubmissionsButton(interaction, tournamentId, roundId) {
+  const guild = interaction.guild;
+  const member = interaction.member;
+
+  const access = checkTournamentAccess(guild, member);
+  if (!access.allowed) {
+    await interaction.reply({ content: access.reason, ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  const currentSettings = guildSettingsCache[guild.id] || {};
+  const savedTournament = currentSettings.tournaments?.[tournamentId];
+  if (!savedTournament) {
+    await interaction.reply({ content: '❌ Tournament configuration not found.', ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  const round = savedTournament.rounds?.[roundId];
+  if (!round) {
+    await interaction.reply({ content: '❌ Round not found.', ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  round.globalSubmissionStatus = 'Closed';
+
+  for (const group of round.groups || []) {
+    if (group.submissionStatus === 'Awaiting submission') {
+      group.submissionStatus = 'Submission Closed';
+    }
+  }
+
+  guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
+  saveGuildSettings(guildSettingsCache);
+  await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+  await recordAuditLog(guild.id, 'CLOSE_GLOBAL_SUBMISSIONS', {
+    tournamentId,
+    roundId,
+    adminId: member.id,
+  });
+
+  const botCommandsChannel = savedTournament.channels?.botCommandsId
+    ? (guild.channels.cache.get(savedTournament.channels.botCommandsId) || await guild.channels.fetch(savedTournament.channels.botCommandsId).catch(() => null))
+    : null;
+
+  if (botCommandsChannel) {
+    await updateGlobalSubmissionControlPanel(guild, savedTournament, round, botCommandsChannel);
+    await publishRoundAllocationSummary(guild, savedTournament, round, botCommandsChannel, savedTournament);
+  }
+
+  await interaction.reply({
+    content: `🔴 **Result Submissions Closed:** Result submissions for **${round.name}** are now **CLOSED**. All new and pending unaccepted submissions are locked.`,
+    ephemeral: true,
+  }).catch(() => {});
+}
+
+/**
+ * Handles the "Refresh Status" button in #bot-commands.
+ */
+export async function handleRefreshSubmissionsButton(interaction, tournamentId, roundId) {
+  const guild = interaction.guild;
+  const member = interaction.member;
+
+  const access = checkTournamentAccess(guild, member);
+  if (!access.allowed) {
+    await interaction.reply({ content: access.reason, ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  const currentSettings = guildSettingsCache[guild.id] || {};
+  const savedTournament = currentSettings.tournaments?.[tournamentId];
+  const round = savedTournament?.rounds?.[roundId];
+
+  const botCommandsChannel = savedTournament?.channels?.botCommandsId
+    ? (guild.channels.cache.get(savedTournament.channels.botCommandsId) || await guild.channels.fetch(savedTournament.channels.botCommandsId).catch(() => null))
+    : null;
+
+  if (savedTournament && round && botCommandsChannel) {
+    await updateGlobalSubmissionControlPanel(guild, savedTournament, round, botCommandsChannel);
+    await publishRoundAllocationSummary(guild, savedTournament, round, botCommandsChannel, savedTournament);
+  }
+
+  await interaction.reply({
+    content: '🔄 **Submission status refreshed successfully.**',
+    ephemeral: true,
+  }).catch(() => {});
+}
+
+/**
+ * Generates initial empty groups following the 25-slot structure:
+ * - Slots 01-02: LOCKED
+ * - Slots 03-18: 16 team positions (initially EMPTY)
+ * - Slots 19-25: UNUSED / RESERVED
+ */
+export function generateEmptyRoundGroups(count = 4, roundName = 'Round 2') {
+  const groups = [];
+  for (let g = 1; g <= count; g++) {
+    const slots = [];
+    for (let s = 1; s <= 2; s++) {
+      slots.push({ slotNumber: s, status: 'LOCKED', label: 'LOCKED', teamId: null, teamName: null, members: [] });
+    }
+    for (let s = 3; s <= 18; s++) {
+      slots.push({ slotNumber: s, status: 'EMPTY', label: 'EMPTY', teamId: null, teamName: null, members: [], qualificationStatus: 'Pending' });
+    }
+    for (let s = 19; s <= 25; s++) {
+      slots.push({ slotNumber: s, status: 'UNUSED', label: 'UNUSED', teamId: null, teamName: null, members: [] });
+    }
+    groups.push({
+      groupId: `group-${g}-${Date.now().toString(36)}`,
+      groupNumber: g,
+      groupName: `Group ${g}`,
+      channelId: null,
+      roleId: null,
+      slots,
+      credentials: null,
+      slotListMessageId: null,
+      submissionControlMessageId: null,
+      submissionStatus: 'Awaiting submission',
+      submissions: [],
+      submissionAudit: [],
+    });
+  }
+  return groups;
+}
+
+/**
+ * Handles the "Qualify Team" button click in an ID/PWD channel.
+ * Opens an ephemeral StringSelectMenu allowing the administrator to select teams.
+ */
+export async function handleQualifyTeamButton(interaction, tournamentId, roundId, groupId) {
+  const guild = interaction.guild;
+  const member = interaction.member;
+
+  const access = checkTournamentAccess(guild, member);
+  if (!access.allowed) {
+    await interaction.reply({ content: access.reason, ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  const currentSettings = guildSettingsCache[guild.id] || {};
+  const savedTournament = currentSettings.tournaments?.[tournamentId];
+  if (!savedTournament) {
+    await interaction.reply({ content: '❌ Tournament configuration not found.', ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  const round = savedTournament.rounds?.[roundId];
+  if (!round) {
+    await interaction.reply({ content: '❌ Round not found.', ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  const group = (round.groups || []).find((g) => g.groupId === groupId || g.groupNumber === Number(groupId));
+  if (!group) {
+    await interaction.reply({ content: '❌ Group not found.', ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  const assignedSlots = (group.slots || []).filter((s) => s.status === 'OCCUPIED' && s.teamName);
+  if (assignedSlots.length === 0) {
+    await interaction.reply({
+      content: `⚠️ No teams are currently assigned to **Group ${group.groupNumber}**.`,
+      ephemeral: true,
+    }).catch(() => {});
+    return;
+  }
+
+  const targetRoundNum = (round.roundNumber || 1) + 1;
+  const nextRoundName = `Round ${targetRoundNum}`;
+
+  const selectMenu = new StringSelectMenuBuilder()
+    .setCustomId(`md_select_qualify_teams:${tournamentId}:${roundId}:${group.groupId}`)
+    .setPlaceholder('Select team(s) to qualify into next round...')
+    .setMinValues(1)
+    .setMaxValues(assignedSlots.length);
+
+  for (const slot of assignedSlots) {
+    const isQual = slot.qualificationStatus === 'Qualified';
+    const label = `Slot ${String(slot.slotNumber).padStart(2, '0')}: ${slot.teamName}`.slice(0, 100);
+    const desc = isQual ? 'ALREADY QUALIFIED 🏆' : 'Pending Qualification ⏳';
+    selectMenu.addOptions(
+      new StringSelectMenuOptionBuilder()
+        .setLabel(label)
+        .setValue(`team_${slot.teamId || slot.slotNumber}`)
+        .setDescription(desc)
+        .setEmoji(isQual ? '🏆' : '🎮')
+    );
+  }
+
+  const row1 = new ActionRowBuilder().addComponents(selectMenu);
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('md_cancel_qualify')
+      .setLabel('Cancel')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🏆 Qualify Teams — ${round.name} (Group ${group.groupNumber})`)
+    .setColor(0x22c55e)
+    .setDescription(
+      `Select one or more teams from **Group ${group.groupNumber}** to qualify for **${nextRoundName}**.\n\n` +
+      `• **Current Group:** Group ${group.groupNumber} (${assignedSlots.length} teams assigned)\n` +
+      `• **Destination:** **${nextRoundName}**\n\n` +
+      `*Selected teams will have their status updated to Qualified and will be automatically allocated into open slots of ${nextRoundName}.*`
+    )
+    .setFooter({ text: 'Admin Action • Changes are saved immediately upon selection' });
+
+  await interaction.reply({
+    embeds: [embed],
+    components: [row1, row2],
+    ephemeral: true,
+  }).catch(() => {});
+}
+
+/**
+ * Handles confirmation of team qualification from select menu.
+ * Idempotently qualifies selected teams and allocates them to the destination round.
+ */
+export async function handleConfirmQualifyTeams(interaction, tournamentId, roundId, groupId, selectedTeamValues) {
+  const guild = interaction.guild;
+  const member = interaction.member;
+
+  const access = checkTournamentAccess(guild, member);
+  if (!access.allowed) {
+    await interaction.update({ content: access.reason, embeds: [], components: [] }).catch(() => {});
+    return;
+  }
+
+  const currentSettings = guildSettingsCache[guild.id] || {};
+  const savedTournament = currentSettings.tournaments?.[tournamentId];
+  if (!savedTournament) {
+    await interaction.update({ content: '❌ Tournament configuration not found.', embeds: [], components: [] }).catch(() => {});
+    return;
+  }
+
+  const round = savedTournament.rounds?.[roundId];
+  if (!round) {
+    await interaction.update({ content: '❌ Source round not found.', embeds: [], components: [] }).catch(() => {});
+    return;
+  }
+
+  const group = (round.groups || []).find((g) => g.groupId === groupId || g.groupNumber === Number(groupId));
+  if (!group) {
+    await interaction.update({ content: '❌ Source group not found.', embeds: [], components: [] }).catch(() => {});
+    return;
+  }
+
+  if (!selectedTeamValues || selectedTeamValues.length === 0) {
+    await interaction.update({ content: '⚠️ No teams were selected for qualification.', embeds: [], components: [] }).catch(() => {});
+    return;
+  }
+
+  const currentRoundNum = round.roundNumber || 1;
+  const destRoundNum = currentRoundNum + 1;
+
+  let destRound = Object.values(savedTournament.rounds || {}).find((r) => r.roundNumber === destRoundNum);
+  if (!destRound) {
+    const destRoundId = `round-${destRoundNum}-${Date.now().toString(36)}`;
+    destRound = {
+      roundId: destRoundId,
+      roundNumber: destRoundNum,
+      name: `Round ${destRoundNum}`,
+      status: 'Upcoming',
+      groups: generateEmptyRoundGroups(4, `Round ${destRoundNum}`),
+      createdAt: new Date().toISOString(),
+      globalSubmissionStatus: 'Closed',
+      qualifications: [],
+    };
+    savedTournament.rounds[destRoundId] = destRound;
+  } else if (!Array.isArray(destRound.groups) || destRound.groups.length === 0) {
+    destRound.groups = generateEmptyRoundGroups(4, destRound.name);
+  }
+
+  // Destination capacity check before applying batch
+  let availableDestSlots = 0;
+  for (const dg of destRound.groups) {
+    for (const dslot of dg.slots || []) {
+      if (dslot.slotNumber >= 3 && dslot.slotNumber <= 18 && dslot.status !== 'OCCUPIED') {
+        availableDestSlots++;
+      }
+    }
+  }
+
+  const teamsToAllocate = [];
+  const alreadyQualifiedNames = [];
+
+  for (const teamVal of selectedTeamValues) {
+    const cleanId = teamVal.replace(/^team_/, '');
+    const sourceSlot = (group.slots || []).find(
+      (s) => s.teamId === cleanId || String(s.slotNumber) === cleanId || s.teamName === cleanId
+    );
+
+    if (!sourceSlot || sourceSlot.status !== 'OCCUPIED' || !sourceSlot.teamName) {
+      continue;
+    }
+
+    const alreadyInDest = destRound.groups.some((dg) =>
+      (dg.slots || []).some((ds) => ds.status === 'OCCUPIED' && (ds.teamId === sourceSlot.teamId || ds.teamName === sourceSlot.teamName))
+    );
+
+    if (alreadyInDest) {
+      alreadyQualifiedNames.push(sourceSlot.teamName);
+      sourceSlot.qualificationStatus = 'Qualified';
+    } else {
+      teamsToAllocate.push(sourceSlot);
+    }
+  }
+
+  if (teamsToAllocate.length > availableDestSlots) {
+    await interaction.update({
+      content: `❌ **Insufficient Capacity in ${destRound.name}:** Needed **${teamsToAllocate.length}** open slot(s), but only **${availableDestSlots}** slot(s) remain open. Qualification batch cancelled to prevent partial assignment.`,
+      embeds: [],
+      components: [],
+    }).catch(() => {});
+    return;
+  }
+
+  // Apply qualification and allocation atomically
+  const newlyQualifiedNames = [];
+  if (!Array.isArray(round.qualifications)) round.qualifications = [];
+
+  for (const sourceSlot of teamsToAllocate) {
+    sourceSlot.qualificationStatus = 'Qualified';
+
+    let allocated = false;
+    for (const dg of destRound.groups) {
+      for (const dslot of dg.slots) {
+        if (dslot.slotNumber >= 3 && dslot.slotNumber <= 18 && dslot.status !== 'OCCUPIED') {
+          dslot.status = 'OCCUPIED';
+          dslot.teamId = sourceSlot.teamId || `team-${Date.now().toString(36)}`;
+          dslot.teamName = sourceSlot.teamName;
+          dslot.label = sourceSlot.teamName;
+          dslot.members = sourceSlot.members || [];
+          dslot.qualificationStatus = 'Pending';
+          allocated = true;
+          break;
+        }
+      }
+      if (allocated) break;
+    }
+
+    const qualRecord = {
+      teamId: sourceSlot.teamId,
+      teamName: sourceSlot.teamName,
+      sourceRoundId: round.roundId,
+      sourceGroupId: group.groupId,
+      destinationRoundId: destRound.roundId,
+      adminId: member.id,
+      timestamp: new Date().toISOString(),
+    };
+    round.qualifications.push(qualRecord);
+    newlyQualifiedNames.push(sourceSlot.teamName);
+  }
+
+  // Persist state in memory and database
+  guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
+  saveGuildSettings(guildSettingsCache);
+  await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+  await recordAuditLog(guild.id, 'QUALIFY_TEAMS', {
+    tournamentId,
+    sourceRoundId: round.roundId,
+    sourceGroupId: group.groupId,
+    destinationRoundId: destRound.roundId,
+    newlyQualified: newlyQualifiedNames,
+    adminId: member.id,
+  });
+
+  // Update source group's slot-list message in its channel in place
+  const groupChannel = group.channelId ? (guild.channels.cache.get(group.channelId) || await guild.channels.fetch(group.channelId).catch(() => null)) : null;
+  if (groupChannel) {
+    await updateGroupSlotListMessage(guild, savedTournament, round, group, groupChannel);
+  }
+
+  // Refresh #bot-commands
+  const botCommandsChannel = savedTournament.channels?.botCommandsId
+    ? (guild.channels.cache.get(savedTournament.channels.botCommandsId) || await guild.channels.fetch(savedTournament.channels.botCommandsId).catch(() => null))
+    : null;
+
+  if (botCommandsChannel) {
+    await publishRoundAllocationSummary(guild, savedTournament, round, botCommandsChannel, savedTournament);
+    await updateGlobalSubmissionControlPanel(guild, savedTournament, round, botCommandsChannel);
+  }
+
+  const successEmbed = new EmbedBuilder()
+    .setTitle(`🏆 Qualification Confirmed — ${round.name} (Group ${group.groupNumber})`)
+    .setColor(0x22c55e)
+    .setDescription(
+      `Successfully qualified **${newlyQualifiedNames.length + alreadyQualifiedNames.length}** team(s) from **Group ${group.groupNumber}** into **${destRound.name}**!\n\n` +
+      (newlyQualifiedNames.length > 0 ? `• **Newly Qualified & Allocated:** ${newlyQualifiedNames.map(n => `**${n}**`).join(', ')}\n` : '') +
+      (alreadyQualifiedNames.length > 0 ? `• **Already Qualified:** ${alreadyQualifiedNames.map(n => `*${n}*`).join(', ')}\n` : '') +
+      `• **Destination Round:** **${destRound.name}** (\`${destRound.roundId}\` — Status: **${destRound.status}**)\n` +
+      `• The group slot list and bot-commands summaries have been updated in place.`
+    )
+    .setFooter({ text: `Admin: ${member.user?.tag || member.id}` })
+    .setTimestamp();
+
+  await interaction.update({
+    content: null,
+    embeds: [successEmbed],
+    components: [],
+  }).catch(() => {});
+}
+
+/**
+ * Handles .submit result command executed by participants.
+ * Checks global submission switch and verifies group eligibility.
+ */
+export async function handleSubmitResultPromptCommand(guild, member, channel, replyFn) {
+  if (!guild || !isOfficialGuild(guild)) {
+    await replyFn('❌ Result submission is restricted to the official MatchDistrict Discord server.');
+    return;
+  }
+
+  const currentSettings = guildSettingsCache[guild.id] || {};
+  const tournaments = currentSettings.tournaments || {};
+
+  let activeTour = null;
+  let activeRound = null;
+  let userGroup = null;
+
+  for (const tour of Object.values(tournaments)) {
+    for (const r of Object.values(tour.rounds || {})) {
+      if (r.status === 'Active' || r.status === 'Started') {
+        for (const g of r.groups || []) {
+          const hasMember = (g.slots || []).some((s) =>
+            s.status === 'OCCUPIED' &&
+            Array.isArray(s.members) &&
+            s.members.some((m) => m.discord_id === member.id)
+          );
+          if (hasMember) {
+            activeTour = tour;
+            activeRound = r;
+            userGroup = g;
+            break;
+          }
+        }
+      }
+      if (userGroup) break;
+    }
+    if (userGroup) break;
+  }
+
+  if (!userGroup) {
+    if (isAdmin(member)) {
+      await replyFn('ℹ️ **Admin Notice:** Use the **Global Result Submission** control panel in the tournament\'s `#bot-commands` channel to open or close submissions.');
+      return;
+    }
+    await replyFn('❌ **Not Found:** You are not an assigned team member in any group of the active tournament round.');
+    return;
+  }
+
+  if (activeRound.globalSubmissionStatus !== 'Open') {
+    await replyFn(`🔴 **Submissions Closed:** Match result submissions for **${activeRound.name}** are currently closed by tournament administrators.`);
+    return;
+  }
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`md_group_submit_result:${activeTour.tournamentId}:${activeRound.roundId}:${userGroup.groupId}`)
+      .setLabel(`Submit Result for Group ${userGroup.groupNumber}`)
+      .setEmoji('📤')
+      .setStyle(ButtonStyle.Success)
+  );
+
+  await replyFn({
+    content: `📋 **Match Result Submission Portal**\n` +
+      `• **Tournament:** **${activeTour.tournamentTitle || activeTour.tournamentId}**\n` +
+      `• **Round:** **${activeRound.name}**\n` +
+      `• **Group:** **Group ${userGroup.groupNumber}**\n\n` +
+      `Click the button below to submit your match placement, kills, and scorecard screenshot:`,
+    components: [row],
+  });
 }
 
 /**
@@ -4724,6 +5371,15 @@ export async function handleGroupSubmitResultButton(interaction, tournamentId, r
   if (round.status !== 'Active' && round.status !== 'Started') {
     await interaction.reply({
       content: `❌ **Submission Unavailable:** Result submission is only permitted for the active tournament round. (Current status: **${round.status}**)`,
+      ephemeral: true,
+    }).catch(() => {});
+    return;
+  }
+
+  // Check global round submission switch
+  if (round.globalSubmissionStatus !== 'Open') {
+    await interaction.reply({
+      content: `🔴 **Submissions Closed:** Global result submissions for **${round.name}** are currently closed by tournament administrators.`,
       ephemeral: true,
     }).catch(() => {});
     return;
@@ -5042,6 +5698,12 @@ export async function handleSubmissionScreenshotUpload(message) {
 
   if (!savedTournament || !round || !group) {
     await message.reply('❌ An error occurred finding the tournament group configuration.').catch(() => {});
+    return true;
+  }
+
+  // Reject upload immediately if global submission switch is Closed
+  if (round.globalSubmissionStatus !== 'Open') {
+    await message.reply('🔴 **Submission Rejected:** Global result submissions have been closed by tournament administrators.').catch(() => {});
     return true;
   }
 
@@ -5519,15 +6181,32 @@ export async function publishGroupCredentials(guild, tournamentId, roundId, grou
     group.credentialsMessageId = newMsg.id;
   }
 
-  // Ensure strict read-only permissions and control message with Submit Result button are up to date
+  group.credentials = {
+    roomId,
+    password,
+    publishedAt: new Date().toISOString(),
+  };
+
+  // Ensure strict read-only permissions and update slot list with credentials
   const groupRole = group.roleId ? (guild.roles.cache.get(group.roleId) || await guild.roles.fetch(group.roleId).catch(() => null)) : null;
   const tourRole = savedTournament.roleId ? (guild.roles.cache.get(savedTournament.roleId) || await guild.roles.fetch(savedTournament.roleId).catch(() => null)) : null;
   await applyStrictGroupChannelPermissions(guild, channel, groupRole, tourRole, guild.members.me);
-  await updateGroupControlMessage(guild, savedTournament, targetRound, group, channel);
+  await removeGroupResultControlMessage(guild, group, channel);
+  await updateGroupSlotListMessage(guild, savedTournament, targetRound, group, channel);
 
   savedTournament.rounds[targetRound.roundId] = targetRound;
   guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
   saveGuildSettings(guildSettingsCache);
+  await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+
+  // Refresh #bot-commands summary
+  if (savedTournament.channels?.botCommandsId) {
+    const botCommandsChannel = guild.channels.cache.get(savedTournament.channels.botCommandsId) ||
+      await guild.channels.fetch(savedTournament.channels.botCommandsId).catch(() => null);
+    if (botCommandsChannel) {
+      await publishRoundAllocationSummary(guild, savedTournament, targetRound, botCommandsChannel, savedTournament);
+    }
+  }
 
   return {
     success: true,

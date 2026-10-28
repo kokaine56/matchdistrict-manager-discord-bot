@@ -76,6 +76,16 @@ import {
   handleAdminAcceptResultButton,
   handleAdminRejectResultButton,
   handleAdminRejectResultModal,
+  removeGroupResultControlMessage,
+  updateGroupSlotListMessage,
+  updateGlobalSubmissionControlPanel,
+  handleOpenSubmissionsButton,
+  handleCloseSubmissionsButton,
+  handleRefreshSubmissionsButton,
+  handleQualifyTeamButton,
+  handleConfirmQualifyTeams,
+  handleSubmitResultPromptCommand,
+  generateEmptyRoundGroups,
 } from './tournamentService.js';
 import {
   initMongo,
@@ -153,6 +163,16 @@ export {
   handleAdminAcceptResultButton,
   handleAdminRejectResultButton,
   handleAdminRejectResultModal,
+  removeGroupResultControlMessage,
+  updateGroupSlotListMessage,
+  updateGlobalSubmissionControlPanel,
+  handleOpenSubmissionsButton,
+  handleCloseSubmissionsButton,
+  handleRefreshSubmissionsButton,
+  handleQualifyTeamButton,
+  handleConfirmQualifyTeams,
+  handleSubmitResultPromptCommand,
+  generateEmptyRoundGroups,
   initMongo,
   isMongoConnected,
   ensurePersistenceAvailable,
@@ -2249,6 +2269,14 @@ client.on(Events.MessageCreate, async (message) => {
           (results.failures.length > 0 ? `\n⚠️ Warnings: ${results.failures.join(', ')}` : '')
         );
         return;
+      } else if (cmd === 'submit') {
+        await handleSubmitResultPromptCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts })
+        );
+        return;
       } else if (cmd === 'cred' || cmd === 'credentials' || cmd === 'room') {
         await handlePublishCredentialsCommand(
           message.guild,
@@ -2291,7 +2319,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       interaction.customId?.startsWith('md_tour_') ||
       interaction.customId?.startsWith('md_round_') ||
       interaction.customId?.startsWith('md_group_') ||
-      interaction.customId?.startsWith('md_result_')
+      interaction.customId?.startsWith('md_result_') ||
+      interaction.customId?.startsWith('md_qualify_') ||
+      interaction.customId === 'md_cancel_qualify'
     )) {
       await handleTournamentButtonInteraction(interaction);
       return;
@@ -2304,7 +2334,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       interaction.customId?.startsWith('md_tour_') ||
       interaction.customId?.startsWith('md_round_') ||
       interaction.customId?.startsWith('md_group_') ||
-      interaction.customId?.startsWith('md_result_')
+      interaction.customId?.startsWith('md_result_') ||
+      interaction.customId?.startsWith('md_select_qualify_teams')
     )) {
       await handleTournamentSelectMenuInteraction(interaction);
       return;
