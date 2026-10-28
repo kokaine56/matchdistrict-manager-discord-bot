@@ -1233,19 +1233,37 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
     lastSyncedAt: savedTournament.roleLastSyncedAt || null,
   } : null;
 
+  // Pre-fetch all channels to ensure full API cache across bot restarts
+  if (typeof guild.channels?.fetch === 'function') {
+    await guild.channels.fetch().catch(() => null);
+  }
+
   // 1. Locate or create Category
   let category = null;
   if (savedTournament.categoryId) {
     category = guild.channels.cache.get(savedTournament.categoryId) ||
       await guild.channels.fetch(savedTournament.categoryId).catch(() => null);
+    if (category && (category.type !== ChannelType.GuildCategory || (category.guildId || category.guild?.id) !== guild.id)) {
+      category = null;
+    }
+  }
+
+  const categoryName = sanitizeCategoryName(tournament.title);
+  if (!category) {
+    const matchingCategories = Array.from(guild.channels.cache.values()).filter(
+      (c) => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === categoryName.toLowerCase()
+    );
+    if (matchingCategories.length > 0) {
+      category = matchingCategories.sort((a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0))[0];
+      savedTournament.categoryId = category.id;
+    }
   }
 
   if (!category || category.type !== ChannelType.GuildCategory) {
-    const categoryName = sanitizeCategoryName(tournament.title);
     const overwrites = [
       {
         id: guild.roles.everyone.id,
-        deny: [PermissionFlagsBits.ViewChannel],
+        allow: [PermissionFlagsBits.ViewChannel],
       },
       {
         id: botMember.id,
@@ -1272,37 +1290,50 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   if (savedTournament.channels.botCommandsId) {
     botCommandsChannel = guild.channels.cache.get(savedTournament.channels.botCommandsId) ||
       await guild.channels.fetch(savedTournament.channels.botCommandsId).catch(() => null);
+    if (botCommandsChannel && (botCommandsChannel.parentId !== category.id || botCommandsChannel.type !== ChannelType.GuildText || (botCommandsChannel.guildId || botCommandsChannel.guild?.id) !== guild.id)) {
+      botCommandsChannel = null;
+    }
   }
 
-  if (!botCommandsChannel || botCommandsChannel.parentId !== category.id) {
-    botCommandsChannel = Array.from(guild.channels.cache.values()).find(
-      (c) => c.parentId === category.id && c.name === 'bot-commands'
+  if (!botCommandsChannel) {
+    const matching = Array.from(guild.channels.cache.values()).filter(
+      (c) => c.parentId === category.id && c.type === ChannelType.GuildText && c.name === 'bot-commands'
     );
+    if (matching.length > 0) {
+      botCommandsChannel = matching.sort((a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0))[0];
+      savedTournament.channels.botCommandsId = botCommandsChannel.id;
+    }
   }
 
-  if (!botCommandsChannel || botCommandsChannel.parentId !== category.id) {
+  const botCommandsOverwrites = [
+    {
+      id: guild.roles.everyone.id,
+      deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages],
+    },
+    {
+      id: botMember.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ManageChannels,
+        PermissionFlagsBits.ManageRoles,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.EmbedLinks,
+      ],
+    },
+  ];
+
+  if (botCommandsChannel) {
+    if (typeof botCommandsChannel.permissionOverwrites?.set === 'function') {
+      await botCommandsChannel.permissionOverwrites.set(botCommandsOverwrites).catch(() => {});
+    }
+  } else {
     botCommandsChannel = await guild.channels.create({
       name: 'bot-commands',
       type: ChannelType.GuildText,
       parent: category.id,
       topic: `Tournament Management & Control Panel (Admin Only) — ${tournament.title} (ID: ${tournamentId})`,
-      permissionOverwrites: [
-        {
-          id: guild.roles.everyone.id,
-          deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages],
-        },
-        {
-          id: botMember.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.ManageChannels,
-            PermissionFlagsBits.ManageRoles,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.EmbedLinks,
-          ],
-        },
-      ],
+      permissionOverwrites: botCommandsOverwrites,
     });
     savedTournament.channels.botCommandsId = botCommandsChannel.id;
   }
@@ -1658,16 +1689,40 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     failures: [],
   };
 
+  // Pre-fetch all channels to ensure full API cache across bot restarts
+  if (typeof guild.channels?.fetch === 'function') {
+    await guild.channels.fetch().catch(() => null);
+  }
+
   // 1. Locate or create Tournament Category (visible to everyone)
   let category = null;
   if (savedTournament.categoryId) {
     category = guild.channels.cache.get(savedTournament.categoryId) ||
       await guild.channels.fetch(savedTournament.categoryId).catch(() => null);
+    if (category && (category.type !== ChannelType.GuildCategory || (category.guildId || category.guild?.id) !== guild.id)) {
+      category = null;
+    }
+  }
+
+  const categoryName = sanitizeCategoryName(tournament.title);
+  if (!category) {
+    const matchingCategories = Array.from(guild.channels.cache.values()).filter(
+      (c) => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === categoryName.toLowerCase()
+    );
+    if (matchingCategories.length > 0) {
+      category = matchingCategories.sort((a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0))[0];
+      savedTournament.categoryId = category.id;
+      if (matchingCategories.length > 1) {
+        console.warn(`[Discord Bot] ⚠️ Multiple categories found for "${categoryName}". Reusing canonical category ${category.id}.`);
+        syncResult.failures.push(`Duplicate categories detected for "${categoryName}". Selected <#${category.id}> as canonical.`);
+      }
+    }
   }
 
   if (category && category.type === ChannelType.GuildCategory) {
     syncResult.categoryAction = 'reused';
     syncResult.categoryId = category.id;
+    savedTournament.categoryId = category.id;
     if (category.permissionOverwrites?.edit) {
       await category.permissionOverwrites.edit(guild.roles.everyone.id, {
         ViewChannel: true,
@@ -1675,7 +1730,6 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     }
   } else {
     try {
-      const categoryName = sanitizeCategoryName(tournament.title);
       const overwrites = [
         {
           id: guild.roles.everyone.id,
@@ -1763,105 +1817,126 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     if (existingId) {
       channelInstance = guild.channels.cache.get(existingId) ||
         await guild.channels.fetch(existingId).catch(() => null);
+      if (channelInstance && (channelInstance.parentId !== category.id || channelInstance.type !== ChannelType.GuildText || (channelInstance.guildId || channelInstance.guild?.id) !== guild.id)) {
+        channelInstance = null;
+      }
     }
 
-    // Fallback: search by name inside the category if mapping was missing
+    // Fallback: search by name inside the category if mapping was missing or invalid
     if (!channelInstance) {
-      channelInstance = Array.from(guild.channels.cache.values()).find(
-        (c) => c.parentId === category.id && c.name === channelDef.name
+      const matching = Array.from(guild.channels.cache.values()).filter(
+        (c) => c.parentId === category.id && c.type === ChannelType.GuildText && c.name.toLowerCase() === channelDef.name.toLowerCase()
       );
+      if (matching.length > 0) {
+        const canonical = matching.find((c) => c.id === existingId) ||
+          matching.sort((a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0))[0];
+        channelInstance = canonical;
+        if (matching.length > 1) {
+          console.warn(`[Discord Bot] ⚠️ Multiple channels found for #${channelDef.name} inside category ${category.name} (${category.id}). Selecting ${canonical.id} as canonical; reporting duplicate for administrator review.`);
+          syncResult.failures.push(`Duplicate channels detected for #${channelDef.name}. Selected <#${canonical.id}> as canonical.`);
+        }
+      }
+    }
+
+    // Determine initial permission overwrites based on channel type
+    let targetOverwrites = [];
+
+    if (channelDef.key === 'botCommandsId' || channelDef.key === 'tournamentTeamsId') {
+      // Restricted admin-only channels: deny @everyone and deny tournament role
+      targetOverwrites = [
+        {
+          id: guild.roles.everyone.id,
+          deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages],
+        },
+        ...(tournamentRole ? [{
+          id: tournamentRole.id,
+          deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages],
+        }] : []),
+        {
+          id: botMember.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.ManageChannels,
+            PermissionFlagsBits.ManageRoles,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.EmbedLinks,
+          ],
+        },
+      ];
+    } else if (channelDef.key === 'tournamentHelpdeskId') {
+      // Public channel with chat: all server members can view and send messages
+      targetOverwrites = [
+        {
+          id: guild.roles.everyone.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.AttachFiles,
+            PermissionFlagsBits.EmbedLinks,
+          ],
+        },
+        {
+          id: botMember.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.ManageChannels,
+            PermissionFlagsBits.ManageRoles,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.EmbedLinks,
+          ],
+        },
+      ];
+    } else {
+      // Public view-only channels (tournament-update, tournament-register)
+      targetOverwrites = [
+        {
+          id: guild.roles.everyone.id,
+          allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
+          deny: [
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.CreatePublicThreads,
+            PermissionFlagsBits.CreatePrivateThreads,
+            PermissionFlagsBits.AddReactions,
+          ],
+        },
+        {
+          id: botMember.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.ManageChannels,
+            PermissionFlagsBits.ManageRoles,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.EmbedLinks,
+          ],
+        },
+      ];
     }
 
     if (channelInstance && channelInstance.parentId === category.id) {
       syncResult.channelsReused.push(channelDef.name);
       savedTournament.channels[channelDef.key] = channelInstance.id;
       activeChannels[channelDef.key] = channelInstance;
-    } else {
-      // Determine initial permission overwrites based on channel type
-      let initialOverwrites = [];
 
-      if (channelDef.key === 'botCommandsId' || channelDef.key === 'tournamentTeamsId') {
-        // Restricted admin-only channels: deny @everyone and deny tournament role
-        initialOverwrites = [
-          {
-            id: guild.roles.everyone.id,
-            deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages],
-          },
-          ...(tournamentRole ? [{
-            id: tournamentRole.id,
-            deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages],
-          }] : []),
-          {
-            id: botMember.id,
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.ManageChannels,
-              PermissionFlagsBits.ManageRoles,
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.ReadMessageHistory,
-              PermissionFlagsBits.EmbedLinks,
-            ],
-          },
-        ];
-      } else if (channelDef.key === 'tournamentHelpdeskId') {
-        // Public channel with chat: all server members can view and send messages
-        initialOverwrites = [
-          {
-            id: guild.roles.everyone.id,
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.ReadMessageHistory,
-              PermissionFlagsBits.AttachFiles,
-              PermissionFlagsBits.EmbedLinks,
-            ],
-          },
-          {
-            id: botMember.id,
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.ManageChannels,
-              PermissionFlagsBits.ManageRoles,
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.ReadMessageHistory,
-              PermissionFlagsBits.EmbedLinks,
-            ],
-          },
-        ];
-      } else {
-        // Public view-only channels (tournament-update, tournament-register)
-        initialOverwrites = [
-          {
-            id: guild.roles.everyone.id,
-            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-            deny: [
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.CreatePublicThreads,
-              PermissionFlagsBits.CreatePrivateThreads,
-              PermissionFlagsBits.AddReactions,
-            ],
-          },
-          {
-            id: botMember.id,
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.ManageChannels,
-              PermissionFlagsBits.ManageRoles,
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.ReadMessageHistory,
-              PermissionFlagsBits.EmbedLinks,
-            ],
-          },
-        ];
+      // Apply or repair permission overwrites on existing channel
+      if (typeof channelInstance.permissionOverwrites?.set === 'function') {
+        try {
+          await channelInstance.permissionOverwrites.set(targetOverwrites);
+        } catch (owErr) {
+          console.warn(`[Discord Bot] ⚠️ Could not repair overwrites on #${channelDef.name}:`, owErr.message);
+        }
       }
-
+    } else {
       try {
         channelInstance = await guild.channels.create({
           name: channelDef.name,
           type: ChannelType.GuildText,
           parent: category.id,
           topic: `${channelDef.topic} — ${tournament.title}`,
-          permissionOverwrites: initialOverwrites,
+          permissionOverwrites: targetOverwrites,
         });
 
         syncResult.channelsCreated.push(channelDef.name);

@@ -84,6 +84,15 @@ export {
   processPendingRoleSyncQueue,
   MAX_ROLE_SYNC_RETRIES,
   ROLE_SYNC_RETRY_INTERVAL_MS,
+  handleChannelCreateAuditLog,
+  handleChannelDeleteAuditLog,
+  handleRoleCreateAuditLog,
+  handleRoleDeleteAuditLog,
+  formatChannelTypeName,
+  recentChannelCreates,
+  recentChannelDeletes,
+  recentRoleCreates,
+  recentRoleDeletes,
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -232,6 +241,26 @@ export const REQUIRED_CHANNELS = [
     name: 'ban-unban-log',
     topic: 'Private MatchDistrict Moderation Logs (Member Bans & Unbans)',
   },
+  {
+    key: 'channelCreateLogId',
+    name: 'channel-create-log',
+    topic: 'Private MatchDistrict Channel Creation Logs',
+  },
+  {
+    key: 'channelDeleteLogId',
+    name: 'channel-delete-log',
+    topic: 'Private MatchDistrict Channel Deletion Logs',
+  },
+  {
+    key: 'roleCreateLogId',
+    name: 'role-create-log',
+    topic: 'Private MatchDistrict Role Creation Logs',
+  },
+  {
+    key: 'roleDeleteLogId',
+    name: 'role-delete-log',
+    topic: 'Private MatchDistrict Role Deletion Logs',
+  },
 ];
 
 export const RESERVED_LOG_CHANNEL_NAMES = new Set([
@@ -239,6 +268,10 @@ export const RESERVED_LOG_CHANNEL_NAMES = new Set([
   'dm-log',
   'msg-log',
   'ban-unban-log',
+  'channel-create-log',
+  'channel-delete-log',
+  'role-create-log',
+  'role-delete-log',
   'matchdistrict-logs',
   'md-welcome-logs',
 ]);
@@ -329,6 +362,10 @@ export function isSetupActive(guildId) {
  */
 export const recentBans = new Map(); // Key: `${guildId}:${userId}`, Value: { moderatorId, reason, logged: boolean, timestamp }
 export const recentJoins = new Map(); // Key: `${guildId}:${userId}`, Value: timestamp
+export const recentChannelCreates = new Map(); // Key: channelId, Value: timestamp
+export const recentChannelDeletes = new Map(); // Key: channelId, Value: timestamp
+export const recentRoleCreates = new Map(); // Key: roleId, Value: timestamp
+export const recentRoleDeletes = new Map(); // Key: roleId, Value: timestamp
 export const pendingSetupRemovals = new Map(); // Key: guildId, Value: { adminId, timestamp, timer }
 
 /**
@@ -432,7 +469,11 @@ export function buildBotPreviewMessage(guild, welcomeEnabled, channelMap) {
     `  - 📋 **Preview & Control:** ${channelMap.botPreviewId ? `<#${channelMap.botPreviewId}>` : 'Not configured'}\n` +
     `  - 📬 **DM Logs:** ${channelMap.dmLogId ? `<#${channelMap.dmLogId}>` : 'Not configured'}\n` +
     `  - 💬 **Message Logs:** ${channelMap.msgLogId ? `<#${channelMap.msgLogId}>` : 'Not configured'}\n` +
-    `  - 🔨 **Ban/Unban Logs:** ${channelMap.banUnbanLogId ? `<#${channelMap.banUnbanLogId}>` : 'Not configured'}\n\n` +
+    `  - 🔨 **Ban/Unban Logs:** ${channelMap.banUnbanLogId ? `<#${channelMap.banUnbanLogId}>` : 'Not configured'}\n` +
+    `  - 📁 **Channel Create Logs:** ${channelMap.channelCreateLogId ? `<#${channelMap.channelCreateLogId}>` : 'Not configured'}\n` +
+    `  - 🗑️ **Channel Delete Logs:** ${channelMap.channelDeleteLogId ? `<#${channelMap.channelDeleteLogId}>` : 'Not configured'}\n` +
+    `  - 🏷️ **Role Create Logs:** ${channelMap.roleCreateLogId ? `<#${channelMap.roleCreateLogId}>` : 'Not configured'}\n` +
+    `  - ❌ **Role Delete Logs:** ${channelMap.roleDeleteLogId ? `<#${channelMap.roleDeleteLogId}>` : 'Not configured'}\n\n` +
     `**Management Commands (Prefix: \`${PREFIX}\`):**\n` +
     `• \`${PREFIX}setup\` — Run or refresh server channels and permissions\n` +
     `• \`${PREFIX}dm welcome on\` — Turn on welcome DMs for new members\n` +
@@ -526,11 +567,15 @@ export async function handleSetupCommand(guild, member, replyFn) {
     // Check if channel ID already saved in guild settings and still exists
     const existingId = savedChannels[req.key];
     if (existingId) {
-      targetChannel = guild.channels.cache.get(existingId);
+      targetChannel = guild.channels.cache.get(existingId) ||
+        await guild.channels.fetch(existingId).catch(() => null);
     }
 
     // If not found by saved ID, check by channel name
     if (!targetChannel) {
+      if (typeof guild.channels?.fetch === 'function') {
+        await guild.channels.fetch().catch(() => null);
+      }
       targetChannel = guild.channels.cache.find(
         (c) => c.type === ChannelType.GuildText && c.name === req.name
       );
@@ -550,6 +595,7 @@ export async function handleSetupCommand(guild, member, replyFn) {
           PermissionFlagsBits.EmbedLinks,
           PermissionFlagsBits.AttachFiles,
           PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.ManageChannels,
         ],
       },
     ];
@@ -583,16 +629,16 @@ export async function handleSetupCommand(guild, member, replyFn) {
 
   // 4. Save guild settings
   const welcomeCurrentlyEnabled = currentSettings.welcomeEnabled !== undefined ? currentSettings.welcomeEnabled : true;
+  const updatedChannels = {};
+  for (const req of REQUIRED_CHANNELS) {
+    updatedChannels[req.key] = channelMap[req.key] || savedChannels[req.key] || null;
+  }
+
   guildSettingsCache[guild.id] = {
     ...currentSettings,
     setupActive: true,
     welcomeEnabled: welcomeCurrentlyEnabled,
-    channels: {
-      botPreviewId: channelMap.botPreviewId || savedChannels.botPreviewId || null,
-      dmLogId: channelMap.dmLogId || savedChannels.dmLogId || null,
-      msgLogId: channelMap.msgLogId || savedChannels.msgLogId || null,
-      banUnbanLogId: channelMap.banUnbanLogId || savedChannels.banUnbanLogId || null,
-    },
+    channels: updatedChannels,
     logChannelId: channelMap.dmLogId || savedChannels.dmLogId || null, // legacy
     setupBy: member.id,
     setupAt: new Date().toISOString(),
@@ -836,7 +882,8 @@ export async function handleSetupConfirmCommand(guild, member, replyFn) {
     }
 
     // Only lookup by stored ID - never by channel name
-    const channel = guild.channels.cache.get(channelId);
+    const channel = guild.channels.cache.get(channelId) ||
+      await guild.channels.fetch(channelId).catch(() => null);
     if (!channel) {
       skipped.push({ name: req.name, reason: 'Already deleted or not found' });
       continue;
@@ -858,15 +905,15 @@ export async function handleSetupConfirmCommand(guild, member, replyFn) {
   }
 
   // 7. Clear stored channel IDs and mark setup as inactive
+  const clearedChannels = {};
+  for (const req of REQUIRED_CHANNELS) {
+    clearedChannels[req.key] = null;
+  }
+
   guildSettingsCache[guild.id] = {
     ...currentSettings,
     setupActive: false,
-    channels: {
-      botPreviewId: null,
-      dmLogId: null,
-      msgLogId: null,
-      banUnbanLogId: null,
-    },
+    channels: clearedChannels,
     logChannelId: null,
     removedBy: member.id,
     removedAt: new Date().toISOString(),
@@ -1504,6 +1551,337 @@ export async function handleGuildBanRemove(ban) {
 }
 
 /**
+ * Format human-readable channel type name.
+ */
+export function formatChannelTypeName(type) {
+  switch (type) {
+    case ChannelType.GuildText: return 'Text Channel';
+    case ChannelType.GuildVoice: return 'Voice Channel';
+    case ChannelType.GuildCategory: return 'Category';
+    case ChannelType.GuildAnnouncement: return 'Announcement Channel';
+    case ChannelType.AnnouncementThread: return 'Announcement Thread';
+    case ChannelType.PublicThread: return 'Public Thread';
+    case ChannelType.PrivateThread: return 'Private Thread';
+    case ChannelType.GuildStageVoice: return 'Stage Voice Channel';
+    case ChannelType.GuildForum: return 'Forum Channel';
+    case ChannelType.GuildMedia: return 'Media Channel';
+    default: return `Channel (Type ${type})`;
+  }
+}
+
+/**
+ * Handles ChannelCreate audit logging into #channel-create-log
+ */
+export async function handleChannelCreateAuditLog(channel) {
+  try {
+    if (!channel || !channel.guild) return;
+    const guild = channel.guild;
+
+    // Official server or setup active check
+    if (!isOfficialGuild(guild) && !isSetupActive(guild.id)) return;
+
+    // Deduplication check
+    if (recentChannelCreates.has(channel.id)) return;
+    recentChannelCreates.set(channel.id, Date.now());
+    for (const [k, v] of recentChannelCreates.entries()) {
+      if (Date.now() - v > 60000) recentChannelCreates.delete(k);
+    }
+
+    const logChannelId = getGuildChannelId(guild.id, 'channelCreateLogId');
+    let logChannel = logChannelId ? guild.channels.cache?.get(logChannelId) : null;
+    if (!logChannel && typeof guild.channels.cache?.find === 'function') {
+      logChannel = guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildText && c.name === 'channel-create-log'
+      );
+    }
+
+    const botMember = guild.members.me;
+    if (!logChannel || (typeof logChannel.permissionsFor === 'function' && !logChannel.permissionsFor(botMember)?.has(PermissionFlagsBits.SendMessages))) {
+      return;
+    }
+
+    let creator = null;
+    try {
+      if (botMember?.permissions?.has && botMember.permissions.has(PermissionFlagsBits.ViewAuditLog) && typeof guild.fetchAuditLogs === 'function') {
+        const auditLogs = await guild.fetchAuditLogs({
+          type: AuditLogEvent.ChannelCreate,
+          limit: 5,
+        });
+        const match = auditLogs.entries.find(
+          (e) => e.target?.id === channel.id && Date.now() - e.createdTimestamp < 30000
+        );
+        if (match) {
+          creator = match.executor;
+        }
+      }
+    } catch (auditErr) {
+      console.warn('[Discord Bot] ⚠️ Could not query audit logs for channel create:', auditErr.message);
+    }
+
+    const isBot = creator?.id === channel.client?.user?.id || (channel.client?.user?.id && creator?.bot);
+    const sourceDisplay = isBot
+      ? '🤖 Bot Operation (MatchDistrict Bot)'
+      : (creator ? '👤 Server Member / Moderator' : 'External / Discord Native Action');
+
+    const creatorDisplay = creator
+      ? `<@${creator.id}> (\`${creator.tag || creator.username}\` | ID: \`${creator.id}\`)`
+      : 'Unavailable (Audit Log permission required or entry missing)';
+
+    let parentDisplay = 'None (Top-Level)';
+    if (channel.parentId) {
+      const parentCat = channel.parent || (guild.channels.cache?.get ? guild.channels.cache.get(channel.parentId) : null);
+      parentDisplay = parentCat ? `📁 **${parentCat.name}** (ID: \`${channel.parentId}\`)` : `ID: \`${channel.parentId}\``;
+    }
+
+    const channelDisplay = channel.type === ChannelType.GuildCategory
+      ? `📁 **${channel.name}** (Category | ID: \`${channel.id}\`)`
+      : `<#${channel.id}> (\`#${channel.name}\` | ID: \`${channel.id}\`)`;
+
+    const nowTs = Math.floor(Date.now() / 1000);
+
+    await logChannel.send(
+      `📁 **Channel Created**\n` +
+      `• **Channel:** ${channelDisplay}\n` +
+      `• **Type:** ${formatChannelTypeName(channel.type)}\n` +
+      `• **Parent Category:** ${parentDisplay}\n` +
+      `• **Created By:** ${creatorDisplay}\n` +
+      `• **Initiated Via:** ${sourceDisplay}\n` +
+      `• **Timestamp:** <t:${nowTs}:F>`
+    );
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error in ChannelCreate audit logger:', err.message);
+  }
+}
+
+/**
+ * Handles ChannelDelete audit logging into #channel-delete-log
+ */
+export async function handleChannelDeleteAuditLog(channel) {
+  try {
+    if (!channel || !channel.guild) return;
+    const guild = channel.guild;
+
+    if (!isOfficialGuild(guild) && !isSetupActive(guild.id)) return;
+
+    if (recentChannelDeletes.has(channel.id)) return;
+    recentChannelDeletes.set(channel.id, Date.now());
+    for (const [k, v] of recentChannelDeletes.entries()) {
+      if (Date.now() - v > 60000) recentChannelDeletes.delete(k);
+    }
+
+    const logChannelId = getGuildChannelId(guild.id, 'channelDeleteLogId');
+    let logChannel = logChannelId ? guild.channels.cache?.get(logChannelId) : null;
+    if (!logChannel && typeof guild.channels.cache?.find === 'function') {
+      logChannel = guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildText && c.name === 'channel-delete-log'
+      );
+    }
+
+    const botMember = guild.members.me;
+    if (!logChannel || (typeof logChannel.permissionsFor === 'function' && !logChannel.permissionsFor(botMember)?.has(PermissionFlagsBits.SendMessages))) {
+      return;
+    }
+
+    let actor = null;
+    let reason = null;
+    try {
+      if (botMember?.permissions?.has && botMember.permissions.has(PermissionFlagsBits.ViewAuditLog) && typeof guild.fetchAuditLogs === 'function') {
+        const auditLogs = await guild.fetchAuditLogs({
+          type: AuditLogEvent.ChannelDelete,
+          limit: 5,
+        });
+        const match = auditLogs.entries.find(
+          (e) => e.target?.id === channel.id && Date.now() - e.createdTimestamp < 30000
+        );
+        if (match) {
+          actor = match.executor;
+          reason = match.reason || null;
+        }
+      }
+    } catch (auditErr) {
+      console.warn('[Discord Bot] ⚠️ Could not query audit logs for channel delete:', auditErr.message);
+    }
+
+    const isBot = actor?.id === channel.client?.user?.id || (channel.client?.user?.id && actor?.bot);
+    const sourceDisplay = isBot
+      ? '🤖 Bot Operation (MatchDistrict Bot)'
+      : (actor ? '👤 Server Member / Moderator' : 'External / Discord Native Action');
+
+    const actorDisplay = actor
+      ? `<@${actor.id}> (\`${actor.tag || actor.username}\` | ID: \`${actor.id}\`)`
+      : 'Unavailable (Audit Log permission required or entry missing)';
+
+    let parentDisplay = 'None (Top-Level)';
+    if (channel.parentId) {
+      const parentCat = channel.parent || (guild.channels.cache?.get ? guild.channels.cache.get(channel.parentId) : null);
+      parentDisplay = parentCat ? `📁 **${parentCat.name}** (ID: \`${channel.parentId}\`)` : `ID: \`${channel.parentId}\``;
+    }
+
+    const nowTs = Math.floor(Date.now() / 1000);
+
+    await logChannel.send(
+      `🗑️ **Channel Deleted**\n` +
+      `• **Channel:** \`#${channel.name || 'Unknown'}\` (ID: \`${channel.id}\`)\n` +
+      `• **Type:** ${formatChannelTypeName(channel.type)}\n` +
+      `• **Parent Category:** ${parentDisplay}\n` +
+      `• **Deleted By:** ${actorDisplay}\n` +
+      `• **Reason:** ${reason || 'No reason provided'}\n` +
+      `• **Initiated Via:** ${sourceDisplay}\n` +
+      `• **Timestamp:** <t:${nowTs}:F>`
+    );
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error in ChannelDelete audit logger:', err.message);
+  }
+}
+
+/**
+ * Handles GuildRoleCreate audit logging into #role-create-log
+ */
+export async function handleRoleCreateAuditLog(role) {
+  try {
+    if (!role || !role.guild) return;
+    const guild = role.guild;
+
+    if (!isOfficialGuild(guild) && !isSetupActive(guild.id)) return;
+
+    if (recentRoleCreates.has(role.id)) return;
+    recentRoleCreates.set(role.id, Date.now());
+    for (const [k, v] of recentRoleCreates.entries()) {
+      if (Date.now() - v > 60000) recentRoleCreates.delete(k);
+    }
+
+    const logChannelId = getGuildChannelId(guild.id, 'roleCreateLogId');
+    let logChannel = logChannelId ? guild.channels.cache?.get(logChannelId) : null;
+    if (!logChannel && typeof guild.channels.cache?.find === 'function') {
+      logChannel = guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildText && c.name === 'role-create-log'
+      );
+    }
+
+    const botMember = guild.members.me;
+    if (!logChannel || (typeof logChannel.permissionsFor === 'function' && !logChannel.permissionsFor(botMember)?.has(PermissionFlagsBits.SendMessages))) {
+      return;
+    }
+
+    let creator = null;
+    try {
+      if (botMember?.permissions?.has && botMember.permissions.has(PermissionFlagsBits.ViewAuditLog) && typeof guild.fetchAuditLogs === 'function') {
+        const auditLogs = await guild.fetchAuditLogs({
+          type: AuditLogEvent.RoleCreate,
+          limit: 5,
+        });
+        const match = auditLogs.entries.find(
+          (e) => e.target?.id === role.id && Date.now() - e.createdTimestamp < 30000
+        );
+        if (match) {
+          creator = match.executor;
+        }
+      }
+    } catch (auditErr) {
+      console.warn('[Discord Bot] ⚠️ Could not query audit logs for role create:', auditErr.message);
+    }
+
+    const isBot = creator?.id === role.client?.user?.id || (role.client?.user?.id && creator?.bot);
+    const sourceDisplay = isBot
+      ? '🤖 Bot Operation (MatchDistrict Bot)'
+      : (creator ? '👤 Server Member / Moderator' : 'External / Discord Native Action');
+
+    const creatorDisplay = creator
+      ? `<@${creator.id}> (\`${creator.tag || creator.username}\` | ID: \`${creator.id}\`)`
+      : 'Unavailable (Audit Log permission required or entry missing)';
+
+    const mentionable = role.mentionable ? 'Yes' : 'No';
+    const color = role.hexColor && role.hexColor !== '#000000' ? role.hexColor : 'Default';
+    const nowTs = Math.floor(Date.now() / 1000);
+
+    await logChannel.send(
+      `🏷️ **Role Created**\n` +
+      `• **Role:** <@&${role.id}> (\`@${role.name}\` | ID: \`${role.id}\`)\n` +
+      `• **Color:** \`${color}\`\n` +
+      `• **Mentionable:** ${mentionable}\n` +
+      `• **Created By:** ${creatorDisplay}\n` +
+      `• **Initiated Via:** ${sourceDisplay}\n` +
+      `• **Timestamp:** <t:${nowTs}:F>`
+    );
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error in RoleCreate audit logger:', err.message);
+  }
+}
+
+/**
+ * Handles GuildRoleDelete audit logging into #role-delete-log
+ */
+export async function handleRoleDeleteAuditLog(role) {
+  try {
+    if (!role || !role.guild) return;
+    const guild = role.guild;
+
+    if (!isOfficialGuild(guild) && !isSetupActive(guild.id)) return;
+
+    if (recentRoleDeletes.has(role.id)) return;
+    recentRoleDeletes.set(role.id, Date.now());
+    for (const [k, v] of recentRoleDeletes.entries()) {
+      if (Date.now() - v > 60000) recentRoleDeletes.delete(k);
+    }
+
+    const logChannelId = getGuildChannelId(guild.id, 'roleDeleteLogId');
+    let logChannel = logChannelId ? guild.channels.cache?.get(logChannelId) : null;
+    if (!logChannel && typeof guild.channels.cache?.find === 'function') {
+      logChannel = guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildText && c.name === 'role-delete-log'
+      );
+    }
+
+    const botMember = guild.members.me;
+    if (!logChannel || (typeof logChannel.permissionsFor === 'function' && !logChannel.permissionsFor(botMember)?.has(PermissionFlagsBits.SendMessages))) {
+      return;
+    }
+
+    let actor = null;
+    let reason = null;
+    try {
+      if (botMember?.permissions?.has && botMember.permissions.has(PermissionFlagsBits.ViewAuditLog) && typeof guild.fetchAuditLogs === 'function') {
+        const auditLogs = await guild.fetchAuditLogs({
+          type: AuditLogEvent.RoleDelete,
+          limit: 5,
+        });
+        const match = auditLogs.entries.find(
+          (e) => e.target?.id === role.id && Date.now() - e.createdTimestamp < 30000
+        );
+        if (match) {
+          actor = match.executor;
+          reason = match.reason || null;
+        }
+      }
+    } catch (auditErr) {
+      console.warn('[Discord Bot] ⚠️ Could not query audit logs for role delete:', auditErr.message);
+    }
+
+    const isBot = actor?.id === role.client?.user?.id || (role.client?.user?.id && actor?.bot);
+    const sourceDisplay = isBot
+      ? '🤖 Bot Operation (MatchDistrict Bot)'
+      : (actor ? '👤 Server Member / Moderator' : 'External / Discord Native Action');
+
+    const actorDisplay = actor
+      ? `<@${actor.id}> (\`${actor.tag || actor.username}\` | ID: \`${actor.id}\`)`
+      : 'Unavailable (Audit Log permission required or entry missing)';
+
+    const nowTs = Math.floor(Date.now() / 1000);
+
+    await logChannel.send(
+      `❌ **Role Deleted**\n` +
+      `• **Role:** \`@${role.name || 'Unknown Role'}\` (ID: \`${role.id}\`)\n` +
+      `• **Deleted By:** ${actorDisplay}\n` +
+      `• **Reason:** ${reason || 'No reason provided'}\n` +
+      `• **Initiated Via:** ${sourceDisplay}\n` +
+      `• **Timestamp:** <t:${nowTs}:F>`
+    );
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error in RoleDelete audit logger:', err.message);
+  }
+}
+
+/**
  * Handles member join event: sends welcome DM and logs attempt to #dm-log
  */
 export async function handleGuildMemberAdd(member) {
@@ -1777,6 +2155,24 @@ client.on(Events.GuildBanAdd, async (ban) => {
 
 client.on(Events.GuildBanRemove, async (ban) => {
   await handleGuildBanRemove(ban);
+});
+
+// Channel creation and deletion audit listeners
+client.on(Events.ChannelCreate, async (channel) => {
+  await handleChannelCreateAuditLog(channel);
+});
+
+client.on(Events.ChannelDelete, async (channel) => {
+  await handleChannelDeleteAuditLog(channel);
+});
+
+// Role creation and deletion audit listeners
+client.on(Events.GuildRoleCreate, async (role) => {
+  await handleRoleCreateAuditLog(role);
+});
+
+client.on(Events.GuildRoleDelete, async (role) => {
+  await handleRoleDeleteAuditLog(role);
 });
 
 // Member join listener
