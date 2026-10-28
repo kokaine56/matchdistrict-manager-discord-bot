@@ -16,6 +16,27 @@ import {
   ButtonBuilder,
   ButtonStyle,
 } from 'discord.js';
+import {
+  handleListTournamentCommand,
+  handleFetchTeamsCommand,
+  checkTournamentAccess,
+  isOfficialGuild,
+  getOfficialGuildId,
+  syncTournamentDiscordChannels,
+  formatTournamentListPages,
+  guildTournamentSessions,
+} from './tournamentService.js';
+
+export {
+  handleListTournamentCommand,
+  handleFetchTeamsCommand,
+  checkTournamentAccess,
+  isOfficialGuild,
+  getOfficialGuildId,
+  syncTournamentDiscordChannels,
+  formatTournamentListPages,
+  guildTournamentSessions,
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -320,6 +341,9 @@ export function getHelpResponse(prefix = PREFIX) {
     `• \`${prefix}dm welcome off\` — *(Admin Only)* Disable welcome DMs for new members\n` +
     `• \`${prefix}ban @user [reason]\` — *(Mod Only)* Ban a user with audit logging\n` +
     `• \`${prefix}clear <1-100>\` — *(Mod Only)* Bulk delete recent messages\n\n` +
+    `**🏆 Tournament Management (Official Server Only):**\n` +
+    `• \`${prefix}list tournament [all]\` — *(Admin Only)* List website tournaments (status, slots, IDs)\n` +
+    `• \`${prefix}fetch teams <tournament_id>\` — *(Admin Only)* Fetch registered teams, validate Discord links & sync channels\n\n` +
     `**ℹ️ General Information:**\n` +
     `• \`${prefix}status\` — Check server configuration & welcome status\n` +
     `• \`${prefix}website\` — Get the official MatchDistrict platform link\n` +
@@ -1048,10 +1072,12 @@ export async function handleStatusCommand(guild, replyFn) {
   const enabled = isWelcomeEnabled(guild.id);
   const active = isSetupActive(guild.id);
   const channels = getGuildChannels(guild.id);
+  const isOfficial = isOfficialGuild(guild);
 
   if (active) {
     await replyFn(
       `📊 **MatchDistrict Server Status**\n` +
+      `• **Official MatchDistrict Server:** ${isOfficial ? '🟢 **Yes (Official Guild)**' : '⚪ **No (External / Community Guild)**'}\n` +
       `• **Setup Status:** 🟢 **Active**\n` +
       `• **Welcome DMs:** ${enabled ? '🟢 **Active / Enabled**' : '🔴 **Disabled**'}\n` +
       `• **Configured Channels:**\n` +
@@ -1064,6 +1090,7 @@ export async function handleStatusCommand(guild, replyFn) {
   } else {
     await replyFn(
       `📊 **MatchDistrict Server Status**\n` +
+      `• **Official MatchDistrict Server:** ${isOfficial ? '🟢 **Yes (Official Guild)**' : '⚪ **No (External / Community Guild)**'}\n` +
       `• **Setup Status:** 🔴 **Inactive / Removed**\n` +
       `• **Welcome DMs:** ${enabled ? '🟢 **Active / Enabled**' : '🔴 **Disabled**'}\n` +
       `• **Configured Channels:** None (Run \`${PREFIX}setup\` to configure management channels)\n\n` +
@@ -1502,6 +1529,22 @@ client.on(Events.MessageCreate, async (message) => {
         // Delete command message invocation where practical
         await message.delete().catch(() => {});
         await handleClearCommand(message.guild, message.member, message.channel, args, (text) => message.channel.send(text));
+        return;
+      } else if (cmd === 'list') {
+        const sub = (args[0] || '').toLowerCase();
+        if (sub === 'tournament' || sub === 'tournaments') {
+          await handleListTournamentCommand(message.guild, message.member, args.slice(1), (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }));
+          return;
+        }
+        await message.reply(`ℹ️ **Usage:** \`${PREFIX}list tournament [all]\` — List tournaments hosted on MatchDistrict.`);
+        return;
+      } else if (cmd === 'fetch') {
+        const sub = (args[0] || '').toLowerCase();
+        if (sub === 'teams' || sub === 'team') {
+          await handleFetchTeamsCommand(message.guild, message.member, args.slice(1), (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }));
+          return;
+        }
+        await message.reply(`ℹ️ **Usage:** \`${PREFIX}fetch teams <tournament_id>\` — Fetch registered teams & sync Discord channels.`);
         return;
       } else if (cmd === 'status') {
         await handleStatusCommand(message.guild, (text) => message.reply(text));
