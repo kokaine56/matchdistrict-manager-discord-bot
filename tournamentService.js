@@ -5545,7 +5545,7 @@ export async function removeGroupResultControlMessage(guild, group, channel) {
 /**
  * Sends or updates a group's persistent 25-slot list and match ID/password information
  * inside that group's private ID/PWD channel.
- * Includes the administrative "Qualify Team" button.
+ * Publishes only the slot list and match credentials.
  */
 export async function updateGroupSlotListMessage(guild, tournament, round, group, channel) {
   if (!channel || typeof channel.send !== 'function') return null;
@@ -5560,30 +5560,14 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
       `⏰ **Published:** <t:${Math.floor(new Date(group.credentials.publishedAt || Date.now()).getTime() / 1000)}:R>`;
   }
 
-  // All 25 slots representation
+  // Display only locked and filled slots in the agreed format.
   let slotsText = '';
   const slots = Array.isArray(group.slots) ? group.slots : [];
-
-  const capacity = Math.min(Math.max(round.teamsPerGroup || 16, 1), 23);
-  const maxTeamSlot = 2 + capacity;
-
   for (let s = 1; s <= 25; s++) {
     const slotNum = String(s).padStart(2, '0');
     const slotData = slots.find((sl) => sl.slotNumber === s);
-
-    if (s >= 1 && s <= 2) {
-      slotsText += `🔒 **Slot ${slotNum}:** \`LOCKED\`\n`;
-    } else if (s >= 3 && s <= maxTeamSlot) {
-      if (slotData && (slotData.status === 'OCCUPIED' || slotData.teamName)) {
-        const isQualified = slotData.qualificationStatus === 'Qualified';
-        const qualTag = isQualified ? ' **[QUALIFIED 🏆]**' : ' *[Pending ⏳]*';
-        slotsText += `🎮 **Slot ${slotNum}:** **${slotData.teamName}**${qualTag}\n`;
-      } else {
-        slotsText += `⚪ **Slot ${slotNum}:** *EMPTY*\n`;
-      }
-    } else {
-      slotsText += `⛔ **Slot ${slotNum}:** \`UNUSED / RESERVED\`\n`;
-    }
+    if (s <= 2) slotsText += `Slot ${slotNum} → 🔒 LOCKED\n`;
+    else if (slotData?.status === 'OCCUPIED' && slotData.teamName) slotsText += `Slot ${slotNum} → ${slotData.teamName}\n`;
   }
 
   const embed = new EmbedBuilder()
@@ -5595,19 +5579,10 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
       `────────────────────────────────────────\n` +
       `### 🔑 Match Credentials\n${credentialsText}\n` +
       `────────────────────────────────────────\n` +
-      `### ⚔️ Group Slot Assignments (1–25)\n${slotsText}`
+      `### ⚔️ Group Slot Assignments\n${slotsText.trim()}`
     )
-    .setFooter({ text: `${tournament.title || 'MatchDistrict'} • Group ${group.groupNumber} • Admin: Qualify Team below` })
+    .setFooter({ text: `${tournament.title || 'MatchDistrict'} • Group ${group.groupNumber}` })
     .setTimestamp();
-
-  // "Qualify Team" button for administrators
-  const actionRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`md_qualify_team:${tournament.id}:${round.roundId}:${group.groupId}`)
-      .setLabel('Qualify Team')
-      .setEmoji('🏆')
-      .setStyle(ButtonStyle.Success)
-  );
 
   const logicalKey = `guild:${guild.id}:tournament:${tournament.id}:round:${round.roundId}:group:${group.groupId}:slot_list`;
 
@@ -5620,7 +5595,7 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
       tournamentId: tournament.id,
       roundId: round.roundId,
       groupId: group.groupId,
-      payload: { embeds: [embed], components: [actionRow] },
+      payload: { embeds: [embed], components: [] },
     });
     group.slotListMessageId = result.messageId;
     return result.messageId;
@@ -5631,10 +5606,10 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
       msg = await channel.messages.fetch(group.slotListMessageId).catch(() => null);
     }
     if (msg && typeof msg.edit === 'function') {
-      await msg.edit({ embeds: [embed], components: [actionRow] }).catch(() => {});
+      await msg.edit({ embeds: [embed], components: [] }).catch(() => {});
       group.slotListMessageId = msg.id;
     } else {
-      const newMsg = await channel.send({ embeds: [embed], components: [actionRow] }).catch(() => null);
+      const newMsg = await channel.send({ embeds: [embed], components: [] }).catch(() => null);
       if (newMsg) group.slotListMessageId = newMsg.id;
     }
     return group.slotListMessageId;
@@ -5999,13 +5974,13 @@ function buildQualifyGroupScreen(round, group) {
     const slotNumber = index + 1;
     const slot = slotsByNumber.get(slotNumber);
     const slotLabel = `Slot ${String(slotNumber).padStart(2, '0')}`;
-    if (slot?.status === 'LOCKED' || slotNumber <= 2) return `🔒 **${slotLabel}:** LOCKED`;
-    if (slot?.status === 'UNUSED' || slot?.status === 'RESERVED') return `⚪ **${slotLabel}:** UNUSED`;
+    if (slot?.status === 'LOCKED' || slotNumber <= 2) return `Slot ${String(slotNumber).padStart(2, '0')} → 🔒 LOCKED`;
+    if (slot?.status === 'UNUSED' || slot?.status === 'RESERVED') return null;
     if (slot?.status === 'OCCUPIED' && slot.teamName) {
-      return `${qualifiedSlots.has(slotNumber) ? '🏆' : '🎮'} **${slotLabel}:** ${slot.teamName}${qualifiedSlots.has(slotNumber) ? ' — QUALIFIED' : ''}`;
+      return `Slot ${String(slotNumber).padStart(2, '0')} → ${slot.teamName}`;
     }
-    return `▫️ **${slotLabel}:** EMPTY`;
-  });
+    return null;
+  }).filter(Boolean);
 
   const embed = new EmbedBuilder()
     .setTitle(`🏆 Qualify Teams — ${round.name} (Group ${group.groupNumber})`)
@@ -6013,7 +5988,7 @@ function buildQualifyGroupScreen(round, group) {
     .setDescription(
       `Select the registered teams from Group ${group.groupNumber} that qualify for the next round.\n` +
       `**Already Qualified:** ${qualifiedSlots.size} team(s)\n\n` +
-      `**25-Slot Registration List**\n${slotLines.join('\n')}`
+        `**Slot List**\n${slotLines.join('\n')}`
     )
     .setTimestamp();
 
