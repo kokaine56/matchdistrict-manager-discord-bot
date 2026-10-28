@@ -257,6 +257,9 @@ async function ensureManagementDashboardRoles(guild, savedTournament, botMember 
   if (!botMember?.permissions?.has?.(PermissionFlagsBits.ManageRoles)) {
     throw new Error('The bot needs Manage Roles permission to create or assign tournament roles.');
   }
+  await guild.roles.fetch().catch((error) => {
+    console.warn('[Discord Bot] Could not refresh guild roles before management role assignment:', error.message);
+  });
   const resolveRole = async (id) => id
     ? guild.roles.cache.get(id) || await guild.roles.fetch(id).catch(() => null)
     : null;
@@ -753,7 +756,7 @@ export async function handleTournamentVerificationMessage(message) {
       .map((user) => user.id))];
     const validIds = [];
     for (const userId of candidateIds) {
-      const member = await message.guild.members.fetch(userId).catch(() => null);
+      const member = await message.guild.members.fetch({ user: userId, force: true }).catch(() => null);
       if (member && !member.user.bot && userId !== message.author.id) validIds.push(userId);
     }
     if (validIds.length < 3) {
@@ -963,7 +966,7 @@ export function buildTournamentControlPanelButtons(tournamentId) {
   return [row1, row2];
 }
 
-function updateDashboardNavigation(guild, tournamentId, operation, screen = null) {
+async function updateDashboardNavigation(guild, tournamentId, operation, screen = null) {
   const settings = guildSettingsCache[guild?.id] || {};
   const savedTournament = settings.tournaments?.[tournamentId];
   if (!savedTournament) return;
@@ -984,7 +987,9 @@ function updateDashboardNavigation(guild, tournamentId, operation, screen = null
   settings.tournaments[tournamentId] = savedTournament;
   guildSettingsCache[guild.id] = settings;
   saveGuildSettings(guildSettingsCache);
-  saveTournamentToDb(guild.id, tournamentId, savedTournament);
+  try { await saveTournamentToDb(guild.id, tournamentId, savedTournament); } catch (error) {
+    console.error(`[Discord Bot] Could not persist dashboard navigation for ${tournamentId}:`, error.message);
+  }
 }
 
 function saveDashboardScreen(guild, tournamentId, savedTournament, screen) {
@@ -1082,10 +1087,11 @@ async function renderManagementAssignmentResult(interaction, result, errorText =
   const verb = result.operation === 'remove' ? 'Removal' : 'Assignment';
   const changed = result.operation === 'remove' ? result.removed || [] : result.assigned || [];
   const embed = new EmbedBuilder().setTitle(`Role ${verb} Result · ${result.roleName}`)
-    .setColor(result.skipped?.length ? 0xeab308 : 0x22c55e)
-    .setDescription(errorText || `Role: <@&${result.roleId}>`);
-  addLinesAsFields(embed, result.operation === 'remove' ? 'Removed' : 'Assigned', changed.map((user) => `<@${user.id}>`), result.operation === 'remove' ? 'No users had the role removed.' : 'No users received the role.');
-  addLinesAsFields(embed, 'Skipped', (result.skipped || []).map((user) => `<@${user.id}> — ${String(user.reason).slice(0, 120)}`), 'No users were skipped.');
+    .setColor(result.failed?.length || !changed.length ? 0xeab308 : 0x22c55e)
+    .setDescription(errorText || `Role: ${result.roleId ? `<@&${result.roleId}>` : result.roleName}`);
+  addLinesAsFields(embed, result.operation === 'remove' ? 'Removed' : 'Given', changed.map((user) => `<@${user.id}>`), result.operation === 'remove' ? 'No users had the role removed.' : 'No users received the role.');
+  addLinesAsFields(embed, result.operation === 'remove' ? 'Did Not Have Role' : 'Already Had Role', (result.alreadyHad || []).map((user) => `<@${user.id}> — ${String(user.reason).slice(0, 120)}`), result.operation === 'remove' ? 'None.' : 'None.');
+  addLinesAsFields(embed, 'Failed / Skipped', (result.failed || result.skipped || []).map((user) => `<@${user.id}> — ${String(user.reason).slice(0, 120)}`), 'None.');
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('dash:management-result:back').setLabel('Back').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('dash:management-result:refresh').setLabel('Refresh').setStyle(ButtonStyle.Secondary),
@@ -1094,13 +1100,13 @@ async function renderManagementAssignmentResult(interaction, result, errorText =
 }
 
 async function handleManagementRolesDashboard(interaction, tournamentId, savedTournament, screen, action, roleKey = '') {
+  if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate().catch(() => {});
   const access = checkTournamentAccess(interaction.guild, interaction.member);
   if (!access.allowed) {
     await interaction.editReply({ content: access.reason, embeds: [], components: [] }).catch(() => {});
     return true;
   }
   try {
-    if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
     if (screen === 'management-roles' && action === 'open') {
       await ensureManagementDashboardRoles(interaction.guild, savedTournament, interaction.guild.members.me);
       savedTournament.dashboardNavigationStack = [{ screen: 'home' }, { screen: 'management-roles' }];
@@ -1124,13 +1130,13 @@ async function handleManagementRolesDashboard(interaction, tournamentId, savedTo
       return true;
     }
     if (screen === 'management-roles' && ['give', 'remove'].includes(action)) {
-      updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'management-role-choice', operation: action });
+      await updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'management-role-choice', operation: action });
       await persistManagementRoleState(interaction.guild.id, tournamentId, savedTournament);
       await renderManagementRoleChoiceScreen(interaction, action);
       return true;
     }
     if (screen === 'management-roles' && action === 'back') {
-      updateDashboardNavigation(interaction.guild, tournamentId, 'back');
+      await updateDashboardNavigation(interaction.guild, tournamentId, 'back');
       await handleBackToTournamentPanel(interaction, tournamentId);
       return true;
     }
@@ -1139,14 +1145,14 @@ async function handleManagementRolesDashboard(interaction, tournamentId, savedTo
       return true;
     }
     if (screen === 'management-role-choice' && action === 'back') {
-      updateDashboardNavigation(interaction.guild, tournamentId, 'back');
+      await updateDashboardNavigation(interaction.guild, tournamentId, 'back');
       await renderManagementRoleScreen(interaction, savedTournament);
       return true;
     }
     if (screen === 'management-role-choice' && action === 'role' && ['tourney-mod', 'spectator'].includes(roleKey)) {
       await ensureManagementDashboardRoles(interaction.guild, savedTournament, interaction.guild.members.me);
       const operation = stackRoleContext(savedTournament).operation || 'give';
-      updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'management-users', roleKey, operation });
+      await updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'management-users', roleKey, operation });
       await persistManagementRoleState(interaction.guild.id, tournamentId, savedTournament);
       await renderManagementUserPicker(interaction, savedTournament, roleKey, '', operation);
       return true;
@@ -1167,7 +1173,7 @@ async function handleManagementRolesDashboard(interaction, tournamentId, savedTo
       return true;
     }
     if (screen === 'management-users' && action === 'back') {
-      updateDashboardNavigation(interaction.guild, tournamentId, 'back');
+      await updateDashboardNavigation(interaction.guild, tournamentId, 'back');
       await renderManagementRoleChoiceScreen(interaction, stackRoleContext(savedTournament).operation || 'give');
       return true;
     }
@@ -1188,34 +1194,56 @@ async function handleManagementRolesDashboard(interaction, tournamentId, savedTo
     if (screen === 'management-confirm' && action === 'confirm') {
       const pending = savedTournament.pendingManagementRoleAssignment;
       if (!pending || !['tourney-mod', 'spectator'].includes(pending.roleKey)) throw new Error('The pending role assignment could not be found. Please choose the users again.');
-      const roles = await ensureManagementDashboardRoles(interaction.guild, savedTournament, interaction.guild.members.me);
+      let roles;
+      try {
+        roles = await ensureManagementDashboardRoles(interaction.guild, savedTournament, interaction.guild.members.me);
+      } catch (roleSetupError) {
+        console.error(`[Discord Bot] Could not prepare management role for ${tournamentId}:`, roleSetupError);
+        const roleName = pending.roleKey === 'tourney-mod' ? 'Tourney-mod' : 'Spectator';
+        const roleId = pending.roleKey === 'tourney-mod' ? savedTournament.tourneyModRoleId : savedTournament.spectatorRoleId;
+        const failedResult = {
+          roleKey: pending.roleKey,
+          operation: pending.operation === 'remove' ? 'remove' : 'give',
+          roleName,
+          roleId: roleId || null,
+          assigned: [], removed: [], alreadyHad: [],
+          failed: [...new Set(pending.userIds)].map((id) => ({ id, reason: roleSetupError.message })),
+          completedAt: new Date().toISOString(),
+        };
+        savedTournament.lastManagementRoleAssignment = failedResult;
+        savedTournament.pendingManagementRoleAssignment = null;
+        saveDashboardScreen(interaction.guild, tournamentId, savedTournament, { screen: 'management-result' });
+        await persistManagementRoleState(interaction.guild.id, tournamentId, savedTournament);
+        await renderManagementAssignmentResult(interaction, failedResult);
+        return true;
+      }
       const role = pending.roleKey === 'tourney-mod' ? roles.tourneyModRole : roles.spectatorRole;
-      const result = { roleKey: pending.roleKey, operation: pending.operation === 'remove' ? 'remove' : 'give', roleName: role.name, roleId: role.id, assigned: [], removed: [], skipped: [], completedAt: new Date().toISOString() };
+      const result = { roleKey: pending.roleKey, operation: pending.operation === 'remove' ? 'remove' : 'give', roleName: role.name, roleId: role.id, assigned: [], removed: [], alreadyHad: [], failed: [], completedAt: new Date().toISOString() };
       for (const userId of [...new Set(pending.userIds)]) {
         try {
-          const member = await interaction.guild.members.fetch(userId);
+          const member = await interaction.guild.members.fetch({ user: userId, force: true });
           if (!member) {
-            result.skipped.push({ id: userId, reason: 'User is not in this server.' });
+            result.failed.push({ id: userId, reason: 'User is not in this server.' });
             continue;
           }
           const hasRole = member.roles.cache.has(role.id);
           if (result.operation === 'remove') {
             if (!hasRole) {
-              result.skipped.push({ id: userId, reason: `User does not have ${role.name}.` });
+              result.alreadyHad.push({ id: userId, reason: `User does not have ${role.name}.` });
               continue;
             }
             await member.roles.remove(role, `Removed ${role.name} from tournament dashboard by ${interaction.user?.tag || interaction.user?.id || 'administrator'}`);
             result.removed.push({ id: userId });
           } else {
             if (hasRole) {
-              result.skipped.push({ id: userId, reason: `User already has ${role.name}.` });
+              result.alreadyHad.push({ id: userId, reason: `User already has ${role.name}.` });
               continue;
             }
             await member.roles.add(role, `Assigned ${role.name} from tournament dashboard by ${interaction.user?.tag || interaction.user?.id || 'administrator'}`);
             result.assigned.push({ id: userId });
           }
         } catch (err) {
-          result.skipped.push({ id: userId, reason: err.code === 10007 ? 'User is not in this server.' : `Role ${result.operation === 'remove' ? 'removal' : 'assignment'} failed: ${err.message}` });
+          result.failed.push({ id: userId, reason: err.code === 10007 ? 'User is not in this server.' : `Role ${result.operation === 'remove' ? 'removal' : 'assignment'} failed: ${err.message}` });
           console.warn(`[Discord Bot] Could not ${result.operation === 'remove' ? 'remove' : 'assign'} ${role.name} ${result.operation === 'remove' ? 'from' : 'to'} ${userId}:`, err.message);
         }
       }
@@ -2386,16 +2414,9 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
     }
   }
 
-  const categoryName = sanitizeCategoryName(tournament.title);
-  if (!category) {
-    const matchingCategories = Array.from(guild.channels.cache.values()).filter(
-      (c) => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === categoryName.toLowerCase()
-    );
-    if (matchingCategories.length > 0) {
-      category = matchingCategories.sort((a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0))[0];
-      savedTournament.categoryId = category.id;
-    }
-  }
+  const tournamentShort = getTournamentShortName(tournament.title, tournament.id);
+  const categoryName = tournamentShort;
+  if (category && category.name !== categoryName) await category.setName(categoryName).catch((err) => console.warn(`[Discord Bot] Could not rename tournament category: ${err.message}`));
 
   if (!category || category.type !== ChannelType.GuildCategory) {
     const overwrites = [
@@ -2423,7 +2444,7 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
     savedTournament.categoryId = category.id;
   }
 
-  const managementCategory = await ensureTournamentCategory(guild, savedTournament, 'managementCategoryId', 'MANAGEMENT', [
+  const managementCategory = await ensureTournamentCategory(guild, savedTournament, 'managementCategoryId', `${tournamentShort} MANAGEMENT`, [
     { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
     { id: managementRole.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessages] },
     { id: botMember.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageRoles,
@@ -2440,15 +2461,6 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
     }
   }
 
-  if (!botCommandsChannel) {
-    const matching = Array.from(guild.channels.cache.values()).filter(
-      (c) => [category.id, managementCategory.id].includes(c.parentId) && c.type === ChannelType.GuildText && c.name === 'bot-commands'
-    );
-    if (matching.length > 0) {
-      botCommandsChannel = matching.sort((a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0))[0];
-      savedTournament.channels.botCommandsId = botCommandsChannel.id;
-    }
-  }
 
   const botCommandsOverwrites = [
     {
@@ -2473,6 +2485,7 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   ];
 
   if (botCommandsChannel) {
+    if (botCommandsChannel.name !== `${sanitizeChannelName(tournamentShort)}-bot-commands`) await botCommandsChannel.setName(`${sanitizeChannelName(tournamentShort)}-bot-commands`).catch((err) => console.warn(`[Discord Bot] Could not rename bot-commands channel: ${err.message}`));
     if (botCommandsChannel.parentId !== managementCategory.id) {
       await botCommandsChannel.setParent(managementCategory.id, { lockPermissions: false });
     }
@@ -2481,7 +2494,7 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
     }
   } else {
     botCommandsChannel = await guild.channels.create({
-      name: 'bot-commands',
+      name: `${sanitizeChannelName(tournamentShort)}-bot-commands`,
       type: ChannelType.GuildText,
       parent: managementCategory.id,
       topic: `Tournament Management & Control Panel (Admin Only) — ${tournament.title} (ID: ${tournamentId})`,
@@ -2856,20 +2869,9 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     }
   }
 
-  const categoryName = sanitizeCategoryName(tournament.title);
-  if (!category) {
-    const matchingCategories = Array.from(guild.channels.cache.values()).filter(
-      (c) => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === categoryName.toLowerCase()
-    );
-    if (matchingCategories.length > 0) {
-      category = matchingCategories.sort((a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0))[0];
-      savedTournament.categoryId = category.id;
-      if (matchingCategories.length > 1) {
-        console.warn(`[Discord Bot] ⚠️ Multiple categories found for "${categoryName}". Reusing canonical category ${category.id}.`);
-        syncResult.failures.push(`Duplicate categories detected for "${categoryName}". Selected <#${category.id}> as canonical.`);
-      }
-    }
-  }
+  const tournamentShort = getTournamentShortName(tournament.title, tournament.id);
+  const categoryName = tournamentShort;
+  if (category && category.name !== categoryName) await category.setName(categoryName).catch((err) => syncResult.failures.push(`Failed to rename tournament category: ${err.message}`));
 
   if (category && category.type === ChannelType.GuildCategory) {
     syncResult.categoryAction = 'reused';
@@ -2915,7 +2917,6 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     }
   }
 
-  const tournamentShort = getTournamentShortName(tournament.title, tournament.id);
   const tournamentPrefix = sanitizeChannelName(tournamentShort);
   const { tourneyModRole: modsRole, spectatorRole } = await ensureManagementDashboardRoles(guild, savedTournament, botMember);
   const botOverwrite = {
@@ -2927,7 +2928,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     { id: guild.roles.everyone.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory] },
     botOverwrite,
   ]);
-  const managementCategory = await ensureTournamentCategory(guild, savedTournament, 'managementCategoryId', 'MANAGEMENT', [
+  const managementCategory = await ensureTournamentCategory(guild, savedTournament, 'managementCategoryId', `${tournamentShort} MANAGEMENT`, [
     { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
     { id: modsRole.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessages] },
     botOverwrite,
@@ -2984,9 +2985,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
   for (const channelDef of REQUIRED_TOURNAMENT_CHANNELS) {
     const existingId = savedTournament.channels[channelDef.key];
-    const desiredName = ['botCommandsId', 'tournamentLogId', 'tournamentTeamsId', 'specResultId'].includes(channelDef.key)
-      ? channelDef.name
-      : `${tournamentPrefix}-${channelDef.name}`;
+    const desiredName = `${tournamentPrefix}-${channelDef.name}`;
     const targetCategory = channelDef.category === 'public' ? publicCategory
       : channelDef.category === 'management' ? managementCategory : category;
     let channelInstance = null;
@@ -2996,33 +2995,6 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
         await guild.channels.fetch(existingId).catch(() => null);
       if (channelInstance && (channelInstance.type !== ChannelType.GuildText || (channelInstance.guildId || channelInstance.guild?.id) !== guild.id)) {
         channelInstance = null;
-      }
-    }
-
-    // Adopt older channels by their former names and move them into the requested category.
-    if (!channelInstance) {
-      const oldNames = {
-        tournamentUpdateId: ['tournament-update', desiredName],
-        tournamentHelpdeskId: ['tournament-helpdesk', desiredName],
-        tournamentRegisterId: ['tournament-register', desiredName],
-        tournamentTeamsId: ['tournament-teams', desiredName],
-      }[channelDef.key] || [desiredName];
-      const matching = Array.from(guild.channels.cache.values()).filter((c) =>
-        c.type === ChannelType.GuildText && oldNames.some((name) => c.name.toLowerCase() === name.toLowerCase()) &&
-        (channelDef.category === 'legacy'
-          ? c.parentId === category.id
-          : (channelDef.key === 'botCommandsId' || channelDef.key === 'tournamentLogId'
-            ? [category.id, targetCategory.id].includes(c.parentId)
-            : (c.name.toLowerCase() === desiredName.toLowerCase() ? c.parentId === targetCategory.id : c.parentId === category.id)))
-      );
-      if (matching.length > 0) {
-        const canonical = matching.find((c) => c.id === existingId) ||
-          matching.sort((a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0))[0];
-        channelInstance = canonical;
-        if (matching.length > 1) {
-          console.warn(`[Discord Bot] ⚠️ Multiple channels found for #${desiredName}. Selecting ${canonical.id} as canonical.`);
-          syncResult.failures.push(`Duplicate channels detected for #${desiredName}. Selected <#${canonical.id}> as canonical.`);
-        }
       }
     }
 
@@ -3129,15 +3101,6 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     }
   }
 
-  if (!voiceChannelInstance) {
-    const matchingVc = Array.from(guild.channels.cache.values()).find(
-      (c) => c.type === ChannelType.GuildVoice && c.name.toLowerCase() === 'room-maker-vc' &&
-        [category.id, publicCategory.id].includes(c.parentId)
-    );
-    if (matchingVc) {
-      voiceChannelInstance = matchingVc;
-    }
-  }
 
   const voiceAllowedBits = [
     PermissionFlagsBits.ViewChannel,
@@ -3159,14 +3122,16 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     ...registeredVoiceOverwrites,
   ];
 
+  const roomMakerName = `${tournamentPrefix}-room-maker-vc`;
   if (voiceChannelInstance) {
+    if (voiceChannelInstance.name !== roomMakerName) await voiceChannelInstance.setName(roomMakerName).catch((err) => syncResult.failures.push(`Failed to rename room-maker voice channel: ${err.message}`));
     savedTournament.channels.roomMakerVcId = voiceChannelInstance.id;
     if (voiceChannelInstance.parentId !== publicCategory.id) {
       await voiceChannelInstance.setParent(publicCategory.id, { lockPermissions: false }).catch((err) => {
         syncResult.failures.push(`Failed to move room-maker-vc: ${err.message}`);
       });
     }
-    syncResult.channelsReused.push('room-maker-vc');
+    syncResult.channelsReused.push(roomMakerName);
     if (voiceChannelInstance.userLimit !== 15 && typeof voiceChannelInstance.setUserLimit === 'function') {
       try {
         await voiceChannelInstance.setUserLimit(15, 'Enforcing 15-user limit for MatchDistrict room maker');
@@ -3180,14 +3145,14 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
   } else {
     try {
       voiceChannelInstance = await guild.channels.create({
-        name: 'room-maker-vc',
+        name: roomMakerName,
         type: ChannelType.GuildVoice,
         parent: publicCategory.id,
         userLimit: 15,
         permissionOverwrites: voiceOverwrites,
       });
       savedTournament.channels.roomMakerVcId = voiceChannelInstance.id;
-      syncResult.channelsCreated.push('room-maker-vc');
+      syncResult.channelsCreated.push(roomMakerName);
     } catch (vcErr) {
       syncResult.failures.push(`Failed to create room-maker-vc: ${vcErr.message}`);
     }
@@ -3360,11 +3325,6 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
             if (grpChannel && (grpChannel.type !== ChannelType.GuildText || (grpChannel.guildId || grpChannel.guild?.id) !== guild.id)) {
               grpChannel = null;
             }
-          }
-          if (!grpChannel) {
-            grpChannel = Array.from(guild.channels.cache.values()).find(
-              (c) => c.parentId === roundCategory.id && c.type === ChannelType.GuildText && c.name.toLowerCase() === channelName.toLowerCase()
-            ) || null;
           }
 
           if (!grpChannel && typeof guild.channels?.create === 'function') {
@@ -5765,11 +5725,6 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
           if (groupChannel && (groupChannel.type !== ChannelType.GuildText || (groupChannel.guildId || groupChannel.guild?.id) !== guild.id)) {
             groupChannel = null;
           }
-        }
-        if (!groupChannel) {
-          groupChannel = Array.from(guild.channels.cache.values()).find(
-            (c) => c.parentId === roundCategory.id && c.type === ChannelType.GuildText && c.name.toLowerCase() === channelName.toLowerCase()
-          ) || null;
         }
 
         const groupOverwrites = [

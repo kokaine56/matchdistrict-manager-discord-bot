@@ -111,6 +111,7 @@ import {
   upsertManagedMessageBatch,
   deleteManagedMessages,
   saveGuildSettingsToDb,
+  saveTournamentToDb,
   getGuildSettingsFromDb,
   loadAllGuildSettingsFromDb,
   loadAllTournamentsFromDb,
@@ -2423,7 +2424,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
           interaction.customId?.startsWith('dash:round:announcement:')
         );
         if (isDashboardComponent && !opensModal && !interaction.deferred && !interaction.replied) await interaction.deferUpdate();
-        if (isDashboardComponent && !isCanonicalDashboard) {
+        const isManagementRoleFlow = String(interaction.customId || '').startsWith('dash:management-roles:') ||
+          String(interaction.customId || '').startsWith('dash:management-role-choice:') ||
+          String(interaction.customId || '').startsWith('dash:management-users:') ||
+          String(interaction.customId || '').startsWith('dash:management-confirm:') ||
+          String(interaction.customId || '').startsWith('dash:management-result:');
+        if (isDashboardComponent && !isCanonicalDashboard && isManagementRoleFlow && interaction.message?.id) {
+          // A recreated dashboard may be visible while Mongo still has the previous message ID.
+          // Adopt this clicked dashboard and execute the action in this interaction, so the first click is never wasted.
+          match[1].controlPanelMessageId = interaction.message.id;
+          guildSettingsCache[interaction.guild.id].tournaments[match[0]] = match[1];
+          saveGuildSettings(guildSettingsCache);
+          await saveTournamentToDb(interaction.guild.id, match[0], match[1]);
+        } else if (isDashboardComponent && !isCanonicalDashboard) {
           const backendData = await fetchTournamentRegistrationsFromBackend(match[0]);
           await setupTournamentControlPanel(interaction.guild, backendData.tournament, backendData.summary, interaction.guild.members.me);
           return;
