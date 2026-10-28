@@ -54,7 +54,44 @@ import {
   publishGroupCredentials,
   handlePublishCredentialsCommand,
   publishRoundAllocationSummary,
+  handleViewRoundsScreen,
+  handleCreateSequentialRound,
+  handleOpenIndividualRoundMenu,
+  handlePromptStartRound,
+  handleConfirmStartRound,
+  handleEditRoundButton,
+  handleEditRoundSubmit,
+  handlePromptDeleteRound,
+  handleConfirmDeleteRound,
+  handleViewRoundAllocation,
+  handleBackToTournamentPanel,
+  pendingResultSubmissions,
+  applyStrictGroupChannelPermissions,
+  updateGroupControlMessage,
+  handleGroupSubmitResultButton,
+  handleGroupSubmitResultModal,
+  handleSubmissionScreenshotUpload,
+  handleGroupRevokeSubmissionButton,
+  handleGroupReopenSubmissionButton,
+  handleAdminAcceptResultButton,
+  handleAdminRejectResultButton,
+  handleAdminRejectResultModal,
 } from './tournamentService.js';
+import {
+  initMongo,
+  isMongoConnected,
+  ensurePersistenceAvailable,
+  upsertManagedMessage,
+  upsertManagedMessageBatch,
+  deleteManagedMessages,
+  saveGuildSettingsToDb,
+  getGuildSettingsFromDb,
+  loadAllGuildSettingsFromDb,
+  syncGuildSettingsCacheToDb,
+  migrateJsonToMongo,
+  reconcileManagedBotState,
+  closeMongo,
+} from './mongoService.js';
 
 export {
   handleListTournamentCommand,
@@ -94,6 +131,41 @@ export {
   publishGroupCredentials,
   handlePublishCredentialsCommand,
   publishRoundAllocationSummary,
+  handleViewRoundsScreen,
+  handleCreateSequentialRound,
+  handleOpenIndividualRoundMenu,
+  handlePromptStartRound,
+  handleConfirmStartRound,
+  handleEditRoundButton,
+  handleEditRoundSubmit,
+  handlePromptDeleteRound,
+  handleConfirmDeleteRound,
+  handleViewRoundAllocation,
+  handleBackToTournamentPanel,
+  pendingResultSubmissions,
+  applyStrictGroupChannelPermissions,
+  updateGroupControlMessage,
+  handleGroupSubmitResultButton,
+  handleGroupSubmitResultModal,
+  handleSubmissionScreenshotUpload,
+  handleGroupRevokeSubmissionButton,
+  handleGroupReopenSubmissionButton,
+  handleAdminAcceptResultButton,
+  handleAdminRejectResultButton,
+  handleAdminRejectResultModal,
+  initMongo,
+  isMongoConnected,
+  ensurePersistenceAvailable,
+  upsertManagedMessage,
+  upsertManagedMessageBatch,
+  deleteManagedMessages,
+  saveGuildSettingsToDb,
+  getGuildSettingsFromDb,
+  loadAllGuildSettingsFromDb,
+  syncGuildSettingsCacheToDb,
+  migrateJsonToMongo,
+  reconcileManagedBotState,
+  closeMongo,
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -299,6 +371,13 @@ export function saveGuildSettings(settings) {
     fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf8');
   } catch (err) {
     console.warn('[Discord Bot] ⚠️ Error saving guild settings:', err.message);
+  }
+
+  // Persist to MongoDB collections if connected
+  if (isMongoConnected() && settings) {
+    syncGuildSettingsCacheToDb(settings).catch((err) => {
+      console.warn('[MongoDB] ⚠️ Error syncing settings cache to database:', err.message);
+    });
   }
 }
 
@@ -647,12 +726,19 @@ export async function handleSetupCommand(guild, member, replyFn) {
   };
   saveGuildSettings(guildSettingsCache);
 
-  // 5. Send or refresh management card in #bot-preview
+  // 5. Send or refresh management card in #bot-preview idempotently
   const previewChannelId = channelMap.botPreviewId || savedChannels.botPreviewId;
   const previewChannel = previewChannelId ? guild.channels.cache.get(previewChannelId) : null;
   if (previewChannel) {
     try {
-      await previewChannel.send(buildBotPreviewMessage(guild, welcomeCurrentlyEnabled, channelMap));
+      const logicalKey = `guild:${guild.id}:channel:${previewChannel.id}:bot_preview`;
+      await upsertManagedMessage(guild.client, {
+        guildId: guild.id,
+        channelId: previewChannel.id,
+        logicalKey,
+        messageType: 'bot_preview_panel',
+        payload: buildBotPreviewMessage(guild, welcomeCurrentlyEnabled, channelMap),
+      });
     } catch (err) {
       console.warn('[Discord Bot] ⚠️ Could not post dashboard into #bot-preview:', err.message);
     }
@@ -1230,6 +1316,48 @@ export async function handleClearCommand(guild, member, channel, args, replyFn) 
   } catch (err) {
     console.error('[Discord Bot] ❌ Bulk delete failed:', err.message);
     await replyFn(`❌ **Clear Failed:** Could not delete messages: ${err.message}`);
+  }
+}
+
+/**
+ * Handles .deletemsg <message_id | logical_key | tournament:<id>>
+ * Persistent administrative deletion across restarts using stored MongoDB records.
+ */
+export async function handleDeleteManagedMessageCommand(guild, member, args, replyFn) {
+  if (!guild) {
+    await replyFn('❌ **Error:** This command must be executed within a Discord server.');
+    return;
+  }
+  if (!isAdmin(member)) {
+    await replyFn('❌ **Permission Denied:** Only server Administrators can delete bot managed messages.');
+    return;
+  }
+
+  const target = (args[0] || '').trim();
+  if (!target) {
+    await replyFn(`ℹ️ **Usage:** \`${PREFIX}deletemsg <message_id | logical_key | tournament:<tournament_id>>\``);
+    return;
+  }
+
+  let filter = { guildId: guild.id };
+  if (target.startsWith('tournament:')) {
+    filter.tournamentId = target.slice('tournament:'.length).trim();
+  } else if (target.includes(':')) {
+    filter.logicalKey = target;
+  } else {
+    filter.messageId = target;
+  }
+
+  try {
+    const result = await deleteManagedMessages(guild.client, filter, member);
+    if (result.deletedCount > 0) {
+      await replyFn(`🗑️ **Managed Message(s) Deleted:** Successfully deleted **${result.deletedCount}** message(s) from Discord and archived database record(s).`);
+    } else {
+      await replyFn(`⚠️ **No Active Messages Found:** No active managed message matched \`${target}\`. If the message was already deleted from Discord, its status has been reconciled in the database.`);
+    }
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error executing deletemsg command:', err.message);
+    await replyFn(`❌ **Error:** Failed to delete managed message: ${err.message}`);
   }
 }
 
@@ -2015,17 +2143,31 @@ export function stopRoleSyncScheduler() {
 }
 
 // Bot ready event listener
-client.once(Events.ClientReady, (readyClient) => {
+client.once(Events.ClientReady, async (readyClient) => {
   console.log(`[Discord Bot] 🚀 Logged in as ${readyClient.user.tag} (ID: ${readyClient.user.id})`);
   console.log(`[Discord Bot] 🎮 MatchDistrict Bot is active across ${readyClient.guilds.cache.size} server(s).`);
   console.log(`[Discord Bot] ⚡ Command prefix: "${PREFIX}"`);
   startRoleSyncScheduler(readyClient);
+
+  // Startup reconciliation for managed Discord resources across MongoDB and Discord
+  try {
+    const officialGuildId = getOfficialGuildId();
+    if (officialGuildId) {
+      await reconcileManagedBotState(readyClient, officialGuildId);
+    }
+  } catch (recErr) {
+    console.warn('[MongoDB] ⚠️ Error in startup reconciliation:', recErr.message);
+  }
 });
 
 // Handle prefix commands and message create logging
 client.on(Events.MessageCreate, async (message) => {
   try {
     if (!message || message.author?.bot) return;
+
+    // Check if message is a submission screenshot upload in temporary upload channel/thread
+    const handledScreenshot = await handleSubmissionScreenshotUpload(message);
+    if (handledScreenshot) return;
 
     const content = message.content?.trim();
 
@@ -2056,6 +2198,9 @@ client.on(Events.MessageCreate, async (message) => {
         return;
       } else if (cmd === 'ban') {
         await handleBanCommand(message.guild, message.member, args, (text) => message.reply(text));
+        return;
+      } else if (cmd === 'deletemsg' || cmd === 'deletemessage') {
+        await handleDeleteManagedMessageCommand(message.guild, message.member, args, (text) => message.reply(text));
         return;
       } else if (cmd === 'clear') {
         // Delete command message invocation where practical
@@ -2142,7 +2287,12 @@ client.on(Events.MessageCreate, async (message) => {
 // Persistent interaction listener (ensures tournament control panel buttons work across bot restarts)
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    if (interaction.isButton() && interaction.customId?.startsWith('md_tour_')) {
+    if (interaction.isButton() && (
+      interaction.customId?.startsWith('md_tour_') ||
+      interaction.customId?.startsWith('md_round_') ||
+      interaction.customId?.startsWith('md_group_') ||
+      interaction.customId?.startsWith('md_result_')
+    )) {
       await handleTournamentButtonInteraction(interaction);
       return;
     }
@@ -2150,7 +2300,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleTournamentModalSubmit(interaction);
       return;
     }
-    if (interaction.isStringSelectMenu() && interaction.customId?.startsWith('md_tour_')) {
+    if (interaction.isStringSelectMenu() && (
+      interaction.customId?.startsWith('md_tour_') ||
+      interaction.customId?.startsWith('md_round_') ||
+      interaction.customId?.startsWith('md_group_') ||
+      interaction.customId?.startsWith('md_result_')
+    )) {
       await handleTournamentSelectMenuInteraction(interaction);
       return;
     }
@@ -2239,6 +2394,20 @@ export async function startBot(tokenOverride) {
   }
 
   try {
+    // 1. Connect to MongoDB and synchronize persistent state before starting Gateway
+    try {
+      const mongoOk = await initMongo();
+      if (mongoOk) {
+        await migrateJsonToMongo(guildSettingsCache);
+        const dbSettings = await loadAllGuildSettingsFromDb();
+        if (dbSettings && Object.keys(dbSettings).length > 0) {
+          guildSettingsCache = { ...guildSettingsCache, ...dbSettings };
+        }
+      }
+    } catch (mongoErr) {
+      console.warn('[MongoDB] ⚠️ Initialization warning:', mongoErr.message);
+    }
+
     console.log('[Discord Bot] 🔄 Connecting to Discord Gateway...');
     await client.login(token);
     return client;
@@ -2270,6 +2439,7 @@ export async function gracefulShutdown(signal) {
     }
     await client.destroy();
     console.log('[Discord Bot] Disconnected from Discord.');
+    await closeMongo();
   } catch {
     // Suppress destroy errors on exit
   }
