@@ -2151,7 +2151,7 @@ client.once(Events.ClientReady, async (readyClient) => {
         const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId);
         await setupTournamentControlPanel(guild, backendData.tournament, backendData.summary, guild.members.me);
       } catch (dashboardErr) {
-        console.warn(`[Discord Bot] Dashboard startup refresh failed for tournament ${tournamentId}:`, dashboardErr.message);
+        console.error(`[Discord Bot] Dashboard startup refresh failed for tournament ${tournamentId}:`, dashboardErr);
       }
     }
   }

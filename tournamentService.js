@@ -2337,6 +2337,13 @@ export async function cleanupBotCommandsClutter(guild, botCommandsChannel, tourn
  */
 export async function setupTournamentControlPanel(guild, tournament, summary, botMember) {
   const tournamentId = tournament.id;
+  if (!guild || !tournamentId) throw new Error('Cannot build the tournament dashboard without a guild and tournament ID.');
+  if (!botMember && typeof guild.members?.fetchMe === 'function') {
+    botMember = await guild.members.fetchMe().catch((err) => {
+      throw new Error(`Could not fetch the bot's guild member: ${err.message}`);
+    });
+  }
+  if (!botMember?.id) throw new Error('Cannot build the tournament dashboard because the bot is not available as a guild member.');
   const currentSettings = guildSettingsCache[guild.id] || {};
   if (!currentSettings.tournaments) {
     currentSettings.tournaments = {};
@@ -2358,6 +2365,17 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   if (!Array.isArray(savedTournament.dashboardNavigationStack) || savedTournament.dashboardNavigationStack.length === 0) {
     savedTournament.dashboardNavigationStack = [{ screen: 'home' }];
   }
+  const persistSetupProgress = async () => {
+    savedTournament.tournamentId = tournamentId;
+    savedTournament.tournamentTitle = tournament.title;
+    savedTournament.guildId = guild.id;
+    currentSettings.tournaments[tournamentId] = savedTournament;
+    guildSettingsCache[guild.id] = currentSettings;
+    saveGuildSettings(guildSettingsCache);
+    if (!(await saveTournamentToDb(guild.id, tournamentId, savedTournament))) {
+      console.warn(`[Discord Bot] MongoDB did not confirm dashboard setup progress for ${tournamentId}.`);
+    }
+  };
 
   // Ensure tournament role exists or is fetched
   let role = null;
@@ -2367,7 +2385,19 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   } catch (err) {
     console.warn('[Discord Bot] Role creation error in control panel setup:', err.message);
   }
-  const { tourneyModRole: managementRole } = await ensureManagementDashboardRoles(guild, savedTournament, botMember);
+  let managementRole = null;
+  try {
+    ({ tourneyModRole: managementRole } = await ensureManagementDashboardRoles(guild, savedTournament, botMember));
+  } catch (roleSetupError) {
+    console.error(`[Discord Bot] Could not fully prepare management roles for dashboard ${tournamentId}:`, roleSetupError);
+    const savedRoleId = savedTournament.tourneyModRoleId || savedTournament.modsRoleId;
+    managementRole = (savedRoleId && (guild.roles.cache.get(savedRoleId) || await guild.roles.fetch(savedRoleId).catch(() => null))) ||
+      guild.roles.cache.find((candidate) => candidate.name.toLowerCase() === 'tourney-mod') || null;
+    if (!managementRole) {
+      throw new Error(`Dashboard setup cannot continue because the Tourney-mod role is unavailable: ${roleSetupError.message}`);
+    }
+  }
+  await persistSetupProgress();
 
   if (role && (!savedTournament.roleLastSyncedAt || previousRoleId !== role.id)) {
     try {
@@ -2443,6 +2473,7 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
     });
     savedTournament.categoryId = category.id;
   }
+  await persistSetupProgress();
 
   const managementCategory = await ensureTournamentCategory(guild, savedTournament, 'managementCategoryId', `${tournamentShort} MANAGEMENT`, [
     { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
@@ -2450,6 +2481,7 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
     { id: botMember.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageRoles,
       PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks] },
   ]);
+  await persistSetupProgress();
 
   // 2. Locate, move, or create #bot-commands inside MANAGEMENT.
   let botCommandsChannel = null;
@@ -2502,9 +2534,35 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
     });
     savedTournament.channels.botCommandsId = botCommandsChannel.id;
   }
+  await persistSetupProgress();
 
   // 3. Compute channel and category status from the current Discord state.
-  const channelsStatus = await buildTournamentChannelStatus(guild, savedTournament, botCommandsChannel);
+  let channelsStatus;
+  try {
+    channelsStatus = await buildTournamentChannelStatus(guild, savedTournament, botCommandsChannel);
+  } catch (statusError) {
+    console.error(`[Discord Bot] Could not inspect channel status for dashboard ${tournamentId}:`, statusError);
+    channelsStatus = {
+      isConfigured: false,
+      activeCount: 0,
+      statusText: `⚠️ **Status unavailable:** ${String(statusError.message || statusError).slice(0, 300)}`,
+    };
+  }
+  const isConfigured = Boolean(channelsStatus?.isConfigured);
+
+  // Persist resource IDs before dashboard-message work so a failed send or edit can
+  // be retried without creating another category or channel on the next attempt.
+  savedTournament.tournamentId = tournamentId;
+  savedTournament.tournamentTitle = tournament.title;
+  savedTournament.guildId = guild.id;
+  savedTournament.categoryId = category.id;
+  savedTournament.managementCategoryId = managementCategory.id;
+  savedTournament.channels.botCommandsId = botCommandsChannel.id;
+  currentSettings.tournaments[tournamentId] = savedTournament;
+  guildSettingsCache[guild.id] = currentSettings;
+  saveGuildSettings(guildSettingsCache);
+  const checkpointSaved = await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+  if (!checkpointSaved) console.warn(`[Discord Bot] MongoDB did not confirm dashboard resource checkpoint for ${tournamentId}.`);
 
   // 4. Construct Embed and Action Buttons
   const embed = buildTournamentControlPanelEmbed(tournament, summary, channelsStatus, roleInfo, savedTournament.rounds || {});
@@ -2566,9 +2624,6 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   }
 
   // 6. Persist mapping
-  savedTournament.tournamentId = tournamentId;
-  savedTournament.tournamentTitle = tournament.title;
-  savedTournament.guildId = guild.id;
   savedTournament.categoryId = category.id;
   savedTournament.channels.botCommandsId = botCommandsChannel.id;
   savedTournament.setupStatus = isConfigured ? 'active' : 'pending_channels';
@@ -2577,10 +2632,7 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   savedTournament.controlPanelVersion = (savedTournament.controlPanelVersion || 0) + 1;
   savedTournament.lastSyncedAt = new Date().toISOString();
 
-  currentSettings.tournaments[tournamentId] = savedTournament;
-  guildSettingsCache[guild.id] = currentSettings;
-  saveGuildSettings(guildSettingsCache);
-  await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+  await persistSetupProgress();
 
   // Keep the dashboard as the only message in this channel.
   // 7. Remove command invocations, user messages, and any other messages.
@@ -9112,7 +9164,7 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
         // The dashboard message is the sole message in this channel; avoid posting a confirmation.
       }, 'dashboard_restore');
     } catch (err) {
-      console.warn(`[Discord Bot] Error in .dash command for tournament ${resolvedTournamentId}:`, err.message);
+      console.error(`[Discord Bot] Error in .dash command for tournament ${resolvedTournamentId}:`, err);
       await replyFn(`❌ **Failed to restore dashboard:** ${err.message}`);
     }
   }
