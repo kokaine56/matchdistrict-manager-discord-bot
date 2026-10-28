@@ -5733,6 +5733,7 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
     if (s <= 2) slotsText += `Slot ${slotNum} → 🔒 LOCKED\n`;
     else if (slotData?.status === 'OCCUPIED' && slotData.teamName) slotsText += `Slot ${slotNum} → ${slotData.teamName}\n`;
   }
+  const slotListContent = `\`\`\`text\n${slotsText.trim()}\n\`\`\``;
 
   const logicalKey = `guild:${guild.id}:tournament:${tournament.id}:round:${round.roundId}:group:${group.groupId}:slot_list`;
 
@@ -5759,7 +5760,7 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
       tournamentId: tournament.id,
       roundId: round.roundId,
       groupId: group.groupId,
-      payload: { content: slotsText.trim() || 'No occupied slots.', embeds: [], components: [] },
+      payload: { content: slotListContent, embeds: [], components: [] },
     });
     group.slotListMessageId = result.messageId;
     const oldCredentialMessages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
@@ -5776,10 +5777,10 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
       msg = await channel.messages.fetch(group.slotListMessageId).catch(() => null);
     }
     if (msg && typeof msg.edit === 'function') {
-      await msg.edit({ content: slotsText.trim() || 'No occupied slots.', embeds: [], components: [] }).catch(() => {});
+      await msg.edit({ content: slotListContent, embeds: [], components: [] }).catch(() => {});
       group.slotListMessageId = msg.id;
     } else {
-      const newMsg = await channel.send({ content: slotsText.trim() || 'No occupied slots.', components: [] }).catch(() => null);
+      const newMsg = await channel.send({ content: slotListContent, components: [] }).catch(() => null);
       if (newMsg) group.slotListMessageId = newMsg.id;
     }
     await deleteManagedMessages(guild.client, {
