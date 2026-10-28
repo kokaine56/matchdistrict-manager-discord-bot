@@ -1,15 +1,30 @@
 # MatchDistrict Manager Discord Bot
 
 Standalone Discord Bot for the MatchDistrict gaming community.
-- Sends personalized welcome direct messages (DMs) to players joining the server (enabled per-server via `.setup`).
-- Creates a private admin log channel (`#matchdistrict-logs`) where all welcome DM delivery logs are posted in real-time.
-- **Exclusive Command Prefix: `.` (No slash commands)**:
-  - `.setup` — *(Admin only)* Enable welcome DMs on the server & automatically create the private `#matchdistrict-logs` channel.
-  - `.status` — Check whether welcome messaging is currently active on the server.
-  - `.website` — Display the official MatchDistrict platform URL and features.
-  - `.ping` — Check bot response time & WebSocket latency.
-  - `.help` — Display list of available commands and bot help.
-- Built-in HTTP health check endpoint for zero-configuration deployment on hosting platforms like Render, Railway, Fly.io, or Docker.
+- **Server Setup (`.setup`)**: Automatically provisions and configures 4 private management channels (`#bot-preview`, `#dm-log`, `#msg-log`, `#ban-unban-log`) with strict permission boundaries.
+- **Welcome Direct Messages (`.dm welcome on / off`)**: Configurable, per-guild welcome direct messages with platform onboarding details and delivery outcome tracking.
+- **Moderation Suite (`.ban`, `.clear`)**: Role-hierarchy-aware member banning with audit trail, and safe bulk message cleanup (1-100 messages) with 14-day Discord filter.
+- **Audit & Activity Logging**:
+  - `#dm-log`: Welcome DM delivery status, timestamps, account age, failure reasons (e.g. DMs disabled / blocked).
+  - `#msg-log`: Regular member messages, edits, and deletions (excludes bots, administrators, and audit channels). Redacts tokens and secrets.
+  - `#ban-unban-log`: Real-time member bans and unbans initiated via bot commands or Discord's native moderation interface, featuring audit log moderator resolution and duplicate prevention.
+- **Built-in HTTP Health Check**: Zero-configuration endpoint for container hosting platforms like Render, Railway, Fly.io, or Docker.
+
+---
+
+## Command Reference (Prefix: `.`)
+
+| Command | Permission | Description |
+| :--- | :--- | :--- |
+| `.setup` | Administrator / Manage Server | Creates or configures `#bot-preview`, `#dm-log`, `#msg-log`, `#ban-unban-log` idempotently. |
+| `.dm welcome on` | Administrator / Manage Server | Enables welcome DMs for new members joining the server. |
+| `.dm welcome off` | Administrator / Manage Server | Disables welcome DMs for new members. |
+| `.ban @user [reason]` | Ban Members / Administrator | Bans a user by mention or ID with role-hierarchy checks and logs to `#ban-unban-log`. |
+| `.clear <1-100>` | Manage Messages / Administrator | Bulk-deletes messages (excluding private audit channels) respecting 14-day limits. |
+| `.status` | Everyone | Displays server setup status, welcome DM toggle, and configured log channels. |
+| `.ping` | Everyone | Measures bot roundtrip response time and WebSocket gateway latency. |
+| `.help` | Everyone | Lists all available bot commands and usage guidelines. |
+| `.website` | Everyone | Displays the official MatchDistrict platform URL and tournament features. |
 
 ---
 
@@ -23,8 +38,8 @@ Standalone Discord Bot for the MatchDistrict gaming community.
 
 ### 2. Enable Privileged Gateway Intents (CRITICAL)
 On the **Bot** tab, scroll down to the **Privileged Gateway Intents** section:
-1. Toggle **ON** the switch for **SERVER MEMBERS INTENT** (allows bot to detect when new members join).
-2. Toggle **ON** the switch for **MESSAGE CONTENT INTENT** (allows bot to read `.` prefix commands like `.setup`, `.ping`, `.help`, `.website`).
+1. Toggle **ON** **SERVER MEMBERS INTENT** (allows the bot to detect when new members join and dispatch welcome DMs).
+2. Toggle **ON** **MESSAGE CONTENT INTENT** (allows the bot to parse `.` prefix commands and record message content in `#msg-log`).
 3. Click **Save Changes** at the bottom of the page.
 
 ### 3. Generate Invite Link & Permissions
@@ -32,32 +47,36 @@ On the **Bot** tab, scroll down to the **Privileged Gateway Intents** section:
 2. Under **Scopes**, select:
    - `bot`
 3. Under **Bot Permissions**, select:
-   - `Manage Channels` (required for `.setup` to create the private `#matchdistrict-logs` channel)
+   - `Manage Channels` (for `.setup` to create and configure private channels)
+   - `Ban Members` (for `.ban` command)
+   - `Manage Messages` (for `.clear` command and command cleanup)
+   - `View Audit Log` (to identify moderators and reasons for ban/unban events)
    - `Send Messages`
    - `Embed Links`
+   - `Attach Files`
    - `Read Message History`
 4. Copy the generated URL at the bottom and open it in a browser to invite the bot to your server.
 
 ---
 
-## Server Setup Workflow (For Server Admins)
+## Management Channels Provisioned by `.setup`
 
-1. Invite the bot to your Discord server.
-2. An Administrator runs:
-   ```text
-   .setup
-   ```
-3. The bot will:
-   - Enable welcome DMs for all new members joining that server.
-   - Automatically create a private `#matchdistrict-logs` text channel visible only to Server Administrators and the bot.
-   - Post a confirmation in the current channel and an activation receipt in `#matchdistrict-logs`.
-4. Whenever a new player joins:
-   - The bot directly DMs them the welcome greeting and website details (`https://matchdistrict.in`).
-   - The bot records a delivery log (success/failure) in `#matchdistrict-logs`.
+1. **`#bot-preview`**:
+   - Private management and status channel visible to administrators.
+   - Displays real-time server configuration, welcome DM status, and full command guide.
+2. **`#dm-log`**:
+   - Records welcome DM delivery attempts (success / failure reasons such as closed privacy DMs).
+3. **`#msg-log`**:
+   - Records messages sent by regular members, message edits (before/after), and message deletions.
+   - Automatically excludes bots, administrators, and messages within audit channels.
+   - Automatically redacts bot tokens, API keys, and sensitive secrets.
+4. **`#ban-unban-log`**:
+   - Records member bans and unbans from both bot commands (`.ban`) and native Discord moderation actions.
+   - Captures target user, responsible moderator, reason, and timestamp with duplicate prevention.
 
 ---
 
-## Local Development
+## Local Development & Testing
 
 ```bash
 # Install dependencies
@@ -67,10 +86,13 @@ npm install
 cp .env.example .env
 # Set DISCORD_BOT_TOKEN in .env
 
+# Run automated unit test suite (19 tests)
+npm test
+
 # Run locally
 npm start
 
-# Or with auto-reload:
+# Run with auto-reload
 npm run dev
 ```
 
@@ -78,7 +100,7 @@ npm run dev
 
 ## Docker Deployment
 
-### Build & Run Locally
+### Build & Run
 ```bash
 # Build Docker image
 docker build -t matchdistrict-manager-discord-bot .
@@ -90,22 +112,3 @@ docker run -d \
   --restart unless-stopped \
   matchdistrict-manager-discord-bot
 ```
-
----
-
-## Deploying on Render
-
-This repository is ready for direct deployment on Render:
-
-1. Push this repository to GitHub (`matchdistrict-manager-discord-bot`).
-2. Go to your [Render Dashboard](https://dashboard.render.com).
-3. Click **New +** -> **Background Worker** (or **Web Service**).
-4. Connect this GitHub repository.
-5. Configuration:
-   - **Environment**: `Docker`
-   - **Dockerfile Path**: `Dockerfile`
-   - **Plan**: `Free`
-6. Add Environment Variable:
-   - Key: `DISCORD_BOT_TOKEN`
-   - Value: `your_bot_token`
-7. Click **Create Service**.

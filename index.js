@@ -4,7 +4,15 @@ import { fileURLToPath } from 'url';
 import process from 'node:process';
 import http from 'http';
 import dotenv from 'dotenv';
-import { Client, GatewayIntentBits, Events, Partials, PermissionFlagsBits, ChannelType } from 'discord.js';
+import {
+  Client,
+  GatewayIntentBits,
+  Events,
+  Partials,
+  PermissionFlagsBits,
+  ChannelType,
+  AuditLogEvent,
+} from 'discord.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -42,18 +50,189 @@ if (healthPort) {
  * Clean and retrieve the Discord Bot Token from environment variables.
  * Never prints or leaks the token to logs or errors.
  */
-function getBotToken() {
+export function getBotToken() {
   const token = process.env.DISCORD_BOT_TOKEN;
   if (typeof token !== 'string') return '';
   return token.trim().replace(/^["']|["']$/g, '').trim();
 }
 
 /**
+ * Bot Command Prefix (Default: '.')
+ */
+export const PREFIX = process.env.DISCORD_PREFIX || '.';
+
+/**
+ * Required audit and management channels configured by .setup
+ */
+export const REQUIRED_CHANNELS = [
+  {
+    key: 'botPreviewId',
+    name: 'bot-preview',
+    topic: 'Private MatchDistrict Bot Preview & Management Channel',
+  },
+  {
+    key: 'dmLogId',
+    name: 'dm-log',
+    topic: 'Private MatchDistrict DM Delivery Logs (Welcome DMs & Bot Outreach)',
+  },
+  {
+    key: 'msgLogId',
+    name: 'msg-log',
+    topic: 'Private MatchDistrict Message Logs (Edits, Deletions & Member Messages)',
+  },
+  {
+    key: 'banUnbanLogId',
+    name: 'ban-unban-log',
+    topic: 'Private MatchDistrict Moderation Logs (Member Bans & Unbans)',
+  },
+];
+
+export const RESERVED_LOG_CHANNEL_NAMES = new Set([
+  'bot-preview',
+  'dm-log',
+  'msg-log',
+  'ban-unban-log',
+  'matchdistrict-logs',
+  'md-welcome-logs',
+]);
+
+/**
+ * Guild settings persistence for welcome activation and private management channels.
+ */
+const SETTINGS_FILE = path.resolve(__dirname, 'guildSettings.json');
+
+export function loadGuildSettings() {
+  try {
+    if (fs.existsSync(SETTINGS_FILE)) {
+      const raw = fs.readFileSync(SETTINGS_FILE, 'utf8');
+      return JSON.parse(raw);
+    }
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error loading guild settings:', err.message);
+  }
+  return {};
+}
+
+export function saveGuildSettings(settings) {
+  try {
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf8');
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error saving guild settings:', err.message);
+  }
+}
+
+export let guildSettingsCache = loadGuildSettings();
+
+export function getGuildSettings(guildId) {
+  if (!guildId) return null;
+  return guildSettingsCache[guildId] || null;
+}
+
+export function isWelcomeEnabled(guildId) {
+  if (!guildId) return false;
+  return Boolean(guildSettingsCache[guildId]?.welcomeEnabled);
+}
+
+export function setWelcomeEnabled(guildId, enabled) {
+  if (!guildId) return;
+  if (!guildSettingsCache[guildId]) {
+    guildSettingsCache[guildId] = {};
+  }
+  guildSettingsCache[guildId].welcomeEnabled = Boolean(enabled);
+  guildSettingsCache[guildId].updatedAt = new Date().toISOString();
+  saveGuildSettings(guildSettingsCache);
+}
+
+export function getGuildChannels(guildId) {
+  if (!guildId) return {};
+  const settings = guildSettingsCache[guildId];
+  return settings?.channels || {};
+}
+
+export function getGuildChannelId(guildId, key) {
+  if (!guildId) return null;
+  const settings = guildSettingsCache[guildId];
+  if (!settings) return null;
+  if (settings.channels && settings.channels[key]) {
+    return settings.channels[key];
+  }
+  // Backwards compatibility for logChannelId
+  if (key === 'dmLogId' || key === 'logChannelId') {
+    return settings.channels?.dmLogId || settings.logChannelId || null;
+  }
+  return null;
+}
+
+/**
+ * Deduplication caches to prevent duplicate actions/logs
+ */
+export const recentBans = new Map(); // Key: `${guildId}:${userId}`, Value: { moderatorId, reason, logged: boolean, timestamp }
+export const recentJoins = new Map(); // Key: `${guildId}:${userId}`, Value: timestamp
+
+/**
+ * Helper to redact sensitive tokens, passwords, and secrets from logged messages
+ */
+export function redactSecrets(text) {
+  if (typeof text !== 'string') return '';
+  let sanitized = text;
+
+  // Redact current bot token if set
+  const currentToken = getBotToken();
+  if (currentToken && currentToken.length > 8) {
+    sanitized = sanitized.replaceAll(currentToken, '[REDACTED_BOT_TOKEN]');
+  }
+
+  // Redact generic Discord bot tokens (3 parts or mfa)
+  sanitized = sanitized.replace(/(?:[\w-]{24,}\.[\w-]{6}\.[\w-]{27,}|mfa\.[\w-]{20,})/g, '[REDACTED_TOKEN]');
+
+  // Redact API keys / secrets / password assignments (avoid matching already redacted tokens)
+  sanitized = sanitized.replace(/(?:(?:api[_-]?key|secret|password|bearer|auth|token)\s*[:=]\s*)['"]?(?!\[REDACTED_)([^\s'"]{8,})['"]?/gi, (match, secret) => {
+    return match.replace(secret, '[REDACTED_SECRET]');
+  });
+
+  return sanitized;
+}
+
+/**
+ * Check if a channel is one of the reserved audit/log channels
+ */
+export function isAuditOrLogChannel(channel, guildId) {
+  if (!channel) return false;
+  const channelId = channel.id;
+  const channelName = channel.name?.toLowerCase();
+
+  if (channelName && RESERVED_LOG_CHANNEL_NAMES.has(channelName)) {
+    return true;
+  }
+
+  if (guildId) {
+    const configuredChannels = getGuildChannels(guildId);
+    if (Object.values(configuredChannels).includes(channelId)) {
+      return true;
+    }
+    const legacyLogId = guildSettingsCache[guildId]?.logChannelId;
+    if (legacyLogId && legacyLogId === channelId) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Check if a member has Administrator or Manage Server permissions
+ */
+export function isAdmin(member) {
+  if (!member) return false;
+  return (
+    member.permissions?.has(PermissionFlagsBits.Administrator) ||
+    member.permissions?.has(PermissionFlagsBits.ManageGuild) ||
+    false
+  );
+}
+
+/**
  * Formats the official MatchDistrict welcome message for a new member.
- * Sends complete platform details, tournaments info, and website link.
- * @param {string} username - Personalized name of the member.
- * @param {string} [guildName] - Name of the Discord server.
- * @returns {string} The formatted welcome message.
  */
 export function buildWelcomeMessage(username, guildName = 'MatchDistrict') {
   return `Hey **${username}**! Welcome to **${guildName}**! 🎉
@@ -67,10 +246,10 @@ We are thrilled to have you in our esports gaming community!
 • 👥 **Team Management:** Create or join esports squads, manage rosters, and register with your teammates.
 • 💰 **Verified Prize Payouts:** Secure, transparent payouts directly to tournament winners.
 
-🤖 **Server Bot Commands (Prefix: \`.\`):**
-• \`.website\` — Get direct links to the MatchDistrict platform
-• \`.ping\` — Check bot latency & status
-• \`.help\` — View available commands
+🤖 **Server Bot Commands (Prefix: \`${PREFIX}\`):**
+• \`${PREFIX}website\` — Get direct links to the MatchDistrict platform
+• \`${PREFIX}ping\` — Check bot latency & status
+• \`${PREFIX}help\` — View available commands
 
 Have fun, play fair, and see you in the battleground! 🚀
 
@@ -78,45 +257,29 @@ Have fun, play fair, and see you in the battleground! 🚀
 }
 
 /**
- * Bot Command Prefix (Default: '.')
+ * Formats the dashboard preview message for #bot-preview
  */
-export const PREFIX = process.env.DISCORD_PREFIX || '.';
-
-/**
- * Guild settings persistence for welcome activation and private log channels.
- */
-const SETTINGS_FILE = path.resolve(__dirname, 'guildSettings.json');
-
-function loadGuildSettings() {
-  try {
-    if (fs.existsSync(SETTINGS_FILE)) {
-      const raw = fs.readFileSync(SETTINGS_FILE, 'utf8');
-      return JSON.parse(raw);
-    }
-  } catch (err) {
-    console.warn('[Discord Bot] ⚠️ Error loading guild settings:', err.message);
-  }
-  return {};
-}
-
-function saveGuildSettings(settings) {
-  try {
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf8');
-  } catch (err) {
-    console.warn('[Discord Bot] ⚠️ Error saving guild settings:', err.message);
-  }
-}
-
-export let guildSettingsCache = loadGuildSettings();
-
-export function isWelcomeEnabled(guildId) {
-  if (!guildId) return false;
-  return Boolean(guildSettingsCache[guildId]?.welcomeEnabled);
-}
-
-export function getGuildLogChannelId(guildId) {
-  if (!guildId) return null;
-  return guildSettingsCache[guildId]?.logChannelId || null;
+export function buildBotPreviewMessage(guild, welcomeEnabled, channelMap) {
+  return (
+    `🤖 **MatchDistrict Server Management Dashboard**\n` +
+    `• **Server:** ${guild.name} (ID: \`${guild.id}\`)\n` +
+    `• **Welcome DMs:** ${welcomeEnabled ? '🟢 **Active / Enabled**' : '🔴 **Disabled**'}\n` +
+    `• **Configured Channels:**\n` +
+    `  - 📋 **Preview & Control:** ${channelMap.botPreviewId ? `<#${channelMap.botPreviewId}>` : 'Not configured'}\n` +
+    `  - 📬 **DM Logs:** ${channelMap.dmLogId ? `<#${channelMap.dmLogId}>` : 'Not configured'}\n` +
+    `  - 💬 **Message Logs:** ${channelMap.msgLogId ? `<#${channelMap.msgLogId}>` : 'Not configured'}\n` +
+    `  - 🔨 **Ban/Unban Logs:** ${channelMap.banUnbanLogId ? `<#${channelMap.banUnbanLogId}>` : 'Not configured'}\n\n` +
+    `**Management Commands (Prefix: \`${PREFIX}\`):**\n` +
+    `• \`${PREFIX}setup\` — Run or refresh server channels and permissions\n` +
+    `• \`${PREFIX}dm welcome on\` — Turn on welcome DMs for new members\n` +
+    `• \`${PREFIX}dm welcome off\` — Turn off welcome DMs\n` +
+    `• \`${PREFIX}ban @user [reason]\` — Ban a member with audit trail\n` +
+    `• \`${PREFIX}clear <1-100>\` — Bulk delete messages in a channel\n` +
+    `• \`${PREFIX}status\` — Check current server configuration\n` +
+    `• \`${PREFIX}ping\` — Verify bot latency & gateway health\n` +
+    `• \`${PREFIX}help\` — Show complete command guide\n\n` +
+    `*Visit MatchDistrict:* https://matchdistrict.in`
+  );
 }
 
 /**
@@ -130,8 +293,14 @@ export function getHelpResponse(prefix = PREFIX) {
   return (
     `🎮 **MatchDistrict Bot Commands**\n` +
     `Prefix: \`${prefix}\`\n\n` +
-    `• \`${prefix}setup\` — *(Admin Only)* Enable welcome DMs & create private log channel\n` +
-    `• \`${prefix}status\` — Check if welcome DMs are enabled on this server\n` +
+    `**🛡️ Administrator & Moderation:**\n` +
+    `• \`${prefix}setup\` — *(Admin Only)* Create/configure private audit channels & initialize bot\n` +
+    `• \`${prefix}dm welcome on\` — *(Admin Only)* Enable welcome DMs for new members\n` +
+    `• \`${prefix}dm welcome off\` — *(Admin Only)* Disable welcome DMs for new members\n` +
+    `• \`${prefix}ban @user [reason]\` — *(Mod Only)* Ban a user with audit logging\n` +
+    `• \`${prefix}clear <1-100>\` — *(Mod Only)* Bulk delete recent messages\n\n` +
+    `**ℹ️ General Information:**\n` +
+    `• \`${prefix}status\` — Check server configuration & welcome status\n` +
     `• \`${prefix}website\` — Get the official MatchDistrict platform link\n` +
     `• \`${prefix}ping\` — Check bot response time & WebSocket latency\n` +
     `• \`${prefix}help\` — Show this list of commands\n\n` +
@@ -149,10 +318,8 @@ export function getWebsiteResponse() {
 }
 
 /**
- * Handles the .setup command to enable welcome messages and create the private log channel.
- * @param {import('discord.js').Guild} guild
- * @param {import('discord.js').GuildMember} member
- * @param {(msg: string) => Promise<any>} replyFn
+ * Handles the .setup command:
+ * Idempotently creates or configures #bot-preview, #dm-log, #msg-log, #ban-unban-log.
  */
 export async function handleSetupCommand(guild, member, replyFn) {
   if (!guild) {
@@ -160,88 +327,402 @@ export async function handleSetupCommand(guild, member, replyFn) {
     return;
   }
 
-  // 1. Check user permissions (Administrator or ManageGuild required)
-  const isAdmin = member?.permissions?.has(PermissionFlagsBits.Administrator) ||
-                  member?.permissions?.has(PermissionFlagsBits.ManageGuild);
-  if (!isAdmin) {
+  // 1. Check user permissions
+  if (!isAdmin(member)) {
     await replyFn('❌ **Permission Denied:** Only server Administrators or members with `Manage Server` permission can run `.setup`.');
     return;
   }
 
   // 2. Check bot permissions to manage channels
   const botMember = guild.members.me;
-  if (!botMember?.permissions.has(PermissionFlagsBits.ManageChannels)) {
-    await replyFn('❌ **Bot Permission Missing:** I need the `Manage Channels` permission to create and configure the private log channel. Please grant this permission and try `.setup` again.');
+  if (!botMember?.permissions?.has(PermissionFlagsBits.ManageChannels)) {
+    await replyFn('❌ **Bot Permission Missing:** I need the `Manage Channels` permission to create and configure the private management channels. Please grant this permission and try `.setup` again.');
     return;
   }
 
-  // 3. Find existing log channel or create a new private channel
-  const channelName = 'matchdistrict-logs';
-  let logChannel = guild.channels.cache.find(
-    c => c.type === ChannelType.GuildText && (c.name === channelName || c.name === 'md-welcome-logs')
-  );
+  const results = {
+    created: [],
+    reused: [],
+    failed: [],
+  };
 
-  if (!logChannel) {
-    try {
-      logChannel = await guild.channels.create({
-        name: channelName,
-        type: ChannelType.GuildText,
-        topic: 'Private MatchDistrict Bot Logs (Welcome DMs & Join Events)',
-        permissionOverwrites: [
-          {
-            id: guild.id, // @everyone role
-            deny: [PermissionFlagsBits.ViewChannel],
-          },
-          {
-            id: guild.client.user.id, // Bot itself
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.SendMessages,
-              PermissionFlagsBits.EmbedLinks,
-              PermissionFlagsBits.AttachFiles,
-              PermissionFlagsBits.ReadMessageHistory,
-            ],
-          },
+  const channelMap = {};
+  const currentSettings = getGuildSettings(guild.id) || {};
+  const savedChannels = currentSettings.channels || {};
+
+  // 3. Process each required channel
+  for (const req of REQUIRED_CHANNELS) {
+    let targetChannel = null;
+
+    // Check if channel ID already saved in guild settings and still exists
+    const existingId = savedChannels[req.key];
+    if (existingId) {
+      targetChannel = guild.channels.cache.get(existingId);
+    }
+
+    // If not found by saved ID, check by channel name
+    if (!targetChannel) {
+      targetChannel = guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildText && c.name === req.name
+      );
+    }
+
+    // Permission overwrites: private to @everyone, full access for bot
+    const overwrites = [
+      {
+        id: guild.roles.everyone.id,
+        deny: [PermissionFlagsBits.ViewChannel],
+      },
+      {
+        id: botMember.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.EmbedLinks,
+          PermissionFlagsBits.AttachFiles,
+          PermissionFlagsBits.ReadMessageHistory,
         ],
-      });
-    } catch (err) {
-      console.error('[Discord Bot] ❌ Failed to create private log channel:', err);
-      await replyFn(`❌ **Channel Creation Failed:** Could not create private log channel: ${err.message}`);
-      return;
+      },
+    ];
+
+    if (targetChannel) {
+      try {
+        await targetChannel.permissionOverwrites.set(overwrites);
+        results.reused.push(targetChannel);
+        channelMap[req.key] = targetChannel.id;
+      } catch (err) {
+        console.warn(`[Discord Bot] ⚠️ Could not update overwrites for #${req.name}:`, err.message);
+        results.reused.push(targetChannel);
+        channelMap[req.key] = targetChannel.id;
+      }
+    } else {
+      try {
+        targetChannel = await guild.channels.create({
+          name: req.name,
+          type: ChannelType.GuildText,
+          topic: req.topic,
+          permissionOverwrites: overwrites,
+        });
+        results.created.push(targetChannel);
+        channelMap[req.key] = targetChannel.id;
+      } catch (err) {
+        console.error(`[Discord Bot] ❌ Failed to create #${req.name}:`, err.message);
+        results.failed.push({ name: req.name, error: err.message });
+      }
     }
   }
 
   // 4. Save guild settings
+  const welcomeCurrentlyEnabled = currentSettings.welcomeEnabled !== undefined ? currentSettings.welcomeEnabled : true;
   guildSettingsCache[guild.id] = {
-    welcomeEnabled: true,
-    logChannelId: logChannel.id,
+    ...currentSettings,
+    welcomeEnabled: welcomeCurrentlyEnabled,
+    channels: {
+      botPreviewId: channelMap.botPreviewId || savedChannels.botPreviewId || null,
+      dmLogId: channelMap.dmLogId || savedChannels.dmLogId || null,
+      msgLogId: channelMap.msgLogId || savedChannels.msgLogId || null,
+      banUnbanLogId: channelMap.banUnbanLogId || savedChannels.banUnbanLogId || null,
+    },
+    logChannelId: channelMap.dmLogId || savedChannels.dmLogId || null, // legacy
     setupBy: member.id,
     setupAt: new Date().toISOString(),
   };
   saveGuildSettings(guildSettingsCache);
 
-  console.log(`[Discord Bot] 🔒 Setup completed for "${guild.name}" (${guild.id}). Welcome enabled, log channel: #${logChannel.name} (${logChannel.id})`);
+  // 5. Send or refresh management card in #bot-preview
+  const previewChannelId = channelMap.botPreviewId || savedChannels.botPreviewId;
+  const previewChannel = previewChannelId ? guild.channels.cache.get(previewChannelId) : null;
+  if (previewChannel) {
+    try {
+      await previewChannel.send(buildBotPreviewMessage(guild, welcomeCurrentlyEnabled, channelMap));
+    } catch (err) {
+      console.warn('[Discord Bot] ⚠️ Could not post dashboard into #bot-preview:', err.message);
+    }
+  }
 
-  // 5. Send confirmation to the server channel
-  await replyFn(
-    `✅ **MatchDistrict Setup Complete!**\n\n` +
-    `• **Welcome DMs:** **Enabled** for all new members joining this server.\n` +
-    `• **Private Log Channel:** <#${logChannel.id}>\n\n` +
-    `Whenever someone joins, the bot will send them a welcome DM containing website details and log the delivery in <#${logChannel.id}>.`
-  );
+  // 6. Build summary response
+  let summary = '';
+  if (results.failed.length === 0) {
+    summary += `✅ **MatchDistrict Server Setup Complete!**\n\n`;
+  } else {
+    summary += `⚠️ **MatchDistrict Server Setup Completed with Errors**\n\n`;
+  }
 
-  // 6. Send activation message into the private log channel
-  try {
-    await logChannel.send(
-      `🔒 **MatchDistrict Private Log Channel Activated**\n` +
-      `• **Status:** Active & logging welcome DMs\n` +
-      `• **Configured by:** <@${member.id}>\n` +
-      `• **Website Sent to Players:** https://matchdistrict.in\n` +
-      `• **Timestamp:** <t:${Math.floor(Date.now() / 1000)}:F>\n\n` +
-      `*All member join events and welcome DM delivery statuses will be posted here.*`
+  if (results.created.length > 0) {
+    summary += `✨ **Created Channels:**\n` + results.created.map((c) => `• <#${c.id}> (\`#${c.name}\`)`).join('\n') + '\n\n';
+  }
+  if (results.reused.length > 0) {
+    summary += `♻️ **Reused Channels:**\n` + results.reused.map((c) => `• <#${c.id}> (\`#${c.name}\`)`).join('\n') + '\n\n';
+  }
+  if (results.failed.length > 0) {
+    summary += `❌ **Failed Operations:**\n` + results.failed.map((f) => `• \`#${f.name}\`: ${f.error}`).join('\n') + '\n\n';
+  }
+
+  summary += `• **Welcome DMs:** ${welcomeCurrentlyEnabled ? '🟢 **Enabled**' : '🔴 **Disabled**'}\n`;
+  summary += `• **Management Dashboard:** ${previewChannelId ? `<#${previewChannelId}>` : 'Not configured'}\n\n`;
+  summary += `Use \`${PREFIX}dm welcome on\` or \`${PREFIX}dm welcome off\` to control welcome DMs.\nUse \`${PREFIX}help\` to view all commands.`;
+
+  await replyFn(summary);
+}
+
+/**
+ * Handles .dm welcome on/off command
+ */
+export async function handleDmCommand(guild, member, args, replyFn) {
+  if (!guild) {
+    await replyFn('❌ **Error:** This command must be executed within a Discord server.');
+    return;
+  }
+
+  if (!isAdmin(member)) {
+    await replyFn('❌ **Permission Denied:** Only server Administrators or members with `Manage Server` permission can configure welcome DMs.');
+    return;
+  }
+
+  const subCommand = (args[0] || '').toLowerCase();
+  const option = (args[1] || '').toLowerCase();
+
+  if (subCommand !== 'welcome' || (option !== 'on' && option !== 'off')) {
+    const current = isWelcomeEnabled(guild.id);
+    await replyFn(
+      `ℹ️ **Usage:** \`${PREFIX}dm welcome on\` or \`${PREFIX}dm welcome off\`\n` +
+      `• **Current Status:** Welcome DMs are ${current ? '🟢 **Enabled**' : '🔴 **Disabled**'}.`
     );
+    return;
+  }
+
+  const enable = option === 'on';
+  setWelcomeEnabled(guild.id, enable);
+
+  // Notify invoking channel
+  if (enable) {
+    await replyFn('✅ **Welcome DMs Enabled:** The bot will now send a direct message welcoming new members when they join.');
+  } else {
+    await replyFn('🛑 **Welcome DMs Disabled:** The bot will not send welcome direct messages to new members.');
+  }
+
+  // Update or post notice in #bot-preview
+  const previewChannelId = getGuildChannelId(guild.id, 'botPreviewId');
+  const previewChannel = previewChannelId ? guild.channels.cache.get(previewChannelId) : null;
+  if (previewChannel) {
+    try {
+      await previewChannel.send(
+        `🔔 **Configuration Update:** Welcome DMs toggled **${enable ? 'ON 🟢' : 'OFF 🔴'}** by <@${member.id}> at <t:${Math.floor(Date.now() / 1000)}:T>.`
+      );
+    } catch (err) {
+      console.warn('[Discord Bot] ⚠️ Could not notify #bot-preview:', err.message);
+    }
+  }
+}
+
+/**
+ * Handles .ban @user [reason] command
+ */
+export async function handleBanCommand(guild, member, args, replyFn) {
+  if (!guild) {
+    await replyFn('❌ **Error:** This command must be executed within a Discord server.');
+    return;
+  }
+
+  // 1. Check moderator permissions
+  const canBan = member?.permissions?.has(PermissionFlagsBits.BanMembers) ||
+                 member?.permissions?.has(PermissionFlagsBits.Administrator);
+  if (!canBan) {
+    await replyFn('❌ **Permission Denied:** You need the `Ban Members` permission to use this command.');
+    return;
+  }
+
+  // 2. Check bot permissions
+  const botMember = guild.members.me;
+  if (!botMember?.permissions?.has(PermissionFlagsBits.BanMembers)) {
+    await replyFn('❌ **Bot Permission Missing:** I need the `Ban Members` permission to ban users. Please grant this permission to my role.');
+    return;
+  }
+
+  // 3. Parse target user
+  const targetArg = args[0];
+  if (!targetArg) {
+    await replyFn(`❌ **Invalid Usage:** Please specify a user to ban.\nExample: \`${PREFIX}ban @user Breaking server rules\` or \`${PREFIX}ban 123456789012345678 Spammer\``);
+    return;
+  }
+
+  const mentionMatch = targetArg.match(/^<@!?([a-zA-Z0-9_.-]{3,32})>$/);
+  const targetId = mentionMatch ? mentionMatch[1] : (targetArg.match(/^[a-zA-Z0-9_.-]{3,32}$/) ? targetArg : null);
+
+  if (!targetId) {
+    await replyFn(`❌ **Invalid Target:** "${targetArg}" is not a valid user mention or Discord user ID.`);
+    return;
+  }
+
+  const reason = args.slice(1).join(' ').trim() || 'No reason provided (Banned by moderator)';
+
+  // 4. Protection checks
+  if (targetId === member.id) {
+    await replyFn('❌ **Action Prohibited:** You cannot ban yourself.');
+    return;
+  }
+
+  if (targetId === guild.client.user.id) {
+    await replyFn('❌ **Action Prohibited:** I cannot ban myself.');
+    return;
+  }
+
+  if (targetId === guild.ownerId) {
+    await replyFn('❌ **Action Prohibited:** Cannot ban the server owner.');
+    return;
+  }
+
+  let targetUser = null;
+  try {
+    targetUser = await guild.client.users.fetch(targetId);
+  } catch {
+    await replyFn(`❌ **User Not Found:** Could not locate a Discord user with ID \`${targetId}\`.`);
+    return;
+  }
+
+  // Hierarchy check if user is a member of the guild
+  let targetMember = null;
+  try {
+    targetMember = await guild.members.fetch(targetId);
+  } catch {
+    // Member might not be in guild; Discord allows banning by user ID (hackban)
+  }
+
+  if (targetMember) {
+    // Check moderator hierarchy
+    if (member.id !== guild.ownerId && targetMember.roles.highest.position >= member.roles.highest.position) {
+      await replyFn('❌ **Role Hierarchy Restriction:** You cannot ban this member because their highest role is equal to or higher than yours.');
+      return;
+    }
+
+    // Check bot hierarchy
+    if (!targetMember.bannable) {
+      await replyFn('❌ **Bot Hierarchy Restriction:** I cannot ban this member because their highest role is equal to or higher than my highest role.');
+      return;
+    }
+  }
+
+  // 5. Register in recentBans to prevent duplicate logs from GuildBanAdd
+  const banKey = `${guild.id}:${targetId}`;
+  recentBans.set(banKey, {
+    moderatorId: member.id,
+    moderatorTag: member.user?.tag || member.id,
+    reason,
+    logged: false,
+    timestamp: Date.now(),
+  });
+
+  // 6. Execute ban
+  try {
+    await guild.bans.create(targetId, {
+      reason: `${reason} | By ${member.user?.tag || member.id} (${member.id})`,
+    });
   } catch (err) {
-    console.warn('[Discord Bot] ⚠️ Could not send activation message to log channel:', err.message);
+    recentBans.delete(banKey);
+    console.error('[Discord Bot] ❌ Ban creation failed:', err.message);
+    await replyFn(`❌ **Ban Failed:** Could not ban user: ${err.message}`);
+    return;
+  }
+
+  // 7. Log to #ban-unban-log
+  const banLogId = getGuildChannelId(guild.id, 'banUnbanLogId');
+  let banLogChannel = banLogId ? guild.channels.cache.get(banLogId) : null;
+  if (!banLogChannel) {
+    banLogChannel = guild.channels.cache.find(
+      (c) => c.type === ChannelType.GuildText && c.name === 'ban-unban-log'
+    );
+  }
+
+  if (banLogChannel && banLogChannel.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
+    const nowTs = Math.floor(Date.now() / 1000);
+    try {
+      await banLogChannel.send(
+        `🔨 **Member Banned**\n` +
+        `• **Target User:** <@${targetUser.id}> (\`${targetUser.tag || targetUser.username}\` | ID: \`${targetUser.id}\`)\n` +
+        `• **Moderator:** <@${member.id}> (\`${member.user?.tag || member.id}\`)\n` +
+        `• **Reason:** ${reason}\n` +
+        `• **Initiated Via:** Bot Command (\`${PREFIX}ban\`)\n` +
+        `• **Timestamp:** <t:${nowTs}:F>`
+      );
+    } catch (logErr) {
+      console.warn('[Discord Bot] ⚠️ Could not write to #ban-unban-log:', logErr.message);
+    }
+  }
+
+  // Mark recentBan as already logged so GuildBanAdd won't duplicate
+  const cachedBan = recentBans.get(banKey);
+  if (cachedBan) {
+    cachedBan.logged = true;
+  }
+  // Auto-expire cache entry after 30 seconds
+  const banTimer = setTimeout(() => recentBans.delete(banKey), 30000);
+  if (banTimer.unref) banTimer.unref();
+
+  // 8. Reply in command channel
+  await replyFn(
+    `✅ Successfully banned **${targetUser.tag || targetUser.username}** (\`${targetId}\`).\n• **Reason:** ${reason}`
+  );
+}
+
+/**
+ * Handles .clear <1-100> command
+ */
+export async function handleClearCommand(guild, member, channel, args, replyFn) {
+  if (!guild || !channel) {
+    await replyFn('❌ **Error:** This command must be executed within a server text channel.');
+    return;
+  }
+
+  // 1. Check moderator permissions
+  const canClear = member?.permissions?.has(PermissionFlagsBits.ManageMessages) ||
+                   member?.permissions?.has(PermissionFlagsBits.Administrator);
+  if (!canClear) {
+    await replyFn('❌ **Permission Denied:** You need the `Manage Messages` permission to clear messages.');
+    return;
+  }
+
+  // 2. Prevent executing inside private audit / log channels
+  if (isAuditOrLogChannel(channel, guild.id)) {
+    await replyFn('❌ **Safety Restriction:** The `.clear` command cannot be executed inside private audit or logging channels.');
+    return;
+  }
+
+  // 3. Check bot permissions in this channel
+  const botMember = guild.members.me;
+  if (!channel.permissionsFor(botMember)?.has(PermissionFlagsBits.ManageMessages)) {
+    await replyFn('❌ **Bot Permission Missing:** I need the `Manage Messages` permission in this channel to delete messages.');
+    return;
+  }
+
+  // 4. Validate amount
+  const rawAmount = args[0];
+  const amount = parseInt(rawAmount, 10);
+  if (isNaN(amount) || amount < 1 || amount > 100) {
+    await replyFn(`❌ **Invalid Argument:** Please specify a number between 1 and 100.\nExample: \`${PREFIX}clear 25\``);
+    return;
+  }
+
+  // 5. Bulk delete messages with 14-day filter
+  try {
+    const deleted = await channel.bulkDelete(amount, true);
+    const count = deleted?.size ?? 0;
+
+    let responseText = '';
+    if (count === 0) {
+      responseText = '⚠️ No messages were deleted. Messages older than 14 days cannot be bulk-deleted due to Discord limitations.';
+    } else {
+      responseText = `🧹 Deleted **${count}** message(s).`;
+    }
+
+    const confirmMsg = await channel.send(responseText);
+    // Auto-clean confirmation after 5 seconds to keep chat tidy
+    const clearTimer = setTimeout(() => {
+      confirmMsg.delete().catch(() => {});
+    }, 5000);
+    if (clearTimer.unref) clearTimer.unref();
+  } catch (err) {
+    console.error('[Discord Bot] ❌ Bulk delete failed:', err.message);
+    await replyFn(`❌ **Clear Failed:** Could not delete messages: ${err.message}`);
   }
 }
 
@@ -255,34 +736,394 @@ export async function handleStatusCommand(guild, replyFn) {
   }
 
   const enabled = isWelcomeEnabled(guild.id);
-  const logChannelId = getGuildLogChannelId(guild.id);
+  const channels = getGuildChannels(guild.id);
 
-  if (enabled) {
-    await replyFn(
-      `📊 **MatchDistrict Server Status**\n` +
-      `• **Welcome DMs:** 🟢 **Active / Enabled**\n` +
-      `• **Private Log Channel:** ${logChannelId ? `<#${logChannelId}>` : 'Not configured'}\n` +
-      `• **Website:** https://matchdistrict.in`
+  await replyFn(
+    `📊 **MatchDistrict Server Status**\n` +
+    `• **Welcome DMs:** ${enabled ? '🟢 **Active / Enabled**' : '🔴 **Disabled**'}\n` +
+    `• **Configured Channels:**\n` +
+    `  - 📋 Preview: ${channels.botPreviewId ? `<#${channels.botPreviewId}>` : 'Not configured'}\n` +
+    `  - 📬 DM Logs: ${channels.dmLogId ? `<#${channels.dmLogId}>` : 'Not configured'}\n` +
+    `  - 💬 Message Logs: ${channels.msgLogId ? `<#${channels.msgLogId}>` : 'Not configured'}\n` +
+    `  - 🔨 Moderation Logs: ${channels.banUnbanLogId ? `<#${channels.banUnbanLogId}>` : 'Not configured'}\n\n` +
+    `• **Website:** https://matchdistrict.in`
+  );
+}
+
+/**
+ * Handles message creation logging for regular server members
+ */
+export async function handleMessageCreateLog(message) {
+  try {
+    if (!message || !message.guild) return;
+    if (message.author?.bot) return;
+
+    // Exclude authorized administrators
+    if (message.member && isAdmin(message.member)) return;
+
+    // Never log messages from private audit channels
+    if (isAuditOrLogChannel(message.channel, message.guild.id)) return;
+
+    // Locate msg-log channel
+    const msgLogId = getGuildChannelId(message.guild.id, 'msgLogId');
+    let logChannel = msgLogId ? message.guild.channels.cache.get(msgLogId) : null;
+    if (!logChannel) {
+      logChannel = message.guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildText && c.name === 'msg-log'
+      );
+    }
+
+    if (!logChannel || !logChannel.permissionsFor(message.guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
+      return;
+    }
+
+    const content = redactSecrets(message.content || '');
+    const nowTs = Math.floor(message.createdTimestamp / 1000);
+    const authorTag = message.author.tag || message.author.username;
+
+    let attachmentInfo = '';
+    if (message.attachments?.size > 0) {
+      attachmentInfo = `\n• **Attachments:** ${message.attachments.map((a) => `[${a.name || 'file'}](${a.url})`).join(', ')}`;
+    }
+
+    let embedInfo = '';
+    if (message.embeds?.length > 0) {
+      embedInfo = `\n• **Embeds:** ${message.embeds.length} embed(s) attached`;
+    }
+
+    const displayContent = content ? `\n• **Content:** ${content}` : '\n• **Content:** *[Empty or non-text message]*';
+
+    await logChannel.send(
+      `💬 **Message Sent**\n` +
+      `• **Author:** <@${message.author.id}> (\`${authorTag}\` | ID: \`${message.author.id}\`)\n` +
+      `• **Channel:** <#${message.channel.id}>\n` +
+      `• **Message ID:** \`${message.id}\`\n` +
+      `• **Timestamp:** <t:${nowTs}:F>${displayContent}${attachmentInfo}${embedInfo}`
     );
-  } else {
-    await replyFn(
-      `📊 **MatchDistrict Server Status**\n` +
-      `• **Welcome DMs:** 🔴 **Disabled**\n` +
-      `• An administrator must run \`${PREFIX}setup\` in this server to enable welcome DMs and create the private log channel.`
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Message create logging error:', err.message);
+  }
+}
+
+/**
+ * Handles message update (edit) logging for regular server members
+ */
+export async function handleMessageUpdateLog(oldMessage, newMessage) {
+  try {
+    if (!newMessage || !newMessage.guild) return;
+    if (newMessage.author?.bot) return;
+
+    if (newMessage.member && isAdmin(newMessage.member)) return;
+    if (isAuditOrLogChannel(newMessage.channel, newMessage.guild.id)) return;
+
+    // If content did not change (e.g. embed preview generated), skip
+    if (oldMessage.content === newMessage.content) return;
+
+    const msgLogId = getGuildChannelId(newMessage.guild.id, 'msgLogId');
+    let logChannel = msgLogId ? newMessage.guild.channels.cache.get(msgLogId) : null;
+    if (!logChannel) {
+      logChannel = newMessage.guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildText && c.name === 'msg-log'
+      );
+    }
+
+    if (!logChannel || !logChannel.permissionsFor(newMessage.guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
+      return;
+    }
+
+    const oldContent = redactSecrets(oldMessage.content || '[Content unavailable or uncached]');
+    const newContent = redactSecrets(newMessage.content || '[Empty message]');
+    const nowTs = Math.floor(Date.now() / 1000);
+    const authorTag = newMessage.author?.tag || newMessage.author?.username || 'Unknown';
+
+    await logChannel.send(
+      `✏️ **Message Edited**\n` +
+      `• **Author:** <@${newMessage.author?.id}> (\`${authorTag}\` | ID: \`${newMessage.author?.id}\`)\n` +
+      `• **Channel:** <#${newMessage.channel.id}>\n` +
+      `• **Message ID:** \`${newMessage.id}\`\n` +
+      `• **Before:** ${oldContent}\n` +
+      `• **After:** ${newContent}\n` +
+      `• **Edited At:** <t:${nowTs}:F>`
     );
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Message edit logging error:', err.message);
+  }
+}
+
+/**
+ * Handles message deletion logging
+ */
+export async function handleMessageDeleteLog(message) {
+  try {
+    if (!message || !message.guild) return;
+    if (message.author?.bot) return;
+    if (message.member && isAdmin(message.member)) return;
+    if (isAuditOrLogChannel(message.channel, message.guild.id)) return;
+
+    const msgLogId = getGuildChannelId(message.guild.id, 'msgLogId');
+    let logChannel = msgLogId ? message.guild.channels.cache.get(msgLogId) : null;
+    if (!logChannel) {
+      logChannel = message.guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildText && c.name === 'msg-log'
+      );
+    }
+
+    if (!logChannel || !logChannel.permissionsFor(message.guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
+      return;
+    }
+
+    const content = message.content ? redactSecrets(message.content) : '[Content unavailable or uncached]';
+    const nowTs = Math.floor(Date.now() / 1000);
+    const authorDisplay = message.author
+      ? `<@${message.author.id}> (\`${message.author.tag || message.author.username}\` | ID: \`${message.author.id}\`)`
+      : 'Unknown User (Uncached)';
+
+    await logChannel.send(
+      `🗑️ **Message Deleted**\n` +
+      `• **Author:** ${authorDisplay}\n` +
+      `• **Channel:** <#${message.channel.id}>\n` +
+      `• **Message ID:** \`${message.id}\`\n` +
+      `• **Content:** ${content}\n` +
+      `• **Deleted At:** <t:${nowTs}:F>`
+    );
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Message delete logging error:', err.message);
+  }
+}
+
+/**
+ * Handles Discord native and external Ban events (GuildBanAdd)
+ */
+export async function handleGuildBanAdd(ban) {
+  try {
+    if (!ban || !ban.guild) return;
+    const guild = ban.guild;
+    const user = ban.user;
+    const banKey = `${guild.id}:${user.id}`;
+
+    // Deduplication check: if logged by .ban command, skip
+    const cached = recentBans.get(banKey);
+    if (cached?.logged) {
+      recentBans.delete(banKey);
+      return;
+    }
+
+    const banLogId = getGuildChannelId(guild.id, 'banUnbanLogId');
+    let logChannel = banLogId ? guild.channels.cache.get(banLogId) : null;
+    if (!logChannel) {
+      logChannel = guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildText && c.name === 'ban-unban-log'
+      );
+    }
+
+    if (!logChannel || !logChannel.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
+      return;
+    }
+
+    let moderator = null;
+    let reason = cached?.reason || ban.reason || null;
+
+    // Fetch responsible moderator from audit log if possible
+    try {
+      if (guild.members.me?.permissions?.has(PermissionFlagsBits.ViewAuditLog)) {
+        const auditLogs = await guild.fetchAuditLogs({
+          type: AuditLogEvent.MemberBanAdd,
+          limit: 3,
+        });
+        const match = auditLogs.entries.find(
+          (e) => e.target?.id === user.id && Date.now() - e.createdTimestamp < 30000
+        );
+        if (match) {
+          moderator = match.executor;
+          if (!reason && match.reason) {
+            reason = match.reason;
+          }
+        }
+      }
+    } catch (auditErr) {
+      console.warn('[Discord Bot] ⚠️ Could not query audit logs for ban:', auditErr.message);
+    }
+
+    const modDisplay = moderator
+      ? `<@${moderator.id}> (\`${moderator.tag || moderator.username}\` | ID: \`${moderator.id}\`)`
+      : (cached?.moderatorId ? `<@${cached.moderatorId}> (\`${cached.moderatorTag}\`)` : 'Unavailable (Audit Log permission required or entry missing)');
+
+    const nowTs = Math.floor(Date.now() / 1000);
+
+    await logChannel.send(
+      `🔨 **Member Banned**\n` +
+      `• **Target User:** <@${user.id}> (\`${user.tag || user.username}\` | ID: \`${user.id}\`)\n` +
+      `• **Moderator:** ${modDisplay}\n` +
+      `• **Reason:** ${reason || 'No reason provided'}\n` +
+      `• **Initiated Via:** ${cached ? 'Bot Command' : 'Discord Native / External'}\n` +
+      `• **Timestamp:** <t:${nowTs}:F>`
+    );
+
+    recentBans.delete(banKey);
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error in GuildBanAdd handler:', err.message);
+  }
+}
+
+/**
+ * Handles Discord native and external Unban events (GuildBanRemove)
+ */
+export async function handleGuildBanRemove(ban) {
+  try {
+    if (!ban || !ban.guild) return;
+    const guild = ban.guild;
+    const user = ban.user;
+
+    const banLogId = getGuildChannelId(guild.id, 'banUnbanLogId');
+    let logChannel = banLogId ? guild.channels.cache.get(banLogId) : null;
+    if (!logChannel) {
+      logChannel = guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildText && c.name === 'ban-unban-log'
+      );
+    }
+
+    if (!logChannel || !logChannel.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
+      return;
+    }
+
+    let moderator = null;
+    let reason = null;
+
+    try {
+      if (guild.members.me?.permissions?.has(PermissionFlagsBits.ViewAuditLog)) {
+        const auditLogs = await guild.fetchAuditLogs({
+          type: AuditLogEvent.MemberBanRemove,
+          limit: 3,
+        });
+        const match = auditLogs.entries.find(
+          (e) => e.target?.id === user.id && Date.now() - e.createdTimestamp < 30000
+        );
+        if (match) {
+          moderator = match.executor;
+          reason = match.reason;
+        }
+      }
+    } catch (auditErr) {
+      console.warn('[Discord Bot] ⚠️ Could not query audit logs for unban:', auditErr.message);
+    }
+
+    const modDisplay = moderator
+      ? `<@${moderator.id}> (\`${moderator.tag || moderator.username}\` | ID: \`${moderator.id}\`)`
+      : 'Unavailable (Audit Log permission required or entry missing)';
+
+    const nowTs = Math.floor(Date.now() / 1000);
+
+    await logChannel.send(
+      `🔓 **Member Unbanned**\n` +
+      `• **Target User:** <@${user.id}> (\`${user.tag || user.username}\` | ID: \`${user.id}\`)\n` +
+      `• **Moderator:** ${modDisplay}\n` +
+      `• **Reason:** ${reason || 'No reason provided'}\n` +
+      `• **Timestamp:** <t:${nowTs}:F>`
+    );
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error in GuildBanRemove handler:', err.message);
+  }
+}
+
+/**
+ * Handles member join event: sends welcome DM and logs attempt to #dm-log
+ */
+export async function handleGuildMemberAdd(member) {
+  try {
+    if (!member || member.user?.bot) return;
+
+    const guildId = member.guild?.id;
+    const guildName = member.guild?.name || 'MatchDistrict';
+    const username = member.user?.globalName || member.user?.username || member.displayName || 'Gamer';
+    const userTag = member.user?.tag || member.user?.username || member.id;
+
+    // Check if welcome DMs are enabled
+    if (!isWelcomeEnabled(guildId)) {
+      console.log(`[Discord Bot] ℹ️ Member ${userTag} joined "${guildName}", but welcome DMs are disabled.`);
+      return;
+    }
+
+    // Deduplication check: avoid duplicate welcome DMs for rapid join re-triggers
+    const joinKey = `${guildId}:${member.id}`;
+    if (recentJoins.has(joinKey)) {
+      return;
+    }
+    recentJoins.set(joinKey, Date.now());
+    const joinTimer = setTimeout(() => recentJoins.delete(joinKey), 60000);
+    if (joinTimer.unref) joinTimer.unref();
+
+    console.log(`[Discord Bot] 👤 New member joined "${guildName}": ${userTag} (${member.id})`);
+
+    const welcomeMessage = buildWelcomeMessage(username, guildName);
+
+    // Locate dm-log channel
+    const dmLogId = getGuildChannelId(guildId, 'dmLogId');
+    let logChannel = dmLogId ? member.guild.channels.cache.get(dmLogId) : null;
+    if (!logChannel) {
+      logChannel = member.guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildText && (c.name === 'dm-log' || c.name === 'matchdistrict-logs')
+      );
+    }
+
+    // Attempt to deliver welcome DM
+    let dmDelivered = false;
+    let failReason = null;
+    try {
+      await member.send(welcomeMessage);
+      dmDelivered = true;
+      console.log(`[Discord Bot] ✅ Successfully delivered welcome DM to ${userTag} (${member.id})`);
+    } catch (dmError) {
+      if (dmError?.code === 50007) {
+        failReason = 'User has Direct Messages disabled in privacy settings or blocked the bot';
+        console.warn(`[Discord Bot] ⚠️ Could not send welcome DM to ${userTag}: DMs disabled.`);
+      } else {
+        failReason = dmError.message || 'Unknown delivery failure';
+        console.warn(`[Discord Bot] ⚠️ Could not send welcome DM to ${userTag}: ${dmError.message}`);
+      }
+    }
+
+    // Log to #dm-log
+    if (logChannel && logChannel.permissionsFor(member.guild.members.me)?.has(PermissionFlagsBits.SendMessages)) {
+      const accountAge = Math.floor(member.user.createdTimestamp / 1000);
+      const nowTs = Math.floor(Date.now() / 1000);
+
+      if (dmDelivered) {
+        await logChannel.send(
+          `📬 **Welcome DM Delivered**\n` +
+          `• **Recipient:** <@${member.id}> (\`${userTag}\` | ID: \`${member.id}\`)\n` +
+          `• **Event:** Member Join Welcome DM\n` +
+          `• **Status:** ✅ **Delivered via Direct Message**\n` +
+          `• **Account Created:** <t:${accountAge}:R>\n` +
+          `• **Timestamp:** <t:${nowTs}:F>`
+        );
+      } else {
+        await logChannel.send(
+          `⚠️ **Welcome DM Delivery Failed**\n` +
+          `• **Recipient:** <@${member.id}> (\`${userTag}\` | ID: \`${member.id}\`)\n` +
+          `• **Event:** Member Join Welcome DM\n` +
+          `• **Status:** ❌ **Failed (${failReason})**\n` +
+          `• **Notice:** User does not accept direct messages from server members.\n` +
+          `• **Account Created:** <t:${accountAge}:R>\n` +
+          `• **Timestamp:** <t:${nowTs}:F>`
+        );
+      }
+    }
+  } catch (err) {
+    console.warn('[Discord Bot] ⚠️ Error in GuildMemberAdd handler:', err.message);
   }
 }
 
 /**
  * Initialize Discord Client with required intents and partials.
- * Includes Guilds, GuildMembers (welcome DMs), GuildMessages, and MessageContent (prefix commands).
+ * Includes GuildModeration for ban/unban events, GuildMessages, MessageContent, GuildMembers, DirectMessages.
  */
 export const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers, // Privileged Server Members Intent
     GatewayIntentBits.GuildMessages, // Message receive intent
-    GatewayIntentBits.MessageContent, // Privileged Message Content Intent (for .prefix commands)
+    GatewayIntentBits.MessageContent, // Privileged Message Content Intent (for prefix commands & message logs)
+    GatewayIntentBits.GuildModeration, // Ban & Unban audit tracking (intent 4)
     GatewayIntentBits.DirectMessages,
   ],
   partials: [Partials.GuildMember, Partials.User, Partials.Channel, Partials.Message],
@@ -292,124 +1133,87 @@ export const client = new Client({
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`[Discord Bot] 🚀 Logged in as ${readyClient.user.tag} (ID: ${readyClient.user.id})`);
   console.log(`[Discord Bot] 🎮 MatchDistrict Bot is active across ${readyClient.guilds.cache.size} server(s).`);
-  console.log(`[Discord Bot] ⚡ Command prefix: "${PREFIX}" (Prefix commands: ${PREFIX}setup, ${PREFIX}status, ${PREFIX}ping, ${PREFIX}help, ${PREFIX}website)`);
+  console.log(`[Discord Bot] ⚡ Command prefix: "${PREFIX}"`);
 });
 
-// Handle Prefix Commands (.setup, .status, .ping, .help, .website)
+// Handle prefix commands and message create logging
 client.on(Events.MessageCreate, async (message) => {
   try {
-    // Ignore bots and empty messages
     if (!message || message.author?.bot) return;
 
     const content = message.content?.trim();
-    if (!content || !content.startsWith(PREFIX)) return;
 
-    // Parse command and arguments
-    const withoutPrefix = content.slice(PREFIX.length).trim();
-    if (!withoutPrefix) return;
+    // Check if this is a prefix command
+    if (content && content.startsWith(PREFIX)) {
+      const withoutPrefix = content.slice(PREFIX.length).trim();
+      if (!withoutPrefix) return;
 
-    const [rawCmd] = withoutPrefix.split(/\s+/);
-    const cmd = rawCmd.toLowerCase();
+      const args = withoutPrefix.split(/\s+/);
+      const cmd = (args.shift() || '').toLowerCase();
 
-    if (cmd === 'setup') {
-      await handleSetupCommand(message.guild, message.member, (text) => message.reply(text));
-    } else if (cmd === 'status') {
-      await handleStatusCommand(message.guild, (text) => message.reply(text));
-    } else if (cmd === 'ping') {
-      const sent = await message.reply('🏓 Pinging...');
-      const roundtripLatency = sent.createdTimestamp - message.createdTimestamp;
-      const wsLatency = Math.round(message.client.ws.ping);
-      await sent.edit(getPingResponse(roundtripLatency, wsLatency));
-    } else if (cmd === 'help') {
-      await message.reply(getHelpResponse(PREFIX));
-    } else if (cmd === 'website' || cmd === 'site') {
-      await message.reply(getWebsiteResponse());
+      if (cmd === 'setup') {
+        await handleSetupCommand(message.guild, message.member, (text) => message.reply(text));
+        return;
+      } else if (cmd === 'dm') {
+        await handleDmCommand(message.guild, message.member, args, (text) => message.reply(text));
+        return;
+      } else if (cmd === 'ban') {
+        await handleBanCommand(message.guild, message.member, args, (text) => message.reply(text));
+        return;
+      } else if (cmd === 'clear') {
+        // Delete command message invocation where practical
+        await message.delete().catch(() => {});
+        await handleClearCommand(message.guild, message.member, message.channel, args, (text) => message.channel.send(text));
+        return;
+      } else if (cmd === 'status') {
+        await handleStatusCommand(message.guild, (text) => message.reply(text));
+        return;
+      } else if (cmd === 'ping') {
+        const sent = await message.reply('🏓 Pinging...');
+        const roundtripLatency = sent.createdTimestamp - message.createdTimestamp;
+        const wsLatency = Math.round(message.client.ws.ping);
+        await sent.edit(getPingResponse(roundtripLatency, wsLatency));
+        return;
+      } else if (cmd === 'help') {
+        await message.reply(getHelpResponse(PREFIX));
+        return;
+      } else if (cmd === 'website' || cmd === 'site') {
+        await message.reply(getWebsiteResponse());
+        return;
+      }
     }
+
+    // If not a command, log regular member messages
+    await handleMessageCreateLog(message);
   } catch (error) {
-    console.warn('[Discord Bot] ⚠️ Error executing prefix command:', error.message);
+    console.warn('[Discord Bot] ⚠️ Error in MessageCreate handler:', error.message);
   }
 });
 
-// Listen for new members joining the server
+// Message edit and delete listeners
+client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
+  await handleMessageUpdateLog(oldMessage, newMessage);
+});
+
+client.on(Events.MessageDelete, async (message) => {
+  await handleMessageDeleteLog(message);
+});
+
+// Ban and unban listeners
+client.on(Events.GuildBanAdd, async (ban) => {
+  await handleGuildBanAdd(ban);
+});
+
+client.on(Events.GuildBanRemove, async (ban) => {
+  await handleGuildBanRemove(ban);
+});
+
+// Member join listener
 client.on(Events.GuildMemberAdd, async (member) => {
-  try {
-    // Ignore bot accounts to prevent loopbacks and spam
-    if (!member || member.user?.bot) {
-      return;
-    }
-
-    const guildId = member.guild?.id;
-    const guildName = member.guild?.name || 'MatchDistrict';
-    const username = member.user?.globalName || member.user?.username || member.displayName || 'Gamer';
-    const userTag = member.user?.tag || member.user?.username || member.id;
-
-    // Check if welcome is enabled for this server
-    if (!isWelcomeEnabled(guildId)) {
-      console.log(`[Discord Bot] ℹ️ Member ${userTag} joined "${guildName}", but welcome is NOT enabled on this server (Admin must run ${PREFIX}setup).`);
-      return;
-    }
-
-    console.log(`[Discord Bot] 👤 New member joined "${guildName}": ${userTag} (${member.id})`);
-
-    const welcomeMessage = buildWelcomeMessage(username, guildName);
-
-    // Locate private log channel
-    const logChannelId = getGuildLogChannelId(guildId);
-    let logChannel = logChannelId ? member.guild.channels.cache.get(logChannelId) : null;
-    if (!logChannel) {
-      logChannel = member.guild.channels.cache.find(
-        c => c.type === ChannelType.GuildText && (c.name === 'matchdistrict-logs' || c.name === 'md-welcome-logs')
-      );
-    }
-
-    // Attempt to deliver the welcome message via Direct Message (DM)
-    let dmDelivered = false;
-    let failReason = null;
-    try {
-      await member.send(welcomeMessage);
-      dmDelivered = true;
-      console.log(`[Discord Bot] ✅ Successfully sent welcome DM to ${userTag} (${member.id})`);
-    } catch (dmError) {
-      if (dmError?.code === 50007) {
-        failReason = 'User has DMs disabled in privacy settings';
-        console.warn(`[Discord Bot] ⚠️ Could not send welcome DM to ${userTag} (${member.id}): User has DMs disabled or blocked.`);
-      } else {
-        failReason = dmError.message;
-        console.warn(`[Discord Bot] ⚠️ Could not send welcome DM to ${userTag} (${member.id}): ${dmError.message}`);
-      }
-    }
-
-    // Send log entry to private log channel
-    if (logChannel && logChannel.permissionsFor(member.guild.members.me)?.has('SendMessages')) {
-      const accountAge = Math.floor(member.user.createdTimestamp / 1000);
-      const nowTs = Math.floor(Date.now() / 1000);
-
-      if (dmDelivered) {
-        await logChannel.send(
-          `📥 **Welcome DM Sent**\n` +
-          `• **Member:** <@${member.id}> (\`${userTag}\` | ID: \`${member.id}\`)\n` +
-          `• **Account Created:** <t:${accountAge}:R>\n` +
-          `• **Status:** ✅ **Delivered via Direct Message**\n` +
-          `• **Website Sent:** https://matchdistrict.in\n` +
-          `• **Logged At:** <t:${nowTs}:T>`
-        );
-      } else {
-        await logChannel.send(
-          `⚠️ **Welcome DM Delivery Failed**\n` +
-          `• **Member:** <@${member.id}> (\`${userTag}\` | ID: \`${member.id}\`)\n` +
-          `• **Account Created:** <t:${accountAge}:R>\n` +
-          `• **Status:** ❌ **Failed (${failReason})**\n` +
-          `• **Notice:** User does not allow DMs from server members.\n` +
-          `• **Logged At:** <t:${nowTs}:T>`
-        );
-      }
-    }
-  } catch (error) {
-    console.warn('[Discord Bot] ⚠️ Unexpected error in GuildMemberAdd handler:', error.message);
-  }
+  await handleGuildMemberAdd(member);
 });
 
-// Client connection and shard error handlers
+// Error listeners
 client.on(Events.Error, (error) => {
   console.error('[Discord Bot] ❌ Discord client encountered an error:', error.message);
 });
@@ -420,8 +1224,6 @@ client.on(Events.ShardError, (error, shardId) => {
 
 /**
  * Start the Discord bot using the configured DISCORD_BOT_TOKEN.
- * @param {string} [tokenOverride] - Optional token override.
- * @returns {Promise<Client|null>}
  */
 export async function startBot(tokenOverride) {
   const token = tokenOverride || getBotToken();
@@ -429,8 +1231,6 @@ export async function startBot(tokenOverride) {
   if (!token) {
     console.error('[Discord Bot] ❌ DISCORD_BOT_TOKEN is not configured.');
     console.error('[Discord Bot] ℹ️ Please configure DISCORD_BOT_TOKEN in your environment or .env file.');
-    console.error('[Discord Bot] ℹ️ Remember to enable "SERVER MEMBERS INTENT" in the Discord Developer Portal:');
-    console.error('[Discord Bot]    https://discord.com/developers/applications -> [Your App] -> Bot -> Privileged Gateway Intents -> Server Members Intent.');
     return null;
   }
 
@@ -441,11 +1241,11 @@ export async function startBot(tokenOverride) {
   } catch (error) {
     console.error('[Discord Bot] ❌ Connection failed:');
     if (error.message?.includes('Privileged intent') || error.message?.includes('disallowed intent')) {
-      console.error('[Discord Bot] 🚨 Privileged Gateway Intent missing! In the Discord Developer Portal, under Bot -> Privileged Gateway Intents, ensure you enable:');
+      console.error('[Discord Bot] 🚨 Privileged Gateway Intent missing! Ensure you enable in Developer Portal:');
       console.error('[Discord Bot]    1. "SERVER MEMBERS INTENT" (for welcome DMs)');
-      console.error('[Discord Bot]    2. "MESSAGE CONTENT INTENT" (for prefix commands .ping, .help, .website)');
+      console.error('[Discord Bot]    2. "MESSAGE CONTENT INTENT" (for prefix commands & message logs)');
     } else if (error.message?.includes('An invalid token')) {
-      console.error('[Discord Bot] 🚨 The provided DISCORD_BOT_TOKEN is invalid. Please double-check your bot token.');
+      console.error('[Discord Bot] 🚨 The provided DISCORD_BOT_TOKEN is invalid.');
     } else {
       console.error(`[Discord Bot] 🚨 ${error.message}`);
     }
@@ -455,7 +1255,7 @@ export async function startBot(tokenOverride) {
 
 // Graceful shutdown handling
 let isShuttingDown = false;
-async function gracefulShutdown(signal) {
+export async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   console.log(`\n[Discord Bot] Received ${signal}. Shutting down bot gracefully...`);
@@ -468,14 +1268,20 @@ async function gracefulShutdown(signal) {
   } catch {
     // Suppress destroy errors on exit
   }
-  process.exit(0);
 }
 
-process.once('SIGINT', () => gracefulShutdown('SIGINT'));
-process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
-
-// Auto-start bot when this file is executed
-startBot().catch((error) => {
-  console.error('[Discord Bot] ❌ Fatal startup error:', error?.message || error);
-  process.exit(1);
+process.once('SIGINT', () => {
+  gracefulShutdown('SIGINT').then(() => process.exit(0));
 });
+process.once('SIGTERM', () => {
+  gracefulShutdown('SIGTERM').then(() => process.exit(0));
+});
+
+// Auto-start bot only when this file is executed directly (not when imported in test suites)
+const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isMainModule) {
+  startBot().catch((error) => {
+    console.error('[Discord Bot] ❌ Fatal startup error:', error?.message || error);
+    process.exit(1);
+  });
+}
