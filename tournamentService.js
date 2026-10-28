@@ -5724,13 +5724,6 @@ export async function removeGroupResultControlMessage(guild, group, channel) {
 export async function updateGroupSlotListMessage(guild, tournament, round, group, channel) {
   if (!channel || typeof channel.send !== 'function') return null;
 
-  const credentials = group.credentials || {};
-  const credentialParts = [
-    ['room', `🎮 **Room ID / Name:** ${credentials.roomId ? `\`${credentials.roomId}\`` : '*Not published yet*'}`],
-    ['password', `🔑 **Password:** ${credentials.password ? `\`${credentials.password}\`` : '*Not published yet*'}`],
-    ['published', `⏰ **Published:** ${credentials.publishedAt ? `<t:${Math.floor(new Date(credentials.publishedAt).getTime() / 1000)}:f>` : '*Not published yet*'}`],
-  ];
-
   // Display only locked and filled slots in the agreed format.
   let slotsText = '';
   const slots = Array.isArray(group.slots) ? group.slots : [];
@@ -5751,6 +5744,13 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
       groupId: group.groupId,
       logicalKey: `${logicalKey}:credentials`,
     }).catch(() => {});
+    await deleteManagedMessages(guild.client, {
+      guildId: guild.id,
+      tournamentId: tournament.id,
+      roundId: round.roundId,
+      groupId: group.groupId,
+      messageType: 'group_match_credential_part',
+    }).catch(() => {});
     const result = await upsertManagedMessage(guild.client, {
       guildId: guild.id,
       channelId: channel.id,
@@ -5762,22 +5762,6 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
       payload: { content: slotsText.trim() || 'No occupied slots.', embeds: [], components: [] },
     });
     group.slotListMessageId = result.messageId;
-    const credentialMessageIds = [];
-    for (const [part, content] of credentialParts) {
-      const credentialResult = await upsertManagedMessage(guild.client, {
-        guildId: guild.id,
-        channelId: channel.id,
-        logicalKey: `${logicalKey}:credential:${part}`,
-        messageType: 'group_match_credential_part',
-        tournamentId: tournament.id,
-        roundId: round.roundId,
-        groupId: group.groupId,
-        payload: { content, components: [] },
-      });
-      credentialMessageIds.push(credentialResult.messageId);
-    }
-    group.credentialMessageIds = credentialMessageIds;
-    group.credentialsMessageId = credentialMessageIds[0] || null;
     const oldCredentialMessages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
     for (const message of oldCredentialMessages?.values?.() || []) {
       if ((message.author.id === guild.client.user?.id || message.author.bot) && message.embeds?.some((embed) => embed.title?.includes('Match Credentials'))) {
@@ -5798,25 +5782,19 @@ export async function updateGroupSlotListMessage(guild, tournament, round, group
       const newMsg = await channel.send({ content: slotsText.trim() || 'No occupied slots.', components: [] }).catch(() => null);
       if (newMsg) group.slotListMessageId = newMsg.id;
     }
-    const credentialMessageIds = [];
-    for (const [part, content] of credentialParts) {
-      await upsertManagedMessage(guild.client, {
-        guildId: guild.id,
-        channelId: channel.id,
-        logicalKey: `${logicalKey}:credential:${part}`,
-        messageType: 'group_match_credential_part',
-        tournamentId: tournament.id,
-        roundId: round.roundId,
-        groupId: group.groupId,
-        payload: { content, components: [] },
-      }).then((result) => {
-        credentialMessageIds.push(result.messageId);
-      }).catch((credentialError) => {
-        console.warn('[Discord Bot] Could not update separate group credential message:', credentialError.message);
-      });
+    await deleteManagedMessages(guild.client, {
+      guildId: guild.id,
+      tournamentId: tournament.id,
+      roundId: round.roundId,
+      groupId: group.groupId,
+      messageType: 'group_match_credential_part',
+    }).catch(() => {});
+    const oldCredentialMessages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+    for (const message of oldCredentialMessages?.values?.() || []) {
+      if ((message.author.id === guild.client.user?.id || message.author.bot) && message.embeds?.some((embed) => embed.title?.includes('Match Credentials'))) {
+        await message.delete().catch(() => {});
+      }
     }
-    group.credentialMessageIds = credentialMessageIds;
-    group.credentialsMessageId = credentialMessageIds[0] || null;
     return group.slotListMessageId;
   }
 }
