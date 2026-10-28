@@ -2405,20 +2405,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
   let dashboardContext = null;
   try {
     const roundAnnouncementModal = interaction.isModalSubmit?.() && interaction.customId?.startsWith('dash:round:announcement-submit:');
-    if ((interaction.isButton?.() || roundAnnouncementModal) && interaction.guild && interaction.channelId) {
+    const isUserSelectInteraction = interaction.isUserSelectMenu?.() === true;
+    if ((interaction.isButton?.() || isUserSelectInteraction || roundAnnouncementModal) && interaction.guild && interaction.channelId) {
       const savedTournaments = guildSettingsCache[interaction.guild.id]?.tournaments || {};
       const match = Object.entries(savedTournaments).find(([, saved]) => saved?.channels?.botCommandsId === interaction.channelId);
       if (match) {
         dashboardContext = { tournamentId: match[0], savedTournament: match[1] };
         const isButtonInteraction = interaction.isButton?.();
-        const isCanonicalDashboard = !isButtonInteraction || interaction.message?.id === match[1]?.controlPanelMessageId;
+        const isDashboardComponent = isButtonInteraction || isUserSelectInteraction;
+        const isCanonicalDashboard = !isDashboardComponent || interaction.message?.id === match[1]?.controlPanelMessageId;
         const opensModal = isButtonInteraction && isCanonicalDashboard && (
           interaction.customId?.startsWith('md_tour_create_round:') ||
           interaction.customId?.startsWith('md_round_edit:') ||
           interaction.customId?.startsWith('dash:round:announcement:')
         );
-        if (isButtonInteraction && !opensModal && !interaction.deferred && !interaction.replied) await interaction.deferUpdate();
-        if (isButtonInteraction && !isCanonicalDashboard) {
+        if (isDashboardComponent && !opensModal && !interaction.deferred && !interaction.replied) await interaction.deferUpdate();
+        if (isDashboardComponent && !isCanonicalDashboard) {
           const backendData = await fetchTournamentRegistrationsFromBackend(match[0]);
           await setupTournamentControlPanel(interaction.guild, backendData.tournament, backendData.summary, interaction.guild.members.me);
           return;
@@ -2426,9 +2428,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
-    if (interaction.isButton() && (
-      interaction.customId?.startsWith('dash:')
-    )) {
+    if ((interaction.isButton() || isUserSelectInteraction) && interaction.customId?.startsWith('dash:')) {
       if (interaction.customId?.startsWith('dash:tournament:select:')) {
         await handleTournamentSelectionButton(interaction);
         return;

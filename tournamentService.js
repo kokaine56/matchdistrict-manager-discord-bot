@@ -9,6 +9,7 @@ import {
   EmbedBuilder,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
+  UserSelectMenuBuilder,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -44,45 +45,77 @@ import {
   isGuildLinkedToOrganiser,
 } from './mongoService.js';
 
-/**
- * Required 4 shared tournament channels structure
- */
+/** Shared and tournament-specific channels provisioned by Create Channels. */
 export const REQUIRED_TOURNAMENT_CHANNELS = [
   {
     key: 'botCommandsId',
     name: 'bot-commands',
     topic: 'Tournament Management & Control Panel (Admin Only)',
-    participantAccess: 'none', // Strictly admins only
+    category: 'management',
+    participantAccess: 'none',
   },
   {
     key: 'tournamentUpdateId',
-    name: 'tournament-update',
+    name: 'updates',
     topic: 'Official Announcements & Tournament Updates',
-    participantAccess: 'read_only', // Participants view-only
+    category: 'public',
+    participantAccess: 'read_only',
+  },
+  {
+    key: 'tournamentRoadmapId',
+    name: 'roadmap',
+    topic: 'Tournament Roadmap',
+    category: 'public',
+    participantAccess: 'read_only',
+  },
+  {
+    key: 'tournamentScoreboardId',
+    name: 'scoreboard',
+    topic: 'Tournament Scoreboard',
+    category: 'public',
+    participantAccess: 'read_only',
+  },
+  {
+    key: 'tournamentHelpdeskId',
+    name: 'helpdesk',
+    topic: 'Participant Questions & Tournament Support Desk',
+    category: 'public',
+    participantAccess: 'read_write',
+  },
+  {
+    key: 'tournamentRegisterId',
+    name: 'register-here',
+    topic: 'Tournament Registration & Official Details Link',
+    category: 'public',
+    participantAccess: 'read_only',
+  },
+  {
+    key: 'tournamentVerificationId',
+    name: 'verification',
+    topic: 'Tournament Verification',
+    category: 'public',
+    participantAccess: 'read_write',
   },
   {
     key: 'tournamentTeamsId',
-    name: 'tournament-teams',
+    name: 'registered-team',
     topic: 'Registered Teams & Tournament Roster (Admin Only)',
-    participantAccess: 'none', // Strictly admins only! Ordinary participants must not be granted access
+    category: 'management',
+    participantAccess: 'none',
   },
   {
     key: 'tournamentLogId',
     name: 'tournament-log',
     topic: 'Tournament Management Activity Log',
+    category: 'management',
     participantAccess: 'none',
   },
   {
-    key: 'tournamentHelpdeskId',
-    name: 'tournament-helpdesk',
-    topic: 'Participant Questions & Tournament Support Desk',
-    participantAccess: 'read_write', // Participants can send messages
-  },
-  {
-    key: 'tournamentRegisterId',
-    name: 'tournament-register',
-    topic: 'Tournament Registration & Official Details Link',
-    participantAccess: 'read_only', // Participants view-only
+    key: 'specResultId',
+    name: 'spec-result',
+    topic: 'Tournament Spectator Results',
+    category: 'management',
+    participantAccess: 'none',
   },
 ];
 
@@ -190,6 +223,164 @@ export function sanitizeCategoryName(name) {
   if (!name || typeof name !== 'string') return 'Tournament';
   const clean = name.trim().slice(0, 95);
   return `🏆 | ${clean}`;
+}
+
+function getTournamentShortName(title, fallback = 'tournament') {
+  const withoutYear = String(title || '').replace(/\b(?:19|20)\d{2}\b/g, '').trim();
+  return (withoutYear || fallback).slice(0, 80);
+}
+
+async function ensureTournamentCategory(guild, savedTournament, key, name, overwrites) {
+  let category = savedTournament[key]
+    ? guild.channels.cache.get(savedTournament[key]) || await guild.channels.fetch(savedTournament[key]).catch(() => null)
+    : null;
+  if (!category || category.type !== ChannelType.GuildCategory || (category.guildId || category.guild?.id) !== guild.id) {
+    category = null;
+  }
+  if (!category) {
+    category = await guild.channels.create({ name, type: ChannelType.GuildCategory, permissionOverwrites: overwrites });
+  } else {
+    if (category.name !== name && typeof category.setName === 'function') {
+      await category.setName(name).catch((err) => console.warn(`[Discord Bot] Could not rename category to ${name}:`, err.message));
+    }
+    if (typeof category.permissionOverwrites?.set === 'function') {
+      await category.permissionOverwrites.set(overwrites).catch((err) => {
+        console.warn(`[Discord Bot] Could not update ${name} category permissions:`, err.message);
+      });
+    }
+  }
+  savedTournament[key] = category.id;
+  return category;
+}
+
+async function ensureManagementDashboardRoles(guild, savedTournament, botMember = guild.members.me) {
+  if (!botMember?.permissions?.has?.(PermissionFlagsBits.ManageRoles)) {
+    throw new Error('The bot needs Manage Roles permission to create or assign tournament roles.');
+  }
+  const resolveRole = async (id) => id
+    ? guild.roles.cache.get(id) || await guild.roles.fetch(id).catch(() => null)
+    : null;
+  let tourneyModRole = await resolveRole(savedTournament.tourneyModRoleId || savedTournament.modsRoleId);
+  tourneyModRole ||= guild.roles.cache.find((role) => role.name.toLowerCase() === 'tourney-mod') || null;
+  if (!tourneyModRole) {
+    tourneyModRole = await guild.roles.create({ name: 'Tourney-mod', permissions: [], mentionable: false, reason: 'Tournament management access' });
+  } else if (tourneyModRole.name !== 'Tourney-mod') {
+    await tourneyModRole.setName('Tourney-mod');
+  }
+
+  let spectatorRole = await resolveRole(savedTournament.spectatorRoleId);
+  spectatorRole ||= guild.roles.cache.find((role) => role.name.toLowerCase() === 'spectator') || null;
+  if (!spectatorRole) {
+    spectatorRole = await guild.roles.create({ name: 'Spectator', permissions: [], mentionable: false, reason: 'Tournament spectator access' });
+  }
+
+  const highestPosition = botMember.roles?.highest?.position;
+  for (const role of [tourneyModRole, spectatorRole]) {
+    if (typeof role.setPermissions === 'function' && role.permissions?.bitfield != null && BigInt(role.permissions.bitfield) !== 0n) {
+      await role.setPermissions([]);
+    }
+    if (typeof highestPosition === 'number' && typeof role.position === 'number' && role.position >= highestPosition) {
+      if (highestPosition <= 1 || typeof role.setPosition !== 'function') {
+        throw new Error(`The bot's highest role must be above @${role.name} to assign it.`);
+      }
+      await role.setPosition(highestPosition - 1);
+    }
+    if (typeof role.comparePositionTo === 'function' && role.comparePositionTo(botMember.roles.highest) >= 0) {
+      throw new Error(`The bot's highest role must be above @${role.name} to assign it.`);
+    }
+  }
+
+  savedTournament.tourneyModRoleId = tourneyModRole.id;
+  savedTournament.modsRoleId = tourneyModRole.id;
+  savedTournament.spectatorRoleId = spectatorRole.id;
+  await applyManagementRoleChannelAccess(guild, savedTournament, tourneyModRole);
+  if (savedTournament.channels?.specResultId) {
+    const specResult = guild.channels.cache.get(savedTournament.channels.specResultId) ||
+      await guild.channels.fetch(savedTournament.channels.specResultId).catch(() => null);
+    if (specResult?.permissionOverwrites?.edit) {
+      await specResult.permissionOverwrites.edit(spectatorRole.id, {
+        ViewChannel: true,
+        ReadMessageHistory: true,
+        SendMessages: true,
+      }).catch((err) => console.warn('[Discord Bot] Could not grant Spectator access to #spec-result:', err.message));
+    }
+  }
+  return { tourneyModRole, spectatorRole };
+}
+
+async function applyManagementRoleChannelAccess(guild, savedTournament, tourneyModRole) {
+  const textPermissions = {
+    ViewChannel: true,
+    ReadMessageHistory: true,
+    SendMessages: true,
+    SendMessagesInThreads: true,
+    CreatePublicThreads: true,
+    CreatePrivateThreads: true,
+    AddReactions: true,
+    AttachFiles: true,
+    EmbedLinks: true,
+    UseApplicationCommands: true,
+    ManageMessages: true,
+    ManageThreads: true,
+    MentionEveryone: true,
+  };
+  const channelIds = new Set([
+    ...Object.values(savedTournament.channels || {}).filter(Boolean),
+    ...Object.values(savedTournament.rounds || {}).flatMap((round) => [
+      ...(Array.isArray(round.groups) ? round.groups.flatMap((group) => [group.channelId, group.voiceChannelId]) : []),
+      round.categoryId,
+    ]).filter(Boolean),
+    savedTournament.publicCategoryId,
+    savedTournament.managementCategoryId,
+  ].filter(Boolean));
+  const voiceAllowed = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak];
+  const voiceDenied = [...new Set(Object.values(PermissionFlagsBits))].filter((permission) => !voiceAllowed.includes(permission));
+  for (const id of channelIds) {
+    const channel = guild.channels.cache.get(id) || await guild.channels.fetch(id).catch(() => null);
+    if (!channel?.permissionOverwrites?.edit) continue;
+    if (channel.type === ChannelType.GuildVoice) {
+      await channel.permissionOverwrites.edit(tourneyModRole.id, { allow: voiceAllowed, deny: voiceDenied }).catch((err) => {
+        console.warn(`[Discord Bot] Could not grant Tourney-mod access to ${channel.name}:`, err.message);
+      });
+    } else if (channel.type === ChannelType.GuildCategory) {
+      await channel.permissionOverwrites.edit(tourneyModRole.id, textPermissions).catch((err) => {
+        console.warn(`[Discord Bot] Could not grant Tourney-mod access to ${channel.name}:`, err.message);
+      });
+    } else {
+      await channel.permissionOverwrites.edit(tourneyModRole.id, textPermissions).catch((err) => {
+        console.warn(`[Discord Bot] Could not grant Tourney-mod access to ${channel.name}:`, err.message);
+      });
+    }
+  }
+}
+
+async function buildTournamentChannelStatus(guild, savedTournament, botCommandsChannel) {
+  const labels = [
+    ['updates', savedTournament.channels?.tournamentUpdateId],
+    ['roadmap', savedTournament.channels?.tournamentRoadmapId],
+    ['scoreboard', savedTournament.channels?.tournamentScoreboardId],
+    ['helpdesk', savedTournament.channels?.tournamentHelpdeskId],
+    ['register-here', savedTournament.channels?.tournamentRegisterId],
+    ['verification', savedTournament.channels?.tournamentVerificationId],
+    ['room-maker-vc', savedTournament.channels?.roomMakerVcId],
+    ['registered-team', savedTournament.channels?.tournamentTeamsId],
+    ['spec-result', savedTournament.channels?.specResultId],
+    ['tournament-log', savedTournament.channels?.tournamentLogId],
+  ];
+  const ids = [savedTournament.publicCategoryId, savedTournament.managementCategoryId,
+    botCommandsChannel?.id, ...labels.map(([, id]) => id),
+    ...Object.values(savedTournament.rounds || {}).map((round) => round.categoryId)].filter(Boolean);
+  await Promise.allSettled(ids.filter((id) => !guild.channels.cache.has(id)).map((id) => guild.channels.fetch(id)));
+  const publicCategory = guild.channels.cache.get(savedTournament.publicCategoryId);
+  const managementCategory = guild.channels.cache.get(savedTournament.managementCategoryId);
+  const found = labels.filter(([, id]) => id && guild.channels.cache.has(id));
+  const configured = Boolean(publicCategory && managementCategory && botCommandsChannel && found.length === labels.length);
+  const roundCategories = Object.values(savedTournament.rounds || {}).filter((round) => round.categoryId && guild.channels.cache.has(round.categoryId));
+  const statusText = `${configured ? '🟢 **Active**' : found.length === 0 ? '🟡 **Pending Creation**' : '⚠️ **Needs Repair**'}\n` +
+    `**Categories:** ${publicCategory ? `<#${publicCategory.id}>` : 'Missing'} · ${managementCategory ? `<#${managementCategory.id}>` : 'Missing'} · ${roundCategories.length} round\n` +
+    `**Channels:** ${botCommandsChannel ? `<#${botCommandsChannel.id}>` : 'bot-commands missing'} · ` +
+    labels.map(([name, id]) => id && guild.channels.cache.has(id) ? `<#${id}>` : `\`${name}\` missing`).join(' · ');
+  return { isConfigured: configured, activeCount: found.length + Number(Boolean(botCommandsChannel)) + Number(Boolean(publicCategory)) + Number(Boolean(managementCategory)), statusText };
 }
 
 /**
@@ -674,6 +865,11 @@ export function buildTournamentControlPanelButtons(tournamentId) {
       .setCustomId('dash:home:rounds')
       .setLabel('Round Management')
       .setEmoji('⚔️')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('dash:management-roles:open')
+      .setLabel('Management Roles')
+      .setEmoji('🛡️')
       .setStyle(ButtonStyle.Secondary)
   );
 
@@ -717,6 +913,301 @@ function updateDashboardNavigation(guild, tournamentId, operation, screen = null
   saveTournamentToDb(guild.id, tournamentId, savedTournament);
 }
 
+function saveDashboardScreen(guild, tournamentId, savedTournament, screen) {
+  const stack = Array.isArray(savedTournament.dashboardNavigationStack) && savedTournament.dashboardNavigationStack.length
+    ? [...savedTournament.dashboardNavigationStack]
+    : [{ screen: 'home' }];
+  stack[stack.length - 1] = screen;
+  savedTournament.dashboardNavigationStack = stack;
+  guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
+  saveGuildSettings(guildSettingsCache);
+}
+
+async function persistManagementRoleState(guildId, tournamentId, savedTournament) {
+  const persisted = await saveTournamentToDb(guildId, tournamentId, savedTournament);
+  if (!persisted) throw new Error('Could not save the role assignment state to MongoDB. Check the database connection and try again.');
+}
+
+async function renderManagementRoleScreen(interaction, savedTournament, errorText = '') {
+  const roleLine = (label, id) => `• **${label}:** ${id ? `<@&${id}>` : 'Ready to create'}`;
+  const embed = new EmbedBuilder()
+    .setTitle(`Management Roles · ${savedTournament.tournamentTitle || 'Tournament'}`)
+    .setColor(0x5865f2)
+    .setDescription(`${errorText ? `⚠️ ${errorText}\n\n` : ''}${roleLine('Tourney-mod', savedTournament.tourneyModRoleId)}\n${roleLine('Spectator', savedTournament.spectatorRoleId)}`);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('dash:management-roles:give').setLabel('Give Role').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('dash:management-roles:remove').setLabel('Remove Role').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('dash:management-roles:back').setLabel('Back').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('dash:management-roles:refresh').setLabel('Refresh').setStyle(ButtonStyle.Secondary),
+  );
+  await interaction.editReply({ embeds: [embed], components: [row], content: null });
+}
+
+async function renderManagementRoleChoiceScreen(interaction, operation, errorText = '') {
+  const verb = operation === 'remove' ? 'Remove' : 'Give';
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('dash:management-role-choice:role:tourney-mod').setLabel('Tourney-mod').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('dash:management-role-choice:role:spectator').setLabel('Spectator').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('dash:management-role-choice:back').setLabel('Back').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('dash:management-role-choice:refresh').setLabel('Refresh').setStyle(ButtonStyle.Secondary),
+  );
+  const embed = new EmbedBuilder().setTitle(`${verb} a Management Role`).setColor(0x5865f2)
+    .setDescription(`${errorText ? `⚠️ ${errorText}\n\n` : ''}Choose **Tourney-mod** or **Spectator** to ${operation === 'remove' ? 'remove from' : 'give to'} selected users.`);
+  await interaction.editReply({ embeds: [embed], components: [row], content: null });
+}
+
+async function renderManagementUserPicker(interaction, savedTournament, roleKey, errorText = '', operation = 'give') {
+  const roleId = roleKey === 'tourney-mod' ? savedTournament.tourneyModRoleId : savedTournament.spectatorRoleId;
+  const roleName = roleKey === 'tourney-mod' ? 'Tourney-mod' : 'Spectator';
+  const picker = new ActionRowBuilder().addComponents(
+    new UserSelectMenuBuilder()
+      .setCustomId('dash:management-users:select')
+      .setPlaceholder(`Choose users to ${operation === 'remove' ? 'remove' : 'give'} ${roleName}`)
+      .setMinValues(1)
+      .setMaxValues(25)
+  );
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('dash:management-users:back').setLabel('Back').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('dash:management-users:refresh').setLabel('Refresh').setStyle(ButtonStyle.Secondary),
+  );
+  const embed = new EmbedBuilder().setTitle(`${operation === 'remove' ? 'Remove' : 'Assign'} ${roleName}`).setColor(0x5865f2)
+    .setDescription(`${errorText ? `⚠️ ${errorText}\n\n` : ''}Choose one or more server users to ${operation === 'remove' ? 'remove' : 'give'} <@&${roleId}>.`);
+  await interaction.editReply({ embeds: [embed], components: [picker, buttons], content: null });
+}
+
+function addLinesAsFields(embed, title, lines, emptyText) {
+  const values = lines.length ? lines : [emptyText];
+  let chunk = '';
+  let part = 1;
+  for (const line of values) {
+    if (chunk && chunk.length + line.length + 1 > 950) {
+      embed.addFields({ name: part === 1 ? title : `${title} (${part})`, value: chunk, inline: false });
+      chunk = '';
+      part++;
+    }
+    chunk += `${chunk ? '\n' : ''}${line}`;
+  }
+  if (chunk) embed.addFields({ name: part === 1 ? title : `${title} (${part})`, value: chunk, inline: false });
+}
+
+async function renderManagementAssignmentConfirm(interaction, savedTournament, pending, errorText = '') {
+  const roleId = pending.roleKey === 'tourney-mod' ? savedTournament.tourneyModRoleId : savedTournament.spectatorRoleId;
+  const roleName = pending.roleKey === 'tourney-mod' ? 'Tourney-mod' : 'Spectator';
+  const mentions = (pending.userIds || []).map((id) => `<@${id}>`).join(', ') || 'No users selected';
+  const embed = new EmbedBuilder().setTitle('Confirm Role Assignment').setColor(0xeab308)
+    .setDescription(`${errorText ? `⚠️ ${errorText}\n\n` : ''}${pending.operation === 'remove' ? 'Remove' : 'Give'} <@&${roleId}> (**${roleName}**) ${pending.operation === 'remove' ? 'from' : 'to'}:\n${mentions}`);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('dash:management-confirm:confirm').setLabel('Confirm').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('dash:management-confirm:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('dash:management-confirm:refresh').setLabel('Refresh').setStyle(ButtonStyle.Secondary),
+  );
+  await interaction.editReply({ embeds: [embed], components: [row], content: null });
+}
+
+async function renderManagementAssignmentResult(interaction, result, errorText = '') {
+  const verb = result.operation === 'remove' ? 'Removal' : 'Assignment';
+  const changed = result.operation === 'remove' ? result.removed || [] : result.assigned || [];
+  const embed = new EmbedBuilder().setTitle(`Role ${verb} Result · ${result.roleName}`)
+    .setColor(result.skipped?.length ? 0xeab308 : 0x22c55e)
+    .setDescription(errorText || `Role: <@&${result.roleId}>`);
+  addLinesAsFields(embed, result.operation === 'remove' ? 'Removed' : 'Assigned', changed.map((user) => `<@${user.id}>`), result.operation === 'remove' ? 'No users had the role removed.' : 'No users received the role.');
+  addLinesAsFields(embed, 'Skipped', (result.skipped || []).map((user) => `<@${user.id}> — ${String(user.reason).slice(0, 120)}`), 'No users were skipped.');
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('dash:management-result:back').setLabel('Back').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('dash:management-result:refresh').setLabel('Refresh').setStyle(ButtonStyle.Secondary),
+  );
+  await interaction.editReply({ embeds: [embed], components: [row], content: null });
+}
+
+async function handleManagementRolesDashboard(interaction, tournamentId, savedTournament, screen, action, roleKey = '') {
+  const access = checkTournamentAccess(interaction.guild, interaction.member);
+  if (!access.allowed) {
+    await interaction.editReply({ content: access.reason, embeds: [], components: [] }).catch(() => {});
+    return true;
+  }
+  try {
+    if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
+    if (screen === 'management-roles' && action === 'open') {
+      await ensureManagementDashboardRoles(interaction.guild, savedTournament, interaction.guild.members.me);
+      savedTournament.dashboardNavigationStack = [{ screen: 'home' }, { screen: 'management-roles' }];
+      guildSettingsCache[interaction.guild.id].tournaments[tournamentId] = savedTournament;
+      saveGuildSettings(guildSettingsCache);
+      await persistManagementRoleState(interaction.guild.id, tournamentId, savedTournament);
+      if (savedTournament.pendingManagementRoleAssignment) {
+        savedTournament.dashboardNavigationStack.push({ screen: 'management-confirm' });
+        saveGuildSettings(guildSettingsCache);
+        await persistManagementRoleState(interaction.guild.id, tournamentId, savedTournament);
+        await renderManagementAssignmentConfirm(interaction, savedTournament, savedTournament.pendingManagementRoleAssignment);
+        return true;
+      }
+      await renderManagementRoleScreen(interaction, savedTournament);
+      return true;
+    }
+    if (screen === 'management-roles' && action === 'refresh') {
+      await ensureManagementDashboardRoles(interaction.guild, savedTournament, interaction.guild.members.me);
+      await persistManagementRoleState(interaction.guild.id, tournamentId, savedTournament);
+      await renderManagementRoleScreen(interaction, savedTournament);
+      return true;
+    }
+    if (screen === 'management-roles' && ['give', 'remove'].includes(action)) {
+      updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'management-role-choice', operation: action });
+      await persistManagementRoleState(interaction.guild.id, tournamentId, savedTournament);
+      await renderManagementRoleChoiceScreen(interaction, action);
+      return true;
+    }
+    if (screen === 'management-roles' && action === 'back') {
+      updateDashboardNavigation(interaction.guild, tournamentId, 'back');
+      await handleBackToTournamentPanel(interaction, tournamentId);
+      return true;
+    }
+    if (screen === 'management-role-choice' && action === 'refresh') {
+      await renderManagementRoleChoiceScreen(interaction, stackRoleContext(savedTournament).operation || 'give');
+      return true;
+    }
+    if (screen === 'management-role-choice' && action === 'back') {
+      updateDashboardNavigation(interaction.guild, tournamentId, 'back');
+      await renderManagementRoleScreen(interaction, savedTournament);
+      return true;
+    }
+    if (screen === 'management-role-choice' && action === 'role' && ['tourney-mod', 'spectator'].includes(roleKey)) {
+      await ensureManagementDashboardRoles(interaction.guild, savedTournament, interaction.guild.members.me);
+      const operation = stackRoleContext(savedTournament).operation || 'give';
+      updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'management-users', roleKey, operation });
+      await persistManagementRoleState(interaction.guild.id, tournamentId, savedTournament);
+      await renderManagementUserPicker(interaction, savedTournament, roleKey, '', operation);
+      return true;
+    }
+    if (screen === 'management-users' && interaction.isUserSelectMenu?.()) {
+      const roleContext = stackRoleContext(savedTournament);
+      const pending = { roleKey: roleContext.roleKey, operation: roleContext.operation || 'give', userIds: interaction.values || [], createdBy: interaction.user?.id, createdAt: new Date().toISOString() };
+      if (!['tourney-mod', 'spectator'].includes(pending.roleKey) || pending.userIds.length === 0) throw new Error('Choose a role and at least one user.');
+      savedTournament.pendingManagementRoleAssignment = pending;
+      saveDashboardScreen(interaction.guild, tournamentId, savedTournament, { screen: 'management-confirm' });
+      await persistManagementRoleState(interaction.guild.id, tournamentId, savedTournament);
+      await renderManagementAssignmentConfirm(interaction, savedTournament, pending);
+      return true;
+    }
+    if (screen === 'management-users' && action === 'refresh') {
+      const context = stackRoleContext(savedTournament);
+      await renderManagementUserPicker(interaction, savedTournament, context.roleKey, '', context.operation || 'give');
+      return true;
+    }
+    if (screen === 'management-users' && action === 'back') {
+      updateDashboardNavigation(interaction.guild, tournamentId, 'back');
+      await renderManagementRoleChoiceScreen(interaction, stackRoleContext(savedTournament).operation || 'give');
+      return true;
+    }
+    if (screen === 'management-confirm' && action === 'refresh') {
+      const pending = savedTournament.pendingManagementRoleAssignment;
+      if (!pending) throw new Error('The pending role assignment could not be found.');
+      await renderManagementAssignmentConfirm(interaction, savedTournament, pending);
+      return true;
+    }
+    if (screen === 'management-confirm' && action === 'cancel') {
+      savedTournament.pendingManagementRoleAssignment = null;
+      savedTournament.dashboardNavigationStack = [{ screen: 'home' }, { screen: 'management-roles' }];
+      saveGuildSettings(guildSettingsCache);
+      await persistManagementRoleState(interaction.guild.id, tournamentId, savedTournament);
+      await renderManagementRoleScreen(interaction, savedTournament);
+      return true;
+    }
+    if (screen === 'management-confirm' && action === 'confirm') {
+      const pending = savedTournament.pendingManagementRoleAssignment;
+      if (!pending || !['tourney-mod', 'spectator'].includes(pending.roleKey)) throw new Error('The pending role assignment could not be found. Please choose the users again.');
+      const roles = await ensureManagementDashboardRoles(interaction.guild, savedTournament, interaction.guild.members.me);
+      const role = pending.roleKey === 'tourney-mod' ? roles.tourneyModRole : roles.spectatorRole;
+      const result = { roleKey: pending.roleKey, operation: pending.operation === 'remove' ? 'remove' : 'give', roleName: role.name, roleId: role.id, assigned: [], removed: [], skipped: [], completedAt: new Date().toISOString() };
+      for (const userId of [...new Set(pending.userIds)]) {
+        try {
+          const member = await interaction.guild.members.fetch(userId);
+          if (!member) {
+            result.skipped.push({ id: userId, reason: 'User is not in this server.' });
+            continue;
+          }
+          const hasRole = member.roles.cache.has(role.id);
+          if (result.operation === 'remove') {
+            if (!hasRole) {
+              result.skipped.push({ id: userId, reason: `User does not have ${role.name}.` });
+              continue;
+            }
+            await member.roles.remove(role, `Removed ${role.name} from tournament dashboard by ${interaction.user?.tag || interaction.user?.id || 'administrator'}`);
+            result.removed.push({ id: userId });
+          } else {
+            if (hasRole) {
+              result.skipped.push({ id: userId, reason: `User already has ${role.name}.` });
+              continue;
+            }
+            await member.roles.add(role, `Assigned ${role.name} from tournament dashboard by ${interaction.user?.tag || interaction.user?.id || 'administrator'}`);
+            result.assigned.push({ id: userId });
+          }
+        } catch (err) {
+          result.skipped.push({ id: userId, reason: err.code === 10007 ? 'User is not in this server.' : `Role ${result.operation === 'remove' ? 'removal' : 'assignment'} failed: ${err.message}` });
+          console.warn(`[Discord Bot] Could not ${result.operation === 'remove' ? 'remove' : 'assign'} ${role.name} ${result.operation === 'remove' ? 'from' : 'to'} ${userId}:`, err.message);
+        }
+      }
+      savedTournament.lastManagementRoleAssignment = result;
+      savedTournament.pendingManagementRoleAssignment = null;
+      saveDashboardScreen(interaction.guild, tournamentId, savedTournament, { screen: 'management-result' });
+      await persistManagementRoleState(interaction.guild.id, tournamentId, savedTournament);
+      if (result.operation === 'give' && result.assigned.length > 0) {
+        await sendTournamentManagementLog(interaction.guild, savedTournament, null, 'Management role given', interaction.member, [
+          { name: 'Role given', value: `<@&${role.id}>` },
+          { name: 'Users who received it', value: result.assigned.map((user) => `<@${user.id}>`).join(', ') },
+        ]);
+      }
+      await renderManagementAssignmentResult(interaction, result);
+      return true;
+    }
+    if (screen === 'management-result' && action === 'refresh') {
+      const result = savedTournament.lastManagementRoleAssignment;
+      if (!result) throw new Error('No role assignment result is available.');
+      await renderManagementAssignmentResult(interaction, result);
+      return true;
+    }
+    if (screen === 'management-result' && action === 'back') {
+      savedTournament.dashboardNavigationStack = [{ screen: 'home' }, { screen: 'management-roles' }];
+      saveGuildSettings(guildSettingsCache);
+      await persistManagementRoleState(interaction.guild.id, tournamentId, savedTournament);
+      await renderManagementRoleScreen(interaction, savedTournament);
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.error(`[Discord Bot] Management role dashboard failed for ${tournamentId}:`, err);
+    if (err.message?.startsWith('Could not save the role assignment state to MongoDB')) {
+      const pending = savedTournament.pendingManagementRoleAssignment;
+      if (pending) {
+        savedTournament.pendingManagementRoleAssignment = null;
+        saveDashboardScreen(interaction.guild, tournamentId, savedTournament, { screen: 'management-users', roleKey: pending.roleKey, operation: pending.operation });
+        await renderManagementUserPicker(interaction, savedTournament, pending.roleKey, err.message, pending.operation).catch(() => {});
+        return true;
+      }
+    }
+    const currentScreen = savedTournament.dashboardNavigationStack?.at(-1)?.screen || screen;
+    if (currentScreen === 'management-confirm' && savedTournament.pendingManagementRoleAssignment) {
+      await renderManagementAssignmentConfirm(interaction, savedTournament, savedTournament.pendingManagementRoleAssignment, err.message).catch(() => {});
+    } else if (currentScreen === 'management-users') {
+      const context = stackRoleContext(savedTournament);
+      await renderManagementUserPicker(interaction, savedTournament, context.roleKey, err.message, context.operation || 'give').catch(() => {});
+    } else if (currentScreen === 'management-role-choice') {
+      await renderManagementRoleChoiceScreen(interaction, stackRoleContext(savedTournament).operation || 'give', err.message).catch(() => {});
+    } else {
+      await renderManagementRoleScreen(interaction, savedTournament, err.message).catch(() => {});
+    }
+    return true;
+  }
+}
+
+function stackRoleContext(savedTournament) {
+  const stack = savedTournament.dashboardNavigationStack || [];
+  for (let index = stack.length - 1; index >= 0; index--) {
+    if (stack[index]?.roleKey || stack[index]?.operation) {
+      return { roleKey: stack[index].roleKey || '', operation: stack[index].operation || '' };
+    }
+  }
+  return { roleKey: '', operation: '' };
+}
+
 export async function handleDashboardNavigationInteraction(interaction) {
   const idParts = String(interaction.customId || '').split(':');
   const [namespace, screen, action] = idParts;
@@ -728,6 +1219,11 @@ export async function handleDashboardNavigationInteraction(interaction) {
   const stack = Array.isArray(savedTournament.dashboardNavigationStack) && savedTournament.dashboardNavigationStack.length
     ? savedTournament.dashboardNavigationStack
     : [{ screen: 'home' }];
+
+  if (screen?.startsWith('management-roles') || screen?.startsWith('management-role-choice') || screen?.startsWith('management-users') ||
+      screen?.startsWith('management-confirm') || screen?.startsWith('management-result')) {
+    return await handleManagementRolesDashboard(interaction, tournamentId, savedTournament, screen, action, idParts[3] || '');
+  }
 
   if (screen === 'qualify') {
     const roundId = idParts[3];
@@ -1769,6 +2265,7 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   } catch (err) {
     console.warn('[Discord Bot] Role creation error in control panel setup:', err.message);
   }
+  const { tourneyModRole: managementRole } = await ensureManagementDashboardRoles(guild, savedTournament, botMember);
 
   if (role && (!savedTournament.roleLastSyncedAt || previousRoleId !== role.id)) {
     try {
@@ -1852,19 +2349,26 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
     savedTournament.categoryId = category.id;
   }
 
-  // 2. Locate or create #bot-commands channel inside category
+  const managementCategory = await ensureTournamentCategory(guild, savedTournament, 'managementCategoryId', 'MANAGEMENT', [
+    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: managementRole.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessages] },
+    { id: botMember.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageRoles,
+      PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks] },
+  ]);
+
+  // 2. Locate, move, or create #bot-commands inside MANAGEMENT.
   let botCommandsChannel = null;
   if (savedTournament.channels.botCommandsId) {
     botCommandsChannel = guild.channels.cache.get(savedTournament.channels.botCommandsId) ||
       await guild.channels.fetch(savedTournament.channels.botCommandsId).catch(() => null);
-    if (botCommandsChannel && (botCommandsChannel.parentId !== category.id || botCommandsChannel.type !== ChannelType.GuildText || (botCommandsChannel.guildId || botCommandsChannel.guild?.id) !== guild.id)) {
+    if (botCommandsChannel && (botCommandsChannel.type !== ChannelType.GuildText || (botCommandsChannel.guildId || botCommandsChannel.guild?.id) !== guild.id)) {
       botCommandsChannel = null;
     }
   }
 
   if (!botCommandsChannel) {
     const matching = Array.from(guild.channels.cache.values()).filter(
-      (c) => c.parentId === category.id && c.type === ChannelType.GuildText && c.name === 'bot-commands'
+      (c) => [category.id, managementCategory.id].includes(c.parentId) && c.type === ChannelType.GuildText && c.name === 'bot-commands'
     );
     if (matching.length > 0) {
       botCommandsChannel = matching.sort((a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0))[0];
@@ -1888,9 +2392,16 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
         PermissionFlagsBits.EmbedLinks,
       ],
     },
+    {
+      id: managementRole.id,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
+    },
   ];
 
   if (botCommandsChannel) {
+    if (botCommandsChannel.parentId !== managementCategory.id) {
+      await botCommandsChannel.setParent(managementCategory.id, { lockPermissions: false });
+    }
     if (typeof botCommandsChannel.permissionOverwrites?.set === 'function') {
       await botCommandsChannel.permissionOverwrites.set(botCommandsOverwrites).catch(() => {});
     }
@@ -1898,60 +2409,15 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
     botCommandsChannel = await guild.channels.create({
       name: 'bot-commands',
       type: ChannelType.GuildText,
-      parent: category.id,
+      parent: managementCategory.id,
       topic: `Tournament Management & Control Panel (Admin Only) — ${tournament.title} (ID: ${tournamentId})`,
       permissionOverwrites: botCommandsOverwrites,
     });
     savedTournament.channels.botCommandsId = botCommandsChannel.id;
   }
 
-  // 3. Compute Channel Setup Status (Parallel channel resolution)
-  const updateId = savedTournament.channels.tournamentUpdateId;
-  const teamsId = savedTournament.channels.tournamentTeamsId;
-  const logId = savedTournament.channels.tournamentLogId;
-  const helpdeskId = savedTournament.channels.tournamentHelpdeskId;
-  const registerId = savedTournament.channels.tournamentRegisterId;
-  const voiceId = savedTournament.channels.roomMakerVcId;
-
-  const chIds = [updateId, teamsId, logId, helpdeskId, registerId, voiceId].filter(Boolean);
-  const uncachedChIds = chIds.filter((id) => !guild.channels.cache.has(id));
-  if (uncachedChIds.length > 0) {
-    await Promise.allSettled(uncachedChIds.map((id) => guild.channels.fetch(id).catch(() => null)));
-  }
-
-  const updateCh = updateId ? guild.channels.cache.get(updateId) || null : null;
-  const teamsCh = teamsId ? guild.channels.cache.get(teamsId) || null : null;
-  const logCh = logId ? guild.channels.cache.get(logId) || null : null;
-  const helpdeskCh = helpdeskId ? guild.channels.cache.get(helpdeskId) || null : null;
-  const registerCh = registerId ? guild.channels.cache.get(registerId) || null : null;
-  const voiceCh = voiceId ? guild.channels.cache.get(voiceId) || null : null;
-
-  const activeParticipantChannelCount = [updateCh, teamsCh, logCh, helpdeskCh, registerCh, voiceCh].filter(Boolean).length;
-  const isConfigured = activeParticipantChannelCount === 6;
-
-  let statusText = '';
-  if (isConfigured) {
-    statusText = `🟢 **Active** — All 7 tournament channels configured:\n` +
-      `  • 🤖 <#${botCommandsChannel.id}>\n` +
-      `  • 📢 <#${updateCh.id}>\n` +
-      `  • 📋 <#${teamsCh.id}>\n` +
-      `  • 🧾 <#${logCh.id}>\n` +
-      `  • 💬 <#${helpdeskCh.id}>\n` +
-      `  • 🔗 <#${registerCh.id}>\n` +
-      `  • 🔊 <#${voiceCh.id}> (\`room-maker-vc\` [Limit: ${voiceCh.userLimit || 15}])`;
-  } else if (activeParticipantChannelCount === 0) {
-    statusText = `🟡 **Pending Creation** — Participant channels not created yet.\n` +
-      `*Click **Create Channels** below to provision announcements, registered teams, tournament logs, helpdesk, registration, and room-maker voice channels.*`;
-  } else {
-    statusText = `⚠️ **Needs Repair** — Only ${activeParticipantChannelCount}/6 channels active (plus bot-commands).\n` +
-      `*Click **Create Channels** below to repair missing channels.*`;
-  }
-
-  const channelsStatus = {
-    isConfigured,
-    activeCount: activeParticipantChannelCount + 1,
-    statusText,
-  };
+  // 3. Compute channel and category status from the current Discord state.
+  const channelsStatus = await buildTournamentChannelStatus(guild, savedTournament, botCommandsChannel);
 
   // 4. Construct Embed and Action Buttons
   const embed = buildTournamentControlPanelEmbed(tournament, summary, channelsStatus, roleInfo, savedTournament.rounds || {});
@@ -2027,7 +2493,7 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   currentSettings.tournaments[tournamentId] = savedTournament;
   guildSettingsCache[guild.id] = currentSettings;
   saveGuildSettings(guildSettingsCache);
-  saveTournamentToDb(guild.id, tournamentId, savedTournament);
+  await saveTournamentToDb(guild.id, tournamentId, savedTournament);
 
   // Keep the dashboard as the only message in this channel.
   // 7. Remove command invocations, user messages, and any other messages.
@@ -2289,6 +2755,8 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
   const syncResult = {
     categoryAction: 'none', // created, reused, failed
     categoryId: null,
+    publicCategoryId: null,
+    managementCategoryId: null,
     channelsCreated: [],
     channelsReused: [],
     channelIds: {},
@@ -2373,6 +2841,26 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     }
   }
 
+  const tournamentShort = getTournamentShortName(tournament.title, tournament.id);
+  const tournamentPrefix = sanitizeChannelName(tournamentShort);
+  const { tourneyModRole: modsRole, spectatorRole } = await ensureManagementDashboardRoles(guild, savedTournament, botMember);
+  const botOverwrite = {
+    id: botMember.id,
+    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageRoles,
+      PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks],
+  };
+  const publicCategory = await ensureTournamentCategory(guild, savedTournament, 'publicCategoryId', `${tournamentShort} INFO`, [
+    { id: guild.roles.everyone.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory] },
+    botOverwrite,
+  ]);
+  const managementCategory = await ensureTournamentCategory(guild, savedTournament, 'managementCategoryId', 'MANAGEMENT', [
+    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: modsRole.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessages] },
+    botOverwrite,
+  ]);
+  syncResult.publicCategoryId = publicCategory.id;
+  syncResult.managementCategoryId = managementCategory.id;
+
   // Ensure dedicated tournament role is created or resolved
   let tournamentRole = null;
   try {
@@ -2422,28 +2910,44 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
   for (const channelDef of REQUIRED_TOURNAMENT_CHANNELS) {
     const existingId = savedTournament.channels[channelDef.key];
+    const desiredName = ['botCommandsId', 'tournamentLogId', 'tournamentTeamsId', 'specResultId'].includes(channelDef.key)
+      ? channelDef.name
+      : `${tournamentPrefix}-${channelDef.name}`;
+    const targetCategory = channelDef.category === 'public' ? publicCategory
+      : channelDef.category === 'management' ? managementCategory : category;
     let channelInstance = null;
 
     if (existingId) {
       channelInstance = guild.channels.cache.get(existingId) ||
         await guild.channels.fetch(existingId).catch(() => null);
-      if (channelInstance && (channelInstance.parentId !== category.id || channelInstance.type !== ChannelType.GuildText || (channelInstance.guildId || channelInstance.guild?.id) !== guild.id)) {
+      if (channelInstance && (channelInstance.type !== ChannelType.GuildText || (channelInstance.guildId || channelInstance.guild?.id) !== guild.id)) {
         channelInstance = null;
       }
     }
 
-    // Fallback: search by name inside the category if mapping was missing or invalid
+    // Adopt older channels by their former names and move them into the requested category.
     if (!channelInstance) {
-      const matching = Array.from(guild.channels.cache.values()).filter(
-        (c) => c.parentId === category.id && c.type === ChannelType.GuildText && c.name.toLowerCase() === channelDef.name.toLowerCase()
+      const oldNames = {
+        tournamentUpdateId: ['tournament-update', desiredName],
+        tournamentHelpdeskId: ['tournament-helpdesk', desiredName],
+        tournamentRegisterId: ['tournament-register', desiredName],
+        tournamentTeamsId: ['tournament-teams', desiredName],
+      }[channelDef.key] || [desiredName];
+      const matching = Array.from(guild.channels.cache.values()).filter((c) =>
+        c.type === ChannelType.GuildText && oldNames.some((name) => c.name.toLowerCase() === name.toLowerCase()) &&
+        (channelDef.category === 'legacy'
+          ? c.parentId === category.id
+          : (channelDef.key === 'botCommandsId' || channelDef.key === 'tournamentLogId'
+            ? [category.id, targetCategory.id].includes(c.parentId)
+            : (c.name.toLowerCase() === desiredName.toLowerCase() ? c.parentId === targetCategory.id : c.parentId === category.id)))
       );
       if (matching.length > 0) {
         const canonical = matching.find((c) => c.id === existingId) ||
           matching.sort((a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0))[0];
         channelInstance = canonical;
         if (matching.length > 1) {
-          console.warn(`[Discord Bot] ⚠️ Multiple channels found for #${channelDef.name} inside category ${category.name} (${category.id}). Selecting ${canonical.id} as canonical; reporting duplicate for administrator review.`);
-          syncResult.failures.push(`Duplicate channels detected for #${channelDef.name}. Selected <#${canonical.id}> as canonical.`);
+          console.warn(`[Discord Bot] ⚠️ Multiple channels found for #${desiredName}. Selecting ${canonical.id} as canonical.`);
+          syncResult.failures.push(`Duplicate channels detected for #${desiredName}. Selected <#${canonical.id}> as canonical.`);
         }
       }
     }
@@ -2451,83 +2955,65 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     // Determine initial permission overwrites based on channel type
     let targetOverwrites = [];
 
-    if (channelDef.key === 'botCommandsId' || channelDef.key === 'tournamentTeamsId') {
-      // Restricted admin-only channels: deny @everyone and deny tournament role
+    if (channelDef.category === 'management') {
       targetOverwrites = [
-        {
-          id: guild.roles.everyone.id,
-          deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages],
-        },
-        ...(tournamentRole ? [{
-          id: tournamentRole.id,
-          deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages],
+        { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: modsRole.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessages] },
+        ...(channelDef.key === 'specResultId' ? [{
+          id: spectatorRole.id,
+          allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessages],
         }] : []),
-        {
-          id: botMember.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.ManageChannels,
-            PermissionFlagsBits.ManageRoles,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.EmbedLinks,
-          ],
-        },
+        botOverwrite,
       ];
-    } else if (channelDef.key === 'tournamentHelpdeskId') {
-      // Public channel with chat: all server members can view and send messages
+    } else if (channelDef.participantAccess === 'read_write') {
       targetOverwrites = [
         {
           id: guild.roles.everyone.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.AttachFiles,
-            PermissionFlagsBits.EmbedLinks,
-          ],
+          allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory,
+            ...(channelDef.key === 'tournamentVerificationId' ? [PermissionFlagsBits.MentionEveryone] : [])],
         },
-        {
-          id: botMember.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.ManageChannels,
-            PermissionFlagsBits.ManageRoles,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.EmbedLinks,
-          ],
-        },
+        { id: modsRole.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessages, PermissionFlagsBits.MentionEveryone] },
+        botOverwrite,
       ];
-    } else {
-      // Public view-only channels (tournament-update, tournament-register)
+    } else if (channelDef.category === 'public') {
       targetOverwrites = [
         {
           id: guild.roles.everyone.id,
           allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
           deny: [
             PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.SendMessagesInThreads,
             PermissionFlagsBits.CreatePublicThreads,
             PermissionFlagsBits.CreatePrivateThreads,
             PermissionFlagsBits.AddReactions,
           ],
         },
-        {
-          id: botMember.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.ManageChannels,
-            PermissionFlagsBits.ManageRoles,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.EmbedLinks,
-          ],
-        },
+        { id: modsRole.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.SendMessagesInThreads, PermissionFlagsBits.CreatePublicThreads, PermissionFlagsBits.CreatePrivateThreads,
+          PermissionFlagsBits.AddReactions, PermissionFlagsBits.ManageMessages, PermissionFlagsBits.MentionEveryone] },
+        botOverwrite,
+      ];
+    } else {
+      targetOverwrites = [
+        { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
+        ...(channelDef.key === 'botCommandsId' || channelDef.key === 'tournamentLogId' ? [{
+          id: modsRole.id,
+          allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessages],
+        }] : []),
+        botOverwrite,
       ];
     }
 
-    if (channelInstance && channelInstance.parentId === category.id) {
-      syncResult.channelsReused.push(channelDef.name);
+    if (channelInstance) {
+      if (channelDef.category !== 'legacy' && channelInstance.parentId !== targetCategory.id) {
+        await channelInstance.setParent(targetCategory.id, { lockPermissions: false }).catch((err) => {
+          syncResult.failures.push(`Failed to move #${channelInstance.name}: ${err.message}`);
+        });
+      }
+      if (channelInstance.name !== desiredName && channelDef.category !== 'legacy') {
+        await channelInstance.setName(desiredName).catch((err) => syncResult.failures.push(`Failed to rename channel: ${err.message}`));
+      }
+      syncResult.channelsReused.push(desiredName);
       savedTournament.channels[channelDef.key] = channelInstance.id;
       activeChannels[channelDef.key] = channelInstance;
 
@@ -2536,24 +3022,24 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
         try {
           await channelInstance.permissionOverwrites.set(targetOverwrites);
         } catch (owErr) {
-          console.warn(`[Discord Bot] ⚠️ Could not repair overwrites on #${channelDef.name}:`, owErr.message);
+          console.warn(`[Discord Bot] ⚠️ Could not repair overwrites on #${desiredName}:`, owErr.message);
         }
       }
     } else {
       try {
         channelInstance = await guild.channels.create({
-          name: channelDef.name,
+          name: desiredName,
           type: ChannelType.GuildText,
-          parent: category.id,
+          parent: targetCategory.id,
           topic: `${channelDef.topic} — ${tournament.title}`,
           permissionOverwrites: targetOverwrites,
         });
 
-        syncResult.channelsCreated.push(channelDef.name);
+        syncResult.channelsCreated.push(desiredName);
         savedTournament.channels[channelDef.key] = channelInstance.id;
         activeChannels[channelDef.key] = channelInstance;
       } catch (err) {
-        syncResult.failures.push(`Failed to create #${channelDef.name}: ${err.message}`);
+        syncResult.failures.push(`Failed to create #${desiredName}: ${err.message}`);
       }
     }
   }
@@ -2564,14 +3050,15 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
   if (existingVcId) {
     voiceChannelInstance = guild.channels.cache.get(existingVcId) ||
       await guild.channels.fetch(existingVcId).catch(() => null);
-    if (voiceChannelInstance && (voiceChannelInstance.parentId !== category.id || voiceChannelInstance.type !== ChannelType.GuildVoice || (voiceChannelInstance.guildId || voiceChannelInstance.guild?.id) !== guild.id)) {
+    if (voiceChannelInstance && (voiceChannelInstance.type !== ChannelType.GuildVoice || (voiceChannelInstance.guildId || voiceChannelInstance.guild?.id) !== guild.id)) {
       voiceChannelInstance = null;
     }
   }
 
   if (!voiceChannelInstance) {
     const matchingVc = Array.from(guild.channels.cache.values()).find(
-      (c) => c.parentId === category.id && c.type === ChannelType.GuildVoice && c.name.toLowerCase() === 'room-maker-vc'
+      (c) => c.type === ChannelType.GuildVoice && c.name.toLowerCase() === 'room-maker-vc' &&
+        [category.id, publicCategory.id].includes(c.parentId)
     );
     if (matchingVc) {
       voiceChannelInstance = matchingVc;
@@ -2585,13 +3072,14 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
   ];
   const voiceDeniedBits = [...new Set(Object.values(PermissionFlagsBits))]
     .filter((permission) => !voiceAllowedBits.includes(permission));
-  const registeredVoiceOverwrites = tournamentRole
-    ? [{ id: tournamentRole.id, allow: voiceAllowedBits, deny: voiceDeniedBits }]
-    : Array.from(currentEligibleMemberIds, (memberId) => ({
+  const registeredVoiceOverwrites = [
+    ...(tournamentRole ? [{ id: tournamentRole.id, allow: voiceAllowedBits, deny: voiceDeniedBits }] : Array.from(currentEligibleMemberIds, (memberId) => ({
       id: memberId,
       allow: voiceAllowedBits,
       deny: voiceDeniedBits,
-    }));
+    }))),
+    { id: modsRole.id, allow: voiceAllowedBits, deny: voiceDeniedBits },
+  ];
   const voiceOverwrites = [
     { id: guild.roles.everyone.id, deny: [...new Set(Object.values(PermissionFlagsBits))] },
     ...registeredVoiceOverwrites,
@@ -2599,6 +3087,11 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
   if (voiceChannelInstance) {
     savedTournament.channels.roomMakerVcId = voiceChannelInstance.id;
+    if (voiceChannelInstance.parentId !== publicCategory.id) {
+      await voiceChannelInstance.setParent(publicCategory.id, { lockPermissions: false }).catch((err) => {
+        syncResult.failures.push(`Failed to move room-maker-vc: ${err.message}`);
+      });
+    }
     syncResult.channelsReused.push('room-maker-vc');
     if (voiceChannelInstance.userLimit !== 15 && typeof voiceChannelInstance.setUserLimit === 'function') {
       try {
@@ -2615,7 +3108,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
       voiceChannelInstance = await guild.channels.create({
         name: 'room-maker-vc',
         type: ChannelType.GuildVoice,
-        parent: category.id,
+        parent: publicCategory.id,
         userLimit: 15,
         permissionOverwrites: voiceOverwrites,
       });
@@ -2753,6 +3246,10 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     for (const round of Object.values(savedTournament.rounds)) {
       if (Array.isArray(round.groups)) {
         const roundNum = round.roundNumber || 1;
+        const roundCategory = await ensureTournamentCategory(guild, round, 'categoryId', `${tournamentShort} R${roundNum}`, [
+          { id: guild.roles.everyone.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory] },
+          botOverwrite,
+        ]);
         for (const group of round.groups) {
           const g = group.groupNumber;
           const roleName = `${tournament.title} R${roundNum} G${g}`.slice(0, 100);
@@ -2786,13 +3283,13 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
           let grpChannel = null;
           if (group.channelId) {
             grpChannel = guild.channels.cache.get(group.channelId) || await guild.channels.fetch(group.channelId).catch(() => null);
-            if (grpChannel && grpChannel.parentId !== category.id) {
+            if (grpChannel && (grpChannel.type !== ChannelType.GuildText || (grpChannel.guildId || grpChannel.guild?.id) !== guild.id)) {
               grpChannel = null;
             }
           }
           if (!grpChannel) {
             grpChannel = Array.from(guild.channels.cache.values()).find(
-              (c) => c.parentId === category.id && c.type === ChannelType.GuildText && c.name.toLowerCase() === channelName.toLowerCase()
+              (c) => c.parentId === roundCategory.id && c.type === ChannelType.GuildText && c.name.toLowerCase() === channelName.toLowerCase()
             ) || null;
           }
 
@@ -2873,7 +3370,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
             grpChannel = await guild.channels.create({
               name: channelName,
               type: ChannelType.GuildText,
-              parent: category.id,
+              parent: roundCategory.id,
               topic: `MatchDistrict ID/PWD & Slot Details for ${round.name} Group ${g}`,
               permissionOverwrites: groupOverwrites,
             }).catch((err) => {
@@ -2891,7 +3388,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
           if (grpChannel) {
             group.channelId = grpChannel.id;
             group.channelName = grpChannel.name;
-            await applyStrictGroupChannelPermissions(guild, grpChannel, grpRole, tournamentRole, botMember, round.groupMessagesOpen);
+            await applyStrictGroupChannelPermissions(guild, grpChannel, grpRole, tournamentRole, botMember, round.groupMessagesOpen, modsRole);
             await removeGroupResultControlMessage(guild, group, grpChannel);
             await updateGroupSlotListMessage(guild, tournament, round, group, grpChannel);
           }
@@ -2974,6 +3471,9 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
       if (!savedTournament) return summary;
 
       const categoryId = savedTournament.categoryId;
+      const legacyCategoryShared = Object.entries(currentSettings.tournaments || {}).some(([otherId, other]) =>
+        otherId !== tournamentId && other.categoryId === categoryId
+      );
 
       // 1. Delete all round group ID/PWD channels and voice channels first (Child Channels First)
       if (savedTournament.rounds && typeof savedTournament.rounds === 'object') {
@@ -2985,7 +3485,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
                 try {
                   const gch = guild.channels.cache.get(group.channelId) ||
                     await guild.channels.fetch(group.channelId).catch(() => null);
-                  if (gch && (!categoryId || gch.parentId === categoryId)) {
+                  if (gch) {
                     const gchName = gch.name;
                     await gch.delete('Tournament management: delete round group ID/PWD channel').catch(() => {});
                     if (!summary.deletedChannels.includes(gchName)) {
@@ -3004,7 +3504,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
                 try {
                   const gvc = guild.channels.cache.get(group.voiceChannelId) ||
                     await guild.channels.fetch(group.voiceChannelId).catch(() => null);
-                  if (gvc && (!categoryId || gvc.parentId === categoryId)) {
+                  if (gvc) {
                     const gvcName = gvc.name;
                     await gvc.delete('Tournament management: delete round group voice channel').catch(() => {});
                     if (!summary.deletedChannels.includes(gvcName)) {
@@ -3026,6 +3526,21 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
               group.submissionControlMessageId = null;
             }
           }
+          if (round.categoryId) {
+            const roundCategory = guild.channels.cache.get(round.categoryId) || await guild.channels.fetch(round.categoryId).catch(() => null);
+            if (roundCategory?.type === ChannelType.GuildCategory) {
+              for (const child of guild.channels.cache.filter((channel) => channel.parentId === roundCategory.id).values()) {
+                await child.delete('Tournament management: delete round category channel').catch((err) => {
+                  summary.failures.push(`Failed to delete ${child.name}: ${err.message}`);
+                });
+              }
+              await roundCategory.delete('Tournament management: delete round category').catch((err) => {
+                summary.failures.push(`Failed to delete round category ${round.categoryId}: ${err.message}`);
+              });
+              summary.categoryDeleted = true;
+            }
+            round.categoryId = null;
+          }
         }
         // Progressive update to MongoDB (restart-safe and idempotent)
         await saveTournamentToDb(guild.id, tournamentId, savedTournament).catch(() => {});
@@ -3037,7 +3552,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
           if (!chId) continue;
           try {
             const channel = guild.channels.cache.get(chId) || await guild.channels.fetch(chId).catch(() => null);
-            if (channel && (!categoryId || channel.parentId === categoryId)) {
+            if (channel) {
               const chName = channel.name;
               await channel.delete('Tournament management: deleted legacy squad channel').catch(() => {});
               if (!summary.deletedChannels.includes(chName)) {
@@ -3054,11 +3569,11 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
       }
 
       // 3. Delete any additional child channels under the tournament category (e.g. temporary verify channels)
-      if (categoryId) {
+      if (categoryId && !legacyCategoryShared) {
         try {
           const childChannels = guild.channels.cache.filter((c) => c.parentId === categoryId);
           for (const [cId, child] of childChannels) {
-            if (cId !== savedTournament.channels?.botCommandsId) {
+            if (cId !== savedTournament.channels?.botCommandsId && cId !== savedTournament.channels?.tournamentLogId) {
               try {
                 const chName = child.name;
                 await child.delete('Tournament management: deleted category child channel').catch(() => {});
@@ -3074,20 +3589,25 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
           }
         } catch {}
       }
+      if (savedTournament.managementCategoryId) {
+        const managementChildren = guild.channels.cache.filter((channel) => channel.parentId === savedTournament.managementCategoryId);
+        for (const [childId, child] of managementChildren) {
+          if ([savedTournament.channels?.botCommandsId, savedTournament.channels?.tournamentLogId].includes(childId)) continue;
+          await child.delete('Tournament management: deleted management category child channel').catch((err) => {
+            summary.failures.push(`Failed to delete child channel ${childId}: ${err.message}`);
+          });
+        }
+      }
 
       // 4. Delete verified tournament channels in savedTournament.channels (#bot-commands deleted last among child channels)
       const channelEntries = Object.entries(savedTournament.channels || {});
-      const sortedChannelEntries = channelEntries.sort(([keyA], [keyB]) => {
-        if (keyA === 'botCommandsId') return 1;
-        if (keyB === 'botCommandsId') return -1;
-        return 0;
-      });
+      const sortedChannelEntries = channelEntries.filter(([key]) => !['botCommandsId', 'tournamentLogId'].includes(key));
 
       for (const [chKey, chId] of sortedChannelEntries) {
         if (!chId) continue;
         try {
           const channel = guild.channels.cache.get(chId) || await guild.channels.fetch(chId).catch(() => null);
-          if (channel && (!categoryId || channel.parentId === categoryId)) {
+          if (channel) {
             const chName = channel.name;
             await channel.delete('Tournament management: deleted tournament channel').catch(() => {});
             if (!summary.deletedChannels.includes(chName)) {
@@ -3102,22 +3622,25 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
         savedTournament.channels[chKey] = null;
       }
 
-      // 5. Delete category last (after all child channels are deleted)
-      if (categoryId) {
-        try {
-          const cat = guild.channels.cache.get(categoryId) ||
-            await guild.channels.fetch(categoryId).catch(() => null);
-          if (cat && cat.type === ChannelType.GuildCategory) {
-            await cat.delete('Tournament management: deleted tournament category').catch(() => {});
-            summary.categoryDeleted = true;
-          }
-        } catch (err) {
-          if (err.code !== 10003) {
-            summary.failures.push(`Failed to delete category: ${err.message}`);
-          }
+      // 5. Delete tournament categories after their managed channels. MANAGEMENT remains
+      // because bot-commands and tournament-log stay there.
+      for (const categoryKey of ['publicCategoryId', ...(legacyCategoryShared ? [] : ['categoryId'])]) {
+        const categoryIdToDelete = savedTournament[categoryKey];
+        if (!categoryIdToDelete) continue;
+        const cat = guild.channels.cache.get(categoryIdToDelete) || await guild.channels.fetch(categoryIdToDelete).catch(() => null);
+        if (!cat || cat.type !== ChannelType.GuildCategory) continue;
+        for (const child of guild.channels.cache.filter((channel) => channel.parentId === cat.id).values()) {
+          await child.delete('Tournament management: delete tournament structure channel').catch((err) => {
+            summary.failures.push(`Failed to delete ${child.name}: ${err.message}`);
+          });
         }
-        savedTournament.categoryId = null;
+        await cat.delete('Tournament management: delete tournament structure category').catch((err) => {
+          summary.failures.push(`Failed to delete category ${cat.name}: ${err.message}`);
+        });
+        summary.categoryDeleted = true;
+        savedTournament[categoryKey] = null;
       }
+      savedTournament.managementCategoryId = savedTournament.managementCategoryId || null;
 
       // 6. Delete managed messages mappings in MongoDB for this tournament
       try {
@@ -3131,8 +3654,11 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
       }
 
       // 7. Update persistent state - DO NOT DELETE TOURNAMENT, ROUNDS, OR ROLES FROM DB!
-      savedTournament.channels = {};
-      savedTournament.categoryId = null;
+      const persistentChannels = {
+        botCommandsId: savedTournament.channels?.botCommandsId || null,
+        tournamentLogId: savedTournament.channels?.tournamentLogId || null,
+      };
+      savedTournament.channels = persistentChannels;
       savedTournament.controlPanelMessageId = null;
       savedTournament.teamListMessageId = null;
       savedTournament.teamListMessageIds = [];
@@ -3603,19 +4129,17 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
         : `• All round-specific group ID/PWD channels (e.g. \`bgmis2026-r1-g1\`, \`bgmis2026-r1-g2\`)\n`;
 
       const promptText = `⚠️ **Confirm Tournament Channels Deletion**\n` +
-        `Are you sure you want to delete all Discord channels for tournament \`${tournamentId}\`?\n\n` +
+        `Are you sure you want to delete the Discord channel structure for tournament \`${tournamentId}\`?\n\n` +
         `**This will permanently delete from Discord:**\n` +
-        `• \`#bot-commands\`\n` +
-        `• \`#tournament-update\`\n` +
-        `• \`#tournament-teams\`\n` +
-        `• \`#tournament-helpdesk\`\n` +
-        `• \`#tournament-register\`\n` +
-        `• \`room-maker-vc\`\n` +
+        `• The tournament INFO category and the non-preserved MANAGEMENT channels\n` +
+        `• \`#updates\`, \`#roadmap\`, \`#scoreboard\`, \`#helpdesk\`, \`#register-here\`, and \`#verification\`\n` +
+        `• \`#registered-team\`, \`#spec-result\`, and \`room-maker-vc\`\n` +
         groupDetails +
-        `• The tournament category\n\n` +
+        `• All round categories and the legacy tournament category\n\n` +
+        `**Preserved Discord channels:** \`#bot-commands\` and \`#tournament-log\` stay in MANAGEMENT.\n\n` +
         `🛡️ **Preserved Data:**\n` +
         `Tournament records, registered teams, round configurations, 25-slot group allocations, results, and qualifications in MongoDB are **NOT deleted** and will remain completely preserved.\n\n` +
-        `*(You can recreate all required channels at any time by clicking **Create Channels**)*\n` +
+        `*(You can recreate the channel structure at any time by clicking **Create Channels**)*\n` +
         `⏱️ **This confirmation prompt will expire in 30 seconds.**`;
 
       await interaction.editReply({ content: promptText, components: [confirmRow], embeds: [] }).catch(() => {});
@@ -4575,6 +5099,12 @@ export async function handleConfirmDeleteRound(interaction, tournamentId, roundI
           if (gch) await gch.delete('Tournament management: delete round group channel').catch(() => {});
         } catch {}
       }
+      if (group.voiceChannelId) {
+        try {
+          const voice = guild.channels.cache.get(group.voiceChannelId) || await guild.channels.fetch(group.voiceChannelId).catch(() => null);
+          if (voice) await voice.delete('Tournament management: delete round group voice channel').catch(() => {});
+        } catch {}
+      }
       if (group.roleId && guild.roles) {
         try {
           const gr = guild.roles.cache.get(group.roleId) || await guild.roles.fetch(group.roleId).catch(() => null);
@@ -4583,6 +5113,18 @@ export async function handleConfirmDeleteRound(interaction, tournamentId, roundI
           }
         } catch {}
       }
+    }
+  }
+
+  if (round.categoryId) {
+    const roundCategory = guild.channels.cache.get(round.categoryId) || await guild.channels.fetch(round.categoryId).catch(() => null);
+    if (roundCategory?.type === ChannelType.GuildCategory) {
+      for (const child of guild.channels.cache.filter((channel) => channel.parentId === roundCategory.id).values()) {
+        await child.delete('Tournament management: delete round category channel').catch(() => {});
+      }
+      await roundCategory.delete('Tournament management: delete round category').catch((err) => {
+        console.warn(`[Discord Bot] Could not delete round category ${round.categoryId}:`, err.message);
+      });
     }
   }
 
@@ -4749,35 +5291,10 @@ export async function handleBackToTournamentPanel(interaction, tournamentId) {
 
     const { tournament, summary } = backendData;
 
-    let category = null;
-    if (savedTournament.categoryId) {
-      category = guild.channels.cache.get(savedTournament.categoryId) || null;
-    }
-
-    const channels = savedTournament.channels || {};
-    const expectedChannels = [
-      channels.tournamentUpdateId,
-      channels.tournamentTeamsId,
-      channels.tournamentLogId,
-      channels.tournamentHelpdeskId,
-      channels.tournamentRegisterId,
-      channels.roomMakerVcId,
-    ].filter(Boolean);
-
-    let activeParticipantChannelCount = 0;
-    for (const chId of expectedChannels) {
-      const ch = guild.channels.cache.get(chId);
-      if (ch) activeParticipantChannelCount++;
-    }
-
-    const isConfigured = Boolean(category && activeParticipantChannelCount >= 6);
-    const channelsStatus = {
-      isConfigured,
-      activeCount: activeParticipantChannelCount + 1,
-      statusText: isConfigured
-        ? `🟢 **Active & Configured** — All 6 channels & category operational.`
-        : `🟡 **Pending Creation** — Participant channels not created yet.`,
-    };
+    const botCommandsChannel = savedTournament.channels?.botCommandsId
+      ? guild.channels.cache.get(savedTournament.channels.botCommandsId) || await guild.channels.fetch(savedTournament.channels.botCommandsId).catch(() => null)
+      : null;
+    const channelsStatus = await buildTournamentChannelStatus(guild, savedTournament, botCommandsChannel);
 
     let roleInfo = null;
     if (savedTournament.roleId) {
@@ -5123,8 +5640,13 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       }
 
       const tourRole = savedTournament.roleId ? guild.roles.cache.get(savedTournament.roleId) : null;
-      const tourPrefix = normalizeTournamentRoleName(tournament.title, tournament.id);
+      const { tourneyModRole: modsRole } = await ensureManagementDashboardRoles(guild, savedTournament, botMember);
       const roundNum = round.roundNumber || 1;
+      const tourPrefix = normalizeTournamentRoleName(tournament.title, tournament.id);
+      const roundCategory = await ensureTournamentCategory(guild, round, 'categoryId', `${getTournamentShortName(tournament.title, tournament.id)} R${roundNum}`, [
+        { id: guild.roles.everyone.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory] },
+        { id: botMember.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+      ]);
 
       const groups = [];
       let totalAssignedMembers = 0;
@@ -5166,13 +5688,13 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
         if (existingGroup?.channelId) {
           groupChannel = guild.channels.cache.get(existingGroup.channelId) ||
             await guild.channels.fetch(existingGroup.channelId).catch(() => null);
-          if (groupChannel && groupChannel.parentId !== category.id) {
+          if (groupChannel && (groupChannel.type !== ChannelType.GuildText || (groupChannel.guildId || groupChannel.guild?.id) !== guild.id)) {
             groupChannel = null;
           }
         }
         if (!groupChannel) {
           groupChannel = Array.from(guild.channels.cache.values()).find(
-            (c) => c.parentId === category.id && c.type === ChannelType.GuildText && c.name.toLowerCase() === channelName.toLowerCase()
+            (c) => c.parentId === roundCategory.id && c.type === ChannelType.GuildText && c.name.toLowerCase() === channelName.toLowerCase()
           ) || null;
         }
 
@@ -5246,7 +5768,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
           groupChannel = await guild.channels.create({
             name: channelName,
             type: ChannelType.GuildText,
-            parent: category.id,
+            parent: roundCategory.id,
             topic: `Private Match Credentials for Group ${g} (${round.name}) — ${tournament.title}`,
             permissionOverwrites: groupOverwrites,
           });
@@ -5367,7 +5889,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
         groups.push(groupObj);
 
         if (groupChannel) {
-          await applyStrictGroupChannelPermissions(guild, groupChannel, groupRole, tourRole, botMember, round.groupMessagesOpen);
+          await applyStrictGroupChannelPermissions(guild, groupChannel, groupRole, tourRole, botMember, round.groupMessagesOpen, modsRole);
           await removeGroupResultControlMessage(guild, groupObj, groupChannel);
           await updateGroupSlotListMessage(guild, tournament, round, groupObj, groupChannel);
         }
@@ -5665,7 +6187,7 @@ export const pendingResultSubmissions = new Map();
  * - Mention everyone/here
  * Also audits and purges any unauthorized active or archived threads under the channel.
  */
-export async function applyStrictGroupChannelPermissions(guild, groupChannel, groupRole, tourRole, botMember, groupMessagesOpen = false) {
+export async function applyStrictGroupChannelPermissions(guild, groupChannel, groupRole, tourRole, botMember, groupMessagesOpen = false, modsRole = null) {
   if (!groupChannel || typeof groupChannel.permissionOverwrites?.set !== 'function') return;
 
   const overwrites = [
@@ -5711,6 +6233,24 @@ export async function applyStrictGroupChannelPermissions(guild, groupChannel, gr
     ...(tourRole ? [{
       id: tourRole.id,
       deny: [PermissionFlagsBits.ViewChannel],
+    }] : []),
+    ...(modsRole ? [{
+      id: modsRole.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.SendMessagesInThreads,
+        PermissionFlagsBits.CreatePublicThreads,
+        PermissionFlagsBits.CreatePrivateThreads,
+        PermissionFlagsBits.AddReactions,
+        PermissionFlagsBits.AttachFiles,
+        PermissionFlagsBits.EmbedLinks,
+        PermissionFlagsBits.UseApplicationCommands,
+        PermissionFlagsBits.ManageMessages,
+        PermissionFlagsBits.ManageThreads,
+        PermissionFlagsBits.MentionEveryone,
+      ],
     }] : []),
     {
       id: botMember.id,
@@ -6425,7 +6965,7 @@ export async function handleDashboardQualifySelection(interaction) {
     settings.tournaments[tournamentId] = savedTournament;
     guildSettingsCache[interaction.guild.id] = settings;
     saveGuildSettings(guildSettingsCache);
-    await saveTournamentToDb(interaction.guild.id, tournamentId, savedTournament);
+      await persistManagementRoleState(interaction.guild.id, tournamentId, savedTournament);
 
     const { embed, components } = buildQualifyGroupScreen(round, group);
     await interaction.editReply({ content: null, embeds: [embed], components });
@@ -7724,7 +8264,8 @@ export async function publishGroupCredentials(guild, tournamentId, roundId, grou
   // Ensure strict read-only permissions and update slot list with credentials
   const groupRole = group.roleId ? (guild.roles.cache.get(group.roleId) || await guild.roles.fetch(group.roleId).catch(() => null)) : null;
   const tourRole = savedTournament.roleId ? (guild.roles.cache.get(savedTournament.roleId) || await guild.roles.fetch(savedTournament.roleId).catch(() => null)) : null;
-  await applyStrictGroupChannelPermissions(guild, channel, groupRole, tourRole, guild.members.me, targetRound.groupMessagesOpen);
+  const { tourneyModRole: modsRole } = await ensureManagementDashboardRoles(guild, savedTournament, guild.members.me);
+  await applyStrictGroupChannelPermissions(guild, channel, groupRole, tourRole, guild.members.me, targetRound.groupMessagesOpen, modsRole);
   await removeGroupResultControlMessage(guild, group, channel);
   await updateGroupSlotListMessage(guild, savedTournament, targetRound, group, channel);
 
@@ -7863,12 +8404,6 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       ? '**Tournament Synchronization Completed with Warnings**'
       : '**Tournament Synchronization Complete**';
 
-    const catActionText = syncResult.categoryAction === 'created'
-      ? `Created (<#${syncResult.categoryId}>)`
-      : syncResult.categoryAction === 'reused'
-        ? `Reused (<#${syncResult.categoryId}>)`
-        : 'Failed';
-
     let msg = `${statusEmoji} ${statusTitle}\n\n` +
       `• 🏆 **Tournament:** **${tournament.title}** (ID: \`${tournament.id}\`)\n` +
       `• 🎮 **Status:** ${tournament.status?.toUpperCase() || 'PUBLISHED'}\n` +
@@ -7877,17 +8412,20 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       `• 🔗 **Eligible Linked Discord Members:** **${summary.eligible_linked_members_count}** participant(s) granted channel access\n` +
       `• ⚠️ **Unlinked Participants:** **${summary.unlinked_members_count}** account(s) not linked to Discord on website\n` +
       `• 🛡️ **Duplicate Discord IDs:** **${summary.duplicate_discord_ids_count || 0}** safely deduplicated\n\n` +
-      `📁 **Tournament Category & Channels:**\n` +
-      `• **Category:** ${catActionText}\n` +
-      `• **Four Shared Channels:**\n` +
-      `• **Four Shared Channels & Registration Link:**\n` +
+      `📁 **Tournament Categories & Channels:**\n` +
+      `• **Categories:** <#${syncResult.publicCategoryId || syncResult.categoryId}> · <#${syncResult.managementCategoryId || syncResult.categoryId}>\n` +
       `  - 🤖 **Bot Commands (Admin Only):** ${syncResult.channelIds?.botCommandsId ? `<#${syncResult.channelIds.botCommandsId}>` : '#bot-commands'}\n` +
-      `  - 📢 **Announcements & Updates:** ${syncResult.channelIds?.tournamentUpdateId ? `<#${syncResult.channelIds.tournamentUpdateId}>` : '#tournament-update'}\n` +
-      `  - 📋 **Registered Teams Roster:** ${syncResult.channelIds?.tournamentTeamsId ? `<#${syncResult.channelIds.tournamentTeamsId}>` : '#tournament-teams'}\n` +
-      `  - 📋 **Registered Teams Roster:** ${syncResult.channelIds?.tournamentTeamsId ? `<#${syncResult.channelIds.tournamentTeamsId}>` : '#tournament-teams'} (Admin Only)\n` +
-      `  - 💬 **Helpdesk & Support:** ${syncResult.channelIds?.tournamentHelpdeskId ? `<#${syncResult.channelIds.tournamentHelpdeskId}>` : '#tournament-helpdesk'}\n` +
-      `  - 🔗 **Registration & Details:** ${syncResult.channelIds?.tournamentRegisterId ? `<#${syncResult.channelIds.tournamentRegisterId}>` : '#tournament-register'}\n` +
-      `• **Roster Status:** ${syncResult.teamsUpdatedInChannel ? '🟢 **Published to #tournament-teams**' : '⚪ **Roster ready**'}\n` +
+      `  - 📢 **Updates:** ${syncResult.channelIds?.tournamentUpdateId ? `<#${syncResult.channelIds.tournamentUpdateId}>` : '#updates'}\n` +
+      `  - 🗺️ **Roadmap:** ${syncResult.channelIds?.tournamentRoadmapId ? `<#${syncResult.channelIds.tournamentRoadmapId}>` : '#roadmap'}\n` +
+      `  - 📊 **Scoreboard:** ${syncResult.channelIds?.tournamentScoreboardId ? `<#${syncResult.channelIds.tournamentScoreboardId}>` : '#scoreboard'}\n` +
+      `  - 💬 **Helpdesk:** ${syncResult.channelIds?.tournamentHelpdeskId ? `<#${syncResult.channelIds.tournamentHelpdeskId}>` : '#helpdesk'}\n` +
+      `  - 🔗 **Register:** ${syncResult.channelIds?.tournamentRegisterId ? `<#${syncResult.channelIds.tournamentRegisterId}>` : '#register-here'}\n` +
+      `  - ✅ **Verification:** ${syncResult.channelIds?.tournamentVerificationId ? `<#${syncResult.channelIds.tournamentVerificationId}>` : '#verification'}\n` +
+      `  - 👥 **Registered Teams:** ${syncResult.channelIds?.tournamentTeamsId ? `<#${syncResult.channelIds.tournamentTeamsId}>` : '#registered-team'}\n` +
+      `  - 🧾 **Spec Results:** ${syncResult.channelIds?.specResultId ? `<#${syncResult.channelIds.specResultId}>` : '#spec-result'}\n` +
+      `  - 🧾 **Tournament Log:** ${syncResult.channelIds?.tournamentLogId ? `<#${syncResult.channelIds.tournamentLogId}>` : '#tournament-log'}\n` +
+      `  - 🔊 **Room Maker:** ${syncResult.channelIds?.roomMakerVcId ? `<#${syncResult.channelIds.roomMakerVcId}>` : '#room-maker-vc'}\n` +
+      `• **Roster Status:** ${syncResult.teamsUpdatedInChannel ? '🟢 **Published to #registered-team**' : '⚪ **Roster ready**'}\n` +
       `• **Permission Overwrites:** **${syncResult.permissionsUpdated}** applied, **${syncResult.permissionsRemoved}** removed\n`;
 
     if (syncResult.obsoleteSquadChannelsDeleted > 0) {
@@ -8128,8 +8666,8 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       `Are you sure you want to permanently delete tournament **${tourTitle}** (\`${tournamentId}\`)?\n\n` +
       `⚠️ **This action is irreversible and will permanently delete:**\n` +
       `• ALL Discord channels including \`#bot-commands\`, announcements, teams, helpdesk, voice channels, and group channels\n` +
-      `• The Discord tournament category\n` +
-      `• All tournament roles and group roles\n` +
+      `• The tournament, INFO, MANAGEMENT, legacy, and round categories\n` +
+      `• The tournament role and round group roles; Tourney-mod and Spectator are preserved\n` +
       `• All MongoDB tournament documents, rounds, slot lists, and managed message mappings\n\n` +
       `⏱️ **This confirmation prompt will expire in 30 seconds.**`;
 
@@ -8211,8 +8749,9 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       `Are you sure you want to permanently delete tournament **${tourTitle}** (\`${tournamentId}\`)?\n\n` +
       `⚠️ **This action is irreversible and will permanently delete:**\n` +
       `• ALL Discord channels including \`#bot-commands\`, announcements, teams, helpdesk, voice channels, and group channels\n` +
-      `• The Discord tournament category\n` +
-      `• All tournament roles and group roles\n` +
+      `• The tournament, INFO, MANAGEMENT, legacy, and round categories\n` +
+      `• The dedicated tournament role and round group roles\n` +
+      `• The Tourney-mod and Spectator roles are preserved\n` +
       `• All MongoDB tournament documents, rounds, slot lists, and managed message mappings\n\n` +
       `⏱️ **This confirmation prompt will expire in 30 seconds.**`;
 
@@ -8248,6 +8787,9 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       await purgeAllTournamentDataFromDb(guild.id, tournamentId);
       return summary;
     }
+    const legacyCategoryShared = Object.entries(currentSettings.tournaments || {}).some(([otherId, other]) =>
+      otherId !== tournamentId && other.categoryId === saved.categoryId
+    );
 
     // 1. Transition state: deletion_pending -> deleting
     saved.deletionStatus = 'deletion_pending';
@@ -8283,7 +8825,7 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
               try {
                 const gch = guild.channels.cache.get(group.channelId) ||
                   await guild.channels.fetch(group.channelId).catch(() => null);
-                if (gch && (!saved.categoryId || gch.parentId === saved.categoryId)) {
+                if (gch) {
                   const gchName = gch.name;
                   await gch.delete('Tournament permanent deletion: round group channel').catch(() => {});
                   summary.deletedChannels.push(gchName);
@@ -8294,7 +8836,7 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
               try {
                 const vch = guild.channels.cache.get(group.voiceChannelId) ||
                   await guild.channels.fetch(group.voiceChannelId).catch(() => null);
-                if (vch && (!saved.categoryId || vch.parentId === saved.categoryId)) {
+                if (vch) {
                   const vchName = vch.name;
                   await vch.delete('Tournament permanent deletion: round group voice channel').catch(() => {});
                   summary.deletedChannels.push(vchName);
@@ -8322,7 +8864,7 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       if (!chId) continue;
       try {
         const channel = guild.channels.cache.get(chId) || await guild.channels.fetch(chId).catch(() => null);
-        if (channel && (!saved.categoryId || channel.parentId === saved.categoryId || chId === saved.channels?.botCommandsId)) {
+        if (channel) {
           const chName = channel.name;
           await channel.delete('Tournament permanent deletion').catch(() => {});
           summary.deletedChannels.push(chName);
@@ -8332,17 +8874,24 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       }
     }
 
-    // 5. Delete category
-    if (saved.categoryId) {
+    // 5. Delete every category owned by the tournament after removing its channels.
+    const tournamentCategoryIds = new Set([
+      ...(legacyCategoryShared ? [] : [saved.categoryId]),
+      saved.publicCategoryId,
+      saved.managementCategoryId,
+      ...Object.values(saved.rounds || {}).map((round) => round.categoryId),
+    ].filter(Boolean));
+    for (const categoryId of tournamentCategoryIds) {
+      const category = guild.channels.cache.get(categoryId) || await guild.channels.fetch(categoryId).catch(() => null);
+      if (!category || category.type !== ChannelType.GuildCategory) continue;
+      for (const child of guild.channels.cache.filter((channel) => channel.parentId === category.id).values()) {
+        await child.delete('Tournament permanent deletion: category child').catch(() => {});
+      }
       try {
-        const cat = guild.channels.cache.get(saved.categoryId) ||
-          await guild.channels.fetch(saved.categoryId).catch(() => null);
-        if (cat && cat.type === ChannelType.GuildCategory) {
-          await cat.delete('Tournament permanent deletion: category').catch(() => {});
-          summary.categoryDeleted = true;
-        }
+        await category.delete('Tournament permanent deletion: category');
+        summary.categoryDeleted = true;
       } catch (err) {
-        summary.failures.push(`Failed to delete category: ${err.message}`);
+        if (err.code !== 10003) summary.failures.push(`Failed to delete category ${category.name}: ${err.message}`);
       }
     }
 
@@ -8352,8 +8901,14 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
         const role = guild.roles.cache?.get(saved.roleId) ||
           await guild.roles.fetch?.(saved.roleId).catch(() => null);
         if (role && typeof role.delete === 'function') {
-          await role.delete(`Tournament ${saved.tournamentTitle || tournamentId} permanent deletion`).catch(() => {});
-          summary.rolesDeletedCount++;
+          try {
+            await role.delete(`Tournament ${saved.tournamentTitle || tournamentId} permanent deletion`);
+            summary.rolesDeletedCount++;
+          } catch (err) {
+            if (err.code !== 10011 && err.code !== 10003) {
+              summary.failures.push(`Failed to delete tournament role ${saved.roleId}: ${err.message}`);
+            }
+          }
         }
       } catch (err) {
         summary.failures.push(`Failed to delete role: ${err.message}`);
