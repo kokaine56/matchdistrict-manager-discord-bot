@@ -794,7 +794,7 @@ export async function handleTournamentVerificationMessage(message) {
     const backend = await fetchTournamentRegistrationsFromBackend(tournamentId);
     const team = (backend.teams || []).find((entry) => {
       const status = String(entry.status || '').toLowerCase();
-      if (['rejected', 'cancelled', 'expired', 'payment_rejected'].includes(status)) return false;
+      if (status !== 'approved') return false;
       return (entry.linked_members || []).some((member) => String(member.discord_id) === String(message.author.id));
     });
     if (!team?.registration_id) {
