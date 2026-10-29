@@ -1387,6 +1387,7 @@ async function updateDashboardNavigation(guild, tournamentId, operation, screen 
   }
 
   savedTournament.dashboardNavigationStack = stack;
+  savedTournament.dashboardCurrentScreen = stack[stack.length - 1];
   settings.tournaments[tournamentId] = savedTournament;
   guildSettingsCache[guild.id] = settings;
   saveGuildSettings(guildSettingsCache);
@@ -1401,11 +1402,51 @@ function saveDashboardScreen(guild, tournamentId, savedTournament, screen) {
     : [{ screen: 'home' }];
   stack[stack.length - 1] = screen;
   savedTournament.dashboardNavigationStack = stack;
+  savedTournament.dashboardCurrentScreen = screen;
   guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
   saveGuildSettings(guildSettingsCache);
+  saveTournamentToDb(guild.id, tournamentId, savedTournament).catch((error) => {
+    console.error(`[Discord Bot] Could not persist dashboard screen for ${tournamentId}:`, error.message);
+  });
+}
+
+async function renderPersistedDashboardScreen(guild, tournamentId, savedTournament, message) {
+  const state = savedTournament?.dashboardNavigationStack?.at(-1) || savedTournament?.dashboardCurrentScreen || { screen: 'home' };
+  const roundId = state.roundId;
+  const currentRound = roundId ? savedTournament.rounds?.[roundId] : null;
+  if (['round', 'add-team', 'add-team-method', 'registration-slots', 'start-round-confirm', 'qualify-groups', 'qualify-group'].includes(state.screen) && !currentRound) {
+    await updateDashboardNavigation(guild, tournamentId, 'home');
+    return false;
+  }
+  if (!message) return false;
+  const interaction = {
+    guild, guildId: guild.id, channelId: savedTournament.channels?.botCommandsId,
+    member: { id: guild.ownerId, guild, permissions: { has: () => true } }, user: guild.client?.user, message,
+    deferred: true, replied: false,
+    editReply: (payload) => message.edit(payload),
+    update: (payload) => message.edit(payload),
+    reply: (payload) => message.edit(payload),
+    followUp: async () => null,
+  };
+  if (state.screen === 'round') return handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, null, message);
+  if (state.screen === 'add-team') return handleAddTeamGroupChooser(interaction, tournamentId, roundId);
+  if (state.screen === 'add-team-method') return renderAddTeamMethodChooser(interaction, roundId);
+  if (state.screen === 'rounds') return handleViewRoundsScreen(interaction, tournamentId);
+  if (state.screen === 'qualify-groups') return handleRoundQualifyGroupSelection(interaction, tournamentId, roundId);
+  if (state.screen === 'qualify-group') return handleDashboardQualifyGroup(interaction, tournamentId, roundId, state.groupId);
+  if (state.screen === 'start-round-confirm') return renderStartRoundConfirmation(interaction, tournamentId, roundId);
+  if (state.screen === 'danger') return handleRenderDangerZoneScreen(interaction, tournamentId);
+  if (state.screen?.startsWith('management-') && !['management-result'].includes(state.screen)) {
+    return handleManagementRolesDashboard(interaction, tournamentId, savedTournament, state.screen, 'refresh');
+  }
+  if (state.screen === 'management-result' && savedTournament.lastManagementRoleAssignment) {
+    return renderManagementAssignmentResult(interaction, savedTournament.lastManagementRoleAssignment);
+  }
+  return false;
 }
 
 async function persistManagementRoleState(guildId, tournamentId, savedTournament) {
+  savedTournament.dashboardCurrentScreen = savedTournament.dashboardNavigationStack?.at(-1) || { screen: 'home' };
   const persisted = await saveTournamentToDb(guildId, tournamentId, savedTournament);
   if (!persisted) throw new Error('Could not save the role assignment state to MongoDB. Check the database connection and try again.');
 }
@@ -1839,8 +1880,49 @@ export async function handleDashboardNavigationInteraction(interaction) {
   }
   if (screen === 'round' && action === 'add-team') {
     const roundId = idParts[3];
-    updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'add-team', roundId });
+    await updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'add-team-method', roundId });
+    await renderAddTeamMethodChooser(interaction, roundId);
+    return true;
+  }
+  if (screen === 'round' && action === 'start') {
+    const roundId = idParts[3];
+    await updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'start-round-confirm', roundId });
+    await renderStartRoundConfirmation(interaction, tournamentId, roundId);
+    return true;
+  }
+  if (screen === 'round' && action === 'registration-close') {
+    await closeRoundRegistration(interaction, tournamentId, idParts[3]);
+    return true;
+  }
+  if (screen === 'start-round-confirm') {
+    const roundId = idParts[3] || savedTournament.dashboardNavigationStack?.at(-1)?.roundId;
+    if (action === 'cancel') {
+      await updateDashboardNavigation(interaction.guild, tournamentId, 'back');
+      await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId);
+      return true;
+    }
+    if (action === 'confirm') {
+      await updateDashboardNavigation(interaction.guild, tournamentId, 'back');
+      await handleConfirmStartRound(interaction, tournamentId, roundId);
+      return true;
+    }
+  }
+  if (screen === 'add-team-method' && action === 'manual') {
+    const roundId = idParts[3] || savedTournament.dashboardNavigationStack?.at(-1)?.roundId;
+    await updateDashboardNavigation(interaction.guild, tournamentId, 'back');
+    await updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'add-team', roundId });
     await handleAddTeamGroupChooser(interaction, tournamentId, roundId);
+    return true;
+  }
+  if (screen === 'add-team-method' && action === 'open-registration') {
+    const roundId = idParts[3] || savedTournament.dashboardNavigationStack?.at(-1)?.roundId;
+    await showOpenRegistrationModal(interaction, tournamentId, roundId);
+    return true;
+  }
+  if (screen === 'add-team-method' && action === 'back') {
+    const roundId = savedTournament.dashboardNavigationStack?.at(-1)?.roundId;
+    await updateDashboardNavigation(interaction.guild, tournamentId, 'back');
+    await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId);
     return true;
   }
   if (screen === 'round' && action === 'submit-results') {
@@ -1926,6 +2008,19 @@ export async function handleDashboardNavigationInteraction(interaction) {
       await interaction.showModal(modal);
       return true;
     }
+  }
+  if (screen === 'registration' && action === 'open') {
+    await showOpenRegistrationModal(interaction, tournamentId, idParts[3]);
+    return true;
+  }
+  if (screen === 'registration-submit') {
+    const roundId = action;
+    await handleOpenRegistrationSubmit(interaction, tournamentId, roundId);
+    return true;
+  }
+  if (screen === 'registration-close') {
+    await closeRoundRegistration(interaction, tournamentId, idParts[3]);
+    return true;
   }
   return false;
 }
@@ -2861,6 +2956,7 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   if (!Array.isArray(savedTournament.dashboardNavigationStack) || savedTournament.dashboardNavigationStack.length === 0) {
     savedTournament.dashboardNavigationStack = [{ screen: 'home' }];
   }
+  savedTournament.dashboardCurrentScreen = savedTournament.dashboardNavigationStack.at(-1);
   const persistSetupProgress = async () => {
     savedTournament.tournamentId = tournamentId;
     savedTournament.tournamentTitle = tournament.title;
@@ -3194,6 +3290,11 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   savedTournament.lastSyncedAt = new Date().toISOString();
 
   await persistSetupProgress();
+  if (panelMessage && savedTournament.dashboardCurrentScreen?.screen !== 'home') {
+    await renderPersistedDashboardScreen(guild, tournamentId, savedTournament, panelMessage).catch((error) => {
+      console.error(`[Discord Bot] Could not restore dashboard screen for ${tournamentId}:`, error.message);
+    });
+  }
 
   // Keep the dashboard as the only message in this channel.
   // 7. Remove command invocations, user messages, and any other messages.
@@ -5326,19 +5427,35 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
   }
 
   let totalAllocatedTeams = 0;
-  let groupsDetailText = '• *No groups have been allocated yet.*';
+  const groupDetailLines = [];
   if (Array.isArray(round.groups) && round.groups.length > 0) {
-    const lines = [];
     for (const g of round.groups) {
       const occupied = (g.slots || []).filter((s) => s.status === 'OCCUPIED').length;
       totalAllocatedTeams += occupied;
       const chMention = g.channelId ? `<#${g.channelId}>` : `#${g.channelName}`;
       const roleMention = g.roleId ? `<@&${g.roleId}>` : `@${g.roleName}`;
-      lines.push(`• **Group ${g.groupNumber}:** ${chMention} | ${roleMention} (${occupied}/23 usable slots)`);
+      groupDetailLines.push(`• **Group ${g.groupNumber}:** ${chMention} | ${roleMention} (${occupied}/23 usable slots)`);
     }
-    groupsDetailText = lines.slice(0, 10).join('\n');
-    if (lines.length > 10) groupsDetailText += `\n*...and ${lines.length - 10} more groups.*`;
   }
+  const groupSummary = [
+    `• **Total Groups:** **${round.groups?.length || 0}**`,
+    `• **Configured Capacity:** **${round.teamsPerGroup || 16}** teams per group`,
+    `• **Teams Allocated:** **${totalAllocatedTeams}**`,
+    `• **Qualified from this Round:** **${(round.qualifications || []).length}** 🏆`,
+    '• **Capacity Policy:** 25 slots per group (Slots 01-02 LOCKED, Slots 03-18 registered teams, Slots 19-25 spare for manually added teams)',
+  ];
+  const groupFields = [];
+  let groupFieldText = groupSummary.join('\n');
+  for (const line of groupDetailLines) {
+    if (groupFieldText.length + line.length + 1 > 950) {
+      groupFields.push({ name: groupFields.length ? 'Group Allocation (continued)' : '👥 Groups & Slot Allocation', value: groupFieldText, inline: false });
+      groupFieldText = line;
+    } else {
+      groupFieldText += `\n${line}`;
+    }
+  }
+  if (!groupDetailLines.length) groupFieldText += '\n• *No groups have been allocated yet.*';
+  groupFields.push({ name: groupFields.length ? 'Group Allocation (continued)' : '👥 Groups & Slot Allocation', value: groupFieldText, inline: false });
 
   const embed = new EmbedBuilder()
     .setTitle(`⚔️ Round Management: ${round.name}`)
@@ -5359,17 +5476,7 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
           `• **Completed:** ${round.completedAt ? `<t:${Math.floor(new Date(round.completedAt).getTime() / 1000)}:R>` : '*N/A*'}`,
         inline: false,
       },
-      {
-        name: '👥 Groups & Slot Allocation',
-        value:
-          `• **Total Groups:** **${round.groups?.length || 0}**\n` +
-          `• **Configured Capacity:** **${round.teamsPerGroup || 16}** teams per group\n` +
-          `• **Teams Allocated:** **${totalAllocatedTeams}**\n` +
-          `• **Qualified from this Round:** **${(round.qualifications || []).length}** 🏆\n` +
-          `• **Capacity Policy:** 25 slots per group (Slots 01-02 LOCKED, Slots 03-18 registered teams, Slots 19-25 spare for manually added teams)\n` +
-          `${groupsDetailText}`,
-        inline: false,
-      }
+      ...groupFields
     )
     .setTimestamp();
 
@@ -5388,7 +5495,7 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
       .setStyle(ButtonStyle.Danger)
       .setDisabled(isActive),
     new ButtonBuilder()
-      .setCustomId(`md_round_start:${tournamentId}:${round.roundId}`)
+      .setCustomId(`dash:round:start:${round.roundId}`)
       .setLabel('Start')
       .setEmoji('▶️')
       .setStyle(ButtonStyle.Success)
@@ -5442,14 +5549,25 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
       .setDisabled(isCompleted)
   );
 
+  const registration = round.registration;
+  const registrationRow = new ActionRowBuilder();
+  if (registration?.status === 'open') {
+    registrationRow.addComponents(
+      new ButtonBuilder().setCustomId(`dash:round:registration-close:${round.roundId}`).setLabel('Close Registration').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`dash:round:registration-channel:${round.roundId}`).setLabel('Open Registration Channel').setStyle(ButtonStyle.Link).setURL(`https://discord.com/channels/${guild.id}/${registration.channelId}`),
+    );
+  } else if (registration?.status === 'closed') {
+    registrationRow.addComponents(new ButtonBuilder().setCustomId(`dash:round:registration-closed:${round.roundId}`).setLabel('Registration Closed').setStyle(ButtonStyle.Secondary).setDisabled(true));
+  }
+
   if (interaction.deferred) {
-    const payload = { content: notice, embeds: [embed], components: [row1, row2, row3, row4] };
+    const payload = { content: notice, embeds: [embed], components: [row1, row2, row3, row4, ...(registrationRow.components.length ? [registrationRow] : [])] };
     if (messageOverride) await messageOverride.edit(payload).catch(() => {});
     else await interaction.editReply(payload).catch(() => {});
   } else if (typeof interaction.update === 'function') {
-    await interaction.update({ content: notice, embeds: [embed], components: [row1, row2, row3, row4] }).catch(() => {});
+    await interaction.update({ content: notice, embeds: [embed], components: [row1, row2, row3, row4, ...(registrationRow.components.length ? [registrationRow] : [])] }).catch(() => {});
   } else if (typeof interaction.reply === 'function') {
-    await interaction.reply({ embeds: [embed], components: [row1, row2, row3, row4], ephemeral: true }).catch(() => {});
+    await interaction.reply({ embeds: [embed], components: [row1, row2, row3, row4, ...(registrationRow.components.length ? [registrationRow] : [])], ephemeral: true }).catch(() => {});
   }
 }
 
@@ -5496,6 +5614,191 @@ async function handleToggleRoundGroupMessages(interaction, tournamentId, roundId
     console.error(`[Discord Bot] Failed to toggle group messaging for ${tournamentId}/${roundId}:`, error);
     await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, `❌ Could not update Submit Results: ${error.message}`);
   }
+}
+
+async function renderAddTeamMethodChooser(interaction, roundId) {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`dash:add-team-method:manual:${roundId}`).setLabel('Add Manually').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`dash:add-team-method:open-registration:${roundId}`).setLabel('Open Registration').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('dash:add-team-method:back').setLabel('Back to Round').setStyle(ButtonStyle.Secondary),
+  );
+  await interaction.editReply({ content: null, embeds: [new EmbedBuilder().setTitle('Add Team').setDescription('Choose how to add teams to this round.').setColor(0x22c55e)], components: [row] }).catch(() => {});
+}
+
+async function renderStartRoundConfirmation(interaction, tournamentId, roundId) {
+  const round = guildSettingsCache[interaction.guild.id]?.tournaments?.[tournamentId]?.rounds?.[roundId];
+  if (!round) return handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, `Round ${roundId} was not found.`);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`dash:start-round-confirm:confirm:${roundId}`).setLabel('Confirm').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`dash:start-round-confirm:cancel:${roundId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
+  await interaction.editReply({ content: null, embeds: [new EmbedBuilder().setTitle(`Start Round ${round.name}?`).setDescription("This can't be undone.").setColor(0xeab308)], components: [row] }).catch(() => {});
+}
+
+async function showOpenRegistrationModal(interaction, tournamentId, roundId) {
+  const round = guildSettingsCache[interaction.guild.id]?.tournaments?.[tournamentId]?.rounds?.[roundId];
+  const free = (round?.groups || []).reduce((total, group) => total + getAvailableManualSpareSlots(group).length, 0);
+  if (!round || round.status === 'Completed' || !free) {
+    await interaction.reply({ content: 'This round has no available spare slots.', ephemeral: true }).catch(() => {});
+    return;
+  }
+  const modal = new ModalBuilder().setCustomId(`dash:registration-submit:${roundId}`).setTitle('Open Team Registration')
+    .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('slot_count').setLabel(`Number of slots (1-${free})`).setPlaceholder(String(free)).setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(3)));
+  await interaction.showModal(modal);
+}
+
+async function handleOpenRegistrationSubmit(interaction, tournamentId, roundId) {
+  if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true }).catch(() => {});
+  const guild = interaction.guild;
+  try {
+    const saved = guildSettingsCache[guild.id]?.tournaments?.[tournamentId];
+    const round = saved?.rounds?.[roundId];
+    if (!round || round.status === 'Completed') throw new Error('This round is no longer available.');
+    if (round.registration?.status === 'open') throw new Error('Registration is already open for this round.');
+    const available = (round.groups || []).reduce((sum, group) => sum + getAvailableManualSpareSlots(group).length, 0);
+    const slotCount = Number(interaction.fields?.getTextInputValue('slot_count'));
+    if (!Number.isInteger(slotCount) || slotCount < 1 || slotCount > available) throw new Error(`Enter a whole number from 1 to ${available}.`);
+    const prefix = await ensureTournamentShortCode(guild, { id: tournamentId, title: saved.tournamentTitle }, saved);
+    const names = getTournamentChannelNames(prefix, `r${round.roundNumber || 1}-register`);
+    const everyone = guild.roles.everyone;
+    const botId = guild.members.me?.id;
+    const overwrites = [
+      { id: everyone.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessages] },
+      ...(botId ? [{ id: botId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageMessages] }] : []),
+    ];
+    let channel = round.registration?.channelId
+      ? guild.channels.cache.get(round.registration.channelId) || await guild.channels.fetch(round.registration.channelId).catch(() => null)
+      : null;
+    if (channel) {
+      await channel.permissionOverwrites.edit(everyone, { SendMessages: true }).catch(() => {});
+      for (const role of guild.roles.cache.values()) {
+        if (role.id === everyone.id || role.id === guild.members.me?.roles?.botRole?.id) continue;
+        await channel.permissionOverwrites.edit(role.id, { SendMessages: null }).catch(() => {});
+      }
+    }
+    if (!channel) channel = await createRoundGroupChannel(guild, {
+      type: ChannelType.GuildText, parent: round.categoryId || saved.categoryId, topic: `Open team registration for ${saved.tournamentTitle}, ${round.name}`,
+      permissionOverwrites: overwrites,
+    }, names, `open registration channel for ${round.name}`);
+    if (!channel) throw new Error('Could not create the registration channel.');
+    const promptText = `**${round.name} — Team Registration**\nSlots available: **${slotCount}**\n\nPost one message per team. The **first line** must be the team name. Add member mentions, user IDs, or usernames on following lines. The sender is included automatically. Teams are accepted first come, first served into groups in order.`;
+    const prompt = round.registration?.promptMessageId
+      ? await channel.messages.fetch(round.registration.promptMessageId).then((msg) => msg.edit(promptText)).catch(() => channel.send(promptText))
+      : await channel.send(promptText);
+    await prompt.pin().catch(() => {});
+    round.registration = { status: 'open', channelId: channel.id, promptMessageId: prompt.id, slotCount, slotsUsed: 0, createdAt: new Date().toISOString(), createdBy: interaction.user?.id };
+    guildSettingsCache[guild.id].tournaments[tournamentId] = saved;
+    saveGuildSettings(guildSettingsCache);
+    if (!(await saveTournamentToDb(guild.id, tournamentId, saved))) throw new Error('Could not save registration state to MongoDB.');
+    await updateDashboardNavigation(guild, tournamentId, 'back');
+    const dashboardChannel = saved.channels?.botCommandsId ? guild.channels.cache.get(saved.channels.botCommandsId) || await guild.channels.fetch(saved.channels.botCommandsId).catch(() => null) : null;
+    const dashboardMessage = dashboardChannel && saved.controlPanelMessageId ? await dashboardChannel.messages.fetch(saved.controlPanelMessageId).catch(() => null) : null;
+    await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, null, dashboardMessage);
+    await interaction.editReply({ content: `Registration opened in <#${channel.id}> for ${slotCount} team(s).` }).catch(() => {});
+  } catch (error) {
+    console.error(`[Discord Bot] Could not open registration for ${tournamentId}/${roundId}:`, error);
+    await interaction.editReply({ content: `❌ ${error.message}` }).catch(() => {});
+  }
+}
+
+async function closeRoundRegistration(interaction, tournamentId, roundId, automatic = false) {
+  const guild = interaction.guild;
+  const saved = guildSettingsCache[guild.id]?.tournaments?.[tournamentId];
+  const round = saved?.rounds?.[roundId];
+  const registration = round?.registration;
+  if (!registration || registration.status !== 'open') {
+    if (!automatic) await interaction.reply({ content: 'Registration is already closed.', ephemeral: true }).catch(() => {});
+    return;
+  }
+  registration.status = 'closed';
+  registration.closedAt = new Date().toISOString();
+  guildSettingsCache[guild.id].tournaments[tournamentId] = saved;
+  saveGuildSettings(guildSettingsCache);
+  await saveTournamentToDb(guild.id, tournamentId, saved);
+  const channel = guild.channels.cache.get(registration.channelId) || await guild.channels.fetch(registration.channelId).catch(() => null);
+  if (channel) {
+    await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false }).catch(() => {});
+    for (const role of guild.roles.cache.values()) {
+      if (role.id === guild.roles.everyone.id || role.id === guild.members.me?.roles?.botRole?.id) continue;
+      await channel.permissionOverwrites.edit(role.id, { SendMessages: false }).catch(() => {});
+    }
+    await channel.send('Registration closed.').catch(() => {});
+  }
+  if (!automatic) await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, 'Registration closed.');
+}
+
+export async function handleRoundRegistrationMessage(message) {
+  if (!message?.guild || message.author?.bot) return false;
+  const tournaments = guildSettingsCache[message.guild.id]?.tournaments || {};
+  const found = Object.entries(tournaments).flatMap(([tournamentId, saved]) =>
+    Object.values(saved.rounds || {}).map((round) => ({ tournamentId, saved, round }))
+  ).find(({ round }) => round.registration?.status === 'open' && round.registration.channelId === message.channelId);
+  if (!found) return false;
+  const { tournamentId, saved, round } = found;
+  const registration = round.registration;
+  const parts = String(message.content || '').split(/\r?\n/);
+  const teamName = parts.shift()?.trim();
+  if (!teamName) { await message.reply('Invalid registration: put the team name on the first line.').catch(() => {}); return true; }
+  const enteredTags = [...new Set([message.author.id, ...parts.join(' ').split(/[\s,]+/).filter(Boolean)])];
+  await withTournamentLock(tournamentId, async () => {
+    const live = guildSettingsCache[message.guild.id]?.tournaments?.[tournamentId];
+    const liveRound = live?.rounds?.[round.roundId];
+    const liveReg = liveRound?.registration;
+    if (!liveReg || liveReg.status !== 'open') { await message.reply('Registration is closed.').catch(() => {}); return; }
+    if (liveReg.slotsUsed >= liveReg.slotCount) { await closeRoundRegistration({ guild: message.guild }, tournamentId, round.roundId, true); await message.reply('No registration slots remain.').catch(() => {}); return; }
+    let group;
+    for (const candidate of [...(liveRound.groups || [])].sort((a,b) => a.groupNumber - b.groupNumber)) {
+      if (getAvailableManualSpareSlots(candidate).length) { group = candidate; break; }
+    }
+    if (!group) { await closeRoundRegistration({ guild: message.guild }, tournamentId, round.roundId, true); await message.reply('No spare slots remain in this round.').catch(() => {}); return; }
+    const slotNumber = getAvailableManualSpareSlots(group)[0];
+    const resolvedMembers = [];
+    for (const enteredAs of enteredTags) {
+      const match = enteredAs.match(/^<@!?(\d+)>$/);
+      const id = match?.[1] || (isValidDiscordSnowflake(enteredAs) ? enteredAs : null);
+      let member = id ? message.guild.members.cache.get(id) || await message.guild.members.fetch(id).catch(() => null) : null;
+      if (!member) {
+        const q = enteredAs.replace(/^@/, '').toLowerCase();
+        member = Array.from(message.guild.members.cache.values()).find((m) => [m.user?.username,m.user?.globalName,m.displayName,m.nickname,m.user?.tag].some((n) => String(n || '').toLowerCase() === q)) || null;
+      }
+      if (member && !resolvedMembers.some((m) => m.discord_id === member.id)) resolvedMembers.push({ discord_id: member.id, username: member.user?.tag || member.user?.username || member.id, enteredAs, found: true });
+      else if (!member) resolvedMembers.push({ discord_id: null, username: enteredAs, enteredAs, found: false });
+    }
+    if (!resolvedMembers.some((m) => m.discord_id === message.author.id)) resolvedMembers.unshift({ discord_id: message.author.id, username: message.author.tag || message.author.username, enteredAs: `<@${message.author.id}>`, found: true });
+    const teamId = `manual_${crypto.randomUUID()}`;
+    const target = group.slots?.find((s) => Number(s.slotNumber) === slotNumber) || { slotNumber, status: 'UNUSED', qualificationStatus: 'Pending' };
+    group.slots ||= [];
+    if (!group.slots.includes(target)) group.slots.push(target);
+    Object.assign(target, { status: 'OCCUPIED', label: teamName, teamId, teamName, members: resolvedMembers, qualificationStatus: 'Pending', addedManually: true });
+    const team = { teamId, teamName, members: resolvedMembers, tournamentId, roundId: round.roundId, roundName: liveRound.name, groupId: group.groupId, groupNumber: group.groupNumber, slotNumber, addedManually: true, addedBy: message.author.id, addedByTag: message.author.tag || message.author.username, createdAt: new Date().toISOString() };
+    live.manualTeams ||= []; live.manualTeams.push(team); liveReg.slotsUsed++;
+    if (!(await saveTournamentToDb(message.guild.id, tournamentId, live))) { liveReg.slotsUsed--; live.manualTeams.pop(); Object.assign(target, { status: 'UNUSED', label: 'UNUSED', teamId: null, teamName: null, members: [] }); await message.reply('Registration could not be saved. Please contact an admin.').catch(() => {}); return; }
+    saveGuildSettings(guildSettingsCache);
+    for (const person of resolvedMembers.filter((m) => m.found && m.discord_id)) {
+      const member = message.guild.members.cache.get(person.discord_id) || await message.guild.members.fetch(person.discord_id).catch(() => null);
+      for (const roleId of [live.roleId, group.roleId].filter(Boolean)) if (member) await queueRoleAdd(member, roleId, `Registered team in ${liveRound.name}, Group ${group.groupNumber}`).catch((err) => console.warn('[Discord Bot] Registration role assignment failed:', err.message));
+    }
+    const groupChannel = group.channelId ? message.guild.channels.cache.get(group.channelId) || await message.guild.channels.fetch(group.channelId).catch(() => null) : null;
+    if (groupChannel) await updateGroupSlotListMessage(message.guild, { id: tournamentId, title: live.tournamentTitle }, liveRound, group, groupChannel);
+    const dashboardChannel = live.channels?.botCommandsId ? message.guild.channels.cache.get(live.channels.botCommandsId) || await message.guild.channels.fetch(live.channels.botCommandsId).catch(() => null) : null;
+    if (dashboardChannel) {
+      await publishRoundAllocationSummary(message.guild, { id: tournamentId, title: live.tournamentTitle }, liveRound, dashboardChannel, live).catch(() => {});
+      await updateGlobalSubmissionControlPanel(message.guild, { id: tournamentId, title: live.tournamentTitle }, liveRound, dashboardChannel).catch(() => {});
+    }
+    const teamsChannel = live.channels?.tournamentTeamsId ? message.guild.channels.cache.get(live.channels.tournamentTeamsId) || await message.guild.channels.fetch(live.channels.tournamentTeamsId).catch(() => null) : null;
+    if (teamsChannel) await upsertManagedMessage(message.guild.client, { guildId: message.guild.id, channelId: teamsChannel.id, channel: teamsChannel, logicalKey: `guild:${message.guild.id}:tournament:${tournamentId}:manual_team:${teamId}`, messageType: 'manual_team_roster_entry', tournamentId, roundId: round.roundId, groupId: group.groupId, payload: { content: `➕ **Manually Added Team**\n**${teamName}** · ${liveRound.name}, Group ${group.groupNumber}, Slot ${String(slotNumber).padStart(2,'0')}\n**Members:** ${resolvedMembers.map((m) => m.discord_id ? `<@${m.discord_id}>` : `\`${m.enteredAs}\` (not found)`).join(', ')}` } }).catch(() => {});
+    await sendTournamentManagementLog(message.guild, { ...live, id: tournamentId }, liveRound, 'Team added through open registration', message.member || message.author, [{ name: 'Team', value: teamName }, { name: 'Group and slot', value: `Group ${group.groupNumber}, Slot ${slotNumber}` }]);
+    const botCommands = live.channels?.botCommandsId ? message.guild.channels.cache.get(live.channels.botCommandsId) || await message.guild.channels.fetch(live.channels.botCommandsId).catch(() => null) : null;
+    const dashboardMessage = botCommands && live.controlPanelMessageId ? await botCommands.messages.fetch(live.controlPanelMessageId).catch(() => null) : null;
+    if (dashboardMessage) await renderPersistedDashboardScreen(message.guild, tournamentId, live, dashboardMessage).catch(() => {});
+    const notFound = resolvedMembers.filter((person) => !person.found).map((person) => person.enteredAs);
+    await message.reply(`✅ **${teamName}** registered in Group ${group.groupNumber}, Slot ${slotNumber}.${notFound.length ? ` Tags not found: ${notFound.map((tag) => `\`${tag}\``).join(', ')}.` : ''}`).catch(() => {});
+    if (liveReg.slotsUsed >= liveReg.slotCount) await closeRoundRegistration({ guild: message.guild }, tournamentId, round.roundId, true);
+  }, 'open team registration').catch(async (error) => {
+    console.error(`[Discord Bot] Open registration handling failed for ${tournamentId}/${round.roundId}:`, error);
+    await message.reply('Registration could not be completed. Please try again or contact an admin.').catch(() => {});
+  });
+  return true;
 }
 
 async function handleAddTeamGroupChooser(interaction, tournamentId, roundId) {

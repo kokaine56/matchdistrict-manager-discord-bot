@@ -90,6 +90,7 @@ import {
   generateEmptyRoundGroups,
   handleDashCommand,
   handleDashboardNavigationInteraction,
+  handleRoundRegistrationMessage,
   handleDashboardQualifySelection,
   fetchTournamentRegistrationsFromBackend,
   handleTournamentVerificationMessage,
@@ -241,6 +242,7 @@ export {
   generateEmptyRoundGroups,
   handleDashCommand,
   handleDashboardNavigationInteraction,
+  handleRoundRegistrationMessage,
   handleDashboardQualifySelection,
   fetchTournamentRegistrationsFromBackend,
   handlePermanentTournamentDeleteCommand,
@@ -2238,6 +2240,8 @@ client.on(Events.MessageCreate, async (message) => {
     }
     if (message.author?.bot) return;
 
+    if (message.guild && await handleRoundRegistrationMessage(message)) return;
+
     // Run automated moderation (link blocking & abusive words filtering)
     if (message.guild) {
       const moderated = await handleMessageModeration(message);
@@ -2532,7 +2536,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   let dashboardContext = null;
   try {
-    const roundAnnouncementModal = interaction.isModalSubmit?.() && interaction.customId?.startsWith('dash:round:announcement-submit:');
+    const roundAnnouncementModal = interaction.isModalSubmit?.() && (
+      interaction.customId?.startsWith('dash:round:announcement-submit:') ||
+      interaction.customId?.startsWith('dash:registration-submit:')
+    );
     const isUserSelectInteraction = interaction.isUserSelectMenu?.() === true;
     const interactionCustomId = String(interaction.customId || '');
     const isDashboardComponent = (interaction.isButton?.() || isUserSelectInteraction) && interactionCustomId.startsWith('dash:');
@@ -2540,6 +2547,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       interactionCustomId.startsWith('md_tour_create_round:') ||
       interactionCustomId.startsWith('md_round_edit:') ||
       interactionCustomId.startsWith('dash:round:announcement:') ||
+      interactionCustomId.startsWith('dash:add-team-method:open-registration:') ||
       interactionCustomId.startsWith('dash:add-team:group:')
     );
 
