@@ -376,22 +376,37 @@ export function getTournamentChannelNames(prefix, channelName) {
 }
 
 /**
- * Category name builder using short prefix:
- * e.g. "DL INFO", "DL MANAGEMENT", "DL R1"
+ * Category name builder using tournament title:
+ * e.g. "🏆 | District League 2026"
  */
-export function getTournamentCategoryName(prefix, suffix = 'INFO') {
-  const p = (prefix || 'TOUR').toUpperCase().trim();
-  const s = (suffix || '').toUpperCase().trim();
-  return s ? `${p} ${s}` : p;
+export function buildTournamentCategoryName(tournamentTitle) {
+  let title = String(tournamentTitle || 'Tournament').trim();
+  if (title.startsWith('🏆 |')) {
+    title = title.slice(4).trim();
+  } else if (title.startsWith('🏆|')) {
+    title = title.slice(2).trim();
+  }
+  return `🏆 | ${title || 'Tournament'}`.slice(0, 100);
 }
 
 /**
- * Sanitize category name: 1-100 characters.
+ * Category name builder for backward compatibility
  */
-export function sanitizeCategoryName(name, suffix = 'INFO') {
-  if (!name || typeof name !== 'string') return 'Tournament';
-  const prefix = getTournamentShortPrefix(name);
-  return getTournamentCategoryName(prefix, suffix);
+export function getTournamentCategoryName(prefixOrTitle, suffix) {
+  if (!suffix) {
+    return buildTournamentCategoryName(prefixOrTitle);
+  }
+  const p = (prefixOrTitle || 'TOUR').toUpperCase().trim();
+  const s = String(suffix).toUpperCase().trim();
+  return `${p} ${s}`;
+}
+
+/**
+ * Sanitize category name: 1-100 characters in "🏆 | <Tournament Name>" format.
+ */
+export function sanitizeCategoryName(name) {
+  if (!name || typeof name !== 'string') return '🏆 | Tournament';
+  return buildTournamentCategoryName(name);
 }
 
 function getTournamentShortName(title, fallback = 'tournament') {
@@ -2816,8 +2831,7 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
 
   // A tournament has one category. Adopt an existing saved category before creating
   // anything so `.dash` can recover without producing a duplicate category.
-  const tournamentShort = getTournamentShortName(tournament.title, tournament.id);
-  const categoryName = sanitizeCategoryName(tournament.title || tournament.id);
+  const categoryName = buildTournamentCategoryName(tournament.title || tournament.id);
   const savedCategoryIds = [
     savedTournament.categoryId,
     savedTournament.publicCategoryId,
@@ -2829,6 +2843,17 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
     category = guild.channels.cache.get(categoryId) || await guild.channels.fetch(categoryId).catch(() => null);
     if (category?.type === ChannelType.GuildCategory && (category.guildId || category.guild?.id) === guild.id) break;
     category = null;
+  }
+  if (!category && guild.channels?.cache) {
+    const rawTitle = String(tournament.title || '').trim().toLowerCase();
+    const targetName = categoryName.trim().toLowerCase();
+    const shortPrefix = getTournamentShortPrefix(tournament.title, tournament.id);
+    const legacyInfoName = `${shortPrefix} INFO`.toLowerCase();
+    category = findInCache(guild.channels.cache, (ch) => {
+      if (ch.type !== ChannelType.GuildCategory) return false;
+      const n = ch.name?.trim().toLowerCase();
+      return n === targetName || n === rawTitle || (legacyInfoName && n === legacyInfoName);
+    });
   }
 
   const categoryOverwrites = [
@@ -3356,9 +3381,9 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     await guild.channels.fetch().catch(() => null);
   }
 
-  // 1. Resolve one canonical tournament category, reusing any saved legacy ID.
+  // 1. Resolve one canonical tournament category, reusing any saved legacy ID or finding by name.
   const shortPrefix = getTournamentShortPrefix(tournament.title, tournament.id);
-  const categoryName = getTournamentCategoryName(shortPrefix, 'INFO');
+  const categoryName = buildTournamentCategoryName(tournament.title || tournament.id);
   const savedCategoryIds = [savedTournament.categoryId, savedTournament.publicCategoryId, savedTournament.managementCategoryId,
     ...Object.values(savedTournament.rounds || {}).map((round) => round?.categoryId)].filter(Boolean);
   let category = null;
@@ -3366,6 +3391,17 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     category = guild.channels.cache.get(categoryId) || await guild.channels.fetch(categoryId).catch(() => null);
     if (category?.type === ChannelType.GuildCategory && (category.guildId || category.guild?.id) === guild.id) break;
     category = null;
+  }
+  if (!category && guild.channels?.cache) {
+    const rawTitle = String(tournament.title || '').trim().toLowerCase();
+    const targetName = categoryName.trim().toLowerCase();
+    const shortPrefix = getTournamentShortPrefix(tournament.title, tournament.id);
+    const legacyInfoName = `${shortPrefix} INFO`.toLowerCase();
+    category = findInCache(guild.channels.cache, (ch) => {
+      if (ch.type !== ChannelType.GuildCategory) return false;
+      const n = ch.name?.trim().toLowerCase();
+      return n === targetName || n === rawTitle || (legacyInfoName && n === legacyInfoName);
+    });
   }
   if (category) {
     syncResult.categoryAction = 'reused';
@@ -3390,32 +3426,6 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
   }
   syncResult.categoryId = category.id;
   savedTournament.categoryId = category.id;
-
-  // Rename any other categories stored in MongoDB strictly by ID
-  if (savedTournament.managementCategoryId && savedTournament.managementCategoryId !== category.id) {
-    const mgmtCat = guild.channels.cache.get(savedTournament.managementCategoryId) ||
-      await guild.channels.fetch(savedTournament.managementCategoryId).catch(() => null);
-    if (mgmtCat && mgmtCat.type === ChannelType.GuildCategory) {
-      const mgmtExpected = getTournamentCategoryName(shortPrefix, 'MANAGEMENT');
-      if (mgmtCat.name !== mgmtExpected) {
-        await mgmtCat.setName(mgmtExpected).catch((err) => syncResult.failures.push(`Failed to rename management category: ${err.message}`));
-      }
-    }
-  }
-  if (savedTournament.rounds && typeof savedTournament.rounds === 'object') {
-    for (const round of Object.values(savedTournament.rounds)) {
-      if (round?.categoryId && round.categoryId !== category.id) {
-        const rCat = guild.channels.cache.get(round.categoryId) ||
-          await guild.channels.fetch(round.categoryId).catch(() => null);
-        if (rCat && rCat.type === ChannelType.GuildCategory) {
-          const rExpected = getTournamentCategoryName(shortPrefix, `R${round.roundNumber || 1}`);
-          if (rCat.name !== rExpected) {
-            await rCat.setName(rExpected).catch((err) => syncResult.failures.push(`Failed to rename round category: ${err.message}`));
-          }
-        }
-      }
-    }
-  }
 
   const { tourneyModRole: modsRole, spectatorRole } = await ensureManagementDashboardRoles(guild, savedTournament, botMember);
   const botOverwrite = {

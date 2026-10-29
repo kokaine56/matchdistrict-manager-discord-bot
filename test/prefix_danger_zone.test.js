@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   getTournamentShortPrefix,
   getTournamentChannelNames,
+  buildTournamentCategoryName,
   getTournamentCategoryName,
   sanitizeCategoryName,
   toMathematicalBold,
@@ -85,12 +86,14 @@ describe('Short Channel Prefix & Danger Zone Requirements', () => {
     assert.equal(isValidChannelName('a'.repeat(101)), false);
   });
 
-  test('4. Category Naming: Uses short prefix (e.g. DL INFO, DL MANAGEMENT, DL R1)', () => {
+  test('4. Category Naming: Uses format 🏆 | <Tournament Name>', () => {
+    assert.equal(buildTournamentCategoryName('District League 2026'), '🏆 | District League 2026');
+    assert.equal(buildTournamentCategoryName('BGMI Championship'), '🏆 | BGMI Championship');
+    assert.equal(buildTournamentCategoryName('Winter Showdown'), '🏆 | Winter Showdown');
+    assert.equal(sanitizeCategoryName('District League 2026'), '🏆 | District League 2026');
+    assert.equal(sanitizeCategoryName('BGMIS 2026'), '🏆 | BGMIS 2026');
+    // Legacy fallback support
     assert.equal(getTournamentCategoryName('DL', 'INFO'), 'DL INFO');
-    assert.equal(getTournamentCategoryName('DL', 'MANAGEMENT'), 'DL MANAGEMENT');
-    assert.equal(getTournamentCategoryName('DL', 'R1'), 'DL R1');
-    assert.equal(sanitizeCategoryName('District League 2026'), 'DL INFO');
-    assert.equal(sanitizeCategoryName('BGMIS 2026'), 'BGMIS INFO');
   });
 
   test('5. Main Dashboard Buttons: Replaces Delete All Channels & Delete Tournament with single red Danger Zone button', () => {
@@ -306,8 +309,8 @@ describe('Short Channel Prefix & Danger Zone Requirements', () => {
 
     const result = await syncTournamentDiscordChannels(mockGuild, tournament, [], mockBotMember);
 
-    // Verify category was renamed to "DL INFO"
-    assert.equal(mockCategory.name, 'DL INFO');
+    // Verify category was renamed to "🏆 | District League 2026"
+    assert.equal(mockCategory.name, '🏆 | District League 2026');
 
     // Verify room maker vc was renamed to "room-maker-vc" (no prefix, no spaces, no icons)
     assert.equal(mockExistingVc.name, 'room-maker-vc');
