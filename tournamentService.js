@@ -47,6 +47,7 @@ import {
   saveTournamentToDb,
   deleteTournamentFromDb,
   getTournamentFromDb,
+  getAllTournamentsFromDb,
   recordAuditLog,
   enforceSingleActiveRoundInDb,
   findTournamentByBotCommandsChannel,
@@ -333,6 +334,38 @@ export function getTournamentShortPrefix(title, fallback = 'tour') {
     return words[0].toUpperCase();
   }
   return words.map((w) => w[0].toUpperCase()).join('');
+}
+
+/** Resolve and persist a server-unique tournament code before provisioning group resources. */
+export async function ensureTournamentShortCode(guild, tournament, savedTournament) {
+  const configured = String(savedTournament?.shortCode || savedTournament?.tournamentShortCode || tournament?.shortCode || '').trim().toUpperCase();
+  const base = (configured || getTournamentShortPrefix(tournament?.title, tournament?.id))
+    .replace(/[^A-Z0-9]/g, '').slice(0, 12) || 'TOUR';
+  const records = await getAllTournamentsFromDb(guild.id);
+  const known = new Map(records.map((record) => [String(record.tournamentId), record]));
+  for (const [id, record] of Object.entries(guildSettingsCache[guild.id]?.tournaments || {})) {
+    if (!known.has(String(id))) known.set(String(id), { ...record, tournamentId: id });
+  }
+  const usedByOther = (code) => [...known.entries()].some(([id, record]) => {
+    if (String(id) === String(tournament.id)) return false;
+    const otherCode = String(record.shortCode || record.tournamentShortCode ||
+      getTournamentShortPrefix(record.tournamentTitle || record.title, id)).trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+    return otherCode === code;
+  });
+
+  let code = base;
+  if (usedByOther(code)) {
+    if (configured) {
+      throw new Error(`Tournament prefix "${code}" is already used in this server. Set a different explicit shortCode for ${tournament.title}.`);
+    }
+    let suffix = 2;
+    while (usedByOther(`${base.slice(0, 10)}${suffix}`) && suffix < 1000) suffix++;
+    if (suffix >= 1000) throw new Error(`Could not safely derive a unique prefix for ${tournament.title}. Configure an explicit shortCode.`);
+    code = `${base.slice(0, 10)}${suffix}`;
+  }
+  savedTournament.shortCode = code;
+  savedTournament.tournamentShortCode = code;
+  return code;
 }
 
 /**
@@ -3352,6 +3385,8 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     setupStatus: 'pending_channels',
   };
 
+  const shortCode = await ensureTournamentShortCode(guild, tournament, savedTournament);
+
   if (!savedTournament.channels) {
     savedTournament.channels = {};
   }
@@ -3827,7 +3862,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
   // 8. Recreate, reuse, or reapply strict permissions and update control messages on all round group channels
   if (savedTournament.rounds && typeof savedTournament.rounds === 'object') {
-    const tourPrefix = normalizeTournamentRoleName(tournament.title, tournament.id);
+    const tourPrefix = shortCode;
     for (const round of Object.values(savedTournament.rounds)) {
       if (Array.isArray(round.groups)) {
         const roundNum = round.roundNumber || 1;
@@ -3835,9 +3870,8 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
         const roundCategory = category;
         for (const group of round.groups) {
           const g = group.groupNumber;
-          const roleName = `${tournament.title} R${roundNum} G${g}`.slice(0, 100);
-          const altRoleName = `${tourPrefix}-r${roundNum}-g${g}`;
-          const channelName = sanitizeChannelName(`${tourPrefix}-r${roundNum}-g${g}`);
+          const roleName = `${tourPrefix} R${roundNum}G${g}`.slice(0, 100);
+          const channelName = `${tourPrefix} ｜ R${roundNum}G${g}`.slice(0, 100);
 
           // Ensure group role exists
           let grpRole = null;
@@ -3856,6 +3890,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
             }).catch(() => null);
           }
           if (grpRole) {
+            if (grpRole.name !== roleName) await grpRole.setName(roleName).catch((err) => syncResult.failures.push(`Failed to rename group role ${grpRole.id}: ${err.message}`));
             group.roleId = grpRole.id;
             group.roleName = grpRole.name;
           }
@@ -3962,6 +3997,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
           }
 
           if (grpChannel) {
+            if (grpChannel.name !== channelName) await grpChannel.setName(channelName).catch((err) => syncResult.failures.push(`Failed to rename group channel ${grpChannel.id}: ${err.message}`));
             group.channelId = grpChannel.id;
             group.channelName = grpChannel.name;
             if (grpChannel.parentId !== category.id) {
@@ -6291,6 +6327,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       // Fetch latest registrations from backend
       const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId);
       const { tournament, teams, summary } = backendData;
+      const shortCode = await ensureTournamentShortCode(guild, tournament, savedTournament);
 
       // Determine eligible allocation pool: derived from preceding round's qualifications if present, otherwise live backend registrations
       const precedingRounds = Object.values(savedTournament.rounds || {})
@@ -6348,7 +6385,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       const tourRole = savedTournament.roleId ? guild.roles.cache.get(savedTournament.roleId) : null;
       const { tourneyModRole: modsRole } = await ensureManagementDashboardRoles(guild, savedTournament, botMember);
       const roundNum = round.roundNumber || 1;
-      const tourPrefix = normalizeTournamentRoleName(tournament.title, tournament.id);
+      const tourPrefix = shortCode;
       round.categoryId = null;
       const roundCategory = category;
 
@@ -6360,13 +6397,12 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       for (let g = 1; g <= groupCount; g++) {
         const groupId = `${round.roundId}_g${g}`;
         const groupNumber = g;
-        const roleName = `${tournament.title} R${roundNum} G${g}`.slice(0, 100);
-        const altRoleName = `${tourPrefix}-r${roundNum}-g${g}`;
-        const channelName = sanitizeChannelName(`${tourPrefix}-r${roundNum}-g${g}`);
+        const roleName = `${tourPrefix} R${roundNum}G${g}`.slice(0, 100);
+        const channelName = `${tourPrefix} ｜ R${roundNum}G${g}`.slice(0, 100);
 
         // 1. Create or reuse group role (no admin permissions)
         let groupRole = null;
-        const existingGroup = (round.groups || []).find((gr) => gr.groupNumber === g);
+        const existingGroup = (round.groups || []).find((gr) => gr.groupId === groupId || Number(gr.groupNumber) === g);
         if (existingGroup?.roleId && guild.roles) {
           groupRole = guild.roles.cache.get(existingGroup.roleId) ||
             await guild.roles.fetch(existingGroup.roleId).catch(() => null);
@@ -6382,6 +6418,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
             reason: `MatchDistrict group role for ${tournament.title} ${round.name} Group ${g}`,
           });
         }
+        if (groupRole && groupRole.name !== roleName) await groupRole.setName(roleName);
 
         // 2. Create or reuse private group channel
         let groupChannel = null;
@@ -6456,6 +6493,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
         ];
 
         if (groupChannel) {
+          if (groupChannel.name !== channelName) await groupChannel.setName(channelName);
           if (groupChannel.parentId !== category.id) {
             await groupChannel.setParent(category.id, { lockPermissions: false });
           }
