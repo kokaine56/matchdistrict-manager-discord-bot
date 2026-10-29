@@ -146,6 +146,10 @@ import {
   logMessageDeleted,
   logTournamentAction,
 } from './auditLogger.js';
+import {
+  handleTicketSetupCommand,
+  handleTicketInteraction,
+} from './ticketService.js';
 
 export {
   handleListTournamentCommand,
@@ -623,26 +627,12 @@ export function isAdmin(member) {
 /**
  * Formats the official MatchDistrict welcome message for a new member.
  */
-export function buildWelcomeMessage(username, guildName = 'MatchDistrict') {
-  return `Hey **${username}**! Welcome to **${guildName}**! 🎉
-
-We are thrilled to have you in our esports gaming community!
-
-🌐 **Official Website & Platform Details:**
-• 🔗 **Website:** https://matchdistrict.in
-• 🏆 **Tournaments & Scrims:** Join daily competitive cups, custom rooms, and paid/free tournaments (BGMI, Free Fire, Valorant, CODM).
-• 📊 **Live Leaderboards:** Real-time player statistics, match results, standings, and automated qualification tracking.
-• 👥 **Team Management:** Create or join esports squads, manage rosters, and register with your teammates.
-• 💰 **Verified Prize Payouts:** Secure, transparent payouts directly to tournament winners.
-
-🤖 **Server Bot Commands (Prefix: \`${PREFIX}\`):**
-• \`${PREFIX}website\` — Get direct links to the MatchDistrict platform
-• \`${PREFIX}ping\` — Check bot latency & status
-• \`${PREFIX}help\` — View available commands
-
-Have fun, play fair, and see you in the battleground! 🚀
-
-— **Team MatchDistrict**`;
+export function buildWelcomeMessage(name) {
+  return `Hey **${name}**! Welcome to **Match District** 🎉\n\n` +
+    `Match District is an esports platform where you can join tournaments, register your squad, follow live leaderboards and results, and get verified prize payouts.\n\n` +
+    `🌐 https://matchdistrict.in\n\n` +
+    `See you in the battleground! 🚀\n` +
+    `— **Team MatchDistrict**`;
 }
 
 /**
@@ -692,7 +682,8 @@ export function getHelpResponse(prefix = PREFIX) {
     `• \`${prefix}dm welcome on\` — *(Admin Only)* Enable welcome DMs for new members\n` +
     `• \`${prefix}dm welcome off\` — *(Admin Only)* Disable welcome DMs for new members\n` +
     `• \`${prefix}ban @user [reason]\` — *(Mod Only)* Ban a user with audit logging\n` +
-    `• \`${prefix}clear <1-100>\` — *(Mod Only)* Bulk delete recent messages\n\n` +
+    `• \`${prefix}clear <1-100>\` — *(Mod Only)* Bulk delete recent messages\n` +
+    `• \`${prefix}ticket setup\` — *(Admin Only)* Setup support ticket panel in #support-ticket\n\n` +
     `**🏆 Tournament & Organiser Management:**\n` +
     `• \`${prefix}organiser\` — *(Admin Only)* Connect this Discord server to your MatchDistrict organiser account\n` +
     `• \`${prefix}organiser unlink\` — *(Admin Only)* Disconnect this Discord server from the organiser account\n` +
@@ -761,7 +752,7 @@ export async function handleSetupCommand(guild, member, replyFn) {
     const existingId = savedChannels[req.key];
     if (existingId) {
       targetChannel = guild.channels.cache.get(existingId) ||
-        await guild.channels.fetch(existingId).catch(() => null);
+        (typeof guild.channels?.fetch === 'function' ? await guild.channels.fetch(existingId).catch(() => null) : null);
     }
 
     // If not found by saved ID, check by channel name
@@ -847,6 +838,7 @@ export async function handleSetupCommand(guild, member, replyFn) {
       await upsertManagedMessage(guild.client, {
         guildId: guild.id,
         channelId: previewChannel.id,
+        channel: previewChannel,
         logicalKey,
         messageType: 'bot_preview_panel',
         payload: buildBotPreviewMessage(guild, welcomeCurrentlyEnabled, channelMap),
@@ -1083,7 +1075,7 @@ export async function handleSetupConfirmCommand(guild, member, replyFn) {
 
     // Only lookup by stored ID - never by channel name
     const channel = guild.channels.cache.get(channelId) ||
-      await guild.channels.fetch(channelId).catch(() => null);
+      (typeof guild.channels?.fetch === 'function' ? await guild.channels.fetch(channelId).catch(() => null) : null);
     if (!channel) {
       skipped.push({ name: req.name, reason: 'Already deleted or not found' });
       continue;
@@ -2015,7 +2007,7 @@ export async function handleGuildMemberAdd(member) {
 
     const guildId = member.guild?.id;
     const guildName = member.guild?.name || 'MatchDistrict';
-    const username = member.user?.globalName || member.user?.username || member.displayName || 'Gamer';
+    const name = member.displayName || member.user?.globalName || member.user?.username || 'Player';
     const userTag = member.user?.tag || member.user?.username || member.id;
 
     // Check if welcome DMs are enabled
@@ -2035,13 +2027,13 @@ export async function handleGuildMemberAdd(member) {
 
     console.log(`[Discord Bot] 👤 New member joined "${guildName}": ${userTag} (${member.id})`);
 
-    const welcomeMessage = buildWelcomeMessage(username, guildName);
+    const welcomeMessage = buildWelcomeMessage(name);
 
     // Locate dm-log channel
     const dmLogId = getGuildChannelId(guildId, 'dmLogId');
     let logChannel = dmLogId ? member.guild.channels.cache.get(dmLogId) : null;
-    if (!logChannel) {
-      logChannel = member.guild.channels.cache.find(
+    if (!logChannel && member.guild.channels?.cache) {
+      logChannel = Array.from(member.guild.channels.cache.values()).find(
         (c) => c.type === ChannelType.GuildText && (c.name === 'dm-log' || c.name === 'matchdistrict-logs')
       );
     }
@@ -2054,12 +2046,12 @@ export async function handleGuildMemberAdd(member) {
       dmDelivered = true;
       console.log(`[Discord Bot] ✅ Successfully delivered welcome DM to ${userTag} (${member.id})`);
     } catch (dmError) {
-      if (dmError?.code === 50007) {
-        failReason = 'User has Direct Messages disabled in privacy settings or blocked the bot';
-        console.warn(`[Discord Bot] ⚠️ Could not send welcome DM to ${userTag}: DMs disabled.`);
+      if (dmError?.code === 50007 || dmError?.status === 403 || String(dmError?.message).toLowerCase().includes('cannot send messages to this user')) {
+        failReason = 'Closed DMs';
+        // If the user has DMs closed, ignore the error silently
       } else {
-        failReason = dmError.message || 'Unknown delivery failure';
-        console.warn(`[Discord Bot] ⚠️ Could not send welcome DM to ${userTag}: ${dmError.message}`);
+        failReason = dmError?.message || 'Unknown delivery failure';
+        console.warn(`[Discord Bot] ⚠️ Could not send welcome DM to ${userTag}: ${dmError?.message}`);
       }
     }
 
@@ -2234,6 +2226,19 @@ client.on(Events.MessageCreate, async (message) => {
         }
         await handleSetupCommand(message.guild, message.member, (text) => message.reply(text));
         return;
+      } else if (cmd === 'ticket') {
+        const subCmd = (args[0] || '').toLowerCase();
+        if (subCmd === 'setup') {
+          await handleTicketSetupCommand(
+            message.guild,
+            message.member,
+            message.channel,
+            (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts })
+          );
+          return;
+        }
+        await message.reply(`ℹ️ **Usage:** \`${PREFIX}ticket setup\` — Setup the support ticket panel.`);
+        return;
       } else if (cmd === 'dm') {
         await handleDmCommand(message.guild, message.member, args, (text) => message.reply(text));
         return;
@@ -2405,6 +2410,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (!checkAndTrackInteraction(interaction.id)) {
     console.log(`[Discord Bot] ⚡ Ignored duplicate interaction ${interaction.id} (${interaction.customId || 'unnamed'})`);
     return;
+  }
+
+  // Handle support ticket interactions (select menus & buttons)
+  if (interaction.customId?.startsWith('ticket:')) {
+    const handled = await handleTicketInteraction(interaction);
+    if (handled) return;
   }
 
   let dashboardContext = null;

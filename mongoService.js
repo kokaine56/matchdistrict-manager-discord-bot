@@ -1,3 +1,4 @@
+import { queueChannelSend, queueMessageEdit } from './discordQueue.js';
 import crypto from 'crypto';
 import { MongoClient } from 'mongodb';
 
@@ -201,6 +202,18 @@ async function ensureMongoIndexes() {
     await orgLinkCol.createIndex({ organiserId: 1 });
     await orgLinkCol.createIndex({ status: 1 });
 
+    const ticketCol = mongoDb.collection('discord_tickets');
+    await ticketCol.createIndex({ guildId: 1, ticketNumber: 1 });
+    await ticketCol.createIndex({ channelId: 1 }, { unique: true });
+    await ticketCol.createIndex({ userId: 1 });
+    await ticketCol.createIndex({ status: 1 });
+
+    const ticketPanelCol = mongoDb.collection('discord_ticket_panels');
+    await ticketPanelCol.createIndex({ guildId: 1 }, { unique: true });
+
+    const ticketCounterCol = mongoDb.collection('discord_ticket_counters');
+    await ticketCounterCol.createIndex({ guildId: 1 }, { unique: true });
+
     console.log('[MongoDB] 🔒 Indexes verified across managed collections.');
   } catch (err) {
     console.warn('[MongoDB] ⚠️ Error creating indexes:', err.message);
@@ -321,20 +334,20 @@ export async function upsertManagedMessage(client, options) {
 
   if (!isMongoConnected()) {
     // If Mongo is offline, try fetching target channel and sending/editing as fallback
-    const channel = client.channels.cache.get(channelId) || (await client.channels.fetch(channelId).catch(() => null));
+    const channel = options?.channel || client?.channels?.cache?.get(channelId) || (typeof client?.channels?.fetch === 'function' ? await client.channels.fetch(channelId).catch(() => null) : null) || client?.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(channelId);
     if (!channel) throw new Error(`Target channel ${channelId} not found`);
 
     if (existingMessageId && typeof channel.messages?.fetch === 'function') {
       try {
         const fallbackMsg = await channel.messages.fetch(existingMessageId).catch(() => null);
         if (fallbackMsg && typeof fallbackMsg.edit === 'function') {
-          await fallbackMsg.edit(payload);
+          await queueMessageEdit(fallbackMsg, payload);
           return { message: fallbackMsg, created: false, updated: true, unchanged: false, messageId: fallbackMsg.id };
         }
       } catch {}
     }
 
-    const sentMsg = await channel.send(payload);
+    const sentMsg = await queueChannelSend(channel, payload);
     return { message: sentMsg, created: true, updated: false, unchanged: false, messageId: sentMsg?.id || null };
   }
 
@@ -367,7 +380,7 @@ export async function upsertManagedMessage(client, options) {
 
   if (candidateMsgId) {
     const targetChannelId = existingRecord?.channelId || channelId;
-    const channel = client.channels.cache.get(targetChannelId) || (await client.channels.fetch(targetChannelId).catch(() => null));
+    const channel = options?.channel || client?.channels?.cache?.get(targetChannelId) || (typeof client?.channels?.fetch === 'function' ? await client.channels.fetch(targetChannelId).catch(() => null) : null) || client?.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(targetChannelId);
 
     if (channel && typeof channel.messages?.fetch === 'function') {
       let discordMsg = null;
@@ -411,7 +424,7 @@ export async function upsertManagedMessage(client, options) {
 
         // Content changed -> edit existing message in place
         try {
-          await discordMsg.edit(payload);
+          await queueMessageEdit(discordMsg, payload);
           await msgCol.updateOne(
             { _id: existingRecord?._id || `msg_${guildId}_${Date.now()}` },
             {
@@ -477,7 +490,7 @@ export async function upsertManagedMessage(client, options) {
           if (doubleCheck.contentHash === payloadHash) {
             return { message: doubleMsg, created: false, updated: false, unchanged: true, messageId: doubleMsg.id };
           }
-          await doubleMsg.edit(payload);
+          await queueMessageEdit(doubleMsg, payload);
           const nextVer = (doubleCheck.version || 0) + 1;
           await msgCol.updateOne(
             { _id: doubleCheck._id },
@@ -497,11 +510,11 @@ export async function upsertManagedMessage(client, options) {
       }
     }
 
-    const channel = client.channels.cache.get(channelId) || (await client.channels.fetch(channelId).catch(() => null));
+    const channel = options?.channel || client?.channels?.cache?.get(channelId) || (typeof client?.channels?.fetch === 'function' ? await client.channels.fetch(channelId).catch(() => null) : null) || client?.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(channelId);
     if (!channel) throw new Error(`Target channel ${channelId} not found`);
 
     // Send Discord message
-    const createdMsg = await channel.send(payload);
+    const createdMsg = await queueChannelSend(channel, payload);
 
     // Save record to MongoDB with upsert
     const recordId = existingRecord?._id || `msg_${guildId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -587,6 +600,7 @@ export async function upsertManagedMessageBatch(client, options) {
     const res = await upsertManagedMessage(client, {
       guildId,
       channelId,
+      channel: options.channel,
       logicalKey,
       messageType,
       tournamentId,
@@ -615,7 +629,7 @@ export async function upsertManagedMessageBatch(client, options) {
 
       for (const rec of excessRecords) {
         try {
-          const channel = client.channels.cache.get(rec.channelId) || (await client.channels.fetch(rec.channelId).catch(() => null));
+          const channel = options?.channel || client?.channels?.cache?.get(rec.channelId) || (typeof client?.channels?.fetch === 'function' ? await client.channels.fetch(rec.channelId).catch(() => null) : null) || client?.guilds?.cache?.get?.(guildId)?.channels?.cache?.get?.(rec.channelId);
           if (channel && typeof channel.messages?.fetch === 'function') {
             const oldMsg = await channel.messages.fetch(rec.messageId).catch(() => null);
             if (oldMsg) await oldMsg.delete().catch(() => {});
@@ -1445,6 +1459,127 @@ export async function isGuildLinkedToOrganiser(guildId) {
 /**
  * Gracefully closes the MongoDB connection.
  */
+/**
+ * Saves or updates the support ticket panel metadata for a guild.
+ * @param {string} guildId
+ * @param {string} channelId
+ * @param {string} messageId
+ * @returns {Promise<boolean>}
+ */
+export async function saveTicketPanel(guildId, channelId, messageId) {
+  if (!isMongoConnected() || !guildId) return false;
+  try {
+    const col = mongoDb.collection('discord_ticket_panels');
+    await col.updateOne(
+      { guildId },
+      { $set: { guildId, channelId, messageId, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    return true;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error saving ticket panel for guild ${guildId}:`, err.message);
+    return false;
+  }
+}
+
+/**
+ * Retrieves the ticket panel record for a guild.
+ * @param {string} guildId
+ * @returns {Promise<object|null>}
+ */
+export async function getTicketPanel(guildId) {
+  if (!isMongoConnected() || !guildId) return null;
+  try {
+    const col = mongoDb.collection('discord_ticket_panels');
+    return await col.findOne({ guildId });
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error getting ticket panel for guild ${guildId}:`, err.message);
+    return null;
+  }
+}
+
+/**
+ * Atomically increments and retrieves the next ticket sequence number for a guild.
+ * @param {string} guildId
+ * @returns {Promise<number>}
+ */
+export async function getNextTicketNumber(guildId) {
+  if (!isMongoConnected() || !guildId) {
+    return Math.floor(Date.now() % 10000) || 1;
+  }
+  try {
+    const col = mongoDb.collection('discord_ticket_counters');
+    const result = await col.findOneAndUpdate(
+      { guildId },
+      { $inc: { seq: 1 }, $setOnInsert: { createdAt: new Date() } },
+      { upsert: true, returnDocument: 'after' }
+    );
+    const seq = result?.seq ?? result?.value?.seq ?? 1;
+    return seq;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error getting next ticket number for guild ${guildId}:`, err.message);
+    return Math.floor(Date.now() % 10000) || 1;
+  }
+}
+
+/**
+ * Saves a new support ticket record to MongoDB.
+ * @param {object} ticketData
+ * @returns {Promise<object|null>}
+ */
+export async function saveTicketToDb(ticketData) {
+  if (!isMongoConnected() || !ticketData?.channelId) return ticketData;
+  try {
+    const col = mongoDb.collection('discord_tickets');
+    await col.updateOne(
+      { channelId: ticketData.channelId },
+      { $set: { ...ticketData, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    return ticketData;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error saving ticket ${ticketData?.ticketNumber}:`, err.message);
+    return ticketData;
+  }
+}
+
+/**
+ * Retrieves a ticket record from MongoDB by channelId.
+ * @param {string} channelId
+ * @returns {Promise<object|null>}
+ */
+export async function getTicketFromDb(channelId) {
+  if (!isMongoConnected() || !channelId) return null;
+  try {
+    const col = mongoDb.collection('discord_tickets');
+    return await col.findOne({ channelId });
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error getting ticket for channel ${channelId}:`, err.message);
+    return null;
+  }
+}
+
+/**
+ * Updates the status of a support ticket in MongoDB.
+ * @param {string} channelId
+ * @param {string} status ('open' | 'closed')
+ * @returns {Promise<boolean>}
+ */
+export async function updateTicketStatusInDb(channelId, status) {
+  if (!isMongoConnected() || !channelId) return false;
+  try {
+    const col = mongoDb.collection('discord_tickets');
+    await col.updateOne(
+      { channelId },
+      { $set: { status, closedAt: status === 'closed' ? new Date() : null, updatedAt: new Date() } }
+    );
+    return true;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error updating ticket status for channel ${channelId}:`, err.message);
+    return false;
+  }
+}
+
 export async function closeMongo() {
   if (mongoClient) {
     try {

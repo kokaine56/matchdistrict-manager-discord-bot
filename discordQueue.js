@@ -1,3 +1,4 @@
+const isTestEnv = Boolean(process.env.NODE_ENV === "test" || process.env.NODE_TEST_CONTEXT || process.argv.some(a => a.includes("test")) || process.execArgv.includes("--test"));
 /**
  * Shared Rate-Limiting Queue for Bulk Discord API Actions.
  *
@@ -10,9 +11,9 @@
 
 export const QUEUE_CONFIG = {
   // Configurable delays (easy to change in one place)
-  ACTION_DELAY_MS: 400,   // Delay for creating/deleting channels, categories, roles (300-500ms)
-  MESSAGE_DELAY_MS: 1000, // Delay for posting/editing messages in channels (~1 second)
-  ROLE_DELAY_MS: 350,     // Delay for role assignment / removal
+  ACTION_DELAY_MS: isTestEnv ? 5 : 400,   // Delay for creating/deleting channels, categories, roles (300-500ms)
+  MESSAGE_DELAY_MS: isTestEnv ? 10 : 1000, // Delay for posting/editing messages in channels (~1 second)
+  ROLE_DELAY_MS: isTestEnv ? 5 : 350,     // Delay for role assignment / removal
   MAX_RETRIES: 5,         // Max retries on rate limit (429)
   CONCURRENCY: 1,         // Concurrency limit (1 at a time, at most 2)
 };
@@ -126,7 +127,7 @@ export async function queueChannelDelete(channel, reason = 'Cleanup') {
     return null;
   }
   // If cache exists and channel is not in cache, it's already gone
-  if (channel.guild?.channels?.cache && !channel.guild.channels.cache.has(channel.id)) {
+  if (typeof channel.guild?.channels?.cache?.has === 'function' && !channel.guild.channels.cache.has(channel.id)) {
     return null;
   }
   return enqueueDiscordAction(async () => {
@@ -155,7 +156,7 @@ export async function queueRoleDelete(role, reason = 'Cleanup') {
   if (!role || role.deleted) {
     return null;
   }
-  if (role.guild?.roles?.cache && !role.guild.roles.cache.has(role.id)) {
+  if (typeof role.guild?.roles?.cache?.has === 'function' && !role.guild.roles.cache.has(role.id)) {
     return null;
   }
   return enqueueDiscordAction(async () => {
