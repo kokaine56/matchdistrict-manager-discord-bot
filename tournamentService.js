@@ -368,6 +368,44 @@ export async function ensureTournamentShortCode(guild, tournament, savedTourname
   return code;
 }
 
+function getRoundGroupChannelNames(prefix, roundNumber, groupNumber) {
+  const label = `R${roundNumber}G${groupNumber}`;
+  return {
+    primary: `${toMathematicalBold(prefix)}｜${toMathematicalBold(label)}`,
+    fallback: `${String(prefix).toLowerCase()}-r${roundNumber}g${groupNumber}`,
+  };
+}
+
+function isDiscordChannelNameRejection(error) {
+  return Number(error?.code) === 50035 || /channel.{0,20}name|name.{0,20}channel/i.test(String(error?.message || ''));
+}
+
+async function renameRoundGroupChannel(channel, names, context) {
+  if (channel.name === names.primary) return;
+  try {
+    await channel.setName(names.primary);
+  } catch (error) {
+    console.error(`[Discord Bot] Failed to rename ${context} to "${names.primary}":`, error);
+    if (!isDiscordChannelNameRejection(error)) return;
+    if (channel.name !== names.fallback) await channel.setName(names.fallback).catch((retryError) => {
+      console.error(`[Discord Bot] Failed to rename ${context} to fallback "${names.fallback}":`, retryError);
+    });
+  }
+}
+
+async function createRoundGroupChannel(guild, options, names, context) {
+  try {
+    return await queueChannelCreate(guild, { ...options, name: names.primary });
+  } catch (error) {
+    console.error(`[Discord Bot] Failed to create ${context} as "${names.primary}":`, error);
+    if (!isDiscordChannelNameRejection(error)) return null;
+    return await queueChannelCreate(guild, { ...options, name: names.fallback }).catch((retryError) => {
+      console.error(`[Discord Bot] Failed to create ${context} with fallback "${names.fallback}":`, retryError);
+      return null;
+    });
+  }
+}
+
 /**
  * Returns primary (<prefix>｜<name>) and fallback (<prefix>-<name>) channel names for Discord channels.
  * - Primary prefix is the short tournament prefix in capitals converted to Mathematical Bold characters.
@@ -3871,15 +3909,12 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
         for (const group of round.groups) {
           const g = group.groupNumber;
           const roleName = `${tourPrefix} R${roundNum}G${g}`.slice(0, 100);
-          const channelName = `${tourPrefix} ｜ R${roundNum}G${g}`.slice(0, 100);
+          const channelNames = getRoundGroupChannelNames(tourPrefix, roundNum, g);
 
           // Ensure group role exists
           let grpRole = null;
           if (group.roleId && guild.roles) {
             grpRole = guild.roles.cache.get(group.roleId) || await guild.roles.fetch(group.roleId).catch(() => null);
-          }
-          if (!grpRole && guild.roles) {
-            grpRole = findInCache(guild.roles.cache, (r) => r.name.toLowerCase() === roleName.toLowerCase() || r.name.toLowerCase() === altRoleName.toLowerCase()) || null;
           }
           if (!grpRole && typeof guild.roles?.create === 'function') {
             grpRole = await queueRoleCreate(guild, {
@@ -3978,13 +4013,12 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
               }] : []),
             ];
 
-            grpChannel = await queueChannelCreate(guild, {
-              name: channelName,
+            grpChannel = await createRoundGroupChannel(guild, {
               type: ChannelType.GuildText,
               parent: roundCategory.id,
               topic: `MatchDistrict ID/PWD & Slot Details for ${round.name} Group ${g}`,
               permissionOverwrites: groupOverwrites,
-            }).catch((err) => {
+            }, channelNames, `round ${roundNum} group ${g} channel`).catch((err) => {
               syncResult.failures.push(`Failed to recreate channel for Group ${g}: ${err.message}`);
               return null;
             });
@@ -3997,7 +4031,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
           }
 
           if (grpChannel) {
-            if (grpChannel.name !== channelName) await grpChannel.setName(channelName).catch((err) => syncResult.failures.push(`Failed to rename group channel ${grpChannel.id}: ${err.message}`));
+            await renameRoundGroupChannel(grpChannel, channelNames, `group channel ${grpChannel.id}`);
             group.channelId = grpChannel.id;
             group.channelName = grpChannel.name;
             if (grpChannel.parentId !== category.id) {
@@ -6398,7 +6432,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
         const groupId = `${round.roundId}_g${g}`;
         const groupNumber = g;
         const roleName = `${tourPrefix} R${roundNum}G${g}`.slice(0, 100);
-        const channelName = `${tourPrefix} ｜ R${roundNum}G${g}`.slice(0, 100);
+        const channelNames = getRoundGroupChannelNames(tourPrefix, roundNum, g);
 
         // 1. Create or reuse group role (no admin permissions)
         let groupRole = null;
@@ -6406,9 +6440,6 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
         if (existingGroup?.roleId && guild.roles) {
           groupRole = guild.roles.cache.get(existingGroup.roleId) ||
             await guild.roles.fetch(existingGroup.roleId).catch(() => null);
-        }
-        if (!groupRole && guild.roles) {
-          groupRole = findInCache(guild.roles.cache, (r) => r.name.toLowerCase() === roleName.toLowerCase() || r.name.toLowerCase() === altRoleName.toLowerCase()) || null;
         }
         if (!groupRole && typeof guild.roles?.create === 'function') {
           groupRole = await queueRoleCreate(guild, {
@@ -6493,7 +6524,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
         ];
 
         if (groupChannel) {
-          if (groupChannel.name !== channelName) await groupChannel.setName(channelName);
+          await renameRoundGroupChannel(groupChannel, channelNames, `group channel ${groupChannel.id}`);
           if (groupChannel.parentId !== category.id) {
             await groupChannel.setParent(category.id, { lockPermissions: false });
           }
@@ -6501,13 +6532,12 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
             await groupChannel.permissionOverwrites.set(groupOverwrites).catch(() => {});
           }
         } else {
-          groupChannel = await queueChannelCreate(guild, {
-            name: channelName,
+          groupChannel = await createRoundGroupChannel(guild, {
             type: ChannelType.GuildText,
             parent: roundCategory.id,
             topic: `Private Match Credentials for Group ${g} (${round.name}) — ${tournament.title}`,
             permissionOverwrites: groupOverwrites,
-          });
+          }, channelNames, `round ${roundNum} group ${g} channel`);
         }
 
         // 3. Populate slots 1-25
@@ -6614,7 +6644,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
           roleId: groupRole?.id || null,
           roleName: groupRole?.name || roleName,
           channelId: groupChannel?.id || null,
-          channelName: groupChannel?.name || channelName,
+          channelName: groupChannel?.name || channelNames.primary,
           slots,
           credentialsMessageId: existingGroup?.credentialsMessageId || null,
           submissionControlMessageId: existingGroup?.submissionControlMessageId || null,
