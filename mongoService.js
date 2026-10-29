@@ -868,10 +868,11 @@ export async function loadAllTournamentsFromDb() {
  * @param {string} tournamentId
  */
 export async function deleteTournamentFromDb(guildId, tournamentId) {
-  if (!isMongoConnected() || !guildId || !tournamentId) return;
+  if (!isMongoConnected() || !tournamentId) return;
   try {
     const tourCol = mongoDb.collection('discord_tournaments');
-    await tourCol.deleteOne({ guildId, tournamentId });
+    const filter = guildId ? { guildId, tournamentId } : { tournamentId };
+    await tourCol.deleteMany(filter);
   } catch (err) {
     console.warn(`[MongoDB] Error deleting tournament ${tournamentId}:`, err.message);
   }
@@ -901,21 +902,42 @@ export async function findTournamentByBotCommandsChannel(guildId, channelId) {
 
 /**
  * Permanently deletes all database records belonging to a tournament across all collections.
- * @param {string} guildId
+ * @param {string} [guildId]
  * @param {string} tournamentId
  */
 export async function purgeAllTournamentDataFromDb(guildId, tournamentId) {
-  if (!isMongoConnected() || !guildId || !tournamentId) return;
+  if (!isMongoConnected() || !tournamentId) return;
   try {
     const tourCol = mongoDb.collection('discord_tournaments');
-    await tourCol.deleteOne({ guildId, tournamentId });
+    const tourFilter = guildId ? { guildId, tournamentId } : { tournamentId };
+    await tourCol.deleteMany(tourFilter);
 
     const msgCol = mongoDb.collection('discord_managed_messages');
-    await msgCol.deleteMany({ guildId, tournamentId });
+    const msgFilter = guildId ? { guildId, tournamentId } : { tournamentId };
+    await msgCol.deleteMany(msgFilter);
 
     console.log(`[MongoDB] 🗑️ Purged all records for tournament ${tournamentId} from MongoDB.`);
   } catch (err) {
     console.warn(`[MongoDB] Error purging tournament ${tournamentId} from database:`, err.message);
+  }
+}
+
+/**
+ * Clears any deletion lock or deletion failure state from MongoDB tournament document.
+ * @param {string} [guildId]
+ * @param {string} tournamentId
+ */
+export async function clearTournamentDeletionLockInDb(guildId, tournamentId) {
+  if (!isMongoConnected() || !tournamentId) return;
+  try {
+    const tourCol = mongoDb.collection('discord_tournaments');
+    const filter = guildId ? { guildId, tournamentId } : { tournamentId };
+    await tourCol.updateMany(
+      filter,
+      { $unset: { deletionStatus: '', deletingStartedAt: '', deletionError: '' } }
+    );
+  } catch (err) {
+    console.warn(`[MongoDB] Error clearing deletion lock in DB for ${tournamentId}:`, err.message);
   }
 }
 
@@ -929,7 +951,10 @@ export async function getPendingTournamentDeletions(guildId) {
   try {
     const tourCol = mongoDb.collection('discord_tournaments');
     const query = {
-      deletionStatus: { $in: ['deletion_pending', 'deleting'] },
+      $or: [
+        { deletionStatus: { $in: ['deletion_pending', 'deleting', 'deletion_failed'] } },
+        { setupStatus: 'deleting' },
+      ],
     };
     if (guildId) query.guildId = guildId;
     return await tourCol.find(query).toArray();

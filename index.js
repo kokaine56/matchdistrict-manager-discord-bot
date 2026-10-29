@@ -2156,9 +2156,10 @@ client.once(Events.ClientReady, async (readyClient) => {
   // Startup reconciliation and deletion recovery for managed Discord resources across MongoDB and Discord
   try {
     await initOrganiserLinksCache();
+    await resumePendingTournamentDeletions(readyClient);
     const officialGuildId = getOfficialGuildId();
     if (officialGuildId) {
-      await resumePendingTournamentDeletions(readyClient, officialGuildId);
+      // Pending deletions resumed for all guilds
       await reconcileManagedBotState(readyClient, officialGuildId);
     }
   } catch (recErr) {

@@ -51,6 +51,7 @@ import {
   enforceSingleActiveRoundInDb,
   findTournamentByBotCommandsChannel,
   purgeAllTournamentDataFromDb,
+  clearTournamentDeletionLockInDb,
   getPendingTournamentDeletions,
   saveOrganiserLink,
   getOrganiserLinkForGuild,
@@ -58,6 +59,42 @@ import {
   loadAllOrganiserLinksFromDb,
   isGuildLinkedToOrganiser,
 } from './mongoService.js';
+
+/** Timeout in milliseconds before a tournament deletion lock is considered stale (3 minutes). */
+export const DELETION_LOCK_TIMEOUT_MS = 3 * 60 * 1000;
+
+/**
+ * Checks if a tournament's deletion lock is stale (older than 3 minutes or unversioned).
+ * @param {object} tourData
+ * @returns {boolean}
+ */
+export function isDeletionStale(tourData) {
+  if (!tourData) return false;
+  const isDeleting = tourData.deletionStatus === 'deletion_pending' || tourData.deletionStatus === 'deleting';
+  if (!isDeleting) return false;
+  if (!tourData.deletingStartedAt) return true;
+  return Date.now() - Number(tourData.deletingStartedAt) > DELETION_LOCK_TIMEOUT_MS;
+}
+
+/**
+ * Clears the deletion lock from cache and MongoDB.
+ * @param {string} guildId
+ * @param {string} tournamentId
+ * @param {object} [tourData]
+ */
+export async function clearTournamentDeletionLock(guildId, tournamentId, tourData = null) {
+  if (guildId && guildSettingsCache[guildId]?.tournaments?.[tournamentId]) {
+    const tour = tourData || guildSettingsCache[guildId].tournaments[tournamentId];
+    delete tour.deletionStatus;
+    delete tour.deletingStartedAt;
+    delete tour.deletionError;
+    guildSettingsCache[guildId].tournaments[tournamentId] = tour;
+    saveGuildSettings(guildSettingsCache);
+  }
+  if (tournamentId) {
+    await clearTournamentDeletionLockInDb(guildId, tournamentId).catch(() => {});
+  }
+}
 
 /** Shared and tournament-specific channels provisioned by Create Channels. */
 export const REQUIRED_TOURNAMENT_CHANNELS = [
@@ -2690,6 +2727,11 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   if (!savedTournament.channels) {
     savedTournament.channels = {};
   }
+  if (savedTournament.deletionStatus) {
+    delete savedTournament.deletionStatus;
+    delete savedTournament.deletingStartedAt;
+    delete savedTournament.deletionError;
+  }
   if (!Array.isArray(savedTournament.dashboardNavigationStack) || savedTournament.dashboardNavigationStack.length === 0) {
     savedTournament.dashboardNavigationStack = [{ screen: 'home' }];
   }
@@ -3058,6 +3100,14 @@ export async function handleSelectTournamentCommand(guild, member, tournamentId,
     return;
   }
 
+  // If this tournament has a leftover deletion status or stale deletion lock, clear bot data so selecting starts fresh
+  const currentSaved = guildSettingsCache[guild.id]?.tournaments?.[tournamentId];
+  if (currentSaved && (currentSaved.deletionStatus || isDeletionStale(currentSaved))) {
+    delete guildSettingsCache[guild.id].tournaments[tournamentId];
+    saveGuildSettings(guildSettingsCache);
+    await purgeAllTournamentDataFromDb(guild.id, tournamentId);
+  }
+
   const botMember = guild.members.me;
   if (!botMember?.permissions?.has(PermissionFlagsBits.ManageChannels)) {
     await replyFn(
@@ -3279,6 +3329,11 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
   if (!savedTournament.channels) {
     savedTournament.channels = {};
+  }
+  if (savedTournament.deletionStatus) {
+    delete savedTournament.deletionStatus;
+    delete savedTournament.deletingStartedAt;
+    delete savedTournament.deletionError;
   }
 
   const syncResult = {
@@ -4423,7 +4478,10 @@ export async function renameTournamentChannelsToStandardFormat(guild, tournament
     // Check if tournament is currently undergoing permanent deletion
     const currentTourSaved = guildSettingsCache[guild.id]?.tournaments?.[tournamentId];
     if (currentTourSaved && (currentTourSaved.deletionStatus === 'deletion_pending' || currentTourSaved.deletionStatus === 'deleting')) {
-      if (action !== 'cancel_delete_permanent' && action !== 'confirm_delete_permanent') {
+      if (isDeletionStale(currentTourSaved)) {
+        console.warn(`[Tournament] ⚠️ Stale deletion lock detected for tournament ${tournamentId} (>3m or unversioned). Auto-clearing lock.`);
+        await clearTournamentDeletionLock(guild.id, tournamentId, currentTourSaved);
+      } else if (action !== 'cancel_delete_permanent' && action !== 'confirm_delete_permanent') {
         const delMsg = '⚠️ **Action Blocked:** This tournament is currently undergoing permanent deletion.';
         if ((interaction.deferred || interaction.replied) && typeof interaction.editReply === 'function') {
           await interaction.editReply({ content: delMsg, components: [] }).catch(() => {});
@@ -4856,6 +4914,7 @@ export async function renameTournamentChannelsToStandardFormat(guild, tournament
 
     // Action: Cancel Delete Tournament (Permanent)
     if (action === 'cancel_delete_permanent') {
+      await clearTournamentDeletionLock(guild.id, tournamentId);
       if (typeof interaction.editReply === 'function' && (interaction.deferred || interaction.replied)) {
         await interaction.editReply({
           content: 'ℹ️ **Permanent Deletion Cancelled:** Tournament and all associated channels remain intact.',
@@ -9344,20 +9403,67 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       }).catch(() => {});
     }
 
-    const result = await executeTournamentPermanentDeletion(guild, tournamentId, member);
+    try {
+      const result = await executeTournamentPermanentDeletion(guild, tournamentId, member);
 
-    const replyMsg = `🗑️ **Permanent Tournament Deletion Completed**\n` +
-      `• **Tournament:** \`${tournamentId}\`\n` +
-      `• **Channels Deleted:** ${result.deletedChannels.length > 0 ? result.deletedChannels.map((c) => `\`#${c}\``).join(', ') : 'None'}\n` +
-      `• **Category Deleted:** ${result.categoryDeleted ? 'Yes' : 'No'}\n` +
-      `• **Roles Deleted:** ${result.rolesDeletedCount}\n` +
-      `• **Database Records Purged:** Yes (MongoDB records, rounds, slot lists, and managed messages purged)\n` +
-      `• **Status:** \`deleted\``;
+      if (!result.success) {
+        const errorDetails = result.error || (result.failures && result.failures.length > 0 ? result.failures.join('; ') : 'An unexpected error occurred during deletion.');
+        const retryRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`dash:main:confirm-delete-tournament:${tournamentId}`)
+            .setLabel('Retry Delete Tournament')
+            .setEmoji('🔄')
+            .setStyle(ButtonStyle.Danger),
+          new ButtonBuilder()
+            .setCustomId(`dash:main:home:${tournamentId}`)
+            .setLabel('Dashboard Home')
+            .setStyle(ButtonStyle.Secondary)
+        );
 
-    if (typeof interaction.followUp === 'function') {
-      await interaction.followUp({ content: replyMsg, ephemeral: true }).catch(() => {});
-    } else if (typeof interaction.editReply === 'function') {
-      await interaction.editReply({ content: replyMsg }).catch(() => {});
+        const failMsg = `⚠️ **Tournament Deletion Incomplete**\n` +
+          `• **Tournament:** \`${tournamentId}\`\n` +
+          `• **Reason:** ${errorDetails}\n\n` +
+          `The deletion lock has been cleared. You can retry permanent deletion now:`;
+
+        if (typeof interaction.editReply === 'function') {
+          await interaction.editReply({ content: failMsg, components: [retryRow] }).catch(() => {});
+        } else if (typeof interaction.followUp === 'function') {
+          await interaction.followUp({ content: failMsg, components: [retryRow], ephemeral: true }).catch(() => {});
+        }
+        return;
+      }
+
+      const replyMsg = `🗑️ **Permanent Tournament Deletion Completed**\n` +
+        `• **Tournament:** \`${tournamentId}\`\n` +
+        `• **Channels Deleted:** ${result.deletedChannels.length > 0 ? result.deletedChannels.map((c) => `\`#${c}\``).join(', ') : 'None'}\n` +
+        `• **Category Deleted:** ${result.categoryDeleted ? 'Yes' : 'No'}\n` +
+        `• **Roles Deleted:** ${result.rolesDeletedCount}\n` +
+        `• **Database Records Purged:** Yes (MongoDB records, rounds, slot lists, and managed messages purged)\n` +
+        `• **Status:** \`deleted\``;
+
+      if (typeof interaction.followUp === 'function') {
+        await interaction.followUp({ content: replyMsg, ephemeral: true }).catch(() => {});
+      } else if (typeof interaction.editReply === 'function') {
+        await interaction.editReply({ content: replyMsg }).catch(() => {});
+      }
+    } catch (err) {
+      console.error(`[Delete Tournament] Handler error for ${tournamentId}:`, err);
+      await clearTournamentDeletionLock(guild.id, tournamentId).catch(() => {});
+
+      const retryRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`dash:main:confirm-delete-tournament:${tournamentId}`)
+          .setLabel('Retry Delete Tournament')
+          .setEmoji('🔄')
+          .setStyle(ButtonStyle.Danger)
+      );
+
+      const errText = `❌ **Tournament Deletion Failed:** ${err.message}\nThe deletion lock was cleared.`;
+      if (typeof interaction.editReply === 'function') {
+        await interaction.editReply({ content: errText, components: [retryRow] }).catch(() => {});
+      } else if (typeof interaction.followUp === 'function') {
+        await interaction.followUp({ content: errText, components: [retryRow], ephemeral: true }).catch(() => {});
+      }
     }
   }
 
@@ -9420,167 +9526,233 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       try {
         saved = await findTournamentByBotCommandsChannel(guild.id, tournamentId);
       } catch {}
+      if (!saved) {
+        try {
+          saved = await getTournamentFromDb(guild.id, tournamentId);
+        } catch {}
+      }
     }
 
     const summary = {
+      success: false,
       deletedChannels: [],
       categoryDeleted: false,
       rolesDeletedCount: 0,
       failures: [],
+      error: null,
     };
 
     if (!saved) {
       await purgeAllTournamentDataFromDb(guild.id, tournamentId);
+      if (currentSettings.tournaments?.[tournamentId]) {
+        delete currentSettings.tournaments[tournamentId];
+        saveGuildSettings(guildSettingsCache);
+      }
+      summary.success = true;
       return summary;
     }
-    const legacyCategoryShared = Object.entries(currentSettings.tournaments || {}).some(([otherId, other]) =>
-      otherId !== tournamentId && [other.categoryId, other.publicCategoryId, other.managementCategoryId,
-        ...Object.values(other.rounds || {}).map((round) => round?.categoryId)].includes(saved.categoryId)
-    );
 
-    // 1. Transition state: deletion_pending -> deleting
-    saved.deletionStatus = 'deletion_pending';
-    if (guildSettingsCache[guild.id]?.tournaments) {
-      guildSettingsCache[guild.id].tournaments[tournamentId] = saved;
-      saveGuildSettings(guildSettingsCache);
-    }
-    await saveTournamentToDb(guild.id, tournamentId, saved).catch(() => {});
-
+    // 1. Transition state to deleting and record timestamp for timeout tracking
     saved.deletionStatus = 'deleting';
+    saved.deletingStartedAt = Date.now();
+    delete saved.deletionError;
+
     if (guildSettingsCache[guild.id]?.tournaments) {
       guildSettingsCache[guild.id].tournaments[tournamentId] = saved;
       saveGuildSettings(guildSettingsCache);
     }
     await saveTournamentToDb(guild.id, tournamentId, saved).catch(() => {});
 
-    // 2. Delete managed messages
-    try {
-      await deleteManagedMessages(guild.client, {
-        guildId: guild.id,
-        tournamentId,
-      });
-    } catch (err) {
-      summary.failures.push(`Managed messages delete: ${err.message}`);
-    }
+    let deletionSucceeded = false;
 
-    // 3. Delete round group channels and group roles
-    if (saved.rounds && typeof saved.rounds === 'object') {
-      for (const round of Object.values(saved.rounds)) {
-        if (Array.isArray(round.groups)) {
-          for (const group of round.groups) {
-            if (group.channelId) {
-              try {
-                const gch = guild.channels.cache.get(group.channelId) ||
-                  await guild.channels.fetch(group.channelId).catch(() => null);
-                if (gch) {
-                  const gchName = gch.name;
-                  await gch.delete('Tournament permanent deletion: round group channel').catch(() => {});
-                  summary.deletedChannels.push(gchName);
+    try {
+      // 2. Delete managed messages (dashboard control panels, slot lists, etc.)
+      try {
+        if (guild.client) {
+          await deleteManagedMessages(guild.client, {
+            guildId: guild.id,
+            tournamentId,
+          });
+        }
+      } catch (err) {
+        console.warn(`[Delete Tournament] Managed messages delete error for ${tournamentId}:`, err.message);
+        summary.failures.push(`Managed messages: ${err.message}`);
+      }
+
+      // 3. Delete round group channels and group roles
+      if (saved.rounds && typeof saved.rounds === 'object') {
+        for (const round of Object.values(saved.rounds)) {
+          if (Array.isArray(round.groups)) {
+            for (const group of round.groups) {
+              if (group.channelId) {
+                try {
+                  const gch = guild.channels.cache.get(group.channelId) ||
+                    await guild.channels.fetch(group.channelId).catch(() => null);
+                  if (gch) {
+                    const gchName = gch.name;
+                    await gch.delete('Tournament permanent deletion: round group channel').catch((err) => {
+                      if (err.code !== 10003) throw err;
+                    });
+                    summary.deletedChannels.push(gchName);
+                  }
+                } catch (err) {
+                  if (err.code !== 10003) {
+                    summary.failures.push(`Group channel ${group.channelId}: ${err.message}`);
+                  }
                 }
-              } catch {}
-            }
-            if (group.voiceChannelId) {
-              try {
-                const vch = guild.channels.cache.get(group.voiceChannelId) ||
-                  await guild.channels.fetch(group.voiceChannelId).catch(() => null);
-                if (vch) {
-                  const vchName = vch.name;
-                  await vch.delete('Tournament permanent deletion: round group voice channel').catch(() => {});
-                  summary.deletedChannels.push(vchName);
+              }
+              if (group.voiceChannelId) {
+                try {
+                  const vch = guild.channels.cache.get(group.voiceChannelId) ||
+                    await guild.channels.fetch(group.voiceChannelId).catch(() => null);
+                  if (vch) {
+                    const vchName = vch.name;
+                    await vch.delete('Tournament permanent deletion: round group voice channel').catch((err) => {
+                      if (err.code !== 10003) throw err;
+                    });
+                    summary.deletedChannels.push(vchName);
+                  }
+                } catch (err) {
+                  if (err.code !== 10003) {
+                    summary.failures.push(`Group VC ${group.voiceChannelId}: ${err.message}`);
+                  }
                 }
-              } catch {}
-            }
-            if (group.roleId && guild.roles) {
-              try {
-                const gr = guild.roles.cache.get(group.roleId) ||
-                  await guild.roles.fetch(group.roleId).catch(() => null);
-                if (gr && typeof gr.delete === 'function') {
-                  await gr.delete('Tournament permanent deletion: round group role').catch(() => {});
-                  summary.rolesDeletedCount++;
+              }
+              if (group.roleId && guild.roles) {
+                try {
+                  const gr = guild.roles.cache.get(group.roleId) ||
+                    await guild.roles.fetch(group.roleId).catch(() => null);
+                  if (gr && typeof gr.delete === 'function') {
+                    await gr.delete('Tournament permanent deletion: round group role').catch((err) => {
+                      if (err.code !== 10011 && err.code !== 10003) throw err;
+                    });
+                    summary.rolesDeletedCount++;
+                  }
+                } catch (err) {
+                  if (err.code !== 10011 && err.code !== 10003) {
+                    summary.failures.push(`Group role ${group.roleId}: ${err.message}`);
+                  }
                 }
-              } catch {}
+              }
             }
           }
         }
       }
-    }
 
-    // 4. Delete participant channels & bot-commands & roomMakerVc
-    const channelIds = Object.values(saved.channels || {});
-    for (const chId of channelIds) {
-      if (!chId) continue;
-      try {
-        const channel = guild.channels.cache.get(chId) || await guild.channels.fetch(chId).catch(() => null);
-        if (channel) {
-          const chName = channel.name;
-          await queueChannelDelete(channel, 'Tournament permanent deletion').catch(() => {});
-          summary.deletedChannels.push(chName);
+      // 4. Delete participant channels & bot-commands & roomMakerVc
+      const channelIds = Object.values(saved.channels || {});
+      for (const chId of channelIds) {
+        if (!chId) continue;
+        try {
+          const channel = guild.channels.cache.get(chId) || await guild.channels.fetch(chId).catch(() => null);
+          if (channel) {
+            const chName = channel.name;
+            await queueChannelDelete(channel, 'Tournament permanent deletion').catch((err) => {
+              if (err.code !== 10003) throw err;
+            });
+            summary.deletedChannels.push(chName);
+          }
+        } catch (err) {
+          if (err.code !== 10003) {
+            summary.failures.push(`Channel ${chId}: ${err.message}`);
+          }
         }
-      } catch (err) {
-        summary.failures.push(`Failed to delete channel ${chId}: ${err.message}`);
       }
-    }
 
-    // 5. Delete every category owned by the tournament after removing its channels.
-    const categoriesUsedByOthers = new Set(Object.entries(currentSettings.tournaments || {})
-      .filter(([otherId]) => otherId !== tournamentId)
-      .flatMap(([, other]) => [other.categoryId, other.publicCategoryId, other.managementCategoryId,
-        ...Object.values(other.rounds || {}).map((round) => round?.categoryId), ...(other.legacyCategoryIds || [])])
-      .filter(Boolean));
-    const tournamentCategoryIds = new Set([
-      saved.categoryId,
-      saved.publicCategoryId,
-      saved.managementCategoryId,
-      ...Object.values(saved.rounds || {}).map((round) => round.categoryId),
-      ...(saved.legacyCategoryIds || []),
-    ].filter((categoryId) => categoryId && !categoriesUsedByOthers.has(categoryId)));
-    for (const categoryId of tournamentCategoryIds) {
-      const category = guild.channels.cache.get(categoryId) || await guild.channels.fetch(categoryId).catch(() => null);
-      if (!category || category.type !== ChannelType.GuildCategory) continue;
-      for (const child of guild.channels.cache.filter((channel) => channel.parentId === category.id).values()) {
-        await child.delete('Tournament permanent deletion: category child').catch(() => {});
-      }
-      try {
-        await category.delete('Tournament permanent deletion: category');
-        summary.categoryDeleted = true;
-      } catch (err) {
-        if (err.code !== 10003) summary.failures.push(`Failed to delete category ${category.name}: ${err.message}`);
-      }
-    }
+      // 5. Delete every category owned by the tournament after removing its channels.
+      const categoriesUsedByOthers = new Set(Object.entries(currentSettings.tournaments || {})
+        .filter(([otherId]) => otherId !== tournamentId)
+        .flatMap(([, other]) => [other.categoryId, other.publicCategoryId, other.managementCategoryId,
+          ...Object.values(other.rounds || {}).map((round) => round?.categoryId), ...(other.legacyCategoryIds || [])])
+        .filter(Boolean));
+      const tournamentCategoryIds = new Set([
+        saved.categoryId,
+        saved.publicCategoryId,
+        saved.managementCategoryId,
+        ...Object.values(saved.rounds || {}).map((round) => round.categoryId),
+        ...(saved.legacyCategoryIds || []),
+      ].filter((categoryId) => categoryId && !categoriesUsedByOthers.has(categoryId)));
 
-    // 6. Delete main tournament role
-    if (saved.roleId && guild.roles) {
-      try {
-        const role = guild.roles.cache?.get(saved.roleId) ||
-          await guild.roles.fetch?.(saved.roleId).catch(() => null);
-        if (role && typeof role.delete === 'function') {
-          try {
-            await queueRoleDelete(role, `Tournament ${saved.tournamentTitle || tournamentId} permanent deletion`);
+      for (const categoryId of tournamentCategoryIds) {
+        try {
+          const category = guild.channels.cache.get(categoryId) || await guild.channels.fetch(categoryId).catch(() => null);
+          if (!category || category.type !== ChannelType.GuildCategory) continue;
+          for (const child of guild.channels.cache.filter((channel) => channel.parentId === category.id).values()) {
+            await child.delete('Tournament permanent deletion: category child').catch(() => {});
+          }
+          await category.delete('Tournament permanent deletion: category').catch((err) => {
+            if (err.code !== 10003) throw err;
+          });
+          summary.categoryDeleted = true;
+        } catch (err) {
+          if (err.code !== 10003) {
+            summary.failures.push(`Category ${categoryId}: ${err.message}`);
+          }
+        }
+      }
+
+      // 6. Delete main tournament role
+      if (saved.roleId && guild.roles) {
+        try {
+          const role = guild.roles.cache?.get(saved.roleId) ||
+            await guild.roles.fetch?.(saved.roleId).catch(() => null);
+          if (role && typeof role.delete === 'function') {
+            await queueRoleDelete(role, `Tournament ${saved.tournamentTitle || tournamentId} permanent deletion`).catch((err) => {
+              if (err.code !== 10011 && err.code !== 10003) throw err;
+            });
             summary.rolesDeletedCount++;
-          } catch (err) {
-            if (err.code !== 10011 && err.code !== 10003) {
-              summary.failures.push(`Failed to delete tournament role ${saved.roleId}: ${err.message}`);
-            }
+          }
+        } catch (err) {
+          if (err.code !== 10011 && err.code !== 10003) {
+            summary.failures.push(`Tournament role ${saved.roleId}: ${err.message}`);
           }
         }
-      } catch (err) {
-        summary.failures.push(`Failed to delete role: ${err.message}`);
       }
-    }
 
-    // 7. Purge all records from MongoDB
-    await purgeAllTournamentDataFromDb(guild.id, tournamentId);
+      // 7. Purge all records from MongoDB
+      await purgeAllTournamentDataFromDb(guild.id, tournamentId);
 
-    // 8. Log audit trail
-    try {
-      const adminTag = adminMember?.user?.tag || adminMember?.tag || 'System / Auto-Recovery';
-      console.log(`[Audit] 🗑️ Permanent tournament deletion executed for ${tournamentId} by ${adminTag}.`);
-    } catch {}
+      // 8. Log audit trail
+      try {
+        const adminTag = adminMember?.user?.tag || adminMember?.tag || 'System / Auto-Recovery';
+        console.log(`[Audit] 🗑️ Permanent tournament deletion executed for ${tournamentId} by ${adminTag}.`);
+      } catch {}
 
-    // 9. Remove from guildSettingsCache and save
-    if (guildSettingsCache[guild.id]?.tournaments) {
-      delete guildSettingsCache[guild.id].tournaments[tournamentId];
-      saveGuildSettings(guildSettingsCache);
+      if (summary.failures.length > 0) {
+        deletionSucceeded = false;
+        summary.success = false;
+        summary.error = summary.failures.join('; ');
+      } else {
+        deletionSucceeded = true;
+        summary.success = true;
+      }
+    } catch (unexpectedErr) {
+      console.error(`[Delete Tournament] Critical error during deletion of ${tournamentId}:`, unexpectedErr);
+      summary.error = unexpectedErr.message;
+      summary.failures.push(`Critical error: ${unexpectedErr.message}`);
+      deletionSucceeded = false;
+      summary.success = false;
+    } finally {
+      if (deletionSucceeded) {
+        // Successful: completely remove tournament from cache and DB
+        if (guildSettingsCache[guild.id]?.tournaments) {
+          delete guildSettingsCache[guild.id].tournaments[tournamentId];
+          saveGuildSettings(guildSettingsCache);
+        }
+        await purgeAllTournamentDataFromDb(guild.id, tournamentId).catch(() => {});
+        console.log(`[Delete Tournament] ✅ Successfully purged tournament ${tournamentId} from bot state.`);
+      } else {
+        // Failed: log the real error, clear the lock (or mark as deletion_failed), lock must NEVER stay set!
+        console.warn(`[Delete Tournament] ⚠️ Deletion did not complete cleanly for ${tournamentId}. Clearing lock to allow retry.`);
+        saved.deletionStatus = 'deletion_failed';
+        saved.deletingStartedAt = null;
+        saved.deletionError = summary.error || summary.failures.join('; ') || 'Unknown deletion failure';
+        if (guildSettingsCache[guild.id]?.tournaments) {
+          guildSettingsCache[guild.id].tournaments[tournamentId] = saved;
+          saveGuildSettings(guildSettingsCache);
+        }
+        await saveTournamentToDb(guild.id, tournamentId, saved).catch(() => {});
+      }
     }
 
     return summary;
@@ -9590,36 +9762,71 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
    * Resumes and finalizes any tournament deletions that were interrupted by a bot restart.
    *
    * @param {import('discord.js').Client} client
-   * @param {string} guildId
+   * @param {string} [targetGuildId]
    */
-  export async function resumePendingTournamentDeletions(client, guildId) {
+  export async function resumePendingTournamentDeletions(client, targetGuildId = null) {
     if (!client) return;
     try {
-      const guild = guildId ? client.guilds.cache.get(guildId) || (await client.guilds.fetch(guildId).catch(() => null)) : null;
-      if (!guild) return;
+      const guildsToScan = targetGuildId
+        ? [client.guilds.cache.get(targetGuildId) || (await client.guilds.fetch(targetGuildId).catch(() => null))].filter(Boolean)
+        : Array.from(client.guilds.cache.values());
 
-      const pendingDeletions = await getPendingTournamentDeletions(guild.id);
-      const pendingIds = new Set(pendingDeletions.map((p) => p.tournamentId));
+      // 1. Check MongoDB for any tournament in deleting/pending/deletion_failed state
+      const pendingFromDb = await getPendingTournamentDeletions(targetGuildId);
 
-      const cachedTournaments = guildSettingsCache[guild.id]?.tournaments || {};
-      for (const [tId, tData] of Object.entries(cachedTournaments)) {
-        if (tData?.deletionStatus === 'deletion_pending' || tData?.deletionStatus === 'deleting') {
-          pendingIds.add(tId);
+      const itemsToProcess = [];
+
+      for (const record of pendingFromDb) {
+        const gId = record.guildId || targetGuildId;
+        const guild = gId ? client.guilds.cache.get(gId) || (await client.guilds.fetch(gId).catch(() => null)) : null;
+        itemsToProcess.push({ guild, guildId: gId, tournamentId: record.tournamentId, record });
+      }
+
+      for (const guild of guildsToScan) {
+        const cachedTournaments = guildSettingsCache[guild.id]?.tournaments || {};
+        for (const [tId, tData] of Object.entries(cachedTournaments)) {
+          if (
+            tData?.deletionStatus === 'deletion_pending' ||
+            tData?.deletionStatus === 'deleting' ||
+            tData?.deletionStatus === 'deletion_failed'
+          ) {
+            if (!itemsToProcess.some((item) => item.guildId === guild.id && item.tournamentId === tId)) {
+              itemsToProcess.push({ guild, guildId: guild.id, tournamentId: tId, record: tData });
+            }
+          }
         }
       }
 
-      if (pendingIds.size === 0) return;
+      if (itemsToProcess.length === 0) return;
 
-      console.log(`[Startup Recovery] 🧹 Resuming permanent deletion for ${pendingIds.size} tournament(s)...`);
-      for (const tId of pendingIds) {
+      console.log(`[Startup Recovery] 🧹 Found ${itemsToProcess.length} pending/stuck tournament deletion(s). Resolving...`);
+
+      for (const item of itemsToProcess) {
+        const { guild, guildId, tournamentId, record } = item;
         try {
-          console.log(`[Startup Recovery] 🗑️ Completing pending deletion for tournament ${tId}...`);
-          await executeTournamentPermanentDeletion(guild, tId, null);
+          if (guild) {
+            console.log(`[Startup Recovery] 🗑️ Completing pending deletion for tournament ${tournamentId} in guild ${guild.id}...`);
+            const result = await executeTournamentPermanentDeletion(guild, tournamentId, null);
+            if (!result.success) {
+              console.warn(`[Startup Recovery] ⚠️ Could not complete deletion for ${tournamentId}. Clearing lock to unblock.`);
+              await clearTournamentDeletionLock(guild.id, tournamentId, record);
+            }
+          } else {
+            console.warn(`[Startup Recovery] ⚠️ Guild ${guildId} unavailable for stuck tournament ${tournamentId}. Purging database records.`);
+            await purgeAllTournamentDataFromDb(guildId, tournamentId);
+            if (guildId && guildSettingsCache[guildId]?.tournaments?.[tournamentId]) {
+              delete guildSettingsCache[guildId].tournaments[tournamentId];
+              saveGuildSettings(guildSettingsCache);
+            }
+          }
         } catch (err) {
-          console.warn(`[Startup Recovery] ⚠️ Error completing deletion for tournament ${tId}:`, err.message);
+          console.warn(`[Startup Recovery] ⚠️ Error during startup deletion of ${tournamentId}:`, err.message);
+          if (guildId) {
+            await clearTournamentDeletionLock(guildId, tournamentId, record).catch(() => {});
+          }
         }
       }
-      console.log(`[Startup Recovery] ✅ Completed all pending tournament deletions.`);
+      console.log(`[Startup Recovery] ✅ Completed startup recovery for pending tournament deletions.`);
     } catch (err) {
       console.warn('[Startup Recovery] ⚠️ Error in resumePendingTournamentDeletions:', err.message);
     }
@@ -9691,8 +9898,13 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       tournamentData.deletionStatus === 'deleted' ||
       tournamentData.setupStatus === 'deleted'
     ) {
-      await replyFn('⚠️ **Tournament Unavailable:** This tournament is currently undergoing permanent deletion or has been deleted.');
-      return;
+      if (isDeletionStale(tournamentData)) {
+        console.warn(`[Tournament] ⚠️ Stale deletion lock detected in handleDashCommand for tournament ${resolvedTournamentId}. Auto-clearing lock.`);
+        await clearTournamentDeletionLock(guild.id, resolvedTournamentId, tournamentData);
+      } else {
+        await replyFn('⚠️ **Tournament Unavailable:** This tournament is currently undergoing permanent deletion or has been deleted.');
+        return;
+      }
     }
 
     try {
