@@ -797,17 +797,18 @@ export async function saveTournamentToDb(guildId, tournamentId, tournamentData) 
   if (!isMongoConnected() || !guildId || !tournamentId) return false;
   try {
     const tourCol = mongoDb.collection('discord_tournaments');
+    const { _id, createdAt, ...dataToSet } = tournamentData || {};
     await tourCol.updateOne(
       { guildId, tournamentId },
       {
         $set: {
-          ...tournamentData,
+          ...dataToSet,
           guildId,
           tournamentId,
           updatedAt: new Date(),
         },
         $setOnInsert: {
-          createdAt: new Date(),
+          createdAt: createdAt || new Date(),
         },
       },
       { upsert: true }
@@ -1004,16 +1005,17 @@ export async function saveGuildSettingsToDb(guildId, settings) {
   if (!isMongoConnected() || !guildId) return;
   try {
     const guildCol = mongoDb.collection('discord_guild_settings');
+    const { _id, createdAt, ...dataToSet } = settings || {};
     await guildCol.updateOne(
       { guildId },
       {
         $set: {
-          ...settings,
+          ...dataToSet,
           guildId,
           updatedAt: new Date(),
         },
         $setOnInsert: {
-          createdAt: new Date(),
+          createdAt: createdAt || new Date(),
         },
       },
       { upsert: true }
@@ -1659,9 +1661,10 @@ export async function savePendingAnnouncement(announcementData) {
   if (!isMongoConnected()) return;
   try {
     const col = mongoDb.collection('discord_pending_announcements');
+    const { _id, createdAt, ...dataToSet } = announcementData || {};
     await col.updateOne(
       { announcementId: announcementData.announcementId },
-      { $set: { ...announcementData, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
+      { $set: { ...dataToSet, updatedAt: new Date() }, $setOnInsert: { createdAt: createdAt || new Date() } },
       { upsert: true }
     );
   } catch (err) {
