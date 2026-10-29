@@ -231,12 +231,54 @@ export function sanitizeChannelName(name, prefix = '') {
 }
 
 /**
+ * Short prefix builder:
+ * If the name has several words, use initials of words and ignore numbers/years (District League 2026 -> DL).
+ * If it is a single word, use that word (BGMIS 2026 -> BGMIS).
+ */
+export function getTournamentShortPrefix(title, fallback = 'tour') {
+  if (!title || typeof title !== 'string') return fallback;
+  const withoutNumbers = title.replace(/\b\d+\b/g, '').trim();
+  const clean = withoutNumbers.replace(/[^a-zA-Z0-9\s]/g, ' ').trim();
+  const words = clean.split(/\s+/).filter(Boolean);
+  if (words.length === 0) {
+    const alphaOnly = title.replace(/[^a-zA-Z0-9]/g, '').trim();
+    return alphaOnly ? alphaOnly.toUpperCase() : fallback.toUpperCase();
+  }
+  if (words.length === 1) {
+    return words[0].toUpperCase();
+  }
+  return words.map((w) => w[0].toUpperCase()).join('');
+}
+
+/**
+ * Returns primary (<prefix>｜<name>) and fallback (<prefix>-<name>) channel names for Discord text channels.
+ */
+export function getTournamentChannelNames(prefix, channelName) {
+  const p = (prefix || 'tour').toLowerCase();
+  const c = (channelName || '').toLowerCase().trim();
+  return {
+    primary: `${p}｜${c}`,
+    fallback: `${p}-${c}`,
+  };
+}
+
+/**
+ * Category name builder using short prefix:
+ * e.g. "DL INFO", "DL MANAGEMENT", "DL R1"
+ */
+export function getTournamentCategoryName(prefix, suffix = 'INFO') {
+  const p = (prefix || 'TOUR').toUpperCase().trim();
+  const s = (suffix || '').toUpperCase().trim();
+  return s ? `${p} ${s}` : p;
+}
+
+/**
  * Sanitize category name: 1-100 characters.
  */
-export function sanitizeCategoryName(name) {
+export function sanitizeCategoryName(name, suffix = 'INFO') {
   if (!name || typeof name !== 'string') return 'Tournament';
-  const clean = name.trim().slice(0, 95);
-  return `🏆 | ${clean}`;
+  const prefix = getTournamentShortPrefix(name);
+  return getTournamentCategoryName(prefix, suffix);
 }
 
 function getTournamentShortName(title, fallback = 'tournament') {
@@ -997,8 +1039,7 @@ export function buildTournamentControlPanelEmbed(tournament, summary, channelsSt
  *   - Sync & Refresh (Combined Data & Role Sync)
  *   - Round Management (Dedicated round progression screen)
  * Row 2 (Danger Zone):
- *   - Delete All Channels (Channel cleanup with MongoDB data retained)
- *   - Delete Tournament (Permanent deletion workflow)
+ *   - Danger Zone (Single red button leading to Danger Zone screen)
  */
 export function buildTournamentControlPanelButtons(tournamentId) {
   const row1 = new ActionRowBuilder().addComponents(
@@ -1031,18 +1072,101 @@ export function buildTournamentControlPanelButtons(tournamentId) {
 
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`dash:main:delete-channels:${tournamentId}`)
-      .setLabel('Delete All Channels')
-      .setEmoji('🗑️')
-      .setStyle(ButtonStyle.Danger),
-    new ButtonBuilder()
-      .setCustomId(`dash:main:delete-tournament:${tournamentId}`)
-      .setLabel('Delete Tournament')
-      .setEmoji('💣')
+      .setCustomId(`dash:screen:danger:${tournamentId}`)
+      .setLabel('Danger Zone')
+      .setEmoji('⚠️')
       .setStyle(ButtonStyle.Danger)
   );
 
   return [row1, row2];
+}
+
+export function buildDangerZoneEmbed(tournament) {
+  const tourTitle = tournament?.title || tournament?.id || 'Tournament';
+  const tourId = tournament?.id || tournament?.tournamentId || 'N/A';
+  return new EmbedBuilder()
+    .setTitle(`⚠️ Danger Zone · ${tourTitle}`)
+    .setColor(0xED4245)
+    .setDescription(
+      `**Destructive Actions for Tournament:** \`${tourTitle}\` (\`${tourId}\`)\n\n` +
+      `Choose an option below with caution:\n\n` +
+      `🗑️ **Delete All Channels**\n` +
+      `Deletes the tournament Discord category and non-preserved channels while **preserving all MongoDB tournament data**, teams, and results.\n\n` +
+      `💣 **Delete Tournament**\n` +
+      `Permanently removes the tournament from Discord and backend databases. This action is irreversible.\n\n` +
+      `Use **Back** to return to the main Control Panel.`
+    )
+    .setFooter({ text: `Tournament ID: ${tourId} • MatchDistrict Danger Zone` })
+    .setTimestamp();
+}
+
+export function buildDangerZoneButtons(tournamentId) {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`dash:danger:delete-channels:${tournamentId}`)
+      .setLabel('Delete All Channels')
+      .setEmoji('🗑️')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`dash:danger:delete-tournament:${tournamentId}`)
+      .setLabel('Delete Tournament')
+      .setEmoji('💣')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`dash:danger:back:${tournamentId}`)
+      .setLabel('Back')
+      .setEmoji('⬅️')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`dash:danger:refresh:${tournamentId}`)
+      .setLabel('Refresh')
+      .setEmoji('🔃')
+      .setStyle(ButtonStyle.Secondary)
+  );
+  return [row];
+}
+
+export async function handleRenderDangerZoneScreen(interaction, tournamentId) {
+  const guild = interaction.guild;
+  const access = checkTournamentAccess(guild, interaction.member);
+  if (!access.allowed) {
+    if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: access.reason, ephemeral: true }).catch(() => {});
+    }
+    return;
+  }
+
+  if (!interaction.deferred && !interaction.replied) {
+    if (typeof interaction.deferUpdate === 'function') {
+      await interaction.deferUpdate().catch(() => {});
+    }
+  }
+
+  let tournament = null;
+  try {
+    const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId).catch(() => null);
+    tournament = backendData?.tournament;
+  } catch {}
+
+  const currentSettings = guildSettingsCache[guild.id] || {};
+  const savedTournament = currentSettings.tournaments?.[tournamentId] || {};
+  const tournamentObj = tournament || { id: tournamentId, title: savedTournament.tournamentTitle || tournamentId };
+
+  const embed = buildDangerZoneEmbed(tournamentObj);
+  const components = buildDangerZoneButtons(tournamentId);
+
+  const payload = { content: null, embeds: [embed], components };
+  if (typeof interaction.editReply === 'function' && (interaction.deferred || interaction.replied)) {
+    await interaction.editReply(payload).catch(async () => {
+      if (typeof interaction.update === 'function') {
+        await interaction.update(payload).catch(() => {});
+      }
+    });
+  } else if (typeof interaction.update === 'function') {
+    await interaction.update(payload).catch(() => {});
+  } else if (typeof interaction.reply === 'function') {
+    await interaction.reply(payload).catch(() => {});
+  }
 }
 
 async function updateDashboardNavigation(guild, tournamentId, operation, screen = null) {
@@ -1394,12 +1518,48 @@ export async function handleDashboardNavigationInteraction(interaction) {
   const [namespace, screen, action] = idParts;
   if (namespace !== 'dash') return false;
   const settings = guildSettingsCache[interaction.guild.id] || {};
-  const match = Object.entries(settings.tournaments || {}).find(([, saved]) => saved?.channels?.botCommandsId === interaction.channelId);
-  if (!match) return false;
-  const [tournamentId, savedTournament] = match;
+  let match = Object.entries(settings.tournaments || {}).find(([, saved]) => saved?.channels?.botCommandsId === interaction.channelId);
+  let tournamentId = null;
+  let savedTournament = null;
+  if (match) {
+    [tournamentId, savedTournament] = match;
+  } else {
+    const candidateId = idParts.find((p) => settings.tournaments?.[p]);
+    if (candidateId) {
+      tournamentId = candidateId;
+      savedTournament = settings.tournaments[candidateId];
+    }
+  }
+  if (!tournamentId || !savedTournament) return false;
   const stack = Array.isArray(savedTournament.dashboardNavigationStack) && savedTournament.dashboardNavigationStack.length
     ? savedTournament.dashboardNavigationStack
     : [{ screen: 'home' }];
+
+  if ((screen === 'screen' && action === 'danger') || (screen === 'home' && action === 'danger') || (screen === 'danger' && action === 'open')) {
+    updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'danger' });
+    await handleRenderDangerZoneScreen(interaction, tournamentId);
+    return true;
+  }
+
+  if (screen === 'danger') {
+    if (action === 'delete-channels') {
+      await handleTournamentButtonInteraction(interaction, `md_tour_delete_channels:${tournamentId}`);
+      return true;
+    }
+    if (action === 'delete-tournament') {
+      await handleTournamentButtonInteraction(interaction, `md_tour_delete_permanent:${tournamentId}`);
+      return true;
+    }
+    if (action === 'back') {
+      updateDashboardNavigation(interaction.guild, tournamentId, 'home');
+      await handleBackToTournamentPanel(interaction, tournamentId);
+      return true;
+    }
+    if (action === 'refresh') {
+      await handleRenderDangerZoneScreen(interaction, tournamentId);
+      return true;
+    }
+  }
 
   if (screen?.startsWith('management-roles') || screen?.startsWith('management-role-choice') || screen?.startsWith('management-users') ||
       screen?.startsWith('management-confirm') || screen?.startsWith('management-result')) {
@@ -2609,6 +2769,8 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   await persistSetupProgress();
 
   // 2. Locate, move, or create #bot-commands inside MANAGEMENT.
+  const shortPrefix = getTournamentShortPrefix(tournament.title, tournament.id);
+  const { primary: botCmdPrimary, fallback: botCmdFallback } = getTournamentChannelNames(shortPrefix, 'bot-commands');
   let botCommandsChannel = null;
   if (savedTournament.channels.botCommandsId) {
     botCommandsChannel = guild.channels.cache.get(savedTournament.channels.botCommandsId) ||
@@ -2642,7 +2804,13 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   ];
 
   if (botCommandsChannel) {
-    if (botCommandsChannel.name !== `${sanitizeChannelName(tournamentShort)}-bot-commands`) await botCommandsChannel.setName(`${sanitizeChannelName(tournamentShort)}-bot-commands`).catch((err) => console.warn(`[Discord Bot] Could not rename bot-commands channel: ${err.message}`));
+    if (botCommandsChannel.name !== botCmdPrimary && botCommandsChannel.name !== botCmdFallback) {
+      try {
+        await botCommandsChannel.setName(botCmdPrimary);
+      } catch (err) {
+        await botCommandsChannel.setName(botCmdFallback).catch((fbErr) => console.warn(`[Discord Bot] Could not rename bot-commands channel: ${fbErr.message}`));
+      }
+    }
     if (botCommandsChannel.parentId !== managementCategory.id) {
       await botCommandsChannel.setParent(managementCategory.id, { lockPermissions: false });
     }
@@ -2650,13 +2818,23 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
       await botCommandsChannel.permissionOverwrites.set(botCommandsOverwrites).catch(() => {});
     }
   } else {
-    botCommandsChannel = await queueChannelCreate(guild, {
-      name: `${sanitizeChannelName(tournamentShort)}-bot-commands`,
-      type: ChannelType.GuildText,
-      parent: managementCategory.id,
-      topic: `Tournament Management & Control Panel (Admin Only) — ${tournament.title} (ID: ${tournamentId})`,
-      permissionOverwrites: botCommandsOverwrites,
-    });
+    try {
+      botCommandsChannel = await queueChannelCreate(guild, {
+        name: botCmdPrimary,
+        type: ChannelType.GuildText,
+        parent: managementCategory.id,
+        topic: `Tournament Management & Control Panel (Admin Only) — ${tournament.title} (ID: ${tournamentId})`,
+        permissionOverwrites: botCommandsOverwrites,
+      });
+    } catch (createPrimaryErr) {
+      botCommandsChannel = await queueChannelCreate(guild, {
+        name: botCmdFallback,
+        type: ChannelType.GuildText,
+        parent: managementCategory.id,
+        topic: `Tournament Management & Control Panel (Admin Only) — ${tournament.title} (ID: ${tournamentId})`,
+        permissionOverwrites: botCommandsOverwrites,
+      });
+    }
     savedTournament.channels.botCommandsId = botCommandsChannel.id;
   }
   await persistSetupProgress();
@@ -3037,8 +3215,8 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
   }
 
   // 1. Resolve one canonical tournament category, reusing any saved legacy ID.
-  const tournamentShort = getTournamentShortName(tournament.title, tournament.id);
-  const categoryName = sanitizeCategoryName(tournament.title || tournament.id);
+  const shortPrefix = getTournamentShortPrefix(tournament.title, tournament.id);
+  const categoryName = getTournamentCategoryName(shortPrefix, 'INFO');
   const savedCategoryIds = [savedTournament.categoryId, savedTournament.publicCategoryId, savedTournament.managementCategoryId,
     ...Object.values(savedTournament.rounds || {}).map((round) => round?.categoryId)].filter(Boolean);
   let category = null;
@@ -3071,7 +3249,32 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
   syncResult.categoryId = category.id;
   savedTournament.categoryId = category.id;
 
-  const tournamentPrefix = sanitizeChannelName(tournamentShort);
+  // Rename any other categories stored in MongoDB strictly by ID
+  if (savedTournament.managementCategoryId && savedTournament.managementCategoryId !== category.id) {
+    const mgmtCat = guild.channels.cache.get(savedTournament.managementCategoryId) ||
+      await guild.channels.fetch(savedTournament.managementCategoryId).catch(() => null);
+    if (mgmtCat && mgmtCat.type === ChannelType.GuildCategory) {
+      const mgmtExpected = getTournamentCategoryName(shortPrefix, 'MANAGEMENT');
+      if (mgmtCat.name !== mgmtExpected) {
+        await mgmtCat.setName(mgmtExpected).catch((err) => syncResult.failures.push(`Failed to rename management category: ${err.message}`));
+      }
+    }
+  }
+  if (savedTournament.rounds && typeof savedTournament.rounds === 'object') {
+    for (const round of Object.values(savedTournament.rounds)) {
+      if (round?.categoryId && round.categoryId !== category.id) {
+        const rCat = guild.channels.cache.get(round.categoryId) ||
+          await guild.channels.fetch(round.categoryId).catch(() => null);
+        if (rCat && rCat.type === ChannelType.GuildCategory) {
+          const rExpected = getTournamentCategoryName(shortPrefix, `R${round.roundNumber || 1}`);
+          if (rCat.name !== rExpected) {
+            await rCat.setName(rExpected).catch((err) => syncResult.failures.push(`Failed to rename round category: ${err.message}`));
+          }
+        }
+      }
+    }
+  }
+
   const { tourneyModRole: modsRole, spectatorRole } = await ensureManagementDashboardRoles(guild, savedTournament, botMember);
   const botOverwrite = {
     id: botMember.id,
