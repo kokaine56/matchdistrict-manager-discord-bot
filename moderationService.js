@@ -191,7 +191,7 @@ export async function handleMessageModeration(message) {
   const content = message.content || '';
 
   // 1. LINK BLOCKING CHECK
-  if (containsLink(content)) {
+  if (containsLink(content) && !isAdmin(message.member)) {
     // Delete message
     await queueMessageDelete(message).catch((delErr) => {
       console.warn('[Moderation] ⚠️ Failed to delete link message:', delErr.message);
@@ -274,7 +274,7 @@ export async function handleMessageUpdateModeration(oldMessage, newMessage) {
   const content = newMessage.content || '';
 
   // Check link blocking on edited content
-  if (containsLink(content)) {
+  if (containsLink(content) && !isAdmin(newMessage.member)) {
     await queueMessageDelete(newMessage).catch(() => {});
 
     let timeoutNote = '';
