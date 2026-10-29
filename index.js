@@ -150,6 +150,13 @@ import {
   handleTicketSetupCommand,
   handleTicketInteraction,
 } from './ticketService.js';
+import {
+  handleMessageModeration,
+  handleMessageUpdateModeration,
+  handleUnmuteCommand,
+  handleUnbanCommand,
+  verifyBotModerationPermissions,
+} from './moderationService.js';
 
 export {
   handleListTournamentCommand,
@@ -420,6 +427,11 @@ export const REQUIRED_CHANNELS = [
     topic: 'Private MatchDistrict Moderation Logs (Member Bans & Unbans)',
   },
   {
+    key: 'modLogId',
+    name: 'mod-log',
+    topic: 'Private MatchDistrict Moderation Logs (Link Blocking, Abusive Words, Timeouts, Bans)',
+  },
+  {
     key: 'channelCreateLogId',
     name: 'channel-create-log',
     topic: 'Private MatchDistrict Channel Creation Logs',
@@ -451,6 +463,7 @@ export const RESERVED_LOG_CHANNEL_NAMES = new Set([
   'dm-log',
   'msg-log',
   'ban-unban-log',
+  'mod-log',
   'channel-create-log',
   'channel-delete-log',
   'role-create-log',
@@ -497,6 +510,12 @@ export let guildSettingsCache = loadGuildSettings();
 export function getGuildSettings(guildId) {
   if (!guildId) return null;
   return guildSettingsCache[guildId] || null;
+}
+
+export function isModerationEnabled(guildId) {
+  if (!guildId) return false;
+  const settings = guildSettingsCache[guildId];
+  return Boolean(settings?.setupActive && settings?.moderationEnabled);
 }
 
 export function isWelcomeEnabled(guildId) {
@@ -683,6 +702,8 @@ export function getHelpResponse(prefix = PREFIX) {
     `• \`${prefix}dm welcome off\` — *(Admin Only)* Disable welcome DMs for new members\n` +
     `• \`${prefix}ban @user [reason]\` — *(Mod Only)* Ban a user with audit logging\n` +
     `• \`${prefix}clear <1-100>\` — *(Mod Only)* Bulk delete recent messages\n` +
+    `• \`${prefix}unmute <@user|id>\` — *(Mod Only)* Remove timeout from a user\n` +
+    `• \`${prefix}unban <@user|id>\` — *(Mod Only)* Unban a user from the server\n` +
     `• \`${prefix}ticket setup\` — *(Admin Only)* Setup support ticket panel in #support-ticket\n\n` +
     `**🏆 Tournament & Organiser Management:**\n` +
     `• \`${prefix}organiser\` — *(Admin Only)* Connect this Discord server to your MatchDistrict organiser account\n` +
@@ -821,6 +842,7 @@ export async function handleSetupCommand(guild, member, replyFn) {
   guildSettingsCache[guild.id] = {
     ...currentSettings,
     setupActive: true,
+    moderationEnabled: true,
     welcomeEnabled: welcomeCurrentlyEnabled,
     channels: updatedChannels,
     logChannelId: channelMap.dmLogId || savedChannels.dmLogId || null, // legacy
@@ -1105,6 +1127,7 @@ export async function handleSetupConfirmCommand(guild, member, replyFn) {
   guildSettingsCache[guild.id] = {
     ...currentSettings,
     setupActive: false,
+    moderationEnabled: false,
     channels: clearedChannels,
     logChannelId: null,
     removedBy: member.id,
@@ -2119,6 +2142,11 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log(`[Discord Bot] ⚡ Command prefix: "${PREFIX}"`);
   startRoleSyncScheduler(readyClient);
 
+  // Verify bot moderation permissions across joined guilds
+  for (const guild of readyClient.guilds.cache.values()) {
+    verifyBotModerationPermissions(guild);
+  }
+
   // Startup reconciliation and deletion recovery for managed Discord resources across MongoDB and Discord
   try {
     await initOrganiserLinksCache();
@@ -2174,6 +2202,12 @@ client.on(Events.MessageCreate, async (message) => {
       }
     }
     if (message.author?.bot) return;
+
+    // Run automated moderation (link blocking & abusive words filtering)
+    if (message.guild) {
+      const moderated = await handleMessageModeration(message);
+      if (moderated) return;
+    }
 
     if (message.guild && await handleTournamentVerificationMessage(message)) return;
 
@@ -2244,6 +2278,24 @@ client.on(Events.MessageCreate, async (message) => {
         return;
       } else if (cmd === 'ban') {
         await handleBanCommand(message.guild, message.member, args, (text) => message.reply(text));
+        return;
+      } else if (cmd === 'unmute') {
+        await handleUnmuteCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          args,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts })
+        );
+        return;
+      } else if (cmd === 'unban') {
+        await handleUnbanCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          args,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts })
+        );
         return;
       } else if (cmd === 'deletemsg' || cmd === 'deletemessage') {
         await handleDeleteManagedMessageCommand(message.guild, message.member, args, (text) => message.reply(text));
@@ -2575,6 +2627,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 // Message edit and delete listeners
 client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
+  if (newMessage && newMessage.guild) {
+    const moderated = await handleMessageUpdateModeration(oldMessage, newMessage);
+    if (moderated) return;
+  }
   await handleMessageUpdateLog(oldMessage, newMessage);
 });
 
