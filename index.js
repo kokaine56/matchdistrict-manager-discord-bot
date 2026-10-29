@@ -2178,7 +2178,11 @@ client.once(Events.ClientReady, async (readyClient) => {
         const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId);
         await setupTournamentControlPanel(guild, backendData.tournament, backendData.summary, guild.members.me);
       } catch (dashboardErr) {
-        console.error(`[Discord Bot] Dashboard startup refresh failed for tournament ${tournamentId}:`, dashboardErr);
+        if (dashboardErr?.message?.includes('was not found on the MatchDistrict website')) {
+          console.warn(`[Discord Bot] ℹ️ Tournament "${tournamentId}" was not found on the MatchDistrict website (deleted or orphaned). Skipping startup dashboard refresh.`);
+        } else {
+          console.error(`[Discord Bot] Dashboard startup refresh failed for tournament ${tournamentId}:`, dashboardErr?.message || dashboardErr);
+        }
       }
     }
   }
