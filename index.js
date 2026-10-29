@@ -461,6 +461,16 @@ export const REQUIRED_CHANNELS = [
     name: 'tournament-log',
     topic: 'Private MatchDistrict Tournament Management Logs',
   },
+  {
+    key: 'ticketLogId',
+    name: 'ticket-log',
+    topic: 'Private MatchDistrict Ticket Event Logs (Opened, Closed, Deleted, Errors)',
+  },
+  {
+    key: 'staffAppLogId',
+    name: 'staff-application-log',
+    topic: 'Private MatchDistrict Staff Application Logs (Applications & Statuses)',
+  },
 ];
 
 export const RESERVED_LOG_CHANNEL_NAMES = new Set([
@@ -474,6 +484,8 @@ export const RESERVED_LOG_CHANNEL_NAMES = new Set([
   'role-create-log',
   'role-delete-log',
   'tournament-log',
+  'ticket-log',
+  'staff-application-log',
   'matchdistrict-logs',
   'md-welcome-logs',
 ]);

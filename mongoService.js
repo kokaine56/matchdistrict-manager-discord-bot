@@ -220,6 +220,11 @@ async function ensureMongoIndexes() {
     const pendingAnncCol = mongoDb.collection('discord_pending_announcements');
     await pendingAnncCol.createIndex({ announcementId: 1 }, { unique: true });
 
+    const staffAppCol = mongoDb.collection('discord_staff_applications');
+    await staffAppCol.createIndex({ applicationId: 1 }, { unique: true });
+    await staffAppCol.createIndex({ guildId: 1, userId: 1 });
+    await staffAppCol.createIndex({ status: 1 });
+
     console.log('[MongoDB] 🔒 Indexes verified across managed collections.');
   } catch (err) {
     console.warn('[MongoDB] ⚠️ Error creating indexes:', err.message);
@@ -1610,6 +1615,48 @@ export async function updateTicketStatusInDb(channelId, status) {
   } catch (err) {
     console.warn(`[MongoDB] ⚠️ Error updating ticket status for channel ${channelId}:`, err.message);
     return false;
+  }
+}
+
+/**
+ * Saves a new staff application to MongoDB.
+ * @param {object} applicationData
+ * @returns {Promise<object>}
+ */
+export async function saveStaffApplicationToDb(applicationData) {
+  if (!applicationData?.applicationId) return applicationData;
+  if (!isMongoConnected()) return applicationData;
+  try {
+    const col = mongoDb.collection('discord_staff_applications');
+    const { _id, createdAt, ...dataToSet } = applicationData || {};
+    await col.updateOne(
+      { applicationId: applicationData.applicationId },
+      {
+        $set: { ...dataToSet, updatedAt: new Date() },
+        $setOnInsert: { createdAt: createdAt || new Date() },
+      },
+      { upsert: true }
+    );
+    return applicationData;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error saving staff application ${applicationData.applicationId}:`, err.message);
+    return applicationData;
+  }
+}
+
+/**
+ * Retrieves a staff application by applicationId.
+ * @param {string} applicationId
+ * @returns {Promise<object|null>}
+ */
+export async function getStaffApplicationFromDb(applicationId) {
+  if (!isMongoConnected() || !applicationId) return null;
+  try {
+    const col = mongoDb.collection('discord_staff_applications');
+    return await col.findOne({ applicationId });
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error retrieving staff application ${applicationId}:`, err.message);
+    return null;
   }
 }
 
