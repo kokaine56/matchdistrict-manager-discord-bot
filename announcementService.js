@@ -279,13 +279,6 @@ export async function handleAnnouncementChannelMessage(message) {
     return true;
   }
 
-  // Fetch all members from the API using Server Members Intent
-  if (typeof message.guild.members?.fetch === 'function') {
-    await message.guild.members.fetch().catch((err) => {
-      console.warn(`[Announcement DM] Could not fetch all members from API in guild ${message.guild.id}:`, err.message);
-    });
-  }
-
   // Resolve target members (excluding bots, no duplicates)
   const targetMembersMap = new Map();
 

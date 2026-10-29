@@ -162,6 +162,11 @@ import {
   handleAnnouncementChannelMessage,
   handleAnnouncementInteraction,
 } from './announcementService.js';
+import {
+  refreshGuildMemberCacheOnce,
+  updateGuildMemberCache,
+  removeGuildMemberFromCache,
+} from './memberCacheService.js';
 
 export {
   handleListTournamentCommand,
@@ -2178,6 +2183,13 @@ client.once(Events.ClientReady, async (readyClient) => {
     console.warn('[MongoDB] ⚠️ Error in startup recovery and reconciliation:', recErr.message);
   }
 
+  // Populate each guild's member cache once, serially, before dashboard refreshes.
+  const startupGuilds = [...readyClient.guilds.cache.values()];
+  for (let index = 0; index < startupGuilds.length; index++) {
+    await refreshGuildMemberCacheOnce(startupGuilds[index]);
+    if (index < startupGuilds.length - 1) await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+
   // Restore each persisted dashboard in place and clean its command channel after every restart.
   for (const guild of readyClient.guilds.cache.values()) {
     const tournaments = guildSettingsCache[guild.id]?.tournaments || {};
@@ -2721,6 +2733,10 @@ client.on(Events.GuildRoleUpdate, async (oldRole, newRole) => {
 client.on(Events.ChannelUpdate, async (oldChannel, newChannel) => {
   await handleChannelUpdateAuditLog(oldChannel, newChannel);
 });
+
+client.on(Events.GuildMemberAdd, updateGuildMemberCache);
+client.on(Events.GuildMemberRemove, removeGuildMemberFromCache);
+client.on(Events.GuildMemberUpdate, (_oldMember, newMember) => updateGuildMemberCache(newMember));
 
 client.on(Events.GuildMemberRemove, async (member) => {
   await handleGuildMemberRemove(member);

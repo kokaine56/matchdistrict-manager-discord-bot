@@ -12,6 +12,7 @@ import {
   queueMessageDelete,
   queueBulkDelete,
 } from './discordQueue.js';
+import { getCachedRoleMemberCount } from './memberCacheService.js';
 import process from 'node:process';
 import crypto from 'crypto';
 import {
@@ -2325,14 +2326,8 @@ export async function syncTournamentRoles(guild, tournamentId, preloadedData = n
     console.error(`[Discord Bot] Tournament role sync failed for ${tournament.title}: ${memberFetchError}`);
   }
 
-  // Pre-fetch all guild members once and reuse across role assignment, revocation, and counting
-  let cachedMembers = guild.members?.cache || null;
-  if (typeof guild.members?.fetch === 'function') {
-    try {
-      const fetched = await guild.members.fetch().catch(() => null);
-      if (fetched) cachedMembers = fetched;
-    } catch {}
-  }
+  // Role reconciliation and counting use the member cache; startup owns the only full fetch.
+  const cachedMembers = guild.members?.cache || null;
 
   // Assign role to eligible members in guild
   for (const discordId of botHasManageRoles && !memberFetchError ? currentEligibleDiscordIds : []) {
@@ -2418,8 +2413,7 @@ export async function syncTournamentRoles(guild, tournamentId, preloadedData = n
   // Count members holding role
   let membersWithRoleCount = 0;
   try {
-    const memberList = Array.from((cachedMembers?.values?.() || guild.members?.cache?.values?.() || []));
-    membersWithRoleCount = memberList.filter((m) => m.roles?.cache?.has(role.id)).length;
+    membersWithRoleCount = getCachedRoleMemberCount(role);
   } catch (err) {
     stats.failed++;
     memberFetchError ||= `Could not count members holding the role: ${err.message}`;
@@ -2919,14 +2913,7 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
     }
   }
 
-  let membersWithRoleCount = 0;
-  if (role) {
-    const members = await guild.members.fetch().catch((err) => {
-      console.warn(`[Discord Bot] Could not refresh member count for tournament role ${role.name}:`, err.message);
-      return null;
-    });
-    if (members) membersWithRoleCount = Array.from(members.values()).filter((member) => member.roles?.cache?.has(role.id)).length;
-  }
+  const membersWithRoleCount = getCachedRoleMemberCount(role);
 
   const roleStats = savedTournament.roleSyncStats || {};
   const roleInfo = role ? {
@@ -5583,7 +5570,6 @@ async function handleAddTeamModalSubmit(interaction, tournamentId, roundId, grou
     if (!current || !round || !group || round.status === 'Completed') throw new Error('This round or group is no longer available for adding a team.');
 
     const resolvedMembers = [];
-    let queriedMembers = null;
     for (const enteredAs of tags) {
       const mentionMatch = enteredAs.match(/^<@!?(\d+)>$/);
       const candidateId = mentionMatch?.[1] || (isValidDiscordSnowflake(enteredAs) ? enteredAs : null);
@@ -5595,10 +5581,6 @@ async function handleAddTeamModalSubmit(interaction, tournamentId, roundId, grou
         const matchesName = (candidate) => [candidate.user?.username, candidate.user?.globalName, candidate.displayName, candidate.nickname, candidate.user?.tag]
           .some((name) => String(name || '').toLowerCase() === query);
         member = Array.from(guild.members.cache.values()).find(matchesName) || null;
-        if (!member && typeof guild.members.fetch === 'function') {
-          if (!queriedMembers) queriedMembers = await guild.members.fetch().catch(() => null);
-          member = Array.from(queriedMembers?.values?.() || []).find(matchesName) || null;
-        }
       }
       if (member) {
         if (!resolvedMembers.some((item) => item.discord_id === member.id)) {
@@ -6374,15 +6356,11 @@ export async function handleBackToTournamentPanel(interaction, tournamentId) {
       const role = guild.roles.cache.get(savedTournament.roleId) ||
         await guild.roles.fetch(savedTournament.roleId).catch(() => null);
       if (role) {
-        const members = await guild.members.fetch().catch((err) => {
-          console.warn(`[Discord Bot] Could not refresh tournament role member count:`, err.message);
-          return null;
-        });
         const roleStats = savedTournament.roleSyncStats || {};
         roleInfo = {
           roleId: role.id,
           roleName: role.name,
-          membersWithRole: members ? Array.from(members.values()).filter((member) => member.roles?.cache?.has(role.id)).length : 0,
+          membersWithRole: getCachedRoleMemberCount(role),
           statusText: roleStats.status === 'failed'
             ? `🔴 Failed: ${roleStats.error || 'See bot logs for details.'}`
             : roleStats.status === 'successful'
