@@ -157,6 +157,11 @@ import {
   handleUnbanCommand,
   verifyBotModerationPermissions,
 } from './moderationService.js';
+import {
+  handleAnncSetupCommand,
+  handleAnnouncementChannelMessage,
+  handleAnnouncementInteraction,
+} from './announcementService.js';
 
 export {
   handleListTournamentCommand,
@@ -704,7 +709,8 @@ export function getHelpResponse(prefix = PREFIX) {
     `• \`${prefix}clear <1-100>\` — *(Mod Only)* Bulk delete recent messages\n` +
     `• \`${prefix}unmute <@user|id>\` — *(Mod Only)* Remove timeout from a user\n` +
     `• \`${prefix}unban <@user|id>\` — *(Mod Only)* Unban a user from the server\n` +
-    `• \`${prefix}ticket setup\` — *(Admin Only)* Setup support ticket panel in #support-ticket\n\n` +
+    `• \`${prefix}ticket setup\` — *(Admin Only)* Setup support ticket panel in #support-ticket\n` +
+    `• \`${prefix}annc setup\` — *(Admin Only)* Setup private announcement DM dispatch channel\n\n` +
     `**🏆 Tournament & Organiser Management:**\n` +
     `• \`${prefix}organiser\` — *(Admin Only)* Connect this Discord server to your MatchDistrict organiser account\n` +
     `• \`${prefix}organiser unlink\` — *(Admin Only)* Disconnect this Discord server from the organiser account\n` +
@@ -2260,6 +2266,19 @@ client.on(Events.MessageCreate, async (message) => {
         }
         await handleSetupCommand(message.guild, message.member, (text) => message.reply(text));
         return;
+      } else if (cmd === 'annc') {
+        const subCmd = (args[0] || '').toLowerCase();
+        if (subCmd === 'setup') {
+          await handleAnncSetupCommand(
+            message.guild,
+            message.member,
+            message.channel,
+            (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts })
+          );
+          return;
+        }
+        await message.reply(`ℹ️ **Usage:** \`${PREFIX}annc setup\` — Setup the announcement DM channel.`);
+        return;
       } else if (cmd === 'ticket') {
         const subCmd = (args[0] || '').toLowerCase();
         if (subCmd === 'setup') {
@@ -2431,6 +2450,12 @@ client.on(Events.MessageCreate, async (message) => {
       }
     }
 
+    // Check if this is an announcement message in the announcement-dm channel
+    if (message.guild) {
+      const isAnnouncement = await handleAnnouncementChannelMessage(message);
+      if (isAnnouncement) return;
+    }
+
     // If not a command, log regular member messages
     await handleMessageCreateLog(message);
   } catch (error) {
@@ -2467,6 +2492,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // Handle support ticket interactions (select menus & buttons)
   if (interaction.customId?.startsWith('ticket:')) {
     const handled = await handleTicketInteraction(interaction);
+    if (handled) return;
+  }
+
+  // Handle announcement DM confirmation interactions (Confirm & Cancel)
+  if (interaction.customId?.startsWith('annc:')) {
+    const handled = await handleAnnouncementInteraction(interaction);
     if (handled) return;
   }
 

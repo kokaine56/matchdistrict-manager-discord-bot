@@ -14,6 +14,7 @@ export const QUEUE_CONFIG = {
   ACTION_DELAY_MS: isTestEnv ? 5 : 400,   // Delay for creating/deleting channels, categories, roles (300-500ms)
   MESSAGE_DELAY_MS: isTestEnv ? 10 : 1000, // Delay for posting/editing messages in channels (~1 second)
   ROLE_DELAY_MS: isTestEnv ? 5 : 350,     // Delay for role assignment / removal
+  DM_DELAY_MS: isTestEnv ? 15 : 1500,     // Delay for sending DMs (about 1 to 2 seconds)
   MAX_RETRIES: 5,         // Max retries on rate limit (429)
   CONCURRENCY: 1,         // Concurrency limit (1 at a time, at most 2)
 };
@@ -78,7 +79,9 @@ async function processQueue() {
     task.reject(err);
   } finally {
     const delay =
-      task.type === 'message'
+      task.type === 'dm'
+        ? (QUEUE_CONFIG.DM_DELAY_MS ?? 1500)
+        : task.type === 'message'
         ? QUEUE_CONFIG.MESSAGE_DELAY_MS
         : task.type === 'role'
         ? QUEUE_CONFIG.ROLE_DELAY_MS
@@ -119,7 +122,20 @@ export async function queueChannelCreate(guild, options) {
   if (existing) {
     return existing;
   }
-  return enqueueDiscordAction(() => guild.channels.create(options), 'action');
+  return enqueueDiscordAction(async () => {
+    try {
+      return await guild.channels.create(options);
+    } catch (err) {
+      if (options.fallbackName && options.fallbackName !== options.name) {
+        console.error(`[Discord Queue] Discord rejected channel name "${options.name}":`, err?.message || err);
+        console.warn(`[Discord Queue] Retrying channel creation with ASCII fallback "${options.fallbackName}"...`);
+        const fallbackOptions = { ...options, name: options.fallbackName };
+        delete fallbackOptions.fallbackName;
+        return await guild.channels.create(fallbackOptions);
+      }
+      throw err;
+    }
+  }, 'action');
 }
 
 export async function queueChannelDelete(channel, reason = 'Cleanup') {
@@ -181,6 +197,11 @@ export async function queueRoleRemove(member, roleId, reason) {
     return false; // Skip if already removed
   }
   return enqueueDiscordAction(() => member.roles.remove(roleId, reason), 'role');
+}
+
+export async function queueDirectMessage(userOrMember, payload) {
+  if (!userOrMember || typeof userOrMember.send !== 'function') return null;
+  return enqueueDiscordAction(() => userOrMember.send(payload), 'dm');
 }
 
 export async function queueChannelSend(channel, payload) {

@@ -231,6 +231,54 @@ export function sanitizeChannelName(name, prefix = '') {
 }
 
 /**
+ * Converts alphanumeric characters to Unicode Mathematical Bold characters.
+ * A to Z -> 𝐀 to 𝐙 (U+1D400 to U+1D419)
+ * a to z -> 𝐚 to 𝐳 (U+1D41A to U+1D433)
+ * 0 to 9 -> 𝟎 to 𝟗 (U+1D7CE to U+1D7D7)
+ * Other characters are preserved as-is.
+ * @param {string} str
+ * @returns {string}
+ */
+export function toMathematicalBold(str) {
+  if (!str || typeof str !== 'string') return '';
+  let res = '';
+  for (const ch of str) {
+    const code = ch.charCodeAt(0);
+    if (code >= 65 && code <= 90) {
+      // A-Z
+      res += String.fromCodePoint(0x1D400 + (code - 65));
+    } else if (code >= 97 && code <= 122) {
+      // a-z
+      res += String.fromCodePoint(0x1D41A + (code - 97));
+    } else if (code >= 48 && code <= 57) {
+      // 0-9
+      res += String.fromCodePoint(0x1D7CE + (code - 48));
+    } else {
+      res += ch;
+    }
+  }
+  return res;
+}
+
+/**
+ * Validates a tournament channel name:
+ * - Only plain allowed characters: lowercase letters (a-z), digits (0-9), hyphens (-), underscores (_),
+ *   plus Mathematical Bold characters (𝐀-𝐙, 𝐚-𝐳, 𝟎-𝟗) and the fullwidth separator '｜' (U+FF5C).
+ * - No emojis, no icons, no spaces.
+ * - At most 100 characters in length.
+ * @param {string} name
+ * @returns {boolean}
+ */
+export function isValidChannelName(name) {
+  if (!name || typeof name !== 'string') return false;
+  const trimmed = name.trim();
+  if (!trimmed) return false;
+  if (trimmed.length > 100 || Array.from(trimmed).length > 100) return false;
+  const allowedRegex = /^[\u{1D400}-\u{1D419}\u{1D41A}-\u{1D433}\u{1D7CE}-\u{1D7D7}\u{FF5C}a-z0-9\-_]+$/u;
+  return allowedRegex.test(trimmed);
+}
+
+/**
  * Short prefix builder:
  * If the name has several words, use initials of words and ignore numbers/years (District League 2026 -> DL).
  * If it is a single word, use that word (BGMIS 2026 -> BGMIS).
@@ -241,7 +289,7 @@ export function getTournamentShortPrefix(title, fallback = 'tour') {
   const clean = withoutNumbers.replace(/[^a-zA-Z0-9\s]/g, ' ').trim();
   const words = clean.split(/\s+/).filter(Boolean);
   if (words.length === 0) {
-    const alphaOnly = title.replace(/[^a-zA-Z0-9]/g, '').trim();
+    const alphaOnly = title.replace(/[^a-zA-Z]/g, '').trim();
     return alphaOnly ? alphaOnly.toUpperCase() : fallback.toUpperCase();
   }
   if (words.length === 1) {
@@ -251,14 +299,42 @@ export function getTournamentShortPrefix(title, fallback = 'tour') {
 }
 
 /**
- * Returns primary (<prefix>｜<name>) and fallback (<prefix>-<name>) channel names for Discord text channels.
+ * Returns primary (<prefix>｜<name>) and fallback (<prefix>-<name>) channel names for Discord channels.
+ * - Primary prefix is the short tournament prefix in capitals converted to Mathematical Bold characters.
+ * - Primary format: <bold-prefix>｜<lowercase-name> (e.g. 𝐃𝐋｜updates, 𝟏𝟎𝐊｜slotlist).
+ * - Fallback format: <ascii-prefix>-<lowercase-name> (e.g. dl-updates, 10k-slotlist).
+ * - Only plain characters that Discord accepts: lowercase letters, digits, hyphens, and underscores.
+ * - No emojis, no icons, no spaces.
+ * @param {string} prefix
+ * @param {string} channelName
+ * @returns {{ primary: string, fallback: string }}
  */
 export function getTournamentChannelNames(prefix, channelName) {
-  const p = (prefix || 'tour').toLowerCase();
-  const c = (channelName || '').toLowerCase().trim();
+  const rawPrefix = String(prefix || 'tour').trim();
+  const upperPrefix = rawPrefix.toUpperCase();
+  const boldPrefix = toMathematicalBold(upperPrefix);
+  const plainPrefix = rawPrefix.toLowerCase().replace(/[^a-z0-9-_]/g, '');
+
+  const c = String(channelName || '')
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9-_]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+
+  const primaryFull = `${boldPrefix}｜${c}`;
+  const fallbackFull = `${plainPrefix || 'tour'}-${c}`;
+
+  const primary = Array.from(primaryFull).length > 100
+    ? Array.from(primaryFull).slice(0, 100).join('')
+    : primaryFull;
+  const fallback = fallbackFull.length > 100
+    ? fallbackFull.slice(0, 100)
+    : fallbackFull;
+
   return {
-    primary: `${p}｜${c}`,
-    fallback: `${p}-${c}`,
+    primary,
+    fallback,
   };
 }
 
@@ -1156,7 +1232,7 @@ export async function handleRenderDangerZoneScreen(interaction, tournamentId) {
   const components = buildDangerZoneButtons(tournamentId);
 
   const payload = { content: null, embeds: [embed], components };
-  if (typeof interaction.editReply === 'function' && (interaction.deferred || interaction.replied)) {
+  if (typeof interaction.editReply === 'function') {
     await interaction.editReply(payload).catch(async () => {
       if (typeof interaction.update === 'function') {
         await interaction.update(payload).catch(() => {});
@@ -2804,11 +2880,18 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   ];
 
   if (botCommandsChannel) {
-    if (botCommandsChannel.name !== botCmdPrimary && botCommandsChannel.name !== botCmdFallback) {
+    if (botCommandsChannel.name !== botCmdPrimary) {
+      const nameToSet = isValidChannelName(botCmdPrimary) ? botCmdPrimary : botCmdFallback;
       try {
-        await botCommandsChannel.setName(botCmdPrimary);
+        await botCommandsChannel.setName(nameToSet);
       } catch (err) {
-        await botCommandsChannel.setName(botCmdFallback).catch((fbErr) => console.warn(`[Discord Bot] Could not rename bot-commands channel: ${fbErr.message}`));
+        console.error(`[Discord Bot] Discord rejected channel rename to "${nameToSet}" for bot-commands:`, err?.message || err);
+        console.warn(`[Discord Bot] Retrying channel rename with ASCII fallback "${botCmdFallback}"...`);
+        try {
+          await botCommandsChannel.setName(botCmdFallback);
+        } catch (fbErr) {
+          console.error(`[Discord Bot] Fallback rename also failed for bot-commands:`, fbErr?.message || fbErr);
+        }
       }
     }
     if (botCommandsChannel.parentId !== managementCategory.id) {
@@ -2818,15 +2901,19 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
       await botCommandsChannel.permissionOverwrites.set(botCommandsOverwrites).catch(() => {});
     }
   } else {
+    const nameToCreate = isValidChannelName(botCmdPrimary) ? botCmdPrimary : botCmdFallback;
     try {
       botCommandsChannel = await queueChannelCreate(guild, {
-        name: botCmdPrimary,
+        name: nameToCreate,
+        fallbackName: botCmdFallback,
         type: ChannelType.GuildText,
         parent: managementCategory.id,
         topic: `Tournament Management & Control Panel (Admin Only) — ${tournament.title} (ID: ${tournamentId})`,
         permissionOverwrites: botCommandsOverwrites,
       });
     } catch (createPrimaryErr) {
+      console.error(`[Discord Bot] Discord rejected channel name "${nameToCreate}":`, createPrimaryErr?.message || createPrimaryErr);
+      console.warn(`[Discord Bot] Retrying channel creation with ASCII fallback "${botCmdFallback}"...`);
       botCommandsChannel = await queueChannelCreate(guild, {
         name: botCmdFallback,
         type: ChannelType.GuildText,
@@ -3344,7 +3431,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
   for (const channelDef of REQUIRED_TOURNAMENT_CHANNELS) {
     const existingId = savedTournament.channels[channelDef.key];
-    const desiredName = `${tournamentPrefix}-${channelDef.name}`;
+    const { primary: desiredName, fallback: desiredFallback } = getTournamentChannelNames(shortPrefix, channelDef.name);
     const targetCategory = category;
     let channelInstance = null;
 
@@ -3415,9 +3502,21 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
         });
       }
       if (channelInstance.name !== desiredName) {
-        await channelInstance.setName(desiredName).catch((err) => syncResult.failures.push(`Failed to rename channel: ${err.message}`));
+        const nameToSet = isValidChannelName(desiredName) ? desiredName : desiredFallback;
+        try {
+          await channelInstance.setName(nameToSet);
+        } catch (renameErr) {
+          console.error(`[Discord Bot] Discord rejected channel rename to "${nameToSet}" for channel ${channelInstance.id}:`, renameErr?.message || renameErr);
+          console.warn(`[Discord Bot] Retrying channel rename with ASCII fallback "${desiredFallback}"...`);
+          try {
+            await channelInstance.setName(desiredFallback);
+          } catch (fbErr) {
+            console.error(`[Discord Bot] Fallback rename also failed for channel ${channelInstance.id}:`, fbErr?.message || fbErr);
+            syncResult.failures.push(`Failed to rename channel: ${fbErr.message}`);
+          }
+        }
       }
-      syncResult.channelsReused.push(desiredName);
+      syncResult.channelsReused.push(channelInstance.name);
       savedTournament.channels[channelDef.key] = channelInstance.id;
       activeChannels[channelDef.key] = channelInstance;
 
@@ -3430,16 +3529,30 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
         }
       }
     } else {
+      const nameToCreate = isValidChannelName(desiredName) ? desiredName : desiredFallback;
       try {
-        channelInstance = await queueChannelCreate(guild, {
-          name: desiredName,
-          type: ChannelType.GuildText,
-          parent: targetCategory.id,
-          topic: `${channelDef.topic} — ${tournament.title}`,
-          permissionOverwrites: targetOverwrites,
-        });
+        try {
+          channelInstance = await queueChannelCreate(guild, {
+            name: nameToCreate,
+            fallbackName: desiredFallback,
+            type: ChannelType.GuildText,
+            parent: targetCategory.id,
+            topic: `${channelDef.topic} — ${tournament.title}`,
+            permissionOverwrites: targetOverwrites,
+          });
+        } catch (createPrimaryErr) {
+          console.error(`[Discord Bot] Discord rejected channel name "${nameToCreate}":`, createPrimaryErr?.message || createPrimaryErr);
+          console.warn(`[Discord Bot] Retrying channel creation with ASCII fallback "${desiredFallback}"...`);
+          channelInstance = await queueChannelCreate(guild, {
+            name: desiredFallback,
+            type: ChannelType.GuildText,
+            parent: targetCategory.id,
+            topic: `${channelDef.topic} — ${tournament.title}`,
+            permissionOverwrites: targetOverwrites,
+          });
+        }
 
-        syncResult.channelsCreated.push(desiredName);
+        syncResult.channelsCreated.push(channelInstance.name);
         savedTournament.channels[channelDef.key] = channelInstance.id;
         activeChannels[channelDef.key] = channelInstance;
       } catch (err) {
@@ -3480,9 +3593,16 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     ...registeredVoiceOverwrites,
   ];
 
-  const roomMakerName = `${tournamentPrefix}-room-maker-vc`;
+  const roomMakerName = 'room-maker-vc';
   if (voiceChannelInstance) {
-    if (voiceChannelInstance.name !== roomMakerName) await voiceChannelInstance.setName(roomMakerName).catch((err) => syncResult.failures.push(`Failed to rename room-maker voice channel: ${err.message}`));
+    if (voiceChannelInstance.name !== roomMakerName) {
+      try {
+        await voiceChannelInstance.setName(roomMakerName);
+      } catch (err) {
+        console.error(`[Discord Bot] Discord rejected voice channel rename to "${roomMakerName}" for channel ${voiceChannelInstance.id}:`, err?.message || err);
+        syncResult.failures.push(`Failed to rename room-maker voice channel: ${err.message}`);
+      }
+    }
     savedTournament.channels.roomMakerVcId = voiceChannelInstance.id;
     if (voiceChannelInstance.parentId !== category.id) {
       await voiceChannelInstance.setParent(category.id, { lockPermissions: false }).catch((err) => {
@@ -3501,18 +3621,21 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
       await voiceChannelInstance.permissionOverwrites.set(voiceOverwrites).catch(() => {});
     }
   } else {
+    const nameToCreate = isValidChannelName(roomMakerName) ? roomMakerName : 'room-maker-vc';
     try {
       voiceChannelInstance = await queueChannelCreate(guild, {
-        name: roomMakerName,
+        name: nameToCreate,
         type: ChannelType.GuildVoice,
         parent: category.id,
         userLimit: 15,
         permissionOverwrites: voiceOverwrites,
       });
-      savedTournament.channels.roomMakerVcId = voiceChannelInstance.id;
+
       syncResult.channelsCreated.push(roomMakerName);
-    } catch (vcErr) {
-      syncResult.failures.push(`Failed to create room-maker-vc: ${vcErr.message}`);
+      savedTournament.channels.roomMakerVcId = voiceChannelInstance.id;
+    } catch (err) {
+      console.error(`[Discord Bot] Discord rejected voice channel name "${nameToCreate}":`, err?.message || err);
+      syncResult.failures.push(`Failed to create voice channel #${roomMakerName}: ${err.message}`);
     }
   }
 
@@ -3830,6 +3953,77 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
   }
 
   return syncResult;
+}
+
+/**
+ * Renames all already-created channels for a tournament to the standard format using IDs stored in MongoDB/cache.
+ * Finds channels only by ID, never by name.
+ * @param {import('discord.js').Guild} guild
+ * @param {string} tournamentId
+ * @returns {Promise<{ renamed: string[], failures: string[] }>}
+ */
+export async function renameTournamentChannelsToStandardFormat(guild, tournamentId) {
+  const results = { renamed: [], failures: [] };
+  if (!guild || !tournamentId) return results;
+
+  let savedTournament = guildSettingsCache[guild.id]?.tournaments?.[tournamentId];
+  if (!savedTournament && isMongoConnected()) {
+    try {
+      savedTournament = await getTournamentFromDb(guild.id, tournamentId);
+    } catch {
+      // Ignore Mongo fetch error and proceed if cached
+    }
+  }
+
+  if (!savedTournament || !savedTournament.channels) return results;
+
+  const title = savedTournament.tournamentTitle || tournamentId;
+  const shortPrefix = getTournamentShortPrefix(title, tournamentId);
+
+  // Rename text channels found only by ID
+  for (const channelDef of REQUIRED_TOURNAMENT_CHANNELS) {
+    const channelId = savedTournament.channels[channelDef.key];
+    if (!channelId) continue;
+
+    const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel || channel.type !== ChannelType.GuildText) continue;
+
+    const { primary: desiredName, fallback: desiredFallback } = getTournamentChannelNames(shortPrefix, channelDef.name);
+    if (channel.name !== desiredName) {
+      const nameToSet = isValidChannelName(desiredName) ? desiredName : desiredFallback;
+      try {
+        await channel.setName(nameToSet);
+        results.renamed.push(nameToSet);
+      } catch (err) {
+        console.error(`[Discord Bot] Discord rejected channel rename to "${nameToSet}" for channel ${channelId}:`, err?.message || err);
+        console.warn(`[Discord Bot] Retrying channel rename with ASCII fallback "${desiredFallback}"...`);
+        try {
+          await channel.setName(desiredFallback);
+          results.renamed.push(desiredFallback);
+        } catch (fbErr) {
+          console.error(`[Discord Bot] Fallback rename also failed for channel ${channelId}:`, fbErr?.message || fbErr);
+          results.failures.push(`Failed to rename channel ${channelId}: ${fbErr.message}`);
+        }
+      }
+    }
+  }
+
+  // Rename room maker voice channel found only by ID
+  const roomMakerVcId = savedTournament.channels.roomMakerVcId;
+  if (roomMakerVcId) {
+    const vc = guild.channels.cache.get(roomMakerVcId) || await guild.channels.fetch(roomMakerVcId).catch(() => null);
+    if (vc && vc.type === ChannelType.GuildVoice && vc.name !== 'room-maker-vc') {
+      try {
+        await vc.setName('room-maker-vc');
+        results.renamed.push('room-maker-vc');
+      } catch (err) {
+        console.error(`[Discord Bot] Discord rejected voice channel rename to "room-maker-vc" for channel ${roomMakerVcId}:`, err?.message || err);
+        results.failures.push(`Failed to rename room maker vc ${roomMakerVcId}: ${err.message}`);
+      }
+    }
+  }
+
+  return results;
 }
 
   /**

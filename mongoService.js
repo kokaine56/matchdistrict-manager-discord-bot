@@ -214,6 +214,12 @@ async function ensureMongoIndexes() {
     const ticketCounterCol = mongoDb.collection('discord_ticket_counters');
     await ticketCounterCol.createIndex({ guildId: 1 }, { unique: true });
 
+    const anncCol = mongoDb.collection('discord_announcement_channels');
+    await anncCol.createIndex({ guildId: 1 }, { unique: true });
+
+    const pendingAnncCol = mongoDb.collection('discord_pending_announcements');
+    await pendingAnncCol.createIndex({ announcementId: 1 }, { unique: true });
+
     console.log('[MongoDB] 🔒 Indexes verified across managed collections.');
   } catch (err) {
     console.warn('[MongoDB] ⚠️ Error creating indexes:', err.message);
@@ -1576,6 +1582,107 @@ export async function updateTicketStatusInDb(channelId, status) {
     return true;
   } catch (err) {
     console.warn(`[MongoDB] ⚠️ Error updating ticket status for channel ${channelId}:`, err.message);
+    return false;
+  }
+}
+
+/**
+ * Saves or updates the announcement DM channel ID for a guild.
+ * @param {string} guildId
+ * @param {string} channelId
+ */
+export async function saveAnnouncementChannel(guildId, channelId) {
+  if (!isMongoConnected() || !guildId || !channelId) return;
+  try {
+    const col = mongoDb.collection('discord_announcement_channels');
+    await col.updateOne(
+      { guildId },
+      { $set: { guildId, channelId, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
+      { upsert: true }
+    );
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error saving announcement channel for guild ${guildId}:`, err.message);
+  }
+}
+
+/**
+ * Retrieves the announcement DM channel ID for a guild.
+ * @param {string} guildId
+ * @returns {Promise<string|null>}
+ */
+export async function getAnnouncementChannel(guildId) {
+  if (!isMongoConnected() || !guildId) return null;
+  try {
+    const col = mongoDb.collection('discord_announcement_channels');
+    const doc = await col.findOne({ guildId });
+    return doc?.channelId || null;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error retrieving announcement channel for guild ${guildId}:`, err.message);
+    return null;
+  }
+}
+
+const localPendingAnnouncements = new Map();
+
+/**
+ * Saves a pending announcement record to MongoDB (and local cache).
+ * @param {object} announcementData
+ */
+export async function savePendingAnnouncement(announcementData) {
+  if (!announcementData?.announcementId) return;
+  localPendingAnnouncements.set(announcementData.announcementId, { ...announcementData });
+  if (!isMongoConnected()) return;
+  try {
+    const col = mongoDb.collection('discord_pending_announcements');
+    await col.updateOne(
+      { announcementId: announcementData.announcementId },
+      { $set: { ...announcementData, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
+      { upsert: true }
+    );
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error saving pending announcement ${announcementData.announcementId}:`, err.message);
+  }
+}
+
+/**
+ * Retrieves a pending announcement by its unique announcementId.
+ * @param {string} announcementId
+ * @returns {Promise<object|null>}
+ */
+export async function getPendingAnnouncement(announcementId) {
+  if (!announcementId) return null;
+  if (!isMongoConnected()) {
+    return localPendingAnnouncements.get(announcementId) || null;
+  }
+  try {
+    const col = mongoDb.collection('discord_pending_announcements');
+    const doc = await col.findOne({ announcementId });
+    if (doc) {
+      localPendingAnnouncements.set(announcementId, doc);
+      return doc;
+    }
+    return localPendingAnnouncements.get(announcementId) || null;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error retrieving pending announcement ${announcementId}:`, err.message);
+    return localPendingAnnouncements.get(announcementId) || null;
+  }
+}
+
+/**
+ * Deletes a pending announcement from MongoDB (and local cache) once confirmed or cancelled.
+ * @param {string} announcementId
+ * @returns {Promise<boolean>}
+ */
+export async function deletePendingAnnouncement(announcementId) {
+  if (!announcementId) return false;
+  localPendingAnnouncements.delete(announcementId);
+  if (!isMongoConnected()) return true;
+  try {
+    const col = mongoDb.collection('discord_pending_announcements');
+    await col.deleteOne({ announcementId });
+    return true;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error deleting pending announcement ${announcementId}:`, err.message);
     return false;
   }
 }
