@@ -90,6 +90,7 @@ export const STAFF_ROLES = [
 
 // In-memory mutex and draft cache
 const ticketSetupInProgress = new Set();
+const activeTicketConfirmations = new Set();
 export const pendingStaffDrafts = new Map(); // draftId -> draft data
 const activeStaffSubmissions = new Set(); // userId
 
@@ -110,12 +111,36 @@ export function isValidEmail(email) {
  * @returns {boolean}
  */
 export function isValidPhoneNumber(phone) {
-  if (!phone || typeof phone !== 'string') return false;
-  const trimmed = phone.trim();
-  const digits = trimmed.replace(/\D/g, '');
-  if (digits.length < 7 || digits.length > 18) return false;
-  const re = /^[\+]?[0-9\s\-\.\(\)]{7,25}$/;
-  return re.test(trimmed);
+  return typeof phone === 'string' && /^\d{10}$/.test(phone);
+}
+
+function buildTicketPanelSelectRow() {
+  const uniqueOptions = [];
+  const seenValues = new Set();
+  for (const option of TICKET_OPTIONS) {
+    if (!seenValues.has(option.value)) {
+      seenValues.add(option.value);
+      uniqueOptions.push(option);
+    }
+  }
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('ticket:select_category')
+      .setPlaceholder('Make a selection')
+      .addOptions(uniqueOptions.map((option) => ({
+        label: option.label,
+        value: option.value,
+        description: option.description || undefined,
+        emoji: option.emoji || undefined,
+      })))
+  );
+}
+
+async function resetTicketPanelSelection(interaction) {
+  if (!interaction.message?.edit) return;
+  await interaction.message.edit({ components: [buildTicketPanelSelectRow()] }).catch((error) => {
+    console.warn('[Ticket Service] Could not reset support panel selection:', error.message);
+  });
 }
 
 /**
@@ -331,11 +356,11 @@ export function buildStaffApplicationModal() {
 
   const phoneInput = new TextInputBuilder()
     .setCustomId('staff_phone')
-    .setLabel('Contact Number (with Country Code)')
+    .setLabel('Contact Number (10 digits)')
     .setStyle(TextInputStyle.Short)
-    .setPlaceholder('+91 9876543210')
-    .setMinLength(7)
-    .setMaxLength(25)
+    .setPlaceholder('9876543210')
+    .setMinLength(10)
+    .setMaxLength(10)
     .setRequired(true);
 
   const motivationInput = new TextInputBuilder()
@@ -579,6 +604,46 @@ export async function handleTicketInteraction(interaction) {
   const { guild, user, member } = interaction;
   if (!guild) return false;
 
+  if (interaction.isButton?.() && customId === 'ticket:confirm_cancel') {
+    await interaction.update({ content: 'Cancelled', embeds: [], components: [] });
+    return true;
+  }
+
+  if (interaction.isButton?.() && customId === 'ticket:confirm_create') {
+    const confirmationKey = `${guild.id}:${interaction.message?.id || interaction.id}`;
+    if (activeTicketConfirmations.has(confirmationKey)) {
+      await interaction.reply({ content: 'Your ticket is already being created.', ephemeral: true }).catch(() => {});
+      return true;
+    }
+    activeTicketConfirmations.add(confirmationKey);
+    const disabledRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('ticket:confirm_create').setLabel('Creating…').setStyle(ButtonStyle.Success).setDisabled(true),
+      new ButtonBuilder().setCustomId('ticket:confirm_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary).setDisabled(true),
+    );
+    try {
+      await interaction.update({ content: 'Creating your support ticket…', components: [disabledRow] });
+      const confirmedSelection = {
+        guild,
+        user,
+        member,
+        customId: 'ticket:select_category',
+        values: ['general_support'],
+        ticketConfirmed: true,
+        isStringSelectMenu: () => true,
+        deferReply: async () => {},
+        editReply: (payload) => interaction.message.edit(payload),
+        reply: (payload) => interaction.followUp(payload),
+      };
+      await handleTicketInteraction(confirmedSelection);
+    } catch (error) {
+      console.error('[Ticket Service] ❌ Error confirming support ticket:', error);
+      await interaction.message?.edit({ content: `❌ An error occurred while creating your ticket: ${error.message}`, components: [] }).catch(() => {});
+    } finally {
+      activeTicketConfirmations.delete(confirmationKey);
+    }
+    return true;
+  }
+
   // ---------------------------------------------------------
   // 1. SELECT MENU: CATEGORY SELECTION
   // ---------------------------------------------------------
@@ -590,6 +655,7 @@ export async function handleTicketInteraction(interaction) {
       try {
         const modal = buildStaffApplicationModal();
         await interaction.showModal(modal);
+        await resetTicketPanelSelection(interaction);
         return true;
       } catch (modalErr) {
         console.error('[Ticket Service] ❌ Error showing staff modal:', modalErr);
@@ -599,12 +665,23 @@ export async function handleTicketInteraction(interaction) {
             ephemeral: true,
           }).catch(() => {});
         }
+        await resetTicketPanelSelection(interaction);
         return true;
       }
     }
 
+    if (selectedValue === 'general_support' && interaction.ticketConfirmed !== true) {
+      const confirmationRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('ticket:confirm_create').setLabel('Create Ticket').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('ticket:confirm_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+      );
+      await interaction.reply({ content: 'Do you want to create a support ticket?', components: [confirmationRow], ephemeral: true });
+      await resetTicketPanelSelection(interaction);
+      return true;
+    }
+
     // Branch B: General Support -> Create Support Ticket Channel
-    await interaction.deferReply({ ephemeral: true });
+    if (!interaction.ticketConfirmed) await interaction.deferReply({ ephemeral: true });
 
     try {
       const selectedOption =
@@ -804,7 +881,7 @@ export async function handleTicketInteraction(interaction) {
         typeof interaction.fields?.getTextInputValue === 'function'
           ? interaction.fields.getTextInputValue('staff_phone')
           : interaction.fields?.staff_phone || ''
-      ).trim();
+      );
 
       const motivation = (
         typeof interaction.fields?.getTextInputValue === 'function'
@@ -824,7 +901,7 @@ export async function handleTicketInteraction(interaction) {
       // Field validation: Phone
       if (!isValidPhoneNumber(phone)) {
         await interaction.reply({
-          content: '❌ **Invalid Contact Number:** Please enter a valid phone number (7 to 18 digits, country codes accepted, e.g. `+91 9876543210`).',
+          content: '❌ **Invalid Contact Number:** Enter exactly 10 digits with no country code, spaces, symbols, or letters.',
           ephemeral: true,
         });
         return true;
