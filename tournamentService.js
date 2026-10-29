@@ -1168,7 +1168,7 @@ export function buildTournamentControlPanelEmbed(tournament, summary, channelsSt
       }
       groupSlotStatusText =
         `• **Active Groups:** **${totalGroups}** (${totalSlots} slots total, 25 slots/group)\n` +
-        `• **Group Slot Policy:** 16 teams/group (Slots 01-02 LOCKED, Slots 03-18 Teams, Slots 19-25 UNUSED)\n` +
+        `• **Group Slot Policy:** Slots 01-02 LOCKED, Slots 03-18 registered teams, Slots 19-25 spare for manually added teams\n` +
         `• **Allocation Breakdown:** 🔒 **${lockedSlots}** locked | 🎮 **${occupiedSlots}** occupied | ⚪ **${emptySlots}** empty | ⛔ **${unusedSlots}** unused`;
     } else {
       groupSlotStatusText = `• **Status:** Round configured in **${activeRound.status}** state.\n• Click **View Rounds** below to manage or start rounds.`;
@@ -1836,6 +1836,12 @@ export async function handleDashboardNavigationInteraction(interaction) {
     }
     return true;
   }
+  if (screen === 'round' && action === 'add-team') {
+    const roundId = idParts[3];
+    updateDashboardNavigation(interaction.guild, tournamentId, 'push', { screen: 'add-team', roundId });
+    await handleAddTeamGroupChooser(interaction, tournamentId, roundId);
+    return true;
+  }
   if (screen === 'round' && action === 'submit-results') {
     await handleToggleRoundGroupMessages(interaction, tournamentId, idParts[3]);
     return true;
@@ -1879,6 +1885,46 @@ export async function handleDashboardNavigationInteraction(interaction) {
     updateDashboardNavigation(interaction.guild, tournamentId, 'home');
     await handleBackToTournamentPanel(interaction, tournamentId);
     return true;
+  }
+  if (screen === 'add-team') {
+    const roundId = idParts[3];
+    if (action === 'refresh') {
+      await handleAddTeamGroupChooser(interaction, tournamentId, roundId);
+      return true;
+    }
+    if (action === 'back') {
+      updateDashboardNavigation(interaction.guild, tournamentId, 'back');
+      await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId);
+      return true;
+    }
+    if (action === 'group') {
+      const groupId = idParts[4];
+      const round = savedTournament.rounds?.[roundId];
+      const group = round?.groups?.find((candidate) => candidate.groupId === groupId);
+      if (!round || !group || round.status === 'Completed') {
+        await interaction.reply({ content: 'This round or group is no longer available for adding a team.', ephemeral: true }).catch(() => {});
+        return true;
+      }
+      const freeSlots = getAvailableManualSpareSlots(group);
+      if (!freeSlots.length) {
+        await interaction.reply({ content: `Group ${group.groupNumber} is full. No team was added.`, ephemeral: true }).catch(() => {});
+        return true;
+      }
+      const modal = new ModalBuilder()
+        .setCustomId(`md_modal_add_team:${tournamentId}:${roundId}:${groupId}`)
+        .setTitle(`Add Team · Group ${group.groupNumber}`)
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder()
+            .setCustomId('team_name').setLabel('Team Name').setStyle(TextInputStyle.Short)
+            .setRequired(true).setMaxLength(100)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder()
+            .setCustomId('discord_tags').setLabel('Discord Tags')
+            .setPlaceholder('Mentions, user IDs or usernames; separate with commas, spaces or new lines')
+            .setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1000))
+        );
+      await interaction.showModal(modal);
+      return true;
+    }
   }
   return false;
 }
@@ -5242,7 +5288,7 @@ export async function handleCreateSequentialRound(interaction, tournamentId) {
 /**
  * Opens the dedicated management view for an individual selected round.
  */
-export async function handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, notice = null) {
+export async function handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, notice = null, messageOverride = null) {
   const guild = interaction.guild;
   const access = checkTournamentAccess(guild, interaction.member);
   if (!access.allowed) {
@@ -5301,7 +5347,7 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
       totalAllocatedTeams += occupied;
       const chMention = g.channelId ? `<#${g.channelId}>` : `#${g.channelName}`;
       const roleMention = g.roleId ? `<@&${g.roleId}>` : `@${g.roleName}`;
-      lines.push(`• **Group ${g.groupNumber}:** ${chMention} | ${roleMention} (${occupied}/16 teams)`);
+      lines.push(`• **Group ${g.groupNumber}:** ${chMention} | ${roleMention} (${occupied}/23 usable slots)`);
     }
     groupsDetailText = lines.slice(0, 10).join('\n');
     if (lines.length > 10) groupsDetailText += `\n*...and ${lines.length - 10} more groups.*`;
@@ -5333,7 +5379,7 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
           `• **Configured Capacity:** **${round.teamsPerGroup || 16}** teams per group\n` +
           `• **Teams Allocated:** **${totalAllocatedTeams}**\n` +
           `• **Qualified from this Round:** **${(round.qualifications || []).length}** 🏆\n` +
-          `• **Capacity Policy:** 25 slots per group (Slots 01-02 LOCKED, Slots 03 to ${2 + (round.teamsPerGroup || 16)} Teams, Remaining Slots UNUSED)\n` +
+          `• **Capacity Policy:** 25 slots per group (Slots 01-02 LOCKED, Slots 03-18 registered teams, Slots 19-25 spare for manually added teams)\n` +
           `${groupsDetailText}`,
         inline: false,
       }
@@ -5400,12 +5446,23 @@ export async function handleOpenIndividualRoundMenu(interaction, tournamentId, r
       .setStyle(ButtonStyle.Primary)
   );
 
+  const row4 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`dash:round:add-team:${round.roundId}`)
+      .setLabel('Add Team')
+      .setEmoji('➕')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(isCompleted)
+  );
+
   if (interaction.deferred) {
-    await interaction.editReply({ content: notice, embeds: [embed], components: [row1, row2, row3] }).catch(() => {});
+    const payload = { content: notice, embeds: [embed], components: [row1, row2, row3, row4] };
+    if (messageOverride) await messageOverride.edit(payload).catch(() => {});
+    else await interaction.editReply(payload).catch(() => {});
   } else if (typeof interaction.update === 'function') {
-    await interaction.update({ content: notice, embeds: [embed], components: [row1, row2, row3] }).catch(() => {});
+    await interaction.update({ content: notice, embeds: [embed], components: [row1, row2, row3, row4] }).catch(() => {});
   } else if (typeof interaction.reply === 'function') {
-    await interaction.reply({ embeds: [embed], components: [row1, row2, row3], ephemeral: true }).catch(() => {});
+    await interaction.reply({ embeds: [embed], components: [row1, row2, row3, row4], ephemeral: true }).catch(() => {});
   }
 }
 
@@ -5451,6 +5508,246 @@ async function handleToggleRoundGroupMessages(interaction, tournamentId, roundId
   } catch (error) {
     console.error(`[Discord Bot] Failed to toggle group messaging for ${tournamentId}/${roundId}:`, error);
     await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, `❌ Could not update Submit Results: ${error.message}`);
+  }
+}
+
+async function handleAddTeamGroupChooser(interaction, tournamentId, roundId) {
+  const guild = interaction.guild;
+  const access = checkTournamentAccess(guild, interaction.member);
+  const savedTournament = guildSettingsCache[guild.id]?.tournaments?.[tournamentId];
+  const round = savedTournament?.rounds?.[roundId];
+  if (!access.allowed || !round || round.status === 'Completed') {
+    await interaction.editReply({ content: access.allowed ? 'This round is not available for adding a team.' : access.reason, embeds: [], components: [] }).catch(() => {});
+    return;
+  }
+
+  const groups = Array.isArray(round.groups) ? round.groups : [];
+  const rows = [];
+  let row = new ActionRowBuilder();
+  for (const [index, group] of groups.entries()) {
+    const freeCount = getAvailableManualSpareSlots(group).length;
+    row.addComponents(new ButtonBuilder()
+      .setCustomId(`dash:add-team:group:${roundId}:${group.groupId}`)
+      .setLabel(freeCount ? `G${group.groupNumber} (${freeCount} free)` : `G${group.groupNumber} (Full)`)
+      .setStyle(freeCount ? ButtonStyle.Primary : ButtonStyle.Secondary)
+      .setDisabled(freeCount === 0));
+    if (row.components.length === 5 || index === groups.length - 1) {
+      rows.push(row);
+      row = new ActionRowBuilder();
+    }
+  }
+  if (rows.length > 4) {
+    await interaction.editReply({ content: 'This round has too many groups to show the Add Team chooser.', embeds: [], components: [] }).catch(() => {});
+    return;
+  }
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`dash:add-team:refresh:${roundId}`).setLabel('Refresh').setEmoji('🔄').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`dash:add-team:back:${roundId}`).setLabel('Back to Round').setEmoji('⬅️').setStyle(ButtonStyle.Secondary)
+  ));
+  const embed = new EmbedBuilder()
+    .setTitle(`➕ Add Team · ${round.name}`)
+    .setColor(0x22c55e)
+    .setDescription(groups.length
+      ? 'Choose a group. Teams use its first available spare slot from 19 through 25.'
+      : 'Start this round and allocate its groups before adding a team.')
+    .setTimestamp();
+  await interaction.editReply({ content: null, embeds: [embed], components: rows }).catch(() => {});
+}
+
+function getAvailableManualSpareSlots(group) {
+  return Array.from({ length: 7 }, (_, index) => index + 19).filter((slotNumber) => {
+    const slot = (group?.slots || []).find((candidate) => Number(candidate.slotNumber) === slotNumber);
+    return !slot || slot.status !== 'OCCUPIED';
+  });
+}
+
+async function handleAddTeamModalSubmit(interaction, tournamentId, roundId, groupId) {
+  if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true }).catch(() => {});
+  const guild = interaction.guild;
+  const access = checkTournamentAccess(guild, interaction.member);
+  if (!access.allowed) {
+    await interaction.editReply({ content: access.reason });
+    return;
+  }
+
+  const teamName = interaction.fields?.getTextInputValue('team_name')?.trim();
+  const enteredTags = interaction.fields?.getTextInputValue('discord_tags')?.trim() || '';
+  const tags = enteredTags.split(/[\s,]+/).map((tag) => tag.trim()).filter(Boolean);
+  if (!teamName) return interaction.editReply({ content: 'Enter a team name.' });
+  if (!tags.length) return interaction.editReply({ content: 'Enter at least one Discord tag, user ID, or username.' });
+
+  try {
+    const current = guildSettingsCache[guild.id]?.tournaments?.[tournamentId];
+    const round = current?.rounds?.[roundId];
+    const group = round?.groups?.find((candidate) => candidate.groupId === groupId);
+    if (!current || !round || !group || round.status === 'Completed') throw new Error('This round or group is no longer available for adding a team.');
+
+    const resolvedMembers = [];
+    let queriedMembers = null;
+    for (const enteredAs of tags) {
+      const mentionMatch = enteredAs.match(/^<@!?(\d+)>$/);
+      const candidateId = mentionMatch?.[1] || (isValidDiscordSnowflake(enteredAs) ? enteredAs : null);
+      let member = candidateId
+        ? guild.members.cache.get(candidateId) || await guild.members.fetch(candidateId).catch(() => null)
+        : null;
+      if (!member) {
+        const query = enteredAs.replace(/^@/, '').toLowerCase();
+        const matchesName = (candidate) => [candidate.user?.username, candidate.user?.globalName, candidate.displayName, candidate.nickname, candidate.user?.tag]
+          .some((name) => String(name || '').toLowerCase() === query);
+        member = Array.from(guild.members.cache.values()).find(matchesName) || null;
+        if (!member && typeof guild.members.fetch === 'function') {
+          if (!queriedMembers) queriedMembers = await guild.members.fetch().catch(() => null);
+          member = Array.from(queriedMembers?.values?.() || []).find(matchesName) || null;
+        }
+      }
+      if (member) {
+        if (!resolvedMembers.some((item) => item.discord_id === member.id)) {
+          resolvedMembers.push({
+            discord_id: member.id,
+            username: member.user?.tag || member.user?.username || member.displayName || member.id,
+            enteredAs,
+            found: true,
+          });
+        }
+      } else {
+        resolvedMembers.push({ discord_id: null, username: enteredAs, enteredAs, found: false });
+      }
+    }
+
+    const teamId = `manual_${crypto.randomUUID()}`;
+    const teamRecord = {
+      teamId,
+      teamName,
+      members: resolvedMembers,
+      tournamentId,
+      roundId,
+      roundName: round.name,
+      groupId,
+      groupNumber: group.groupNumber,
+      slotNumber: null,
+      addedManually: true,
+      addedBy: interaction.user?.id || interaction.member?.id,
+      addedByTag: interaction.user?.tag || interaction.member?.user?.tag || interaction.member?.id,
+      createdAt: new Date().toISOString(),
+    };
+
+    await withTournamentLock(tournamentId, async () => {
+      const latestSaved = guildSettingsCache[guild.id]?.tournaments?.[tournamentId];
+      const latestRound = latestSaved?.rounds?.[roundId];
+      const latestGroup = latestRound?.groups?.find((candidate) => candidate.groupId === groupId);
+      if (!latestGroup || latestRound.status === 'Completed') throw new Error('This round or group is no longer available for adding a team.');
+      latestGroup.slots ||= [];
+      for (let slotNumber = 19; slotNumber <= 25; slotNumber++) {
+        if (!latestGroup.slots.some((slot) => Number(slot.slotNumber) === slotNumber)) {
+          latestGroup.slots.push({ slotNumber, status: 'UNUSED', label: 'UNUSED', teamId: null, teamName: null, members: [], qualificationStatus: 'Pending' });
+        }
+      }
+      const targetSlotNumber = getAvailableManualSpareSlots(latestGroup)[0];
+      if (!targetSlotNumber) throw new Error(`Group ${latestGroup.groupNumber} is full. No team was added.`);
+      let targetSlot = latestGroup.slots.find((slot) => Number(slot.slotNumber) === targetSlotNumber);
+      if (!targetSlot) {
+        targetSlot = { slotNumber: targetSlotNumber, status: 'UNUSED', label: 'UNUSED', teamId: null, teamName: null, members: [], qualificationStatus: 'Pending' };
+        latestGroup.slots.push(targetSlot);
+      }
+
+      const previousSlot = { ...targetSlot };
+      const previousManualTeams = [...(latestSaved.manualTeams || [])];
+      teamRecord.slotNumber = Number(targetSlot.slotNumber);
+      Object.assign(targetSlot, {
+        status: 'OCCUPIED',
+        label: teamName,
+        teamId,
+        teamName,
+        members: resolvedMembers,
+        qualificationStatus: 'Pending',
+        addedManually: true,
+      });
+      latestSaved.manualTeams ||= [];
+      latestSaved.manualTeams.push({ ...teamRecord });
+      const persisted = await saveTournamentToDb(guild.id, tournamentId, latestSaved);
+      if (!persisted) {
+        Object.assign(targetSlot, previousSlot);
+        latestSaved.manualTeams = previousManualTeams;
+        throw new Error('Could not save the team to MongoDB. No team was added.');
+      }
+      saveGuildSettings(guildSettingsCache);
+    }, 'manual team allocation');
+
+    const saved = guildSettingsCache[guild.id].tournaments[tournamentId];
+    const savedRound = saved.rounds[roundId];
+    const savedGroup = savedRound.groups.find((candidate) => candidate.groupId === groupId);
+    const addedSlot = savedGroup.slots.find((slot) => Number(slot.slotNumber) === teamRecord.slotNumber);
+    const roleFailures = [];
+    for (const person of resolvedMembers.filter((item) => item.found && item.discord_id)) {
+      const member = guild.members.cache.get(person.discord_id) || await guild.members.fetch(person.discord_id).catch(() => null);
+      if (!member) continue;
+      for (const roleId of [saved.roleId, savedGroup.roleId].filter(Boolean)) {
+        try {
+          await queueRoleAdd(member, roleId, `Manually added to ${savedRound.name}, Group ${savedGroup.groupNumber}`);
+        } catch (error) {
+          roleFailures.push(`${person.username}: ${error.message}`);
+        }
+      }
+    }
+
+    const teamChannelId = saved.channels?.tournamentTeamsId;
+    const teamsChannel = teamChannelId
+      ? guild.channels.cache.get(teamChannelId) || await guild.channels.fetch(teamChannelId).catch(() => null)
+      : null;
+    if (teamsChannel) {
+      const rosterMembers = resolvedMembers.map((person) => person.discord_id
+        ? `<@${person.discord_id}>`
+        : `\`${person.enteredAs}\` (not found)`).join(', ');
+      const rosterKey = `guild:${guild.id}:tournament:${tournamentId}:manual_team:${teamId}`;
+      await upsertManagedMessage(guild.client, {
+        guildId: guild.id,
+        channelId: teamsChannel.id,
+        channel: teamsChannel,
+        logicalKey: rosterKey,
+        messageType: 'manual_team_roster_entry',
+        tournamentId,
+        roundId,
+        groupId,
+        payload: { content: `➕ **Manually Added Team**\n**${teamName}** · ${savedRound.name}, Group ${savedGroup.groupNumber}, Slot ${String(addedSlot.slotNumber).padStart(2, '0')}\n**Members:** ${rosterMembers}` },
+      }).catch((error) => console.warn('[Discord Bot] Could not add manual team to registered-team channel:', error.message));
+    }
+
+    const groupChannel = savedGroup.channelId
+      ? guild.channels.cache.get(savedGroup.channelId) || await guild.channels.fetch(savedGroup.channelId).catch(() => null)
+      : null;
+    if (groupChannel) await updateGroupSlotListMessage(guild, { id: tournamentId, title: saved.tournamentTitle }, savedRound, savedGroup, groupChannel);
+
+    const botCommandsChannel = saved.channels?.botCommandsId
+      ? guild.channels.cache.get(saved.channels.botCommandsId) || await guild.channels.fetch(saved.channels.botCommandsId).catch(() => null)
+      : null;
+    if (botCommandsChannel) {
+      await publishRoundAllocationSummary(guild, { id: tournamentId, title: saved.tournamentTitle }, savedRound, botCommandsChannel, saved);
+      await updateGlobalSubmissionControlPanel(guild, { id: tournamentId, title: saved.tournamentTitle }, savedRound, botCommandsChannel);
+    }
+
+    await sendTournamentManagementLog(guild, { ...saved, id: tournamentId }, savedRound, 'Team added manually', interaction.member, [
+      { name: 'Team', value: teamName },
+      { name: 'Group and slot', value: `Group ${savedGroup.groupNumber}, Slot ${String(addedSlot.slotNumber).padStart(2, '0')}` },
+    ]);
+
+    const dashboardChannel = saved.channels?.botCommandsId
+      ? guild.channels.cache.get(saved.channels.botCommandsId) || await guild.channels.fetch(saved.channels.botCommandsId).catch(() => null)
+      : null;
+    const dashboardMessage = dashboardChannel && saved.controlPanelMessageId
+      ? await dashboardChannel.messages.fetch(saved.controlPanelMessageId).catch(() => null)
+      : null;
+    await updateDashboardNavigation(guild, tournamentId, 'back');
+    await handleOpenIndividualRoundMenu(interaction, tournamentId, roundId, null, dashboardMessage);
+
+    const notFound = resolvedMembers.filter((person) => !person.found).map((person) => person.enteredAs);
+    await interaction.editReply({
+      content: `✅ Added **${teamName}** to **${savedRound.name}, Group ${savedGroup.groupNumber}, Slot ${String(addedSlot.slotNumber).padStart(2, '0')}**.` +
+        (notFound.length ? `\n**Tags not found:** ${notFound.map((tag) => `\`${tag}\``).join(', ')}` : '') +
+        (roleFailures.length ? `\nSome role assignments could not be completed: ${roleFailures.join('; ')}` : ''),
+    });
+  } catch (error) {
+    console.error(`[Discord Bot] Failed to add manual team to ${tournamentId}/${roundId}/${groupId}:`, error);
+    await interaction.editReply({ content: `❌ ${error.message}` }).catch(() => {});
   }
 }
 
@@ -6283,7 +6580,7 @@ export async function handleStartRoundButton(interaction, tournamentId) {
     const promptText = `⚠️ **Confirm Starting ${targetRound.name}**\n` +
       `This will execute the official allocation workflow:\n` +
       `• Fetch latest verified registrations from MatchDistrict backend\n` +
-      `• Divide eligible teams into groups of 16 across 25 slots (Slots 01-02 LOCKED, Slots 03-18 Teams, Slots 19-25 UNUSED)\n` +
+      `• Divide eligible teams into groups of 16 across 25 slots (Slots 01-02 LOCKED, Slots 03-18 registered teams, Slots 19-25 spare for manually added teams)\n` +
       `• Create/reuse dedicated group roles and private ID/password channels\n` +
       `• Assign group roles to verified linked Discord players\n` +
       `• Publish allocation summary to <#${savedTournament.channels?.botCommandsId || 'bot-commands'}>\n\n` +
@@ -6827,6 +7124,11 @@ export async function handleTournamentSelectMenuInteraction(interaction) {
  */
 export async function handleTournamentModalSubmit(interaction) {
   const customId = interaction.customId || '';
+  if (customId.startsWith('md_modal_add_team:')) {
+    const [, tournamentId, roundId, groupId] = customId.split(':');
+    await handleAddTeamModalSubmit(interaction, tournamentId, roundId, groupId);
+    return;
+  }
   if (customId.startsWith('md_modal_create_round:')) {
     const tournamentId = customId.split(':')[1];
     const roundName = interaction.fields?.getTextInputValue('round_name')?.trim();
@@ -6889,7 +7191,7 @@ export async function publishRoundAllocationSummary(guild, tournament, round, bo
     const qualifiedSlots = assignedSlots.filter((s) => s.qualificationStatus === 'Qualified');
 
     groupsOverview += `⚔️ **Group ${group.groupNumber}** (${channelMention} | ${roleMention})\n` +
-      `  • Teams Allocated: **${assignedSlots.length}/16**\n` +
+      `  • Teams Allocated: **${assignedSlots.length}/23 usable slots**\n` +
       `  • Qualified: **${qualifiedSlots.length}** 🏆\n` +
       `  • Match Credentials: ${group.credentials?.roomId ? '✅ Published' : '⏳ Pending'}\n\n`;
   }

@@ -2527,7 +2527,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const opensDashboardModal = interaction.isButton?.() && (
       interactionCustomId.startsWith('md_tour_create_round:') ||
       interactionCustomId.startsWith('md_round_edit:') ||
-      interactionCustomId.startsWith('dash:round:announcement:')
+      interactionCustomId.startsWith('dash:round:announcement:') ||
+      interactionCustomId.startsWith('dash:add-team:group:')
     );
 
     // Acknowledge before any Mongo lookup or dashboard recovery work. Main actions
