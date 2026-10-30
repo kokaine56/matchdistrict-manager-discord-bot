@@ -194,20 +194,22 @@ export function resolveAuditChannel(guild, category) {
     banUnban: ['banUnbanLogId', 'botPreviewId'],
     msg: ['msgLogId'],
     dm: ['dmLogId'],
+    member: ['memberLogId', 'botPreviewId'],
     tournament: ['botPreviewId', 'channelCreateLogId', 'roleCreateLogId'],
     admin: ['botPreviewId', 'channelCreateLogId', 'roleCreateLogId'],
   };
 
   const nameFallbackMap = {
-    roleCreate: ['role-create-log', 'role-log', 'matchdistrict-logs', 'bot-preview'],
-    roleDelete: ['role-delete-log', 'role-create-log', 'matchdistrict-logs', 'bot-preview'],
-    channelCreate: ['channel-create-log', 'matchdistrict-logs', 'bot-preview'],
-    channelDelete: ['channel-delete-log', 'channel-create-log', 'matchdistrict-logs', 'bot-preview'],
-    banUnban: ['ban-unban-log', 'matchdistrict-logs', 'bot-preview'],
+    roleCreate: ['role-create-log', 'role-log', 'matchdistrict-logs', 'bot-log', 'bot-preview'],
+    roleDelete: ['role-delete-log', 'role-create-log', 'matchdistrict-logs', 'bot-log', 'bot-preview'],
+    channelCreate: ['channel-create-log', 'matchdistrict-logs', 'bot-log', 'bot-preview'],
+    channelDelete: ['channel-delete-log', 'channel-create-log', 'matchdistrict-logs', 'bot-log', 'bot-preview'],
+    banUnban: ['ban-unban-log', 'matchdistrict-logs', 'bot-log', 'bot-preview'],
+    member: ['member-log', 'bot-log', 'bot-preview'],
     msg: ['msg-log', 'matchdistrict-logs'],
     dm: ['dm-log', 'matchdistrict-logs'],
-    tournament: ['bot-preview', 'matchdistrict-logs', 'tournament-update'],
-    admin: ['bot-preview', 'matchdistrict-logs', 'tournament-update'],
+    tournament: ['bot-log', 'bot-preview', 'matchdistrict-logs', 'tournament-update'],
+    admin: ['bot-log', 'bot-preview', 'matchdistrict-logs', 'tournament-update'],
   };
 
   const candidateKeys = keyMap[category] || ['botPreviewId'];
@@ -220,7 +222,7 @@ export function resolveAuditChannel(guild, category) {
   }
 
   // Fallback by channel name
-  const candidateNames = nameFallbackMap[category] || ['matchdistrict-logs', 'bot-preview'];
+  const candidateNames = nameFallbackMap[category] || ['matchdistrict-logs', 'bot-log', 'bot-preview'];
   if (guild.channels.cache && typeof guild.channels.cache.find === 'function') {
     const ch = guild.channels.cache.find(
       (c) => c.type === ChannelType.GuildText && candidateNames.includes(c.name)
@@ -672,29 +674,23 @@ export async function logMemberJoined(member, dmStatus = null) {
   const accountAgeTs = Math.floor(member.user.createdTimestamp / 1000);
   const nowTs = Math.floor(Date.now() / 1000);
 
-  let title = 'Member Joined';
-  let color = AUDIT_COLORS.INFO;
-  let statusText = 'Joined Server';
-
-  if (dmStatus) {
-    if (dmStatus.delivered) {
-      title = 'Welcome DM Delivered';
-      color = AUDIT_COLORS.CREATE;
-      statusText = 'Delivered via Direct Message';
-    } else {
-      title = 'Welcome DM Delivery Failed';
-      color = AUDIT_COLORS.WARN;
-      statusText = `Failed (${dmStatus.reason || 'DMs Disabled'})`;
-    }
-  }
+  const title = 'Member Joined';
+  const color = AUDIT_COLORS.CREATE;
 
   const fields = [
     { name: 'Member', value: `<@${member.id}>`, inline: true },
     { name: 'User ID', value: `\`${member.id}\``, inline: true },
-    { name: 'Status', value: statusText, inline: true },
+    { name: 'Status', value: 'Joined Server', inline: true },
     { name: 'Account Created', value: `<t:${accountAgeTs}:R>`, inline: true },
     { name: 'Time', value: `<t:${nowTs}:F>`, inline: true },
   ];
+  if (dmStatus) {
+    fields.push({
+      name: 'Welcome DM',
+      value: dmStatus.delivered ? 'Delivered' : `Not delivered (${dmStatus.reason || 'unavailable'})`,
+      inline: true,
+    });
+  }
 
   const embed = createAuditEmbed({
     title,
@@ -702,7 +698,7 @@ export async function logMemberJoined(member, dmStatus = null) {
     fields,
   });
 
-  await sendAuditLog(guild, 'dm', embed);
+  await sendAuditLog(guild, 'member', embed);
 }
 
 /**
@@ -737,7 +733,7 @@ export async function logMemberLeft(member) {
     fields,
   });
 
-  await sendAuditLog(guild, 'dm', embed);
+  await sendAuditLog(guild, 'member', embed);
 }
 
 /**

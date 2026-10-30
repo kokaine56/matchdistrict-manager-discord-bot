@@ -154,6 +154,7 @@ import {
 import {
   handleMessageModeration,
   handleMessageUpdateModeration,
+  handleMuteCommand,
   handleUnmuteCommand,
   handleUnbanCommand,
   verifyBotModerationPermissions,
@@ -420,13 +421,18 @@ export const PREFIX = process.env.DISCORD_PREFIX || '.';
 export const REQUIRED_CHANNELS = [
   {
     key: 'botPreviewId',
-    name: 'bot-preview',
-    topic: 'Private MatchDistrict Bot Preview & Management Channel',
+    name: 'bot-log',
+    topic: 'Private MatchDistrict Bot Management and Audit Log',
   },
   {
     key: 'dmLogId',
     name: 'dm-log',
     topic: 'Private MatchDistrict DM Delivery Logs (Welcome DMs & Bot Outreach)',
+  },
+  {
+    key: 'memberLogId',
+    name: 'member-log',
+    topic: 'Private MatchDistrict Member Join and Leave Logs',
   },
   {
     key: 'msgLogId',
@@ -481,8 +487,10 @@ export const REQUIRED_CHANNELS = [
 ];
 
 export const RESERVED_LOG_CHANNEL_NAMES = new Set([
+  'bot-log',
   'bot-preview',
   'dm-log',
+  'member-log',
   'msg-log',
   'ban-unban-log',
   'mod-log',
@@ -603,6 +611,7 @@ export const recentRoleDeletes = new Map(); // Key: roleId, Value: timestamp
 export const pendingSetupRemovals = new Map(); // Key: guildId, Value: { adminId, timestamp, timer }
 const memberCountUpdateTimers = new Map();
 const memberCountSetupPromises = new Map();
+const memberCountFetchRequested = new Set();
 
 /**
  * Helper to redact sensitive tokens, passwords, and secrets from logged messages
@@ -681,7 +690,7 @@ export function buildWelcomeMessage(name) {
 }
 
 /**
- * Formats the dashboard preview message for #bot-preview
+ * Formats the bot management message for #bot-log
  */
 export function buildBotPreviewMessage(guild, welcomeEnabled, channelMap) {
   return (
@@ -689,8 +698,10 @@ export function buildBotPreviewMessage(guild, welcomeEnabled, channelMap) {
     `• **Server:** ${guild.name} (ID: \`${guild.id}\`)\n` +
     `• **Welcome DMs:** ${welcomeEnabled ? '🟢 **Active / Enabled**' : '🔴 **Disabled**'}\n` +
     `• **Configured Channels:**\n` +
-    `  - 📋 **Preview & Control:** ${channelMap.botPreviewId ? `<#${channelMap.botPreviewId}>` : 'Not configured'}\n` +
+    `  - 📋 **Bot Logs & Control:** ${channelMap.botPreviewId ? `<#${channelMap.botPreviewId}>` : 'Not configured'}\n` +
     `  - 📬 **DM Logs:** ${channelMap.dmLogId ? `<#${channelMap.dmLogId}>` : 'Not configured'}\n` +
+    `  - 👋 **Member Join/Leave Logs:** ${channelMap.memberLogId ? `<#${channelMap.memberLogId}>` : 'Not configured'}\n` +
+    `  - 🔊 **Live Member Count:** ${channelMap.memberCountId ? `<#${channelMap.memberCountId}>` : 'Not configured'}\n` +
     `  - 💬 **Message Logs:** ${channelMap.msgLogId ? `<#${channelMap.msgLogId}>` : 'Not configured'}\n` +
     `  - 🔨 **Ban/Unban Logs:** ${channelMap.banUnbanLogId ? `<#${channelMap.banUnbanLogId}>` : 'Not configured'}\n` +
     `  - 📁 **Channel Create Logs:** ${channelMap.channelCreateLogId ? `<#${channelMap.channelCreateLogId}>` : 'Not configured'}\n` +
@@ -702,6 +713,7 @@ export function buildBotPreviewMessage(guild, welcomeEnabled, channelMap) {
     `• \`${PREFIX}member count <text>\` — Customize the member-count voice channel name\n` +
     `• \`${PREFIX}dm welcome on\` — Turn on welcome DMs for new members\n` +
     `• \`${PREFIX}dm welcome off\` — Turn off welcome DMs\n` +
+    `• \`${PREFIX}mute @user <minutes>\` / \`${PREFIX}unmute @user\` — Manage member timeouts\n` +
     `• \`${PREFIX}ban @user [reason]\` — Ban a member with audit trail\n` +
     `• \`${PREFIX}clear <1-100>\` — Bulk delete messages in a channel\n` +
     `• \`${PREFIX}status\` — Check current server configuration\n` +
@@ -723,12 +735,14 @@ export function getHelpResponse(prefix = PREFIX) {
     `🎮 **MatchDistrict Bot Commands**\n` +
     `Prefix: \`${prefix}\`\n\n` +
     `**🛡️ Administrator & Moderation:**\n` +
-    `• \`${prefix}setup\` — *(Admin Only)* Create/configure private audit channels & initialize bot\n` +
+    `• \`${prefix}setup\` — *(Admin Only)* Create/configure management and member-log channels\n` +
+    `• \`${prefix}member count <text>\` — *(Admin Only)* Set the member-count channel prefix\n` +
     `• \`${prefix}setup remove\` — *(Admin Only)* Safely remove and delete management channels (requires confirmation)\n` +
     `• \`${prefix}dm welcome on\` — *(Admin Only)* Enable welcome DMs for new members\n` +
     `• \`${prefix}dm welcome off\` — *(Admin Only)* Disable welcome DMs for new members\n` +
     `• \`${prefix}ban @user [reason]\` — *(Mod Only)* Ban a user with audit logging\n` +
     `• \`${prefix}clear <1-100>\` — *(Mod Only)* Bulk delete recent messages\n` +
+    `• \`${prefix}mute <@user|id> <minutes>\` — *(Mod Only)* Timeout a user for a number of minutes\n` +
     `• \`${prefix}unmute <@user|id>\` — *(Mod Only)* Remove timeout from a user\n` +
     `• \`${prefix}unban <@user|id>\` — *(Mod Only)* Unban a user from the server\n` +
     `• \`${prefix}ticket setup\` — *(Admin Only)* Setup support ticket panel in #support-ticket\n` +
@@ -760,8 +774,8 @@ export function getWebsiteResponse() {
   );
 }
 
-function memberCountChannelName(guild, prefix = getGuildSettings(guild?.id)?.memberCountPrefix || 'Members') {
-  const count = Number(guild?.memberCount);
+function memberCountChannelName(guild, prefix = getGuildSettings(guild?.id)?.memberCountPrefix || 'Members', memberCount = guild?.memberCount) {
+  const count = Number(memberCount);
   return `${prefix}: ${(Number.isFinite(count) && count >= 0 ? count : 0).toLocaleString('en-US')}`;
 }
 
@@ -773,11 +787,20 @@ async function resolveSavedMemberCountChannel(guild) {
   return channel?.type === ChannelType.GuildVoice ? channel : null;
 }
 
-async function refreshMemberCountChannel(guild) {
+async function refreshMemberCountChannel(guild, { fetchMembers = false } = {}) {
   try {
     const channel = await resolveSavedMemberCountChannel(guild);
     if (!channel) return false;
-    const desiredName = memberCountChannelName(guild);
+    let memberCount = Number(guild.memberCount);
+    if (fetchMembers && typeof guild.members?.fetch === 'function') {
+      try {
+        const members = await guild.members.fetch();
+        if (members && Number.isFinite(members.size)) memberCount = members.size;
+      } catch (fetchError) {
+        console.warn(`[Discord Bot] Could not refresh full member list for guild ${guild.id}; using gateway count:`, fetchError?.message || fetchError);
+      }
+    }
+    const desiredName = memberCountChannelName(guild, undefined, memberCount);
     if (channel.name !== desiredName) await channel.setName(desiredName, 'Update live server member count');
     return true;
   } catch (error) {
@@ -786,13 +809,16 @@ async function refreshMemberCountChannel(guild) {
   }
 }
 
-function scheduleMemberCountChannelRefresh(guild) {
+function scheduleMemberCountChannelRefresh(guild, { fetchMembers = false } = {}) {
   if (!guild?.id) return;
+  if (fetchMembers) memberCountFetchRequested.add(guild.id);
   const existingTimer = memberCountUpdateTimers.get(guild.id);
   if (existingTimer) clearTimeout(existingTimer);
   const timer = setTimeout(async () => {
     memberCountUpdateTimers.delete(guild.id);
-    await refreshMemberCountChannel(guild);
+    const shouldFetchMembers = memberCountFetchRequested.has(guild.id);
+    memberCountFetchRequested.delete(guild.id);
+    await refreshMemberCountChannel(guild, { fetchMembers: shouldFetchMembers });
   }, 1500);
   if (timer.unref) timer.unref();
   memberCountUpdateTimers.set(guild.id, timer);
@@ -809,7 +835,14 @@ async function ensureMemberCountVoiceChannel(guild, botMember) {
     if (channel?.type !== ChannelType.GuildVoice) channel = null;
     if (!channel) {
       await guild.channels.fetch().catch(() => null);
-      channel = guild.channels.cache.find((candidate) => candidate.type === ChannelType.GuildVoice && /^Members: [\d,]+$/.test(candidate.name)) || null;
+      const configuredPrefix = getGuildSettings(guild.id)?.memberCountPrefix || 'Members';
+      channel = guild.channels.cache.find((candidate) => {
+        if (candidate.type !== ChannelType.GuildVoice) return false;
+        const suffix = candidate.name.startsWith(`${configuredPrefix}: `)
+          ? candidate.name.slice(configuredPrefix.length + 2)
+          : '';
+        return /^\d[\d,]*$/.test(suffix) || /^Members: [\d,]+$/.test(candidate.name);
+      }) || null;
     }
 
     const permissionOverwrites = [
@@ -874,13 +907,15 @@ export async function handleMemberCountCommand(guild, member, args, replyFn) {
     guildSettingsCache[guild.id].memberCountPrefix = prefix;
     guildSettingsCache[guild.id].updatedAt = new Date().toISOString();
     saveGuildSettings(guildSettingsCache);
-    await syncGuildSettingsCacheToDb(guildSettingsCache);
+    await saveGuildSettingsToDb(guild.id, guildSettingsCache[guild.id]);
 
-    const updated = await refreshMemberCountChannel(guild);
-    if (!updated) {
+    const channel = await resolveSavedMemberCountChannel(guild);
+    if (!channel) {
       await replyFn(`✅ Saved the member-count prefix as **${prefix}**. The channel is missing; run \`${PREFIX}setup\` to recreate it.`);
       return;
     }
+    const updatedName = memberCountChannelName(guild, prefix);
+    if (channel.name !== updatedName) await channel.setName(updatedName, 'Update member-count channel prefix');
     await replyFn(`✅ Member-count channel updated to **${memberCountChannelName(guild, prefix)}**.`);
   } catch (error) {
     console.warn(`[Discord Bot] Could not set member-count prefix for guild ${guild.id}:`, error?.message || error);
@@ -890,7 +925,7 @@ export async function handleMemberCountCommand(guild, member, args, replyFn) {
 
 /**
  * Handles the .setup command:
- * Idempotently creates or configures #bot-preview, #dm-log, #msg-log, #ban-unban-log.
+ * Idempotently creates or configures #bot-log, #member-log, and other management channels.
  */
 export async function handleSetupCommand(guild, member, replyFn) {
   if (!guild) {
@@ -905,9 +940,12 @@ export async function handleSetupCommand(guild, member, replyFn) {
   }
 
   // 2. Check bot permissions to manage channels
-  const botMember = guild.members.me;
+  let botMember = guild.members.me;
+  if ((!botMember || botMember.partial) && typeof guild.members?.fetchMe === 'function') {
+    botMember = await guild.members.fetchMe().catch(() => null);
+  }
   if (!botMember?.permissions?.has(PermissionFlagsBits.ManageChannels)) {
-    await replyFn('❌ **Bot Permission Missing:** I need the `Manage Channels` permission to create and configure the private management channels. Please grant this permission and try `.setup` again.');
+    await replyFn('❌ **Bot Permission Missing:** I need the `Manage Channels` permission to create and configure the setup channels. Please grant this permission and try `.setup` again.');
     return;
   }
 
@@ -938,7 +976,9 @@ export async function handleSetupCommand(guild, member, replyFn) {
         await guild.channels.fetch().catch(() => null);
       }
       targetChannel = guild.channels.cache.find(
-        (c) => c.type === ChannelType.GuildText && c.name === req.name
+        (c) => c.type === ChannelType.GuildText && (
+          c.name === req.name || (req.key === 'botPreviewId' && c.name === 'bot-preview')
+        )
       );
     }
 
@@ -964,11 +1004,14 @@ export async function handleSetupCommand(guild, member, replyFn) {
     if (targetChannel) {
       try {
         await targetChannel.permissionOverwrites.set(overwrites);
+        if (req.key === 'botPreviewId' && targetChannel.name !== req.name) {
+          await targetChannel.setName(req.name, 'Rename legacy bot-preview channel to bot-log');
+        }
         results.reused.push(targetChannel);
         channelMap[req.key] = targetChannel.id;
       } catch (err) {
         console.warn(`[Discord Bot] ⚠️ Could not update overwrites for #${req.name}:`, err.message);
-        results.reused.push(targetChannel);
+        results.failed.push({ name: req.name, error: err.message });
         channelMap[req.key] = targetChannel.id;
       }
     } else {
@@ -1017,9 +1060,9 @@ export async function handleSetupCommand(guild, member, replyFn) {
     setupAt: new Date().toISOString(),
   };
   saveGuildSettings(guildSettingsCache);
-  await syncGuildSettingsCacheToDb(guildSettingsCache);
+  await saveGuildSettingsToDb(guild.id, guildSettingsCache[guild.id]);
 
-  // 5. Send or refresh management card in #bot-preview idempotently
+  // 5. Send or refresh management card in #bot-log idempotently
   const previewChannelId = channelMap.botPreviewId || savedChannels.botPreviewId;
   const previewChannel = previewChannelId ? guild.channels.cache.get(previewChannelId) : null;
   if (previewChannel) {
@@ -1034,7 +1077,7 @@ export async function handleSetupCommand(guild, member, replyFn) {
         payload: buildBotPreviewMessage(guild, welcomeCurrentlyEnabled, channelMap),
       });
     } catch (err) {
-      console.warn('[Discord Bot] ⚠️ Could not post dashboard into #bot-preview:', err.message);
+      console.warn('[Discord Bot] ⚠️ Could not post management card into #bot-log:', err.message);
     }
   }
 
@@ -1409,7 +1452,7 @@ export async function handleDmCommand(guild, member, args, replyFn) {
     await replyFn('🛑 **Welcome DMs Disabled:** The bot will not send welcome direct messages to new members.');
   }
 
-  // Update or post notice in #bot-preview
+  // Update or post notice in #bot-log
   const previewChannelId = getGuildChannelId(guild.id, 'botPreviewId');
   const previewChannel = previewChannelId ? guild.channels.cache.get(previewChannelId) : null;
   if (previewChannel) {
@@ -1418,7 +1461,7 @@ export async function handleDmCommand(guild, member, args, replyFn) {
         `🔔 **Configuration Update:** Welcome DMs toggled **${enable ? 'ON 🟢' : 'OFF 🔴'}** by <@${member.id}> at <t:${Math.floor(Date.now() / 1000)}:T>.`
       );
     } catch (err) {
-      console.warn('[Discord Bot] ⚠️ Could not notify #bot-preview:', err.message);
+      console.warn('[Discord Bot] ⚠️ Could not notify #bot-log:', err.message);
     }
   }
 }
@@ -2210,7 +2253,7 @@ export async function handleGuildMemberRemove(member) {
 }
 
 /**
- * Handles member join event: sends welcome DM and logs attempt to #dm-log
+ * Handles member join event: sends optional welcome DM and logs to #member-log.
  */
 export async function handleGuildMemberAdd(member) {
   try {
@@ -2221,11 +2264,8 @@ export async function handleGuildMemberAdd(member) {
     const name = member.displayName || member.user?.globalName || member.user?.username || 'Player';
     const userTag = member.user?.tag || member.user?.username || member.id;
 
-    // Check if welcome DMs are enabled
-    if (!isWelcomeEnabled(guildId)) {
-      console.log(`[Discord Bot] ℹ️ Member ${userTag} joined "${guildName}", but welcome DMs are disabled.`);
-      return;
-    }
+    // Member join logging is independent from the optional welcome DM setting.
+    const welcomeEnabled = isWelcomeEnabled(guildId);
 
     // Deduplication check: avoid duplicate welcome DMs for rapid join re-triggers
     const joinKey = `${guildId}:${member.id}`;
@@ -2238,16 +2278,13 @@ export async function handleGuildMemberAdd(member) {
 
     console.log(`[Discord Bot] 👤 New member joined "${guildName}": ${userTag} (${member.id})`);
 
-    const welcomeMessage = buildWelcomeMessage(name);
-
-    // Locate dm-log channel
-    const dmLogId = getGuildChannelId(guildId, 'dmLogId');
-    let logChannel = dmLogId ? member.guild.channels.cache.get(dmLogId) : null;
-    if (!logChannel && member.guild.channels?.cache) {
-      logChannel = Array.from(member.guild.channels.cache.values()).find(
-        (c) => c.type === ChannelType.GuildText && (c.name === 'dm-log' || c.name === 'matchdistrict-logs')
-      );
+    if (!welcomeEnabled) {
+      if (isSetupActive(guildId)) await logMemberJoined(member);
+      console.log(`[Discord Bot] ℹ️ Welcome DMs are disabled for guild ${guildId}; member join was still logged.`);
+      return;
     }
+
+    const welcomeMessage = buildWelcomeMessage(name);
 
     // Attempt to deliver welcome DM
     let dmDelivered = false;
@@ -2266,7 +2303,7 @@ export async function handleGuildMemberAdd(member) {
       }
     }
 
-    // Log to #dm-log if setup channels are active
+    // Log joins in the dedicated #member-log channel when setup is active.
     if (isSetupActive(guildId)) {
       await logMemberJoined(
         member,
@@ -2393,7 +2430,7 @@ client.on(Events.MessageCreate, async (message) => {
           ? commandText.slice(PREFIX.length).trim()
           : commandText.replace(new RegExp(`^<@!?${client.user?.id}>\\s*`), '');
         const dashboardCommand = (commandText.startsWith(PREFIX) || withoutPrefix !== commandText) &&
-          ['dash', 'dashboard', 'setup', 'member'].includes(withoutPrefix.split(/\s+/)[0]?.toLowerCase());
+          ['dash', 'dashboard', 'setup', 'member', 'mute', 'unmute'].includes(withoutPrefix.split(/\s+/)[0]?.toLowerCase());
         if (dashboardCommand) {
           // Let .dash run; its handler deletes the invocation after access checks.
         } else {
@@ -2461,7 +2498,13 @@ client.on(Events.MessageCreate, async (message) => {
           await handleSetupCancelCommand(message.guild, message.member, (text) => message.reply(text));
           return;
         }
-        await handleSetupCommand(message.guild, message.member, (text) => message.reply(text));
+        try {
+          await handleSetupCommand(message.guild, message.member, (text) => message.reply(text));
+        } catch (error) {
+          console.error(`[Discord Bot] .setup failed for guild ${message.guild?.id}:`, error);
+          const detail = String(error?.message || 'unknown error').slice(0, 300);
+          await message.reply(`❌ `.setup` could not finish: ${detail}`).catch(() => {});
+        }
         return;
       } else if (cmd === 'member') {
         if ((args[0] || '').toLowerCase() === 'count') {
@@ -2501,6 +2544,15 @@ client.on(Events.MessageCreate, async (message) => {
         return;
       } else if (cmd === 'ban') {
         await handleBanCommand(message.guild, message.member, args, (text) => message.reply(text));
+        return;
+      } else if (cmd === 'mute') {
+        await handleMuteCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          args,
+          (text) => message.reply(text)
+        );
         return;
       } else if (cmd === 'unmute') {
         await handleUnmuteCommand(
@@ -2916,7 +2968,7 @@ client.on(Events.ChannelUpdate, async (oldChannel, newChannel) => {
 client.on(Events.GuildMemberAdd, updateGuildMemberCache);
 client.on(Events.GuildMemberRemove, removeGuildMemberFromCache);
 client.on(Events.GuildMemberUpdate, (_oldMember, newMember) => updateGuildMemberCache(newMember));
-client.on(Events.GuildMemberAdd, (member) => scheduleMemberCountChannelRefresh(member.guild));
+client.on(Events.GuildMemberAdd, (member) => scheduleMemberCountChannelRefresh(member.guild, { fetchMembers: true }));
 client.on(Events.GuildMemberRemove, (member) => scheduleMemberCountChannelRefresh(member.guild));
 
 client.on(Events.GuildMemberRemove, async (member) => {

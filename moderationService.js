@@ -330,6 +330,51 @@ export async function handleMessageUpdateModeration(oldMessage, newMessage) {
 }
 
 /**
+ * Handles `.mute <@user|userId> <minutes>` using Discord member timeouts.
+ */
+export async function handleMuteCommand(guild, member, channel, args, replyFn) {
+  if (!guild) return replyFn('❌ This command can only be executed within a server.');
+
+  const hasPerm = member?.permissions?.has(PermissionFlagsBits.Administrator) ||
+    member?.permissions?.has(PermissionFlagsBits.ModerateMembers);
+  if (!hasPerm) {
+    return replyFn('❌ **Permission Denied:** You need `Administrator` or `Moderate Members` permission to mute users.');
+  }
+  if (!guild.members.me?.permissions?.has(PermissionFlagsBits.ModerateMembers)) {
+    return replyFn('❌ **Bot Missing Permission:** I need the `Moderate Members` permission to mute users.');
+  }
+
+  const targetId = extractUserId(args?.[0]);
+  if (!targetId) return replyFn('ℹ️ **Usage:** `.mute <@user|userId> <minutes>` — Example: `.mute @Player 10`.');
+  const minutes = Number(args?.[1]);
+  const maxMinutes = 28 * 24 * 60;
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > maxMinutes) {
+    return replyFn(`❌ Enter a whole number of minutes from 1 to ${maxMinutes} (Discord's 28-day timeout limit).`);
+  }
+
+  const targetMember = await guild.members.fetch(targetId).catch(() => null);
+  if (!targetMember) return replyFn(`❌ Could not find member with ID \`${targetId}\` in this server.`);
+  if (targetMember.id === member.id) return replyFn('❌ You cannot mute yourself.');
+
+  try {
+    await targetMember.timeout(minutes * 60_000, `Muted by ${member.user?.tag || member.id} for ${minutes} minute(s)`);
+  } catch (error) {
+    console.error(`[Moderation] ❌ Failed to mute member ${targetMember.id}:`, error);
+    return replyFn(`❌ Failed to mute that member: ${error.message}`);
+  }
+
+  await replyFn(`✅ **Muted <@${targetMember.id}> for ${minutes} minute${minutes === 1 ? '' : 's'}.**`);
+  await sendModLog(guild, {
+    action: 'Member Muted',
+    user: targetMember.user,
+    moderator: member.user,
+    channel,
+    reason: `Timeout applied for ${minutes} minute(s) via .mute`,
+    color: 0xed4245,
+  });
+}
+
+/**
  * Handles the .unmute command.
  * Removes timeout from a user.
  *
