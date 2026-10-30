@@ -2393,7 +2393,7 @@ client.on(Events.MessageCreate, async (message) => {
           ? commandText.slice(PREFIX.length).trim()
           : commandText.replace(new RegExp(`^<@!?${client.user?.id}>\\s*`), '');
         const dashboardCommand = (commandText.startsWith(PREFIX) || withoutPrefix !== commandText) &&
-          ['dash', 'dashboard'].includes(withoutPrefix.split(/\s+/)[0]?.toLowerCase());
+          ['dash', 'dashboard', 'setup', 'member'].includes(withoutPrefix.split(/\s+/)[0]?.toLowerCase());
         if (dashboardCommand) {
           // Let .dash run; its handler deletes the invocation after access checks.
         } else {
