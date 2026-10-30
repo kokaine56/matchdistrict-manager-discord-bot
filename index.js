@@ -601,6 +601,8 @@ export const recentChannelDeletes = new Map(); // Key: channelId, Value: timesta
 export const recentRoleCreates = new Map(); // Key: roleId, Value: timestamp
 export const recentRoleDeletes = new Map(); // Key: roleId, Value: timestamp
 export const pendingSetupRemovals = new Map(); // Key: guildId, Value: { adminId, timestamp, timer }
+const memberCountUpdateTimers = new Map();
+const memberCountSetupPromises = new Map();
 
 /**
  * Helper to redact sensitive tokens, passwords, and secrets from logged messages
@@ -757,6 +759,95 @@ export function getWebsiteResponse() {
   );
 }
 
+function memberCountChannelName(guild) {
+  const count = Number(guild?.memberCount);
+  return `Members: ${(Number.isFinite(count) && count >= 0 ? count : 0).toLocaleString('en-US')}`;
+}
+
+async function resolveSavedMemberCountChannel(guild) {
+  const channelId = getGuildSettings(guild.id)?.channels?.memberCountId;
+  if (!channelId) return null;
+  const channel = guild.channels.cache.get(channelId) ||
+    (typeof guild.channels?.fetch === 'function' ? await guild.channels.fetch(channelId).catch(() => null) : null);
+  return channel?.type === ChannelType.GuildVoice ? channel : null;
+}
+
+async function refreshMemberCountChannel(guild) {
+  try {
+    const channel = await resolveSavedMemberCountChannel(guild);
+    if (!channel) return false;
+    const desiredName = memberCountChannelName(guild);
+    if (channel.name !== desiredName) await channel.setName(desiredName, 'Update live server member count');
+    return true;
+  } catch (error) {
+    console.warn(`[Discord Bot] Could not update member-count channel for guild ${guild?.id}:`, error?.message || error);
+    return false;
+  }
+}
+
+function scheduleMemberCountChannelRefresh(guild) {
+  if (!guild?.id) return;
+  const existingTimer = memberCountUpdateTimers.get(guild.id);
+  if (existingTimer) clearTimeout(existingTimer);
+  const timer = setTimeout(async () => {
+    memberCountUpdateTimers.delete(guild.id);
+    await refreshMemberCountChannel(guild);
+  }, 1500);
+  if (timer.unref) timer.unref();
+  memberCountUpdateTimers.set(guild.id, timer);
+}
+
+async function ensureMemberCountVoiceChannel(guild, botMember) {
+  if (memberCountSetupPromises.has(guild.id)) return memberCountSetupPromises.get(guild.id);
+  const setupPromise = (async () => {
+    const channels = getGuildSettings(guild.id)?.channels || {};
+    let channel = channels.memberCountId
+      ? (guild.channels.cache.get(channels.memberCountId) || await guild.channels.fetch(channels.memberCountId).catch(() => null))
+      : null;
+
+    if (channel?.type !== ChannelType.GuildVoice) channel = null;
+    if (!channel) {
+      await guild.channels.fetch().catch(() => null);
+      channel = guild.channels.cache.find((candidate) => candidate.type === ChannelType.GuildVoice && /^Members: [\d,]+$/.test(candidate.name)) || null;
+    }
+
+    const permissionOverwrites = [
+      {
+        id: guild.roles.everyone.id,
+        allow: [PermissionFlagsBits.ViewChannel],
+        deny: [PermissionFlagsBits.Connect, PermissionFlagsBits.Speak, PermissionFlagsBits.ManageChannels],
+      },
+      {
+        id: botMember.id,
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels],
+      },
+    ];
+
+    if (channel) {
+      await channel.permissionOverwrites.set(permissionOverwrites);
+      if (channel.name !== memberCountChannelName(guild)) {
+        await channel.setName(memberCountChannelName(guild), 'Refresh live server member count during .setup');
+      }
+      return { channel, created: false };
+    }
+
+    channel = await guild.channels.create({
+      name: memberCountChannelName(guild),
+      type: ChannelType.GuildVoice,
+      permissionOverwrites,
+      reason: 'Create public locked live server member-count channel during .setup',
+    });
+    return { channel, created: true };
+  })();
+
+  memberCountSetupPromises.set(guild.id, setupPromise);
+  try {
+    return await setupPromise;
+  } finally {
+    memberCountSetupPromises.delete(guild.id);
+  }
+}
+
 /**
  * Handles the .setup command:
  * Idempotently creates or configures #bot-preview, #dm-log, #msg-log, #ban-unban-log.
@@ -857,12 +948,23 @@ export async function handleSetupCommand(guild, member, replyFn) {
     }
   }
 
+  // 3a. Create or reuse the public, locked live member-count voice channel.
+  try {
+    const { channel: memberCountChannel, created } = await ensureMemberCountVoiceChannel(guild, botMember);
+    channelMap.memberCountId = memberCountChannel.id;
+    (created ? results.created : results.reused).push(memberCountChannel);
+  } catch (err) {
+    console.error(`[Discord Bot] ❌ Failed to configure member-count voice channel in guild ${guild.id}:`, err.message);
+    results.failed.push({ name: 'member-count voice channel', error: err.message });
+  }
+
   // 4. Save guild settings
   const welcomeCurrentlyEnabled = currentSettings.welcomeEnabled !== undefined ? currentSettings.welcomeEnabled : true;
   const updatedChannels = {};
   for (const req of REQUIRED_CHANNELS) {
     updatedChannels[req.key] = channelMap[req.key] || savedChannels[req.key] || null;
   }
+  updatedChannels.memberCountId = channelMap.memberCountId || savedChannels.memberCountId || null;
 
   guildSettingsCache[guild.id] = {
     ...currentSettings,
@@ -875,6 +977,7 @@ export async function handleSetupCommand(guild, member, replyFn) {
     setupAt: new Date().toISOString(),
   };
   saveGuildSettings(guildSettingsCache);
+  await syncGuildSettingsCacheToDb(guildSettingsCache);
 
   // 5. Send or refresh management card in #bot-preview idempotently
   const previewChannelId = channelMap.botPreviewId || savedChannels.botPreviewId;
@@ -914,6 +1017,7 @@ export async function handleSetupCommand(guild, member, replyFn) {
   }
 
   summary += `• **Welcome DMs:** ${welcomeCurrentlyEnabled ? '🟢 **Enabled**' : '🔴 **Disabled**'}\n`;
+  summary += `• **Member Count:** ${channelMap.memberCountId ? `<#${channelMap.memberCountId}>` : 'Not configured'}\n`;
   summary += `• **Management Dashboard:** ${previewChannelId ? `<#${previewChannelId}>` : 'Not configured'}\n\n`;
   summary += `Use \`${PREFIX}dm welcome on\` or \`${PREFIX}dm welcome off\` to control welcome DMs.\nUse \`${PREFIX}help\` to view all commands.`;
 
@@ -955,7 +1059,7 @@ export async function handleSetupRemoveCommand(guild, member, replyFn) {
       const id = savedChannels[r.key];
       return id ? `• <#${id}> (\`#${r.name}\`)` : `• \`#${r.name}\` *(unlinked)*`;
     })
-    .join('\n');
+    .join('\n') + (savedChannels.memberCountId ? `\n• <#${savedChannels.memberCountId}> (live member-count voice channel)` : '');
 
   // 5. Store pending removal state with 30s timeout
   if (pendingSetupRemovals.has(guild.id)) {
@@ -1143,11 +1247,30 @@ export async function handleSetupConfirmCommand(guild, member, replyFn) {
     }
   }
 
+  if (savedChannels.memberCountId) {
+    const channelId = savedChannels.memberCountId;
+    const channel = guild.channels.cache.get(channelId) ||
+      (typeof guild.channels?.fetch === 'function' ? await guild.channels.fetch(channelId).catch(() => null) : null);
+    if (!channel) {
+      skipped.push({ name: 'member-count voice channel', reason: 'Already deleted or not found' });
+    } else if ((channel.guildId || channel.guild?.id) !== guild.id || channel.id !== channelId || channel.type !== ChannelType.GuildVoice) {
+      failed.push({ name: 'member-count voice channel', error: 'Channel does not belong to this server configuration' });
+    } else {
+      try {
+        await channel.delete(`MatchDistrict .setup remove confirmed by ${member.user?.tag || member.id} (${member.id})`);
+        deleted.push({ id: channelId, name: channel.name });
+      } catch (err) {
+        failed.push({ name: 'member-count voice channel', error: err.message });
+      }
+    }
+  }
+
   // 7. Clear stored channel IDs and mark setup as inactive
   const clearedChannels = {};
   for (const req of REQUIRED_CHANNELS) {
     clearedChannels[req.key] = null;
   }
+  clearedChannels.memberCountId = null;
 
   guildSettingsCache[guild.id] = {
     ...currentSettings,
@@ -2189,6 +2312,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   const startupGuilds = [...readyClient.guilds.cache.values()];
   for (let index = 0; index < startupGuilds.length; index++) {
     await refreshGuildMemberCacheOnce(startupGuilds[index]);
+    await refreshMemberCountChannel(startupGuilds[index]);
     if (index < startupGuilds.length - 1) await new Promise((resolve) => setTimeout(resolve, 1500));
   }
 
@@ -2745,6 +2869,8 @@ client.on(Events.ChannelUpdate, async (oldChannel, newChannel) => {
 client.on(Events.GuildMemberAdd, updateGuildMemberCache);
 client.on(Events.GuildMemberRemove, removeGuildMemberFromCache);
 client.on(Events.GuildMemberUpdate, (_oldMember, newMember) => updateGuildMemberCache(newMember));
+client.on(Events.GuildMemberAdd, (member) => scheduleMemberCountChannelRefresh(member.guild));
+client.on(Events.GuildMemberRemove, (member) => scheduleMemberCountChannelRefresh(member.guild));
 
 client.on(Events.GuildMemberRemove, async (member) => {
   await handleGuildMemberRemove(member);
