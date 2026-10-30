@@ -699,6 +699,7 @@ export function buildBotPreviewMessage(guild, welcomeEnabled, channelMap) {
     `  - ❌ **Role Delete Logs:** ${channelMap.roleDeleteLogId ? `<#${channelMap.roleDeleteLogId}>` : 'Not configured'}\n\n` +
     `**Management Commands (Prefix: \`${PREFIX}\`):**\n` +
     `• \`${PREFIX}setup\` — Run or refresh server channels and permissions\n` +
+    `• \`${PREFIX}member count <text>\` — Customize the member-count voice channel name\n` +
     `• \`${PREFIX}dm welcome on\` — Turn on welcome DMs for new members\n` +
     `• \`${PREFIX}dm welcome off\` — Turn off welcome DMs\n` +
     `• \`${PREFIX}ban @user [reason]\` — Ban a member with audit trail\n` +
@@ -759,9 +760,9 @@ export function getWebsiteResponse() {
   );
 }
 
-function memberCountChannelName(guild) {
+function memberCountChannelName(guild, prefix = getGuildSettings(guild?.id)?.memberCountPrefix || 'Members') {
   const count = Number(guild?.memberCount);
-  return `Members: ${(Number.isFinite(count) && count >= 0 ? count : 0).toLocaleString('en-US')}`;
+  return `${prefix}: ${(Number.isFinite(count) && count >= 0 ? count : 0).toLocaleString('en-US')}`;
 }
 
 async function resolveSavedMemberCountChannel(guild) {
@@ -845,6 +846,45 @@ async function ensureMemberCountVoiceChannel(guild, botMember) {
     return await setupPromise;
   } finally {
     memberCountSetupPromises.delete(guild.id);
+  }
+}
+
+export async function handleMemberCountCommand(guild, member, args, replyFn) {
+  if (!guild) {
+    await replyFn('❌ This command must be used inside a Discord server.');
+    return;
+  }
+  if (!isAdmin(member)) {
+    await replyFn('❌ Only server Administrators or members with `Manage Server` permission can change the member-count channel name.');
+    return;
+  }
+
+  const prefix = (Array.isArray(args) ? args.join(' ') : String(args || '')).trim();
+  if (!prefix) {
+    await replyFn(`ℹ️ Usage: \`${PREFIX}member count <custom text>\` — Example: \`${PREFIX}member count Our Community\``);
+    return;
+  }
+  if (prefix.length > 90) {
+    await replyFn('❌ The custom text must be 90 characters or fewer so the member count fits within Discord’s channel-name limit.');
+    return;
+  }
+
+  try {
+    guildSettingsCache[guild.id] ||= {};
+    guildSettingsCache[guild.id].memberCountPrefix = prefix;
+    guildSettingsCache[guild.id].updatedAt = new Date().toISOString();
+    saveGuildSettings(guildSettingsCache);
+    await syncGuildSettingsCacheToDb(guildSettingsCache);
+
+    const updated = await refreshMemberCountChannel(guild);
+    if (!updated) {
+      await replyFn(`✅ Saved the member-count prefix as **${prefix}**. The channel is missing; run \`${PREFIX}setup\` to recreate it.`);
+      return;
+    }
+    await replyFn(`✅ Member-count channel updated to **${memberCountChannelName(guild, prefix)}**.`);
+  } catch (error) {
+    console.warn(`[Discord Bot] Could not set member-count prefix for guild ${guild.id}:`, error?.message || error);
+    await replyFn('❌ Could not update the member-count channel. Please try again.');
   }
 }
 
@@ -2422,6 +2462,13 @@ client.on(Events.MessageCreate, async (message) => {
           return;
         }
         await handleSetupCommand(message.guild, message.member, (text) => message.reply(text));
+        return;
+      } else if (cmd === 'member') {
+        if ((args[0] || '').toLowerCase() === 'count') {
+          await handleMemberCountCommand(message.guild, message.member, args.slice(1), (text) => message.reply(text));
+        } else {
+          await message.reply(`ℹ️ Usage: \`${PREFIX}member count <custom text>\` — Example: \`${PREFIX}member count Our Community\``);
+        }
         return;
       } else if (cmd === 'annc') {
         const subCmd = (args[0] || '').toLowerCase();
