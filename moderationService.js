@@ -332,11 +332,36 @@ export async function handleMessageUpdateModeration(oldMessage, newMessage) {
 /**
  * Handles `.mute <@user|userId> <minutes>` using Discord member timeouts.
  */
+function canModerateTarget(guild, moderator, target) {
+  if (!target || target.id === guild.ownerId) return 'The server owner cannot be timed out.';
+  if (target.user?.bot) return 'Bot accounts cannot be timed out.';
+
+  const moderatorIsAdmin = moderator.id === guild.ownerId ||
+    moderator.permissions?.has(PermissionFlagsBits.Administrator);
+  const targetIsAdmin = target.permissions?.has(PermissionFlagsBits.Administrator);
+  if (targetIsAdmin && !moderatorIsAdmin) return 'Moderators cannot timeout administrators.';
+
+  const botMember = guild.members.me;
+  if (!botMember?.roles?.highest || !target.roles?.highest) {
+    return 'Could not verify the bot and target role hierarchy.';
+  }
+  if (target.roles.highest.comparePositionTo(botMember.roles.highest) >= 0) {
+    return 'The target has a role equal to or higher than the bot’s highest role.';
+  }
+
+  if (!moderatorIsAdmin) {
+    if (!moderator.roles?.highest || moderator.roles.highest.comparePositionTo(target.roles.highest) <= 0) {
+      return 'You can only moderate members below your highest role.';
+    }
+  }
+  return null;
+}
+
 export async function handleMuteCommand(guild, member, channel, args, replyFn) {
   if (!guild) return replyFn('❌ This command can only be executed within a server.');
 
-  const hasPerm = member?.permissions?.has(PermissionFlagsBits.Administrator) ||
-    member?.permissions?.has(PermissionFlagsBits.ModerateMembers);
+  const moderatorIsAdmin = member?.id === guild.ownerId || member?.permissions?.has(PermissionFlagsBits.Administrator);
+  const hasPerm = moderatorIsAdmin || member?.permissions?.has(PermissionFlagsBits.ModerateMembers);
   if (!hasPerm) {
     return replyFn('❌ **Permission Denied:** You need `Administrator` or `Moderate Members` permission to mute users.');
   }
@@ -344,9 +369,12 @@ export async function handleMuteCommand(guild, member, channel, args, replyFn) {
     return replyFn('❌ **Bot Missing Permission:** I need the `Moderate Members` permission to mute users.');
   }
 
-  const targetId = extractUserId(args?.[0]);
+  if (!Array.isArray(args) || args.length !== 2) {
+    return replyFn('ℹ️ **Usage:** `.mute <@user|userId> <minutes>` — Example: `.mute @Player 10`.');
+  }
+  const targetId = extractUserId(args[0]);
   if (!targetId) return replyFn('ℹ️ **Usage:** `.mute <@user|userId> <minutes>` — Example: `.mute @Player 10`.');
-  const minutes = Number(args?.[1]);
+  const minutes = /^\d+$/.test(args[1]) ? Number(args[1]) : NaN;
   const maxMinutes = 28 * 24 * 60;
   if (!Number.isInteger(minutes) || minutes < 1 || minutes > maxMinutes) {
     return replyFn(`❌ Enter a whole number of minutes from 1 to ${maxMinutes} (Discord's 28-day timeout limit).`);
@@ -354,7 +382,9 @@ export async function handleMuteCommand(guild, member, channel, args, replyFn) {
 
   const targetMember = await guild.members.fetch(targetId).catch(() => null);
   if (!targetMember) return replyFn(`❌ Could not find member with ID \`${targetId}\` in this server.`);
-  if (targetMember.id === member.id) return replyFn('❌ You cannot mute yourself.');
+  if (targetMember.id === member.id) return replyFn('❌ You cannot timeout yourself.');
+  const denial = canModerateTarget(guild, member, targetMember);
+  if (denial) return replyFn(`❌ ${denial}`);
 
   try {
     await targetMember.timeout(minutes * 60_000, `Muted by ${member.user?.tag || member.id} for ${minutes} minute(s)`);
@@ -363,7 +393,8 @@ export async function handleMuteCommand(guild, member, channel, args, replyFn) {
     return replyFn(`❌ Failed to mute that member: ${error.message}`);
   }
 
-  await replyFn(`✅ **Muted <@${targetMember.id}> for ${minutes} minute${minutes === 1 ? '' : 's'}.**`);
+  const targetName = targetMember.displayName || targetMember.user?.username || targetMember.id;
+  await replyFn(`✅ **${targetName} has been muted for ${minutes} minute${minutes === 1 ? '' : 's'}.**`);
   await sendModLog(guild, {
     action: 'Member Muted',
     user: targetMember.user,
@@ -390,9 +421,8 @@ export async function handleUnmuteCommand(guild, member, channel, args, replyFn)
   }
 
   // 1. Permission check: Administrator or Moderate Members
-  const hasPerm =
-    member?.permissions?.has(PermissionFlagsBits.Administrator) ||
-    member?.permissions?.has(PermissionFlagsBits.ModerateMembers);
+  const moderatorIsAdmin = member?.id === guild.ownerId || member?.permissions?.has(PermissionFlagsBits.Administrator);
+  const hasPerm = moderatorIsAdmin || member?.permissions?.has(PermissionFlagsBits.ModerateMembers);
 
   if (!hasPerm) {
     return replyFn(
@@ -409,15 +439,19 @@ export async function handleUnmuteCommand(guild, member, channel, args, replyFn)
   }
 
   // 3. Parse target user
-  const targetId = extractUserId(args[0]);
-  if (!targetId) {
+  if (!Array.isArray(args) || args.length !== 1) {
     return replyFn('ℹ️ **Usage:** `.unmute <@user|userId>` — Remove timeout from a user.');
   }
+  const targetId = extractUserId(args[0]);
+  if (!targetId) return replyFn('ℹ️ **Usage:** `.unmute <@user|userId>` — Remove timeout from a user.');
 
   const targetMember = await guild.members.fetch(targetId).catch(() => null);
   if (!targetMember) {
     return replyFn(`❌ Could not find member with ID \`${targetId}\` in this server.`);
   }
+  if (targetMember.id === member.id) return replyFn('❌ You cannot manage your own timeout.');
+  const denial = canModerateTarget(guild, member, targetMember);
+  if (denial) return replyFn(`❌ ${denial}`);
 
   // 4. Check if currently timed out
   const isTimedOut = Boolean(
@@ -428,7 +462,7 @@ export async function handleUnmuteCommand(guild, member, channel, args, replyFn)
   );
 
   if (!isTimedOut) {
-    return replyFn(`ℹ️ **<@${targetMember.id}> is not currently timed out.**`);
+    return replyFn('This user does not currently have an active timeout.');
   }
 
   // 5. Remove timeout
@@ -440,7 +474,8 @@ export async function handleUnmuteCommand(guild, member, channel, args, replyFn)
   }
 
   // 6. Confirm and log
-  await replyFn(`✅ **Successfully unmuted <@${targetMember.id}>.**`);
+  const targetName = targetMember.displayName || targetMember.user?.username || targetMember.id;
+  await replyFn(`✅ **${targetName}’s timeout has been removed.**`);
 
   await sendModLog(guild, {
     action: 'Member Unmuted',

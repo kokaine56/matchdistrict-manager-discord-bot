@@ -15,6 +15,7 @@ import {
   containsLink,
   handleMessageModeration,
   handleMessageUpdateModeration,
+  handleMuteCommand,
   handleUnmuteCommand,
   handleUnbanCommand,
   verifyBotModerationPermissions,
@@ -104,6 +105,7 @@ function createMockGuild(options = {}) {
       fetch: async (id) => members.get(id) || null,
       me: {
         id: 'bot-123',
+        roles: { highest: createMockRole(100) },
         permissions: {
           has: (perm) => true,
         },
@@ -145,10 +147,18 @@ function createMockMember(guild, options = {}) {
         return false;
       },
     },
+    roles: { highest: createMockRole(options.rolePosition ?? (options.isAdmin ? 200 : 10)) },
   };
 
   guild.members.cache.set(member.id, member);
   return member;
+}
+
+function createMockRole(position) {
+  return {
+    position,
+    comparePositionTo(other) { return this.position - other.position; },
+  };
 }
 
 function createMockMessage(guild, member, channel, content) {
@@ -336,7 +346,7 @@ test('Moderation: .unmute command removes timeout and logs', async () => {
     }
   );
 
-  assert.ok(replyText.includes('Successfully unmuted'), 'Unmute confirmation replied');
+  assert.ok(replyText.includes('timeout has been removed'), 'Unmute confirmation replied');
   assert.strictEqual(timedOutMember.isCommunicationDisabled(), false, 'Timeout removed');
 
   // Verify mod log
@@ -344,6 +354,55 @@ test('Moderation: .unmute command removes timeout and logs', async () => {
   const modLogChannel = guild.channels.cache.get(modLogId);
   const logMsg = modLogChannel._messages[modLogChannel._messages.length - 1];
   assert.ok(logMsg.embeds[0].data.title.includes('Member Unmuted'), 'Logged to #mod-log');
+});
+
+test('Moderation: .mute applies the requested timeout in minutes', async () => {
+  const guild = createMockGuild({ id: 'guild-mute-test' });
+  const adminMember = createMockMember(guild, { id: 'mod-admin', isAdmin: true });
+  await handleSetupCommand(guild, adminMember, async () => {});
+  const target = createMockMember(guild, { id: 'mute-target', username: 'Player' });
+  const channel = await guild.channels.create({ name: 'general', type: ChannelType.GuildText });
+  const before = Date.now();
+  let reply = '';
+
+  await handleMuteCommand(guild, adminMember, channel, [`<@${target.id}>`, '10'], async (message) => { reply = message; });
+
+  assert.match(reply, /Player has been muted for 10 minutes/);
+  assert.ok(target.communicationDisabledUntilTimestamp >= before + 600_000);
+  assert.ok(target.communicationDisabledUntilTimestamp <= Date.now() + 600_000);
+});
+
+test('Moderation: .mute validates duration, target role hierarchy, and moderator permission', async () => {
+  const guild = createMockGuild({ id: 'guild-mute-validation-test' });
+  const moderator = createMockMember(guild, {
+    id: 'moderator', permissions: [PermissionFlagsBits.ModerateMembers], rolePosition: 20,
+  });
+  const higherTarget = createMockMember(guild, { id: 'higher-target', rolePosition: 30 });
+  const channel = await guild.channels.create({ name: 'general', type: ChannelType.GuildText });
+
+  for (const invalidDuration of ['0', '-1', '1.5', '40321', '10minutes']) {
+    let reply = '';
+    await handleMuteCommand(guild, moderator, channel, [`<@${higherTarget.id}>`, invalidDuration], async (message) => { reply = message; });
+    assert.match(reply, /whole number of minutes/);
+  }
+
+  let hierarchyReply = '';
+  await handleMuteCommand(guild, moderator, channel, [`<@${higherTarget.id}>`, '10'], async (message) => { hierarchyReply = message; });
+  assert.match(hierarchyReply, /below your highest role/);
+
+  let permissionReply = '';
+  const regularMember = createMockMember(guild, { id: 'regular-mod' });
+  await handleMuteCommand(guild, regularMember, channel, [`<@${higherTarget.id}>`, '10'], async (message) => { permissionReply = message; });
+  assert.match(permissionReply, /Permission Denied/);
+});
+
+test('Moderation: .unmute reports an active-timeout miss clearly', async () => {
+  const guild = createMockGuild({ id: 'guild-unmute-not-timed-out' });
+  const adminMember = createMockMember(guild, { id: 'mod-admin', isAdmin: true });
+  const target = createMockMember(guild, { id: 'not-muted' });
+  let reply = '';
+  await handleUnmuteCommand(guild, adminMember, null, [`<@${target.id}>`], async (message) => { reply = message; });
+  assert.equal(reply, 'This user does not currently have an active timeout.');
 });
 
 test('Moderation: .unban command unbans user and logs', async () => {

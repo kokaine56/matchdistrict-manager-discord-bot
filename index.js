@@ -611,7 +611,6 @@ export const recentRoleDeletes = new Map(); // Key: roleId, Value: timestamp
 export const pendingSetupRemovals = new Map(); // Key: guildId, Value: { adminId, timestamp, timer }
 const memberCountUpdateTimers = new Map();
 const memberCountSetupPromises = new Map();
-const memberCountFetchRequested = new Set();
 
 /**
  * Helper to redact sensitive tokens, passwords, and secrets from logged messages
@@ -787,20 +786,11 @@ async function resolveSavedMemberCountChannel(guild) {
   return channel?.type === ChannelType.GuildVoice ? channel : null;
 }
 
-async function refreshMemberCountChannel(guild, { fetchMembers = false } = {}) {
+async function refreshMemberCountChannel(guild) {
   try {
     const channel = await resolveSavedMemberCountChannel(guild);
     if (!channel) return false;
-    let memberCount = Number(guild.memberCount);
-    if (fetchMembers && typeof guild.members?.fetch === 'function') {
-      try {
-        const members = await guild.members.fetch();
-        if (members && Number.isFinite(members.size)) memberCount = members.size;
-      } catch (fetchError) {
-        console.warn(`[Discord Bot] Could not refresh full member list for guild ${guild.id}; using gateway count:`, fetchError?.message || fetchError);
-      }
-    }
-    const desiredName = memberCountChannelName(guild, undefined, memberCount);
+    const desiredName = memberCountChannelName(guild);
     if (channel.name !== desiredName) await channel.setName(desiredName, 'Update live server member count');
     return true;
   } catch (error) {
@@ -809,16 +799,13 @@ async function refreshMemberCountChannel(guild, { fetchMembers = false } = {}) {
   }
 }
 
-function scheduleMemberCountChannelRefresh(guild, { fetchMembers = false } = {}) {
+function scheduleMemberCountChannelRefresh(guild) {
   if (!guild?.id) return;
-  if (fetchMembers) memberCountFetchRequested.add(guild.id);
   const existingTimer = memberCountUpdateTimers.get(guild.id);
   if (existingTimer) clearTimeout(existingTimer);
   const timer = setTimeout(async () => {
     memberCountUpdateTimers.delete(guild.id);
-    const shouldFetchMembers = memberCountFetchRequested.has(guild.id);
-    memberCountFetchRequested.delete(guild.id);
-    await refreshMemberCountChannel(guild, { fetchMembers: shouldFetchMembers });
+    await refreshMemberCountChannel(guild);
   }, 1500);
   if (timer.unref) timer.unref();
   memberCountUpdateTimers.set(guild.id, timer);
@@ -2503,7 +2490,7 @@ client.on(Events.MessageCreate, async (message) => {
         } catch (error) {
           console.error(`[Discord Bot] .setup failed for guild ${message.guild?.id}:`, error);
           const detail = String(error?.message || 'unknown error').slice(0, 300);
-          await message.reply(`❌ `.setup` could not finish: ${detail}`).catch(() => {});
+          await message.reply(`❌ \`.setup\` could not finish: ${detail}`).catch(() => {});
         }
         return;
       } else if (cmd === 'member') {
@@ -2968,7 +2955,7 @@ client.on(Events.ChannelUpdate, async (oldChannel, newChannel) => {
 client.on(Events.GuildMemberAdd, updateGuildMemberCache);
 client.on(Events.GuildMemberRemove, removeGuildMemberFromCache);
 client.on(Events.GuildMemberUpdate, (_oldMember, newMember) => updateGuildMemberCache(newMember));
-client.on(Events.GuildMemberAdd, (member) => scheduleMemberCountChannelRefresh(member.guild, { fetchMembers: true }));
+client.on(Events.GuildMemberAdd, (member) => scheduleMemberCountChannelRefresh(member.guild));
 client.on(Events.GuildMemberRemove, (member) => scheduleMemberCountChannelRefresh(member.guild));
 
 client.on(Events.GuildMemberRemove, async (member) => {
