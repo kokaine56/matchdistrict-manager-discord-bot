@@ -1566,7 +1566,8 @@ export async function getNextTicketNumber(guildId) {
  * @returns {Promise<object|null>}
  */
 export async function saveTicketToDb(ticketData) {
-  if (!isMongoConnected() || !ticketData?.channelId) return ticketData;
+  if (!ticketData?.channelId) throw new Error('A channel ID is required to save a support ticket.');
+  if (!isMongoConnected()) throw new Error('MongoDB is not connected; the support ticket was not saved.');
   try {
     const col = mongoDb.collection('discord_tickets');
     await col.updateOne(
@@ -1577,8 +1578,18 @@ export async function saveTicketToDb(ticketData) {
     return ticketData;
   } catch (err) {
     console.warn(`[MongoDB] ⚠️ Error saving ticket ${ticketData?.ticketNumber}:`, err.message);
-    return ticketData;
+    throw err;
   }
+}
+
+/**
+ * Deletes a ticket record when channel/access setup fails after persistence.
+ * @param {string} channelId
+ * @returns {Promise<void>}
+ */
+export async function deleteTicketFromDb(channelId) {
+  if (!isMongoConnected() || !channelId) return;
+  await mongoDb.collection('discord_tickets').deleteOne({ channelId });
 }
 
 /**

@@ -12,8 +12,6 @@ import {
 } from 'discord.js';
 import {
   queueChannelCreate,
-  queueChannelDelete,
-  queueRoleCreate,
   queueChannelSend,
   enqueueDiscordAction,
 } from './discordQueue.js';
@@ -21,7 +19,9 @@ import {
   saveTicketPanel,
   getTicketPanel,
   getNextTicketNumber,
+  isMongoConnected,
   saveTicketToDb,
+  deleteTicketFromDb,
   getTicketFromDb,
   updateTicketStatusInDb,
   saveStaffApplicationToDb,
@@ -91,6 +91,18 @@ export const STAFF_ROLES = [
 // In-memory mutex and draft cache
 const ticketSetupInProgress = new Set();
 const activeTicketConfirmations = new Set();
+const ticketNumberReservations = new Map();
+
+function buildTicketConfirmationRow(disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('ticket:confirm_create').setLabel('Create Ticket').setStyle(ButtonStyle.Success).setDisabled(disabled),
+    new ButtonBuilder().setCustomId('ticket:confirm_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary).setDisabled(disabled),
+  );
+}
+
+function logTicketCreationStep(step, details = {}) {
+  console.log(`[Ticket Creation] ${step} ${JSON.stringify(details)}`);
+}
 export const pendingStaffDrafts = new Map(); // draftId -> draft data
 const activeStaffSubmissions = new Set(); // userId
 
@@ -616,12 +628,44 @@ export async function handleTicketInteraction(interaction) {
       return true;
     }
     activeTicketConfirmations.add(confirmationKey);
-    const disabledRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('ticket:confirm_create').setLabel('Creating…').setStyle(ButtonStyle.Success).setDisabled(true),
-      new ButtonBuilder().setCustomId('ticket:confirm_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary).setDisabled(true),
-    );
+    const disabledRow = buildTicketConfirmationRow(true);
+    const deadline = Date.now() + 30_000;
+    let timedOut = false;
+    let timeoutId;
+    let activeCreatedChannel = null;
+    let creationTask = null;
+    const timeoutPromise = new Promise((resolve) => {
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        logTicketCreationStep('creation timed out', { guildId: guild.id, userId: user.id, timeoutMs: 30_000 });
+        const timeoutResponse = {
+          content: '❌ Ticket creation timed out. Please try again. If a channel was created, it will be cleaned up.',
+          components: [buildTicketConfirmationRow(false)],
+        };
+        interaction.editReply(timeoutResponse).catch(async (error) => {
+          console.error('[Ticket Creation] Could not update timed-out confirmation:', error);
+          if (!interaction.replied && !interaction.deferred) {
+            await interaction.reply({ ...timeoutResponse, ephemeral: true }).catch(() => {});
+          }
+        });
+        if (activeCreatedChannel) {
+          activeCreatedChannel.delete('Ticket creation timed out').catch((error) => {
+            console.error('[Ticket Creation] Timed-out channel cleanup failed:', error);
+          });
+          deleteTicketFromDb(activeCreatedChannel.id).catch((error) => {
+            console.error('[Ticket Creation] Timed-out MongoDB cleanup failed:', error);
+          });
+        }
+        resolve();
+      }, 30_000);
+    });
     try {
-      await interaction.update({ content: 'Creating your support ticket…', components: [disabledRow] });
+      await Promise.race([
+        interaction.update({ content: 'Creating your support ticket…', components: [disabledRow] }),
+        timeoutPromise,
+      ]);
+      if (timedOut) return true;
+      logTicketCreationStep('confirmation acknowledged', { guildId: guild.id, userId: user.id, interactionId: interaction.id });
       const confirmedSelection = {
         guild,
         user,
@@ -629,17 +673,42 @@ export async function handleTicketInteraction(interaction) {
         customId: 'ticket:select_category',
         values: ['general_support'],
         ticketConfirmed: true,
+        ticketDeadline: deadline,
+        ticketReservationKey: confirmationKey,
+        setCreatedTicketChannel: (channel) => { activeCreatedChannel = channel; },
+        isTicketCreationTimedOut: () => timedOut || Date.now() >= deadline,
         isStringSelectMenu: () => true,
         deferReply: async () => {},
-        editReply: (payload) => interaction.message.edit(payload),
+        editReply: (payload) => {
+          if (timedOut) return Promise.resolve(null);
+          return interaction.editReply(payload);
+        },
         reply: (payload) => interaction.followUp(payload),
       };
-      await handleTicketInteraction(confirmedSelection);
+      creationTask = handleTicketInteraction(confirmedSelection);
+      creationTask.catch((error) => console.error('[Ticket Creation] Unhandled creation task error:', error));
+      await Promise.race([creationTask, timeoutPromise]);
     } catch (error) {
       console.error('[Ticket Service] ❌ Error confirming support ticket:', error);
-      await interaction.message?.edit({ content: `❌ An error occurred while creating your ticket: ${error.message}`, components: [] }).catch(() => {});
+      const failureResponse = {
+        content: `❌ Could not create your ticket: ${error.message || 'Please try again.'}`,
+        components: [buildTicketConfirmationRow(false)],
+      };
+      if (interaction.replied || interaction.deferred) {
+        await interaction.editReply(failureResponse).catch(() => {});
+      } else {
+        await interaction.reply({ ...failureResponse, ephemeral: true }).catch(() => {});
+      }
     } finally {
-      activeTicketConfirmations.delete(confirmationKey);
+      clearTimeout(timeoutId);
+      if (timedOut && creationTask) {
+        creationTask.then(
+          () => activeTicketConfirmations.delete(confirmationKey),
+          () => activeTicketConfirmations.delete(confirmationKey),
+        );
+      } else {
+        activeTicketConfirmations.delete(confirmationKey);
+      }
     }
     return true;
   }
@@ -683,9 +752,18 @@ export async function handleTicketInteraction(interaction) {
     // Branch B: General Support -> Create Support Ticket Channel
     if (!interaction.ticketConfirmed) await interaction.deferReply({ ephemeral: true });
 
+    let ticketChannel = null;
+    let savedTicket = false;
+    const ticketReservationKey = interaction.ticketReservationKey || `${guild.id}:${interaction.id || Date.now()}`;
     try {
+      const ensureCreationActive = async () => {
+        if (!interaction.isTicketCreationTimedOut?.()) return;
+        throw new Error('Ticket creation exceeded 30 seconds. The ticket channel will be cleaned up.');
+      };
+      logTicketCreationStep('creation started', { guildId: guild.id, userId: user.id });
       const selectedOption =
         TICKET_OPTIONS.find((opt) => opt.value === selectedValue) || { label: 'General Support' };
+      const botMember = guild.members.me || await guild.members.fetchMe();
 
       // Ensure "SUPPORT TICKETS" category exists
       let category = Array.from(guild.channels.cache.values()).find(
@@ -693,7 +771,8 @@ export async function handleTicketInteraction(interaction) {
       );
 
       if (!category) {
-        category = await queueChannelCreate(guild, {
+        logTicketCreationStep('creating SUPPORT TICKETS category', { guildId: guild.id });
+        category = await guild.channels.create({
           name: 'SUPPORT TICKETS',
           type: ChannelType.GuildCategory,
           permissionOverwrites: [
@@ -702,34 +781,76 @@ export async function handleTicketInteraction(interaction) {
               deny: [PermissionFlagsBits.ViewChannel],
             },
             {
-              id: guild.members.me.id,
+              id: botMember.id,
               allow: [
                 PermissionFlagsBits.ViewChannel,
                 PermissionFlagsBits.ManageChannels,
+                PermissionFlagsBits.ManageRoles,
                 PermissionFlagsBits.ManageMessages,
               ],
             },
           ],
         });
+        logTicketCreationStep('category created', { categoryId: category?.id || null });
       }
+      await ensureCreationActive();
+
+      // Make sure the bot can administer ticket channels under this category.
+      logTicketCreationStep('checking bot category permissions', { categoryId: category.id, botId: botMember.id });
+      await category.permissionOverwrites.edit(botMember.id, {
+        ViewChannel: true,
+        ManageChannels: true,
+        ManageRoles: true,
+      });
+      await ensureCreationActive();
+      const categoryPermissions = category.permissionsFor(botMember);
+      if (!categoryPermissions?.has([
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ManageChannels,
+        PermissionFlagsBits.ManageRoles,
+      ])) {
+        throw new Error('The bot needs View Channel, Manage Channels, and Manage Roles on the SUPPORT TICKETS category.');
+      }
+      logTicketCreationStep('bot category permissions verified', { categoryId: category.id });
 
       // Ensure "Support Team" role exists
-      let supportRole = Array.from(guild.roles.cache.values()).find(
+      const guildSettings = getGuildSettings(guild.id) || {};
+      const storedSupportRoleId = guildSettings.supportTeamRoleId || guildSettings.supportRoleId;
+      logTicketCreationStep('looking up Support Team role', { guildId: guild.id, storedRoleId: storedSupportRoleId || null });
+      let supportRole = storedSupportRoleId ? guild.roles.cache.get(storedSupportRoleId) : null;
+      if (storedSupportRoleId && !supportRole) {
+        supportRole = await guild.roles.fetch(storedSupportRoleId).catch(() => null);
+      }
+      supportRole ||= Array.from(guild.roles.cache.values()).find(
         (r) => r.name?.toLowerCase() === 'support team'
       );
 
       if (!supportRole) {
-        supportRole = await queueRoleCreate(guild, {
+        logTicketCreationStep('creating Support Team role', { guildId: guild.id });
+        supportRole = await guild.roles.create({
           name: 'Support Team',
           color: 0x3498DB,
           reason: 'Role for handling support tickets',
         });
       }
+      if (!supportRole?.id) throw new Error('The Support Team role could not be found or created.');
+      logTicketCreationStep('Support Team role resolved', { roleId: supportRole.id, source: storedSupportRoleId ? 'stored-or-name' : 'name' });
+      guildSettingsCache[guild.id] = { ...guildSettings, supportTeamRoleId: supportRole.id };
+      saveGuildSettings(guildSettingsCache);
+      await ensureCreationActive();
 
       // Fetch atomic incrementing ticket sequence from MongoDB
-      const seq = await getNextTicketNumber(guild.id);
+      let seq = ticketNumberReservations.get(ticketReservationKey);
+      if (!seq) {
+        logTicketCreationStep('reserving ticket number', { guildId: guild.id });
+        seq = await getNextTicketNumber(guild.id);
+        ticketNumberReservations.set(ticketReservationKey, seq);
+      } else {
+        logTicketCreationStep('reusing reserved ticket number', { guildId: guild.id, ticketNumber: seq });
+      }
       const ticketNumber = String(seq).padStart(4, '0');
       const channelName = `${ticketNumber}-support`;
+      await ensureCreationActive();
 
       const permissionOverwrites = [
         {
@@ -747,7 +868,7 @@ export async function handleTicketInteraction(interaction) {
           ],
         },
         {
-          id: guild.members.me.id, // Bot
+          id: botMember.id, // Bot
           allow: [
             PermissionFlagsBits.ViewChannel,
             PermissionFlagsBits.SendMessages,
@@ -755,6 +876,7 @@ export async function handleTicketInteraction(interaction) {
             PermissionFlagsBits.AttachFiles,
             PermissionFlagsBits.EmbedLinks,
             PermissionFlagsBits.ManageChannels,
+            PermissionFlagsBits.ManageRoles,
             PermissionFlagsBits.ManageMessages,
           ],
         },
@@ -775,28 +897,72 @@ export async function handleTicketInteraction(interaction) {
         });
       }
 
-      // Create ticket channel via rate-limited queue
-      const ticketChannel = await queueChannelCreate(guild, {
+      logTicketCreationStep('ticket permission overwrite plan', {
+        everyoneId: guild.id,
+        ticketUserId: user.id,
+        supportRoleId: supportRole.id,
+        botUserId: botMember.id,
+        categoryId: category.id,
+      });
+      logTicketCreationStep('creating ticket channel', { guildId: guild.id, userId: user.id, channelName, categoryId: category.id });
+      ticketChannel = await guild.channels.create({
         name: channelName,
         type: ChannelType.GuildText,
         parent: category?.id,
         topic: `Ticket #${ticketNumber} | Creator: ${user.tag || user.username} (${user.id}) | Category: ${selectedOption.label}`,
         permissionOverwrites,
       });
+      interaction.setCreatedTicketChannel?.(ticketChannel);
 
       if (!ticketChannel) {
+        logTicketCreationStep('channel creation returned no channel', { guildId: guild.id, channelName });
         await interaction.editReply({
           content: '❌ Failed to create your ticket channel. Please try again or contact a server administrator.',
+          components: [buildTicketConfirmationRow(false)],
         });
-        await logTicketEvent(guild, 'ticket_error', {
+        void logTicketEvent(guild, 'ticket_error', {
           userId: user.id,
           action: 'Create Ticket Channel',
           error: 'Failed to create channel via Discord API',
-        });
+        }).catch((error) => console.error('[Ticket Creation] Ticket error log failed:', error));
         return true;
       }
+      logTicketCreationStep('ticket channel created', { channelId: ticketChannel.id, channelName: ticketChannel.name, parentId: ticketChannel.parentId });
+      await ensureCreationActive();
+
+      if (ticketChannel.permissionsLocked) {
+        logTicketCreationStep('channel permissions were synced; applying explicit ticket overwrites', { channelId: ticketChannel.id });
+        await ticketChannel.permissionOverwrites.set(permissionOverwrites, 'Apply explicit private ticket access');
+        await ensureCreationActive();
+      }
+
+      let userCanView = false;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const effectivePermissions = ticketChannel.permissionsFor(member);
+        userCanView = Boolean(effectivePermissions?.has(PermissionFlagsBits.ViewChannel));
+        logTicketCreationStep('checking ticket user access', { channelId: ticketChannel.id, userId: user.id, attempt, canView: userCanView });
+        if (userCanView) break;
+        logTicketCreationStep('repairing ticket user overwrite', { channelId: ticketChannel.id, userId: user.id, attempt });
+        await ticketChannel.permissionOverwrites.edit(user.id, {
+          ViewChannel: true,
+          SendMessages: true,
+          ReadMessageHistory: true,
+          AttachFiles: true,
+        });
+        await ensureCreationActive();
+        userCanView = Boolean(ticketChannel.permissionsFor(member)?.has(PermissionFlagsBits.ViewChannel));
+        logTicketCreationStep('ticket user overwrite repair result', { channelId: ticketChannel.id, userId: user.id, attempt, canView: userCanView });
+        if (userCanView) break;
+      }
+      if (!userCanView) {
+        throw new Error('Discord did not grant you access to the new ticket channel. The channel will be removed; please try again.');
+      }
+      logTicketCreationStep('ticket user access verified', { channelId: ticketChannel.id, userId: user.id });
+      await ensureCreationActive();
 
       // Save ticket in MongoDB
+      if (!isMongoConnected()) throw new Error('Ticket storage is unavailable. Please try again shortly.');
+      logTicketCreationStep('saving ticket to MongoDB', { ticketNumber, channelId: ticketChannel.id, userId: user.id });
       await saveTicketToDb({
         guildId: guild.id,
         ticketNumber,
@@ -806,20 +972,9 @@ export async function handleTicketInteraction(interaction) {
         status: 'open',
         createdAt: new Date(),
       });
-
-      // Log ticket opened event to ticket-log
-      await logTicketEvent(guild, 'ticket_opened', {
-        ticketNumber,
-        channelId: ticketChannel.id,
-        channelName: ticketChannel.name,
-        userId: user.id,
-        optionChosen: selectedOption.label,
-      });
-
-      // Reply to user ephemerally with link to ticket channel
-      await interaction.editReply({
-        content: `✅ Your ticket has been created: <#${ticketChannel.id}>`,
-      });
+      savedTicket = true;
+      logTicketCreationStep('ticket saved to MongoDB', { ticketNumber, channelId: ticketChannel.id });
+      await ensureCreationActive();
 
       // In ticket channel: welcome embed + Close Ticket button + Support ping
       const welcomeEmbed = new EmbedBuilder()
@@ -844,23 +999,58 @@ export async function handleTicketInteraction(interaction) {
         ? `<@&${supportRole.id}> <@${user.id}>`
         : `<@${user.id}>`;
 
-      await queueChannelSend(ticketChannel, {
+      logTicketCreationStep('sending ticket welcome message', { channelId: ticketChannel.id, userId: user.id, supportRoleId: supportRole.id });
+      await ticketChannel.send({
         content: pingContent,
         embeds: [welcomeEmbed],
         components: [actionRow],
       });
+      logTicketCreationStep('ticket welcome message sent', { channelId: ticketChannel.id });
+      await ensureCreationActive();
+
+      logTicketCreationStep('replying with ticket link', { channelId: ticketChannel.id, userId: user.id });
+      await interaction.editReply({
+        content: `✅ Your ticket has been created: <#${ticketChannel.id}>`,
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setLabel('Open Ticket').setStyle(ButtonStyle.Link).setURL(
+            ticketChannel.url || `https://discord.com/channels/${guild.id}/${ticketChannel.id}`,
+          ),
+        )],
+      });
+      ticketNumberReservations.delete(ticketReservationKey);
+      logTicketCreationStep('confirmation updated successfully', { channelId: ticketChannel.id, userId: user.id });
+      void logTicketEvent(guild, 'ticket_opened', {
+        ticketNumber,
+        channelId: ticketChannel.id,
+        channelName: ticketChannel.name,
+        userId: user.id,
+        optionChosen: selectedOption.label,
+      }).catch((error) => console.error('[Ticket Creation] Ticket-opened log failed:', error));
 
       return true;
     } catch (err) {
       console.error('[Ticket Service] ❌ Error creating ticket:', err);
       await interaction.editReply({
-        content: `❌ An error occurred while creating your ticket: ${err.message}`,
+        content: `❌ Could not create your ticket: ${err.message || 'Please try again or contact support.'}`,
+        components: [buildTicketConfirmationRow(false)],
       }).catch(() => {});
-      await logTicketEvent(guild, 'ticket_error', {
+      logTicketCreationStep('creation failed', { guildId: guild.id, userId: user.id, channelId: ticketChannel?.id || null, error: err?.stack || err?.message || String(err) });
+      if (ticketChannel) {
+        logTicketCreationStep('deleting failed ticket channel', { channelId: ticketChannel.id });
+        await ticketChannel.delete('Remove incomplete ticket channel').catch((cleanupError) => {
+          console.error('[Ticket Creation] Failed to clean up ticket channel:', cleanupError);
+        });
+      }
+      if (savedTicket && ticketChannel) {
+        await deleteTicketFromDb(ticketChannel.id).catch((cleanupError) => {
+          console.error('[Ticket Creation] Failed to remove ticket record during cleanup:', cleanupError);
+        });
+      }
+      void logTicketEvent(guild, 'ticket_error', {
         userId: user.id,
         action: 'Create Ticket Channel',
         error: err.message,
-      });
+      }).catch((logError) => console.error('[Ticket Creation] Ticket error log failed:', logError));
       return true;
     }
   }
