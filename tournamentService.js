@@ -369,6 +369,104 @@ export async function ensureTournamentShortCode(guild, tournament, savedTourname
   return code;
 }
 
+function getEffectiveTournamentPrefix(savedTournament, tournament = {}) {
+  return String(savedTournament?.customChannelPrefix || savedTournament?.shortCode || savedTournament?.tournamentShortCode ||
+    getTournamentShortPrefix(tournament?.title || savedTournament?.tournamentTitle, tournament?.id || savedTournament?.tournamentId || 'tour')).trim();
+}
+
+function getRenamedTournamentChannelName(name, currentPrefix, newPrefix) {
+  const boldCurrent = toMathematicalBold(String(currentPrefix).toUpperCase());
+  const boldNew = toMathematicalBold(String(newPrefix).toUpperCase());
+  if (name.startsWith(`${boldCurrent}｜`)) return `${boldNew}｜${name.slice(boldCurrent.length + 1)}`;
+  const asciiCurrent = String(currentPrefix).toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  const asciiNew = String(newPrefix).toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  if (asciiCurrent && name.toLowerCase().startsWith(`${asciiCurrent}-`)) return `${asciiNew}-${name.slice(asciiCurrent.length + 1)}`;
+  return null;
+}
+
+async function submitTournamentPrefixModal(interaction, tournamentId, savedTournament) {
+  const access = checkTournamentAccess(interaction.guild, interaction.member);
+  if (!access.allowed) {
+    await interaction.reply({ content: access.reason, ephemeral: true });
+    return;
+  }
+  const currentPrefix = getEffectiveTournamentPrefix(savedTournament, { id: tournamentId, title: savedTournament.tournamentTitle });
+  const submittedCurrent = interaction.fields.getTextInputValue('current_prefix').trim();
+  const newPrefix = interaction.fields.getTextInputValue('new_prefix').trim();
+  if (submittedCurrent !== currentPrefix) {
+    await interaction.reply({ content: 'The tournament prefix changed while this form was open. Reopen the editor and try again.', ephemeral: true });
+    return;
+  }
+  if (!/^[A-Za-z0-9_-]{1,20}$/.test(newPrefix)) {
+    await interaction.reply({ content: 'Prefix must be 1–20 letters, numbers, hyphens, or underscores.', ephemeral: true });
+    return;
+  }
+  if (newPrefix.toUpperCase() === currentPrefix.toUpperCase()) {
+    await interaction.reply({ content: 'The new prefix is the same as the current prefix.', ephemeral: true });
+    return;
+  }
+
+  const guild = interaction.guild;
+  let category = savedTournament.categoryId
+    ? guild.channels.cache.get(savedTournament.categoryId) || await guild.channels.fetch(savedTournament.categoryId).catch(() => null)
+    : null;
+  if (!category || category.type !== ChannelType.GuildCategory || (category.guildId || category.guild?.id) !== guild.id) {
+    const panelId = savedTournament.channels?.botCommandsId;
+    const panel = panelId ? guild.channels.cache.get(panelId) || await guild.channels.fetch(panelId).catch(() => null) : null;
+    category = panel?.parent && panel.parent.type === ChannelType.GuildCategory
+      ? panel.parent
+      : (panel?.parentId ? guild.channels.cache.get(panel.parentId) || await guild.channels.fetch(panel.parentId).catch(() => null) : null);
+  }
+  if (!category) {
+    await interaction.reply({ content: 'Could not find this tournament’s category. No channels were changed.', ephemeral: true });
+    return;
+  }
+
+  if (typeof guild.channels?.fetch === 'function') await guild.channels.fetch().catch(() => null);
+  const children = [...(guild.channels.cache?.values?.() || [])].filter((channel) =>
+    channel.type !== ChannelType.GuildCategory && channel.parentId === category.id);
+  const plans = children.map((channel) => ({ channel, oldName: channel.name, name: getRenamedTournamentChannelName(channel.name, currentPrefix, newPrefix) }))
+    .filter((plan) => plan.name && plan.name !== plan.channel.name);
+  const overlong = plans.find(({ name }) => Array.from(name).length > 100 || !isValidChannelName(name));
+  if (overlong) {
+    await interaction.reply({ content: `The prefix would make #${overlong.channel.name} exceed Discord’s channel naming limits. No channels were changed.`, ephemeral: true });
+    return;
+  }
+  const plannedNames = new Set(plans.map(({ name }) => name.toLowerCase()));
+  if (plannedNames.size !== plans.length || children.some((channel) =>
+    !plans.some((plan) => plan.channel.id === channel.id) && plannedNames.has(channel.name.toLowerCase()))) {
+    await interaction.reply({ content: 'A channel with one of the new names already exists in this tournament category. No channels were changed.', ephemeral: true });
+    return;
+  }
+
+  const renamed = [];
+  try {
+    for (const plan of plans) {
+      await enqueueDiscordAction(() => plan.channel.setName(plan.name), 'action', { maxRetries: 0 });
+      renamed.push(plan);
+    }
+    const oldCustomPrefix = savedTournament.customChannelPrefix;
+    savedTournament.customChannelPrefix = newPrefix;
+    guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
+    saveGuildSettings(guildSettingsCache);
+    if (!await saveTournamentToDb(guild.id, tournamentId, savedTournament)) {
+      if (oldCustomPrefix === undefined) delete savedTournament.customChannelPrefix;
+      else savedTournament.customChannelPrefix = oldCustomPrefix;
+      guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
+      saveGuildSettings(guildSettingsCache);
+      throw new Error('Could not save the prefix to MongoDB.');
+    }
+    await interaction.reply({ content: `Tournament channel prefix updated to **${newPrefix}**. Renamed ${renamed.length} channel${renamed.length === 1 ? '' : 's'}.`, ephemeral: true }).catch(() => {});
+  } catch (error) {
+    for (const plan of renamed.reverse()) {
+      await enqueueDiscordAction(() => plan.channel.setName(plan.oldName), 'action', { maxRetries: 0 })
+        .catch((rollbackError) => console.error(`[Discord Bot] Prefix rename rollback failed for ${plan.channel.id}:`, rollbackError));
+    }
+    console.error(`[Discord Bot] Tournament prefix update failed for ${tournamentId}:`, error);
+    await interaction.reply({ content: `Could not update the tournament channel prefix: ${error?.message || 'Discord rejected a channel rename.'} No prefix change was saved.`, ephemeral: true }).catch(() => {});
+  }
+}
+
 function getRoundGroupChannelNames(prefix, roundNumber, groupNumber) {
   const label = `R${roundNumber}G${groupNumber}`;
   return {
@@ -1585,7 +1683,15 @@ export function buildTournamentControlPanelButtons(tournamentId) {
       .setStyle(ButtonStyle.Danger)
   );
 
-  return [row1, row2];
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`dash:settings:edit-prefix:${tournamentId}`)
+      .setLabel('Edit Channel Prefix')
+      .setEmoji('✏️')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  return [row1, row2, row3];
 }
 
 export function buildDangerZoneEmbed(tournament) {
@@ -2079,6 +2185,33 @@ export async function handleDashboardNavigationInteraction(interaction) {
     }
   }
   if (!tournamentId || !savedTournament) return false;
+  if (screen === 'settings' && action === 'prefix-submit') {
+    await submitTournamentPrefixModal(interaction, tournamentId, savedTournament);
+    return true;
+  }
+  if (screen === 'settings' && action === 'edit-prefix') {
+    const access = checkTournamentAccess(interaction.guild, interaction.member);
+    if (!access.allowed) {
+      await interaction.reply({ content: access.reason, ephemeral: true });
+      return true;
+    }
+    const currentPrefix = getEffectiveTournamentPrefix(savedTournament, { id: tournamentId, title: savedTournament.tournamentTitle });
+    const modal = new ModalBuilder()
+      .setCustomId(`dash:settings:prefix-submit:${tournamentId}`)
+      .setTitle('Edit Channel Prefix')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('current_prefix').setLabel('Current Prefix (read-only)').setStyle(TextInputStyle.Short)
+            .setValue(currentPrefix).setRequired(true).setMaxLength(20)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('new_prefix').setLabel('New Prefix').setStyle(TextInputStyle.Short)
+            .setPlaceholder('Enter a new prefix').setRequired(true).setMaxLength(20)
+        )
+      );
+    await interaction.showModal(modal);
+    return true;
+  }
   const stack = Array.isArray(savedTournament.dashboardNavigationStack) && savedTournament.dashboardNavigationStack.length
     ? savedTournament.dashboardNavigationStack
     : [{ screen: 'home' }];
@@ -3419,7 +3552,7 @@ export async function setupTournamentControlPanel(guild, tournament, summary, bo
   await persistSetupProgress();
 
   // 2. Locate, move, or create #bot-commands inside MANAGEMENT.
-  const shortPrefix = getTournamentShortPrefix(tournament.title, tournament.id);
+  const shortPrefix = getEffectiveTournamentPrefix(savedTournament, tournament);
   const { primary: botCmdPrimary, fallback: botCmdFallback } = getTournamentChannelNames(shortPrefix, 'bot-commands');
   let botCommandsChannel = null;
   if (savedTournament.channels.botCommandsId) {
@@ -3864,7 +3997,8 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     setupStatus: 'pending_channels',
   };
 
-  const shortCode = await ensureTournamentShortCode(guild, tournament, savedTournament);
+  await ensureTournamentShortCode(guild, tournament, savedTournament);
+  const channelPrefix = getEffectiveTournamentPrefix(savedTournament, tournament);
 
   if (!savedTournament.channels) {
     savedTournament.channels = {};
@@ -3896,7 +4030,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
   }
 
   // 1. Resolve one canonical tournament category, reusing any saved legacy ID or finding by name.
-  const shortPrefix = getTournamentShortPrefix(tournament.title, tournament.id);
+  const shortPrefix = channelPrefix;
   const categoryName = buildTournamentCategoryName(tournament.title || tournament.id);
   const savedCategoryIds = [savedTournament.categoryId, savedTournament.publicCategoryId, savedTournament.managementCategoryId,
     ...Object.values(savedTournament.rounds || {}).map((round) => round?.categoryId)].filter(Boolean);
@@ -4341,7 +4475,7 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
 
   // 8. Recreate, reuse, or reapply strict permissions and update control messages on all round group channels
   if (savedTournament.rounds && typeof savedTournament.rounds === 'object') {
-    const tourPrefix = shortCode;
+    const tourPrefix = channelPrefix;
     for (const round of Object.values(savedTournament.rounds)) {
       if (Array.isArray(round.groups)) {
         const roundNum = round.roundNumber || 1;
@@ -4554,7 +4688,7 @@ export async function renameTournamentChannelsToStandardFormat(guild, tournament
   if (!savedTournament || !savedTournament.channels) return results;
 
   const title = savedTournament.tournamentTitle || tournamentId;
-  const shortPrefix = getTournamentShortPrefix(title, tournamentId);
+  const shortPrefix = getEffectiveTournamentPrefix(savedTournament, { id: tournamentId, title });
 
   // Rename text channels found only by ID
   for (const channelDef of REQUIRED_TOURNAMENT_CHANNELS) {
@@ -5965,7 +6099,7 @@ async function handleOpenRegistrationSubmit(interaction, tournamentId, roundId) 
     const available = (round.groups || []).reduce((sum, group) => sum + getAvailableManualSpareSlots(group).length, 0);
     const slotCount = Number(interaction.fields?.getTextInputValue('slot_count'));
     if (!Number.isInteger(slotCount) || slotCount < 1 || slotCount > available) throw new Error(`Enter a whole number from 1 to ${available}.`);
-    const prefix = await ensureTournamentShortCode(guild, { id: tournamentId, title: saved.tournamentTitle }, saved);
+    const prefix = getEffectiveTournamentPrefix(saved, { id: tournamentId, title: saved.tournamentTitle });
     const names = getTournamentChannelNames(prefix, `r${round.roundNumber || 1}-register`);
     const everyone = guild.roles.everyone;
     const botId = guild.members.me?.id;
@@ -7246,7 +7380,8 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       // Fetch latest registrations from backend
       const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId);
       const { tournament, teams, summary } = backendData;
-      const shortCode = await ensureTournamentShortCode(guild, tournament, savedTournament);
+      await ensureTournamentShortCode(guild, tournament, savedTournament);
+      const channelPrefix = getEffectiveTournamentPrefix(savedTournament, tournament);
 
       // Determine eligible allocation pool: derived from preceding round's qualifications if present, otherwise live backend registrations
       const precedingRounds = Object.values(savedTournament.rounds || {})
@@ -7304,7 +7439,7 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
       const tourRole = savedTournament.roleId ? guild.roles.cache.get(savedTournament.roleId) : null;
       const { tourneyModRole: modsRole } = await ensureManagementDashboardRoles(guild, savedTournament, botMember);
       const roundNum = round.roundNumber || 1;
-      const tourPrefix = shortCode;
+      const tourPrefix = channelPrefix;
       round.categoryId = null;
       const roundCategory = category;
 

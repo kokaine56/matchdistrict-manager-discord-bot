@@ -2770,7 +2770,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     const roundAnnouncementModal = interaction.isModalSubmit?.() && (
       interaction.customId?.startsWith('dash:round:announcement-submit:') ||
-      interaction.customId?.startsWith('dash:registration-submit:')
+      interaction.customId?.startsWith('dash:registration-submit:') ||
+      interaction.customId?.startsWith('dash:settings:prefix-submit:')
     );
     const isUserSelectInteraction = interaction.isUserSelectMenu?.() === true;
     const interactionCustomId = String(interaction.customId || '');
@@ -2779,6 +2780,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       interactionCustomId.startsWith('md_tour_create_round:') ||
       interactionCustomId.startsWith('md_round_edit:') ||
       interactionCustomId.startsWith('dash:round:announcement:') ||
+      interactionCustomId.startsWith('dash:settings:edit-prefix:') ||
       interactionCustomId.startsWith('dash:add-team-method:open-registration:') ||
       interactionCustomId.startsWith('dash:add-team:group:')
     );
