@@ -30,7 +30,7 @@ function sleep(ms) {
 /**
  * Execute a task with rate limit (429) handling and backoff
  */
-async function executeWithRetry(fn, retryCount = 0) {
+async function executeWithRetry(fn, retryCount = 0, maxRetries = QUEUE_CONFIG.MAX_RETRIES, rememberRateLimitOnExhaustion = false) {
   const now = Date.now();
   if (now < globalRateLimitResetUntil) {
     const waitTime = globalRateLimitResetUntil - now + 50;
@@ -46,19 +46,22 @@ async function executeWithRetry(fn, retryCount = 0) {
       err?.retryAfter != null ||
       err?.rawError?.retry_after != null;
 
-    if (isRateLimited && retryCount < QUEUE_CONFIG.MAX_RETRIES) {
+    if (isRateLimited) {
       const retryAfterSec =
         err.retryAfter ??
         err.rawError?.retry_after ??
         (err.headers?.get ? parseFloat(err.headers.get('retry-after')) : null) ??
         1;
       const retryAfterMs = Math.ceil(retryAfterSec * 1000) + 100;
-      globalRateLimitResetUntil = Math.max(globalRateLimitResetUntil, Date.now() + retryAfterMs);
+      if (retryCount < maxRetries || rememberRateLimitOnExhaustion) {
+        globalRateLimitResetUntil = Math.max(globalRateLimitResetUntil, Date.now() + retryAfterMs);
+      }
+      if (retryCount >= maxRetries) throw err;
       console.warn(
-        `[Discord Queue] ⚠️ Rate limit encountered. Waiting ${retryAfterMs}ms before retry (${retryCount + 1}/${QUEUE_CONFIG.MAX_RETRIES})...`
+        `[Discord Queue] ⚠️ Rate limit encountered. Waiting ${retryAfterMs}ms before retry (${retryCount + 1}/${maxRetries})...`
       );
       await sleep(retryAfterMs);
-      return executeWithRetry(fn, retryCount + 1);
+      return executeWithRetry(fn, retryCount + 1, maxRetries, rememberRateLimitOnExhaustion);
     }
     throw err;
   }
@@ -73,7 +76,7 @@ async function processQueue() {
   const task = queue.shift();
 
   try {
-    const result = await executeWithRetry(task.fn);
+    const result = await executeWithRetry(task.fn, 0, task.maxRetries, task.rememberRateLimitOnExhaustion);
     task.resolve(result);
   } catch (err) {
     task.reject(err);
@@ -101,9 +104,16 @@ async function processQueue() {
  * @param {() => Promise<any>} fn - The async function executing the API call
  * @param {'action'|'message'|'role'} type - The operation type determining the delay
  */
-export function enqueueDiscordAction(fn, type = 'action') {
+export function enqueueDiscordAction(fn, type = 'action', options = {}) {
   return new Promise((resolve, reject) => {
-    queue.push({ fn, type, resolve, reject });
+    queue.push({
+      fn,
+      type,
+      resolve,
+      reject,
+      maxRetries: options.maxRetries ?? QUEUE_CONFIG.MAX_RETRIES,
+      rememberRateLimitOnExhaustion: Boolean(options.rememberRateLimitOnExhaustion),
+    });
     processQueue();
   });
 }
@@ -138,7 +148,7 @@ export async function queueChannelCreate(guild, options) {
   }, 'action');
 }
 
-export async function queueChannelDelete(channel, reason = 'Cleanup') {
+export async function queueChannelDelete(channel, reason = 'Cleanup', options = {}) {
   if (!channel || channel.deleted) {
     return null;
   }
@@ -153,7 +163,7 @@ export async function queueChannelDelete(channel, reason = 'Cleanup') {
       if (err?.code === 10003) return null; // Unknown Channel (already deleted)
       throw err;
     }
-  }, 'action');
+  }, 'action', options);
 }
 
 export async function queueRoleCreate(guild, options) {

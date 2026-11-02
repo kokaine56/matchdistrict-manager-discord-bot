@@ -149,7 +149,9 @@ import {
 } from './auditLogger.js';
 import {
   handleTicketSetupCommand,
+  handleTicketDeleteCommand,
   handleTicketInteraction,
+  recoverTicketChannels,
 } from './ticketService.js';
 import {
   handleMessageModeration,
@@ -744,7 +746,7 @@ export function getHelpResponse(prefix = PREFIX) {
     `• \`${prefix}mute <@user|id> <minutes>\` — *(Mod Only)* Timeout a user for a number of minutes\n` +
     `• \`${prefix}unmute <@user|id>\` — *(Mod Only)* Remove timeout from a user\n` +
     `• \`${prefix}unban <@user|id>\` — *(Mod Only)* Unban a user from the server\n` +
-    `• \`${prefix}ticket setup\` — *(Admin Only)* Setup support ticket panel in #support-ticket\n` +
+    `• \`${prefix}ticket setup\` / \`${prefix}ticket delete\` — *(Admin Only)* Manage the support ticket service\n` +
     `• \`${prefix}annc setup\` — *(Admin Only)* Setup private announcement DM dispatch channel\n\n` +
     `**🏆 Tournament & Organiser Management:**\n` +
     `• \`${prefix}organiser\` — *(Admin Only)* Connect this Discord server to your MatchDistrict organiser account\n` +
@@ -2361,6 +2363,11 @@ client.once(Events.ClientReady, async (readyClient) => {
 
   // Startup reconciliation and deletion recovery for managed Discord resources across MongoDB and Discord
   try {
+    await recoverTicketChannels(readyClient);
+  } catch (ticketRecoveryError) {
+    console.error('[Ticket Recovery] Startup ticket recovery failed:', ticketRecoveryError);
+  }
+  try {
     await initOrganiserLinksCache();
     await resumePendingTournamentDeletions(readyClient);
     const officialGuildId = getOfficialGuildId();
@@ -2524,7 +2531,15 @@ client.on(Events.MessageCreate, async (message) => {
           );
           return;
         }
-        await message.reply(`ℹ️ **Usage:** \`${PREFIX}ticket setup\` — Setup the support ticket panel.`);
+        if (subCmd === 'delete') {
+          await handleTicketDeleteCommand(
+            message.guild,
+            message.member,
+            (payload, opts) => message.reply(typeof payload === 'object' ? payload : { content: payload, ...opts }),
+          );
+          return;
+        }
+        await message.reply(`ℹ️ **Usage:** \`${PREFIX}ticket setup\` or \`${PREFIX}ticket delete\`.`);
         return;
       } else if (cmd === 'dm') {
         await handleDmCommand(message.guild, message.member, args, (text) => message.reply(text));

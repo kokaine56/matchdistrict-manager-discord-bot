@@ -1536,6 +1536,23 @@ export async function getTicketPanel(guildId) {
   }
 }
 
+export async function deleteTicketPanel(guildId) {
+  if (!isMongoConnected() || !guildId) return false;
+  const result = await mongoDb.collection('discord_ticket_panels').deleteOne({ guildId });
+  return result.deletedCount > 0;
+}
+
+export async function getTicketsForGuild(guildId) {
+  if (!isMongoConnected() || !guildId) return [];
+  return mongoDb.collection('discord_tickets').find({ guildId }).toArray();
+}
+
+export async function deleteOpenTicketsForGuild(guildId) {
+  if (!isMongoConnected() || !guildId) return 0;
+  const result = await mongoDb.collection('discord_tickets').deleteMany({ guildId, status: 'open' });
+  return result.deletedCount || 0;
+}
+
 /**
  * Atomically increments and retrieves the next ticket sequence number for a guild.
  * @param {string} guildId

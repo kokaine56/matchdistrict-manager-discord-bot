@@ -12,16 +12,20 @@ import {
 } from 'discord.js';
 import {
   queueChannelCreate,
+  queueChannelDelete,
   queueChannelSend,
   enqueueDiscordAction,
 } from './discordQueue.js';
 import {
   saveTicketPanel,
   getTicketPanel,
+  deleteTicketPanel,
+  getTicketsForGuild,
+  deleteOpenTicketsForGuild,
+  deleteTicketFromDb,
   getNextTicketNumber,
   isMongoConnected,
   saveTicketToDb,
-  deleteTicketFromDb,
   getTicketFromDb,
   updateTicketStatusInDb,
   saveStaffApplicationToDb,
@@ -426,11 +430,68 @@ export async function handleTicketSetupCommand(guild, member, channel, replyFn) 
     const currentSettings = getGuildSettings(guild.id) || {};
     const savedChannels = currentSettings.channels || {};
     const panelRecord = await getTicketPanel(guild.id);
+    // 3. Find the existing panel before resolving its category so moving the panel moves future tickets.
+    let ticketPanelChannel = null;
+    const existingChannelId = panelRecord?.channelId || savedChannels.supportTicketId;
+    if (existingChannelId) {
+      ticketPanelChannel = guild.channels.cache.get(existingChannelId) ||
+        (typeof guild.channels?.fetch === 'function' ? await guild.channels.fetch(existingChannelId).catch(() => null) : null);
+    }
+    if (!ticketPanelChannel) {
+      ticketPanelChannel = Array.from(guild.channels.cache.values()).find(
+        (c) => c.name?.toLowerCase() === 'support-ticket' && (c.type === ChannelType.GuildText || c.type === 0)
+      );
+    }
+
+    const panelAlreadyHasCategory = Boolean(ticketPanelChannel?.parentId);
+    let helpSupportCategory = panelAlreadyHasCategory
+      ? guild.channels.cache.get(ticketPanelChannel.parentId) || await guild.channels.fetch(ticketPanelChannel.parentId).catch(() => null)
+      : null;
+    if (panelAlreadyHasCategory && !helpSupportCategory) {
+      throw new Error(`Could not load the current category for #${ticketPanelChannel.name}; leaving the panel in place.`);
+    }
+    if (!panelAlreadyHasCategory) {
+      helpSupportCategory = Array.from(guild.channels.cache.values()).find(
+        (c) => c.type === ChannelType.GuildCategory && c.name?.toLowerCase() === 'help & support'
+      );
+      if (!helpSupportCategory) {
+        helpSupportCategory = await queueChannelCreate(guild, {
+          name: 'Help & Support',
+          type: ChannelType.GuildCategory,
+          permissionOverwrites: [{
+            id: guild.members.me.id,
+            allow: [
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.ManageChannels,
+              PermissionFlagsBits.ManageRoles,
+            ],
+          }],
+        });
+      }
+      if (!helpSupportCategory) throw new Error('Could not create or find the Help & Support category.');
+      if (ticketPanelChannel) {
+        await enqueueDiscordAction(
+          () => ticketPanelChannel.setParent(helpSupportCategory.id, { lockPermissions: false }),
+          'action'
+        );
+      }
+    }
+    if (helpSupportCategory?.name?.toLowerCase() === 'help & support') {
+      await enqueueDiscordAction(
+        () => helpSupportCategory.permissionOverwrites.edit(guild.members.me.id, {
+          ViewChannel: true,
+          ManageChannels: true,
+          ManageRoles: true,
+        }),
+        'action'
+      );
+    }
 
     const channelOptions = {
       name: 'support-ticket',
       type: ChannelType.GuildText,
       topic: 'Official MatchDistrict Support Ticket Channel',
+      parent: helpSupportCategory?.id,
       permissionOverwrites: [
         {
           id: guild.roles?.everyone?.id || guild.id, // @everyone can read but not send messages
@@ -460,19 +521,6 @@ export async function handleTicketSetupCommand(guild, member, channel, replyFn) 
         },
       ],
     };
-
-    // 3. Find or create the "support-ticket" channel idempotently
-    let ticketPanelChannel = null;
-    const existingChannelId = panelRecord?.channelId || savedChannels.supportTicketId;
-    if (existingChannelId) {
-      ticketPanelChannel = guild.channels.cache.get(existingChannelId) ||
-        (typeof guild.channels?.fetch === 'function' ? await guild.channels.fetch(existingChannelId).catch(() => null) : null);
-    }
-    if (!ticketPanelChannel) {
-      ticketPanelChannel = Array.from(guild.channels.cache.values()).find(
-        (c) => c.name?.toLowerCase() === 'support-ticket' && (c.type === ChannelType.GuildText || c.type === 0)
-      );
-    }
 
     if (!ticketPanelChannel) {
       ticketPanelChannel = await queueChannelCreate(guild, channelOptions);
@@ -552,9 +600,9 @@ export async function handleTicketSetupCommand(guild, member, channel, replyFn) 
         embeds: [panelEmbed],
         components: [row],
       });
-      if (panelMessage?.id) {
-        await saveTicketPanel(guild.id, ticketPanelChannel.id, panelMessage.id);
-      }
+    }
+    if (panelMessage?.id) {
+      await saveTicketPanel(guild.id, ticketPanelChannel.id, panelMessage.id);
     }
 
     // 7. Ensure shared logging channels (ticket-log and staff-application-log) exist idempotently
@@ -600,6 +648,208 @@ export async function handleTicketSetupCommand(guild, member, channel, replyFn) 
   }
 }
 
+async function deleteTicketChannelWithRetries(channel, reason, source) {
+  if (!channel) return true;
+  const guild = channel.guild;
+  const botMember = guild?.members?.me;
+  const channelCanManage = Boolean(channel.permissionsFor?.(botMember)?.has(PermissionFlagsBits.ManageChannels));
+  const parent = channel.parentId ? guild.channels.cache.get(channel.parentId) : null;
+  const categoryCanManage = Boolean(parent?.permissionsFor?.(botMember)?.has(PermissionFlagsBits.ManageChannels));
+  let verifiedChannelCanManage = channelCanManage;
+  logTicketCreationStep('checking delete permissions', {
+    source,
+    channelId: channel.id,
+    botId: botMember?.id || null,
+    channelManageChannels: channelCanManage,
+    categoryId: parent?.id || null,
+    categoryManageChannels: categoryCanManage,
+  });
+  if (!verifiedChannelCanManage && botMember?.permissions?.has(PermissionFlagsBits.ManageChannels) && channel.permissionOverwrites?.edit) {
+    try {
+      logTicketCreationStep('repairing bot Manage Channels permission on ticket channel', { channelId: channel.id, botId: botMember.id });
+      await channel.permissionOverwrites.edit(botMember.id, {
+        ViewChannel: true,
+        ManageChannels: true,
+      });
+      verifiedChannelCanManage = Boolean(channel.permissionsFor?.(botMember)?.has(PermissionFlagsBits.ManageChannels));
+      logTicketCreationStep('ticket channel Manage Channels permission repair result', { channelId: channel.id, verified: verifiedChannelCanManage });
+    } catch (error) {
+      console.error(`[Ticket Service] Could not repair bot channel permissions for ${channel.id}:`, error);
+    }
+  }
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      logTicketCreationStep('deleting ticket channel through queue', { source, channelId: channel.id, attempt });
+      await queueChannelDelete(channel, reason, { maxRetries: 0, rememberRateLimitOnExhaustion: true });
+      logTicketCreationStep('ticket channel deleted', { source, channelId: channel.id, attempt });
+      return true;
+    } catch (error) {
+      lastError = error;
+      console.error(`[Ticket Service] Channel delete failed (${source}, attempt ${attempt}/3, channel ${channel.id}):`, error);
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+    }
+  }
+  console.error(`[Ticket Service] Channel delete exhausted retries (${source}, channel ${channel.id}):`, lastError);
+  return false;
+}
+
+export async function recoverTicketChannels(client) {
+  if (!isMongoConnected()) {
+    console.warn('[Ticket Recovery] MongoDB is unavailable; closed ticket recovery was skipped.');
+    return;
+  }
+  for (const guild of client.guilds.cache.values()) {
+    let tickets;
+    try {
+      tickets = await getTicketsForGuild(guild.id);
+    } catch (error) {
+      console.error(`[Ticket Recovery] Could not load tickets for guild ${guild.id}:`, error);
+      continue;
+    }
+    for (const ticket of tickets) {
+      let channel = guild.channels.cache.get(ticket.channelId);
+      if (!channel) {
+        try {
+          channel = await guild.channels.fetch(ticket.channelId);
+        } catch (error) {
+          if (error?.code !== 10003) {
+            console.error(`[Ticket Recovery] Could not check channel ${ticket.channelId}:`, error);
+            continue;
+          }
+          channel = null;
+        }
+      }
+      if (!channel) {
+        try {
+          await deleteTicketFromDb(ticket.channelId);
+          console.log(`[Ticket Recovery] Removed MongoDB ticket record for missing channel ${ticket.channelId}.`);
+        } catch (error) {
+          console.error(`[Ticket Recovery] Could not remove missing-channel record ${ticket.channelId}:`, error);
+        }
+        continue;
+      }
+      if (String(ticket.status).toLowerCase() !== 'closed') continue;
+
+      const deleted = await deleteTicketChannelWithRetries(channel, 'Recover closed ticket during startup', 'startup recovery');
+      if (deleted) {
+        try {
+          await deleteTicketFromDb(ticket.channelId);
+          await logTicketEvent(guild, 'ticket_deleted', {
+            ticketNumber: ticket.ticketNumber,
+            channelName: channel.name,
+            userId: ticket.userId,
+            deletedBy: 'startup recovery',
+          });
+        } catch (error) {
+          console.error(`[Ticket Recovery] Could not finalize closed ticket ${ticket.channelId}:`, error);
+        }
+      }
+    }
+  }
+}
+
+export async function handleTicketDeleteCommand(guild, member, replyFn) {
+  if (!guild) return replyFn('❌ This command can only be used inside a server.');
+  if (!isMemberAdmin(member)) {
+    return replyFn('❌ **Permission Denied:** Only server Administrators or members with `Manage Server` permission can run `.ticket delete`.');
+  }
+  const confirmRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`ticket:delete_confirm:${member.id}`).setLabel('Confirm').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`ticket:delete_cancel:${member.id}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
+  return replyFn({
+    content: '⚠️ **Remove the support ticket service?** This will delete the `#support-ticket` panel channel, all open ticket channels, and the `Help & Support` category only if it is empty. Ticket log channels and non-empty categories will remain.',
+    components: [confirmRow],
+  });
+}
+
+async function confirmTicketServiceDelete(interaction, action, expectedAdminId) {
+  if (interaction.user.id !== expectedAdminId || !isMemberAdmin(interaction.member)) {
+    await interaction.reply({ content: '❌ Only the administrator who started this removal can use these buttons.', ephemeral: true });
+    return true;
+  }
+  if (action === 'cancel') {
+    await interaction.update({ content: 'Ticket service removal cancelled.', components: [] });
+    return true;
+  }
+
+  const { guild } = interaction;
+  await interaction.update({ content: 'Removing the support ticket service…', components: [] });
+  const summary = { panel: 0, openTickets: 0, category: 0, failures: 0 };
+  try {
+    if (!isMongoConnected()) throw new Error('MongoDB is unavailable; ticket setup records cannot be cleared.');
+    const settings = getGuildSettings(guild.id) || {};
+    const panelRecord = await getTicketPanel(guild.id);
+    const panelChannelId = panelRecord?.channelId || settings.channels?.supportTicketId;
+    let panelChannel = panelChannelId ? guild.channels.cache.get(panelChannelId) : null;
+    if (panelChannelId && !panelChannel) {
+      panelChannel = await guild.channels.fetch(panelChannelId).catch((error) => {
+        if (error?.code !== 10003) throw error;
+        return null;
+      });
+    }
+    if (!panelChannel) {
+      panelChannel = Array.from(guild.channels.cache.values()).find(
+        (item) => item.name?.toLowerCase() === 'support-ticket' && item.type === ChannelType.GuildText
+      ) || null;
+    }
+    const panelParent = panelChannel?.parentId ? guild.channels.cache.get(panelChannel.parentId) : null;
+
+    const tickets = await getTicketsForGuild(guild.id);
+    const openTickets = tickets.filter((ticket) => String(ticket.status).toLowerCase() === 'open');
+    for (const ticket of openTickets) {
+      let ticketChannel = guild.channels.cache.get(ticket.channelId);
+      if (!ticketChannel) {
+        ticketChannel = await guild.channels.fetch(ticket.channelId).catch((error) => {
+          if (error?.code !== 10003) throw error;
+          return null;
+        });
+      }
+      if (!ticketChannel) continue;
+      const deleted = await deleteTicketChannelWithRetries(ticketChannel, 'Remove support ticket service', 'ticket service removal');
+      if (deleted) summary.openTickets += 1;
+      else summary.failures += 1;
+    }
+
+    if (panelChannel) {
+      const deleted = await deleteTicketChannelWithRetries(panelChannel, 'Remove support ticket panel', 'ticket service removal');
+      if (deleted) summary.panel = 1;
+      else summary.failures += 1;
+    }
+
+    let helpCategory = panelParent?.name?.toLowerCase() === 'help & support'
+      ? panelParent
+      : Array.from(guild.channels.cache.values()).find(
+        (item) => item.type === ChannelType.GuildCategory && item.name?.toLowerCase() === 'help & support'
+      );
+    if (helpCategory) {
+      const channels = await guild.channels.fetch().catch(() => guild.channels.cache);
+      const children = Array.from(channels.values()).filter((item) => item.parentId === helpCategory.id);
+      if (children.length === 0) {
+        const deleted = await deleteTicketChannelWithRetries(helpCategory, 'Remove empty Help & Support category', 'ticket service removal');
+        if (deleted) summary.category = 1;
+        else summary.failures += 1;
+      }
+    }
+
+    await deleteTicketPanel(guild.id);
+    await deleteOpenTicketsForGuild(guild.id);
+    const updatedSettings = { ...settings, channels: { ...(settings.channels || {}) } };
+    delete updatedSettings.channels.supportTicketId;
+    guildSettingsCache[guild.id] = updatedSettings;
+    saveGuildSettings(guildSettingsCache);
+
+    const result = `✅ Ticket service removal finished: deleted ${summary.panel} panel channel, ${summary.openTickets} open ticket channel(s), and ${summary.category} empty Help & Support category. ${summary.failures ? `${summary.failures} channel deletion(s) failed; check the bot logs.` : ''}`;
+    await interaction.editReply({ content: result, components: [] });
+  } catch (error) {
+    console.error('[Ticket Service] Ticket service removal failed:', error);
+    await interaction.editReply({ content: `❌ Ticket service removal failed: ${error.message}`, components: [] }).catch(() => {});
+  }
+  return true;
+}
+
 /**
  * Global interaction handler for all ticket-related interactions:
  * - Category select menu (General Support vs Apply as Staff)
@@ -615,6 +865,11 @@ export async function handleTicketInteraction(interaction) {
 
   const { guild, user, member } = interaction;
   if (!guild) return false;
+
+  const deleteServiceMatch = customId.match(/^ticket:delete_(confirm|cancel):([^:]+)$/);
+  if (deleteServiceMatch) {
+    return confirmTicketServiceDelete(interaction, deleteServiceMatch[1], deleteServiceMatch[2]);
+  }
 
   if (interaction.isButton?.() && customId === 'ticket:confirm_cancel') {
     await interaction.update({ content: 'Cancelled', embeds: [], components: [] });
@@ -765,51 +1020,34 @@ export async function handleTicketInteraction(interaction) {
         TICKET_OPTIONS.find((opt) => opt.value === selectedValue) || { label: 'General Support' };
       const botMember = guild.members.me || await guild.members.fetchMe();
 
-      // Ensure "SUPPORT TICKETS" category exists
-      let category = Array.from(guild.channels.cache.values()).find(
-        (c) => c.type === ChannelType.GuildCategory && c.name?.toUpperCase() === 'SUPPORT TICKETS'
-      );
-
-      if (!category) {
-        logTicketCreationStep('creating SUPPORT TICKETS category', { guildId: guild.id });
-        category = await guild.channels.create({
-          name: 'SUPPORT TICKETS',
-          type: ChannelType.GuildCategory,
-          permissionOverwrites: [
-            {
-              id: guild.roles?.everyone?.id || guild.id,
-              deny: [PermissionFlagsBits.ViewChannel],
-            },
-            {
-              id: botMember.id,
-              allow: [
-                PermissionFlagsBits.ViewChannel,
-                PermissionFlagsBits.ManageChannels,
-                PermissionFlagsBits.ManageRoles,
-                PermissionFlagsBits.ManageMessages,
-              ],
-            },
-          ],
-        });
-        logTicketCreationStep('category created', { categoryId: category?.id || null });
+      const panelRecord = await getTicketPanel(guild.id);
+      const panelChannelId = panelRecord?.channelId || getGuildSettings(guild.id)?.channels?.supportTicketId;
+      const panelChannel = panelChannelId
+        ? guild.channels.cache.get(panelChannelId) || await guild.channels.fetch(panelChannelId).catch(() => null)
+        : null;
+      if (!panelChannel?.parentId) {
+        throw new Error('The support-ticket panel has no category. Run `.ticket setup` before creating a ticket.');
       }
+      const category = guild.channels.cache.get(panelChannel.parentId) || await guild.channels.fetch(panelChannel.parentId).catch(() => null);
+      if (!category || category.type !== ChannelType.GuildCategory) {
+        throw new Error('Could not find the category containing the support-ticket panel.');
+      }
+      logTicketCreationStep('using support panel category for ticket', { panelChannelId: panelChannel.id, categoryId: category.id, categoryName: category.name });
       await ensureCreationActive();
 
-      // Make sure the bot can administer ticket channels under this category.
+      // Keep the Help & Support category manageable while leaving other existing categories unchanged.
       logTicketCreationStep('checking bot category permissions', { categoryId: category.id, botId: botMember.id });
-      await category.permissionOverwrites.edit(botMember.id, {
-        ViewChannel: true,
-        ManageChannels: true,
-        ManageRoles: true,
-      });
-      await ensureCreationActive();
+      if (category.name?.toLowerCase() === 'help & support') {
+        await category.permissionOverwrites.edit(botMember.id, {
+          ViewChannel: true,
+          ManageChannels: true,
+          ManageRoles: true,
+        });
+        await ensureCreationActive();
+      }
       const categoryPermissions = category.permissionsFor(botMember);
-      if (!categoryPermissions?.has([
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.ManageChannels,
-        PermissionFlagsBits.ManageRoles,
-      ])) {
-        throw new Error('The bot needs View Channel, Manage Channels, and Manage Roles on the SUPPORT TICKETS category.');
+      if (!categoryPermissions?.has(PermissionFlagsBits.ViewChannel)) {
+        throw new Error('The bot needs View Channel access to the category containing the support-ticket panel.');
       }
       logTicketCreationStep('bot category permissions verified', { categoryId: category.id });
 
@@ -1347,45 +1585,55 @@ export async function handleTicketInteraction(interaction) {
       const ticket = await getTicketFromDb(interaction.channelId);
 
       // 1. Mark ticket closed in MongoDB
-      await updateTicketStatusInDb(interaction.channelId, 'closed');
-
-      // 2. Log ticket closed event to ticket-log
-      await logTicketEvent(guild, 'ticket_closed', {
-        ticketNumber: ticket?.ticketNumber,
-        channelId: interaction.channelId,
-        channelName: interaction.channel?.name,
-        closedBy: user.id,
-        userId: ticket?.userId,
-      });
+      const updated = await updateTicketStatusInDb(interaction.channelId, 'closed');
+      if (!updated) throw new Error('Ticket status could not be saved to MongoDB.');
 
       // 3. Acknowledge button interaction
       if (typeof interaction.update === 'function') {
         await interaction.update({
-          content: '🔒 Ticket closing confirmed. Channel will be deleted shortly.',
+          content: '🔒 Ticket closed. This channel will be deleted in 5 seconds.',
           components: [],
-        }).catch(() => {});
+        }).catch((error) => console.error('[Ticket Service] Could not update close confirmation; continuing deletion:', error));
       }
 
-      // 4. Tell the channel that the ticket is closing
+      // 4. Tell the channel it will be deleted, then wait before deleting.
       const chName = interaction.channel?.name;
-      await queueChannelSend(interaction.channel, {
-        content: `🔒 **Ticket closed by <@${user.id}>. This channel will be deleted in 5 seconds...**`,
-      });
+      try {
+        await queueChannelSend(interaction.channel, {
+          content: 'Ticket closed. This channel will be deleted in 5 seconds.',
+        });
+      } catch (sendError) {
+        console.error('[Ticket Service] Could not send the ticket-closed notice:', sendError);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5000));
 
-      // 5. Delete the channel after a few seconds (5 seconds)
-      setTimeout(async () => {
-        try {
-          await queueChannelDelete(interaction.channel, `Ticket closed by ${user.tag}`);
-          await logTicketEvent(guild, 'ticket_deleted', {
-            ticketNumber: ticket?.ticketNumber,
-            channelName: chName,
-            userId: ticket?.userId,
-            deletedBy: user.tag,
-          });
-        } catch (delErr) {
-          console.warn('[Ticket Service] ⚠️ Error deleting ticket channel:', delErr.message);
-        }
-      }, 5000);
+      const deleted = await deleteTicketChannelWithRetries(
+        interaction.channel,
+        `Ticket closed by ${user.tag || user.id}`,
+        'confirmed close',
+      );
+      if (!deleted) {
+        await interaction.followUp({
+          content: '❌ The ticket was marked closed, but Discord did not allow the channel deletion. The bot will retry on its next startup.',
+          ephemeral: true,
+        }).catch((error) => console.error('[Ticket Service] Could not report ticket deletion failure:', error));
+        return true;
+      }
+
+      await deleteTicketFromDb(interaction.channelId);
+      void logTicketEvent(guild, 'ticket_closed', {
+        ticketNumber: ticket?.ticketNumber,
+        channelId: interaction.channelId,
+        channelName: chName,
+        closedBy: user.id,
+        userId: ticket?.userId,
+      }).catch((error) => console.error('[Ticket Service] Closed-ticket log failed:', error));
+      void logTicketEvent(guild, 'ticket_deleted', {
+        ticketNumber: ticket?.ticketNumber,
+        channelName: chName,
+        userId: ticket?.userId,
+        deletedBy: user.tag || user.id,
+      }).catch((error) => console.error('[Ticket Service] Deleted-ticket log failed:', error));
 
       return true;
     } catch (err) {
