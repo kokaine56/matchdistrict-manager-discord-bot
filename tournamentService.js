@@ -1047,9 +1047,160 @@ export async function handleTournamentSelectionButton(interaction) {
   }
 }
 
+// Rate limiting map for failed verification attempts: Map<"guildId:userId", number[]>
+const verificationFailedAttempts = new Map();
+
 /**
- * Verify a registered Discord-linked user from a message in the tournament's verification channel.
- * Verification is persisted locally in Mongo and synced to the website through the bot API.
+ * Handles completion of tournament verification: website API call, role grant, message update, log, and roster refresh.
+ */
+async function completeTournamentVerification({
+  guild,
+  channel,
+  tournamentId,
+  savedTournament,
+  registrationId,
+  teamName,
+  captainId,
+  teammateIds = [],
+  invokerUser,
+  interaction = null,
+}) {
+  const apiUrl = getBackendApiUrl();
+  const secret = getBackendBotSecret();
+
+  try {
+    const response = await fetch(`${apiUrl}/api/bot/tournaments/${encodeURIComponent(tournamentId)}/verification/complete`, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        ...(secret ? { Authorization: `Bearer ${secret}`, 'x-bot-secret': secret } : {}),
+        'x-guild-id': guild.id,
+      },
+      body: JSON.stringify({
+        registration_id: registrationId,
+        captain_discord_id: captainId,
+        teammate_discord_ids: teammateIds,
+        guild_id: guild.id,
+      }),
+    });
+
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success) {
+      const errorMsg = result.message || result.error || `Verification failed (HTTP ${response.status}).`;
+      if (interaction) {
+        if (!interaction.replied && !interaction.deferred) {
+          await interaction.reply({ content: `⚠️ ${errorMsg}`, ephemeral: true }).catch(() => {});
+        } else {
+          await interaction.followUp({ content: `⚠️ ${errorMsg}`, ephemeral: true }).catch(() => {});
+        }
+      } else {
+        const reply = await channel.send(`⚠️ <@${captainId}>, ${errorMsg}`).catch(() => null);
+        if (reply) setTimeout(() => reply.delete().catch(() => {}), 10000);
+      }
+      return true;
+    }
+
+    const resolvedTeamName = result.team_name || teamName || 'Your team';
+    const slotNumber = result.slot_number;
+
+    // 1. Persist verified status in Mongo and local cache
+    const verifiedAt = new Date().toISOString();
+    savedTournament.verifiedRegistrations ||= {};
+    savedTournament.verifiedRegistrations[String(registrationId)] = {
+      registrationId: String(registrationId),
+      teamId: String(registrationId),
+      teamName: resolvedTeamName,
+      discordId: String(captainId),
+      verifiedAt,
+      mentionedMemberIds: teammateIds,
+      slotNumber: slotNumber || null,
+    };
+    guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
+    await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+
+    // 2. Assign tournament participant role to captain & teammates
+    if (savedTournament.roleId) {
+      for (const uid of [captainId, ...teammateIds]) {
+        const member = await guild.members.fetch(uid).catch(() => null);
+        if (member) {
+          await queueRoleAdd(member, savedTournament.roleId, `Verified participant for ${savedTournament.tournamentTitle || 'tournament'}`).catch(() => {});
+        }
+      }
+    }
+
+    // 3. Edit / send confirmation message
+    const allMemberMentions = [captainId, ...teammateIds].map(id => `<@${id}>`).join(', ');
+    const slotText = slotNumber ? ` (Slot #${slotNumber})` : '';
+    const confirmationText = `🎉 **Team ${resolvedTeamName} is confirmed!**${slotText}\n• Captain & Teammates: ${allMemberMentions}`;
+
+    if (interaction) {
+      if (interaction.deferred) {
+        await interaction.editReply({ content: confirmationText, components: [] }).catch(() => {});
+      } else if (!interaction.replied) {
+        await interaction.update({ content: confirmationText, components: [] }).catch(() => {});
+      } else {
+        await interaction.followUp({ content: confirmationText }).catch(() => {});
+      }
+    } else {
+      await channel.send(confirmationText).catch(() => {});
+    }
+
+    // 4. Send log entry to #tournament-log
+    await sendTournamentManagementLog(
+      guild,
+      { id: tournamentId, title: savedTournament.tournamentTitle },
+      null,
+      'Team Verified & Confirmed',
+      invokerUser,
+      [
+        { name: 'Team Name', value: resolvedTeamName },
+        { name: 'Captain', value: `<@${captainId}>` },
+        ...(teammateIds.length > 0 ? [{ name: 'Teammates', value: teammateIds.map(id => `<@${id}>`).join(', ') }] : []),
+        ...(slotNumber ? [{ name: 'Slot Number', value: `#${slotNumber}` }] : []),
+        { name: 'Registration ID', value: String(registrationId) },
+      ]
+    );
+
+    // 5. Refresh #registered-team channel roster
+    try {
+      const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId).catch(() => null);
+      if (backendData?.teams && savedTournament.channels?.tournamentTeamsId) {
+        const teamsChannel = guild.channels.cache.get(savedTournament.channels.tournamentTeamsId) ||
+          await guild.channels.fetch(savedTournament.channels.tournamentTeamsId).catch(() => null);
+        if (teamsChannel) {
+          await updateTeamsRosterMessages(
+            guild,
+            backendData.tournament || { id: tournamentId, title: savedTournament.tournamentTitle },
+            backendData.teams,
+            teamsChannel,
+            savedTournament
+          );
+        }
+      }
+    } catch (refreshErr) {
+      console.warn('[Discord Bot] Roster refresh after verification error:', refreshErr.message);
+    }
+
+    return true;
+  } catch (error) {
+    console.error(`[Discord Bot] Verification completion failed for tournament ${tournamentId}:`, error);
+    if (interaction) {
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: `⚠️ Verification could not be completed: ${error.message}`, ephemeral: true }).catch(() => {});
+      } else {
+        await interaction.followUp({ content: `⚠️ Verification could not be completed: ${error.message}`, ephemeral: true }).catch(() => {});
+      }
+    } else {
+      const reply = await channel.send(`⚠️ <@${captainId}>, verification could not be completed: ${error.message}`).catch(() => null);
+      if (reply) setTimeout(() => reply.delete().catch(() => {}), 10000);
+    }
+    return true;
+  }
+}
+
+/**
+ * Handle 8-character verification code posted in the tournament's verification channel.
  */
 export async function handleTournamentVerificationMessage(message) {
   if (!message?.guild || !message.channel || message.author?.bot) return false;
@@ -1060,65 +1211,221 @@ export async function handleTournamentVerificationMessage(message) {
   if (!match) return false;
 
   const [tournamentId, savedTournament] = match;
+  const rawText = (message.content || '').trim();
+
+  // Strictly an 8-character code (uppercase letters and digits)
+  if (!/^[A-Za-z0-9]{8}$/.test(rawText)) {
+    // Ignore every other message in this channel
+    return false;
+  }
+
+  // Delete the message immediately to prevent code leaking
+  await message.delete().catch(() => {});
+
+  const rateKey = `${message.guild.id}:${message.author.id}`;
+  const now = Date.now();
+  const tenMinutesAgo = now - 10 * 60 * 1000;
+  let attempts = (verificationFailedAttempts.get(rateKey) || []).filter(t => t > tenMinutesAgo);
+
+  if (attempts.length >= 5) {
+    const reply = await message.channel.send({
+      content: `⚠️ <@${message.author.id}>, too many failed verification attempts. Please wait 10 minutes before trying again.`
+    }).catch(() => null);
+    if (reply) setTimeout(() => reply.delete().catch(() => {}), 10000);
+    return true;
+  }
+
+  const code = rawText.toUpperCase();
+  const apiUrl = getBackendApiUrl();
+  const secret = getBackendBotSecret();
+
   try {
-    const backend = await fetchTournamentRegistrationsFromBackend(tournamentId);
-    const team = (backend.teams || []).find((entry) => {
-      const status = String(entry.status || '').toLowerCase();
-      if (status !== 'approved') return false;
-      return (entry.linked_members || []).some((member) => String(member.discord_id) === String(message.author.id));
-    });
-    if (!team?.registration_id) {
-      await message.reply('This Discord account is not linked to a registered team in this tournament.').catch(() => {});
-      return true;
-    }
-
-    const candidateIds = [...new Set([...message.mentions.users.values()]
-      .filter((user) => user && user.id !== message.author.id && !user.bot)
-      .map((user) => user.id))];
-    const validIds = [];
-    for (const userId of candidateIds) {
-      const member = await message.guild.members.fetch({ user: userId, force: true }).catch(() => null);
-      if (member && !member.user.bot && userId !== message.author.id) validIds.push(userId);
-    }
-    if (validIds.length < 3) {
-      await message.reply(`Verification needs 3 different real members of this server (excluding you). I found ${validIds.length} valid mention${validIds.length === 1 ? '' : 's'}.`).catch(() => {});
-      return true;
-    }
-
-    const verifiedAt = new Date().toISOString();
-    savedTournament.verifiedRegistrations ||= {};
-    savedTournament.verifiedRegistrations[String(team.registration_id)] = {
-      registrationId: String(team.registration_id),
-      teamId: String(team.id || team.registration_id),
-      teamName: team.team_name || 'Registered team',
-      discordId: String(message.author.id),
-      verifiedAt,
-      mentionedMemberIds: validIds.slice(0, 3),
-    };
-    guildSettingsCache[message.guild.id].tournaments[tournamentId] = savedTournament;
-    await saveTournamentToDb(message.guild.id, tournamentId, savedTournament);
-
-    const apiUrl = getBackendApiUrl();
-    const secret = getBackendBotSecret();
-    const response = await fetch(`${apiUrl}/api/bot/tournaments/${encodeURIComponent(tournamentId)}/registrations/${encodeURIComponent(team.registration_id)}/verification`, {
+    const response = await fetch(`${apiUrl}/api/bot/tournaments/${encodeURIComponent(tournamentId)}/verification/check-code`, {
       method: 'POST',
       headers: {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
         ...(secret ? { Authorization: `Bearer ${secret}`, 'x-bot-secret': secret } : {}),
+        'x-guild-id': message.guild.id,
       },
-      body: JSON.stringify({ discord_id: String(message.author.id) }),
+      body: JSON.stringify({ code, guild_id: message.guild.id }),
     });
+
     const result = await response.json().catch(() => ({}));
+
     if (!response.ok || !result.success) {
-      throw new Error(result.message || result.error || `Website verification sync failed (HTTP ${response.status}).`);
+      attempts.push(now);
+      verificationFailedAttempts.set(rateKey, attempts);
+
+      let reasonMsg = result.message || 'Invalid verification code.';
+      if (result.reason === 'not_found') {
+        reasonMsg = 'Verification code not found. Please double-check the 8-character code from your MatchDistrict dashboard.';
+      } else if (result.reason === 'different_tournament') {
+        reasonMsg = 'This verification code belongs to a different tournament.';
+      } else if (result.reason === 'already_used') {
+        reasonMsg = 'This verification code has already been used.';
+      } else if (result.reason === 'not_approved_yet') {
+        reasonMsg = 'Registration is pending review/approval and cannot be verified yet.';
+      }
+
+      const reply = await message.channel.send({
+        content: `❌ <@${message.author.id}>, ${reasonMsg}`
+      }).catch(() => null);
+      if (reply) setTimeout(() => reply.delete().catch(() => {}), 10000);
+      return true;
     }
-    await message.reply(`✅ **${team.team_name || 'Your team'} is verified** for ${backend.tournament?.title || savedTournament.tournamentTitle || 'this tournament'}.`).catch(() => {});
-  } catch (error) {
-    console.error(`[Discord Bot] Verification processing failed for tournament ${tournamentId}, user ${message.author.id}:`, error);
-    await message.reply(`Verification could not be completed: ${error.message}`).catch(() => {});
+
+    const { registration_id, team_name, teammates_needed } = result;
+
+    // Solo tournament (teammates_needed === 0): Verify immediately!
+    if (!teammates_needed || teammates_needed <= 0) {
+      return await completeTournamentVerification({
+        guild: message.guild,
+        channel: message.channel,
+        tournamentId,
+        savedTournament,
+        registrationId: registration_id,
+        teamName: team_name,
+        captainId: message.author.id,
+        teammateIds: [],
+        invokerUser: message.author,
+      });
+    }
+
+    // Teammates needed: build UserSelectMenu + Cancel button
+    const selectMenu = new UserSelectMenuBuilder()
+      .setCustomId(`tver:select:${tournamentId}:${registration_id}:${message.author.id}:${teammates_needed}`)
+      .setPlaceholder(`Select your ${teammates_needed} remaining teammate${teammates_needed > 1 ? 's' : ''}`)
+      .setMinValues(teammates_needed)
+      .setMaxValues(teammates_needed);
+
+    const cancelButton = new ButtonBuilder()
+      .setCustomId(`tver:cancel:${tournamentId}:${registration_id}:${message.author.id}`)
+      .setLabel('Cancel')
+      .setStyle(ButtonStyle.Secondary);
+
+    const row1 = new ActionRowBuilder().addComponents(selectMenu);
+    const row2 = new ActionRowBuilder().addComponents(cancelButton);
+
+    const promptMsg = await message.channel.send({
+      content: `👋 <@${message.author.id}>, **${team_name}** found. Select your **${teammates_needed}** remaining teammate${teammates_needed > 1 ? 's' : ''}.`,
+      components: [row1, row2],
+    });
+
+    // 10-minute timeout: expire prompt and leave code unused
+    setTimeout(async () => {
+      try {
+        const fetched = await message.channel.messages.fetch(promptMsg.id).catch(() => null);
+        if (fetched && fetched.components?.length > 0) {
+          await fetched.edit({
+            content: `⏱️ Verification timed out for **${team_name}**. The code remains unused.`,
+            components: [],
+          }).catch(() => {});
+        }
+      } catch {}
+    }, 10 * 60 * 1000);
+
+    return true;
+  } catch (err) {
+    console.error(`[Discord Bot] Verification check failed for tournament ${tournamentId}, user ${message.author.id}:`, err);
+    const reply = await message.channel.send({
+      content: `⚠️ <@${message.author.id}>, verification check failed: ${err.message}`
+    }).catch(() => null);
+    if (reply) setTimeout(() => reply.delete().catch(() => {}), 10000);
+    return true;
   }
-  return true;
+}
+
+/**
+ * Handle teammate selection and cancel interactions in tournament verification.
+ */
+export async function handleTournamentVerificationInteraction(interaction) {
+  if (!interaction.customId?.startsWith('tver:')) return false;
+
+  const parts = interaction.customId.split(':');
+  // tver:select:<tournamentId>:<registrationId>:<captainId>:<teammatesNeeded>
+  // tver:cancel:<tournamentId>:<registrationId>:<captainId>
+  const action = parts[1];
+  const tournamentId = parts[2];
+  const registrationId = parts[3];
+  const captainId = parts[4];
+  const teammatesNeeded = parseInt(parts[5], 10) || 0;
+
+  if (interaction.user.id !== captainId) {
+    await interaction.reply({
+      content: '⚠️ This verification prompt is not for you. Only the captain who submitted the code can interact with this.',
+      ephemeral: true,
+    }).catch(() => {});
+    return true;
+  }
+
+  const savedTournament = guildSettingsCache[interaction.guild.id]?.tournaments?.[tournamentId];
+  if (!savedTournament) {
+    await interaction.reply({ content: '⚠️ Tournament configuration not found.', ephemeral: true }).catch(() => {});
+    return true;
+  }
+
+  if (action === 'cancel') {
+    await interaction.update({
+      content: `❌ Verification cancelled. The code remains unused.`,
+      components: [],
+    }).catch(() => {});
+    return true;
+  }
+
+  if (action === 'select') {
+    const selectedIds = interaction.values || [];
+    if (selectedIds.length !== teammatesNeeded) {
+      await interaction.reply({
+        content: `⚠️ You must select exactly ${teammatesNeeded} teammate${teammatesNeeded > 1 ? 's' : ''}.`,
+        ephemeral: true,
+      }).catch(() => {});
+      return true;
+    }
+
+    if (selectedIds.includes(interaction.user.id)) {
+      await interaction.reply({
+        content: `⚠️ You cannot select yourself as a teammate. Please choose your remaining teammates.`,
+        ephemeral: true,
+      }).catch(() => {});
+      return true;
+    }
+
+    // Validate members: real server members & not bots
+    for (const uid of selectedIds) {
+      const member = await interaction.guild.members.fetch(uid).catch(() => null);
+      if (!member) {
+        await interaction.reply({
+          content: `⚠️ <@${uid}> is not a member of this server. All teammates must be in the server.`,
+          ephemeral: true,
+        }).catch(() => {});
+        return true;
+      }
+      if (member.user.bot) {
+        await interaction.reply({
+          content: `⚠️ <@${uid}> is a bot. Bots cannot be tournament teammates.`,
+          ephemeral: true,
+        }).catch(() => {});
+        return true;
+      }
+    }
+
+    await interaction.deferUpdate().catch(() => {});
+
+    return await completeTournamentVerification({
+      guild: interaction.guild,
+      channel: interaction.channel,
+      tournamentId,
+      savedTournament,
+      registrationId,
+      captainId: interaction.user.id,
+      teammateIds: selectedIds,
+      invokerUser: interaction.user,
+      interaction,
+    });
+  }
+
+  return false;
 }
 
 /**

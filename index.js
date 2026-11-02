@@ -94,6 +94,7 @@ import {
   handleDashboardQualifySelection,
   fetchTournamentRegistrationsFromBackend,
   handleTournamentVerificationMessage,
+  handleTournamentVerificationInteraction,
   handlePermanentTournamentDeleteCommand,
   executeTournamentPermanentDeletion,
   resumePendingTournamentDeletions,
@@ -2756,6 +2757,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // Handle announcement DM confirmation interactions (Confirm & Cancel)
   if (interaction.customId?.startsWith('annc:')) {
     const handled = await handleAnnouncementInteraction(interaction);
+    if (handled) return;
+  }
+
+  // Handle tournament verification interactions (teammate select & cancel)
+  if (interaction.customId?.startsWith('tver:')) {
+    const handled = await handleTournamentVerificationInteraction(interaction);
     if (handled) return;
   }
 
