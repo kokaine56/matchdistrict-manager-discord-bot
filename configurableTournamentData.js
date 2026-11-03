@@ -14,6 +14,17 @@ export function clearInMemoryData() {
   localEntries.clear();
 }
 
+function normalizeTournament(doc) {
+  if (!doc) return null;
+  const rawReq = doc.requiredDiscordMembers;
+  const parsed = typeof rawReq === 'number' ? rawReq : parseInt(rawReq, 10);
+  const requiredDiscordMembers = (!isNaN(parsed) && parsed >= 1 && parsed <= 4) ? parsed : 4;
+  return {
+    ...doc,
+    requiredDiscordMembers,
+  };
+}
+
 // ----------------------------------------------------
 // TOURNAMENT CRUD
 // ----------------------------------------------------
@@ -22,8 +33,9 @@ export async function saveConfigurableTournament(doc) {
   if (!doc) return null;
   const now = new Date();
   const tournamentId = doc.tournamentId || crypto.randomUUID();
+  const normalized = normalizeTournament(doc);
   const record = {
-    ...doc,
+    ...normalized,
     tournamentId,
     updatedAt: now,
     createdAt: doc.createdAt || now,
@@ -54,14 +66,16 @@ export async function getConfigurableTournament(tournamentId) {
       const col = getMongoDb().collection('discord_configurable_tournaments');
       const doc = await col.findOne({ tournamentId });
       if (doc) {
-        localTournaments.set(tournamentId, doc);
-        return doc;
+        const normalized = normalizeTournament(doc);
+        localTournaments.set(tournamentId, normalized);
+        return normalized;
       }
     } catch (err) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error reading tournament ${tournamentId}:`, err.message);
     }
   }
-  return localTournaments.get(tournamentId) || null;
+  const local = localTournaments.get(tournamentId);
+  return local ? normalizeTournament(local) : null;
 }
 
 export async function getConfigurableTournamentByCategory(guildId, categoryId) {
@@ -71,8 +85,9 @@ export async function getConfigurableTournamentByCategory(guildId, categoryId) {
       const col = getMongoDb().collection('discord_configurable_tournaments');
       const doc = await col.findOne({ guildId, categoryId });
       if (doc) {
-        localTournaments.set(doc.tournamentId, doc);
-        return doc;
+        const normalized = normalizeTournament(doc);
+        localTournaments.set(doc.tournamentId, normalized);
+        return normalized;
       }
     } catch (err) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error reading tournament by category:`, err.message);
@@ -81,7 +96,7 @@ export async function getConfigurableTournamentByCategory(guildId, categoryId) {
 
   for (const doc of localTournaments.values()) {
     if (doc.guildId === guildId && doc.categoryId === categoryId) {
-      return doc;
+      return normalizeTournament(doc);
     }
   }
   return null;
@@ -94,8 +109,9 @@ export async function getConfigurableTournamentBySetupChannel(setupChannelId) {
       const col = getMongoDb().collection('discord_configurable_tournaments');
       const doc = await col.findOne({ setupChannelId });
       if (doc) {
-        localTournaments.set(doc.tournamentId, doc);
-        return doc;
+        const normalized = normalizeTournament(doc);
+        localTournaments.set(doc.tournamentId, normalized);
+        return normalized;
       }
     } catch (err) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error reading tournament by setup channel:`, err.message);
@@ -104,7 +120,7 @@ export async function getConfigurableTournamentBySetupChannel(setupChannelId) {
 
   for (const doc of localTournaments.values()) {
     if (doc.setupChannelId === setupChannelId) {
-      return doc;
+      return normalizeTournament(doc);
     }
   }
   return null;
@@ -116,16 +132,17 @@ export async function getAllConfigurableTournaments(guildId = null) {
       const col = getMongoDb().collection('discord_configurable_tournaments');
       const query = guildId ? { guildId } : {};
       const docs = await col.find(query).toArray();
-      for (const d of docs) {
+      const normalizedDocs = docs.map(normalizeTournament);
+      for (const d of normalizedDocs) {
         localTournaments.set(d.tournamentId, d);
       }
-      return docs;
+      return normalizedDocs;
     } catch (err) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error getting all tournaments:`, err.message);
     }
   }
 
-  const all = Array.from(localTournaments.values());
+  const all = Array.from(localTournaments.values()).map(normalizeTournament);
   return guildId ? all.filter((d) => d.guildId === guildId) : all;
 }
 

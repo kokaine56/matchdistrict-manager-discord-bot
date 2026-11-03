@@ -5,6 +5,7 @@ import {
   ButtonStyle,
   ChannelType,
   PermissionFlagsBits,
+  StringSelectMenuBuilder,
 } from 'discord.js';
 import crypto from 'node:crypto';
 import {
@@ -58,6 +59,11 @@ export function buildDashboardEmbed(tournament, registrations = [], enrolledCoun
       .join('\n');
   }
 
+  const reqMembers = tournament.requiredDiscordMembers ?? 4;
+  const reqMembersText = reqMembers === 1
+    ? '`1 Member` *(Leader only)*'
+    : `\`${reqMembers} Members\` *(Leader + ${reqMembers - 1} teammate${reqMembers > 2 ? 's' : ''})*`;
+
   return new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle(`🏆 Tournament Management Dashboard`)
@@ -66,6 +72,9 @@ export function buildDashboardEmbed(tournament, registrations = [], enrolledCoun
       `**Category ID:** \`${tournament.categoryId}\`\n` +
       `**Enrolled Squads:** \`${enrolledCount}\`\n` +
       `**Active Registrations:** \`${registrations.length}\`\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `⚙️ **Tournament Settings:**\n` +
+      `• **Required Discord Members:** ${reqMembersText}\n\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
       `📁 **Standard Channels:**\n${channelsText}\n\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
@@ -108,8 +117,13 @@ export function buildDashboardButtons(tournamentId) {
     new ButtonBuilder()
       .setCustomId(`md_cfg_manage_regs_${tournamentId}`)
       .setLabel('Manage Registrations')
+      .setEmoji('📋')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`md_cfg_settings_${tournamentId}`)
+      .setLabel('Tournament Settings')
       .setEmoji('⚙️')
-      .setStyle(ButtonStyle.Primary)
+      .setStyle(ButtonStyle.Secondary)
   );
 
   return [row1, row2];
@@ -414,6 +428,101 @@ export async function handleConfigurableChannelUpdate(oldChannel, newChannel) {
 }
 
 /**
+ * Displays the Tournament Settings configuration panel.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} tournamentId
+ */
+export async function handleTournamentSettingsButton(interaction, tournamentId) {
+  const tournament = await getConfigurableTournament(tournamentId);
+  if (!tournament) {
+    return interaction.reply({ content: '❌ Tournament configuration not found.', ephemeral: true });
+  }
+
+  const reqMembers = tournament.requiredDiscordMembers ?? 4;
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`md_cfg_set_req_members_${tournamentId}`)
+    .setPlaceholder('Choose Required Discord Members...')
+    .addOptions([
+      {
+        label: '1 Member',
+        description: 'Leader only',
+        value: '1',
+        default: reqMembers === 1,
+      },
+      {
+        label: '2 Members',
+        description: 'Leader + 1 teammate',
+        value: '2',
+        default: reqMembers === 2,
+      },
+      {
+        label: '3 Members',
+        description: 'Leader + 2 teammates',
+        value: '3',
+        default: reqMembers === 3,
+      },
+      {
+        label: '4 Members',
+        description: 'Leader + 3 teammates',
+        value: '4',
+        default: reqMembers === 4,
+      },
+    ]);
+
+  const row = new ActionRowBuilder().addComponents(select);
+
+  await interaction.reply({
+    content:
+      `⚙️ **Tournament Settings — ${tournament.name}**\n\n` +
+      `**Required Discord Members**\n` +
+      `Choose how many Discord server members must be associated with a team during enrollment. The team leader is always included.\n\n` +
+      `📌 *Current Setting:* **${reqMembers} Member${reqMembers > 1 ? 's' : ''}** (${reqMembers === 1 ? 'Leader only' : `Leader + ${reqMembers - 1} teammate(s)`})\n\n` +
+      `Select a new value below to modify:`,
+    components: [row],
+    ephemeral: true,
+  });
+}
+
+/**
+ * Handles changing the Required Discord Members setting.
+ * Saves to MongoDB and edits the persistent dashboard in-place without creating a new message.
+ * @param {import('discord.js').StringSelectMenuInteraction} interaction
+ * @param {string} tournamentId
+ */
+export async function handleSetRequiredMembers(interaction, tournamentId) {
+  const tournament = await getConfigurableTournament(tournamentId);
+  if (!tournament) {
+    return interaction.reply({ content: '❌ Tournament configuration not found.', ephemeral: true });
+  }
+
+  const selectedVal = parseInt(interaction.values[0], 10);
+  if (isNaN(selectedVal) || selectedVal < 1 || selectedVal > 4) {
+    return interaction.reply({
+      content: '❌ Invalid setting value. Allowed values are 1, 2, 3, or 4.',
+      ephemeral: true,
+    });
+  }
+
+  tournament.requiredDiscordMembers = selectedVal;
+  await saveConfigurableTournament(tournament);
+
+  // Edit existing persistent dashboard in place
+  await refreshDashboard(interaction.client, tournamentId);
+
+  const desc = selectedVal === 1
+    ? 'Leader only'
+    : `Leader + ${selectedVal - 1} teammate${selectedVal > 2 ? 's' : ''}`;
+
+  await interaction.update({
+    content:
+      `✅ **Required Discord Members updated to ${selectedVal} Member${selectedVal > 1 ? 's' : ''}** (${desc})!\n\n` +
+      `Persistent tournament dashboard has been updated in-place.`,
+    components: [],
+  });
+}
+
+/**
  * Main dispatcher for all md_cfg_ interactions (buttons, modals, selects).
  * @param {import('discord.js').Interaction} interaction
  * @returns {Promise<boolean>}
@@ -526,6 +635,20 @@ export async function handleConfigurableTournamentInteraction(interaction) {
   if (customId.startsWith('md_cfg_delete_reg_')) {
     const registrationId = customId.replace('md_cfg_delete_reg_', '');
     await handleDeleteRegistration(interaction, registrationId);
+    return true;
+  }
+
+  // 15. Tournament Settings button
+  if (customId.startsWith('md_cfg_settings_')) {
+    const tournamentId = customId.replace('md_cfg_settings_', '');
+    await handleTournamentSettingsButton(interaction, tournamentId);
+    return true;
+  }
+
+  // 16. Required Discord Members select menu
+  if (customId.startsWith('md_cfg_set_req_members_')) {
+    const tournamentId = customId.replace('md_cfg_set_req_members_', '');
+    await handleSetRequiredMembers(interaction, tournamentId);
     return true;
   }
 

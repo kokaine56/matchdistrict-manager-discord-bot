@@ -37,11 +37,15 @@ import {
   handleSetupTournamentCommand,
   handleCreateStandardChannels,
   handleConfigurableChannelUpdate,
+  handleTournamentSettingsButton,
+  handleSetRequiredMembers,
 } from '../configurableTournamentService.js';
 
 import {
   buildEnrollmentEmbed,
   buildEnrollmentComponents,
+  handleEnrollModalSubmit,
+  handleEnrollUserSelect,
 } from '../teamEnrollmentService.js';
 
 import {
@@ -198,9 +202,10 @@ test('Dashboard Layout - ActionRows and Embed generation', () => {
   assert.equal(row1Buttons[2].data.custom_id, 'md_cfg_refresh_dash_tour-1');
 
   const row2Buttons = rows[1].components;
-  assert.equal(row2Buttons.length, 2);
+  assert.equal(row2Buttons.length, 3);
   assert.equal(row2Buttons[0].data.custom_id, 'md_cfg_add_reg_tour-1');
   assert.equal(row2Buttons[1].data.custom_id, 'md_cfg_manage_regs_tour-1');
+  assert.equal(row2Buttons[2].data.custom_id, 'md_cfg_settings_tour-1');
 });
 
 // ----------------------------------------------------
@@ -759,4 +764,389 @@ test('Startup Reconciliation - Restores IDP permissions and messages on restart'
   assert.equal(restoredOverwrites.length, 1);
   assert.equal(restoredOverwrites[0].userId, 'leader-res-99');
   assert.equal(restoredOverwrites[0].perms.ViewChannel, true);
+});
+
+// ----------------------------------------------------
+// 10. Configurable Discord Member Requirement Tests
+// ----------------------------------------------------
+
+function createMockModalInteraction(tournamentId, userId, teamName, p1 = 'Leader 101', p2 = 'P2 102', p3 = 'P3 103', p4 = 'P4 104') {
+  let replyPayload = null;
+  return {
+    id: `inter-${Date.now()}-${Math.random()}`,
+    guildId: 'guild-cfg',
+    guild: {
+      id: 'guild-cfg',
+      members: {
+        cache: new Map([
+          [userId, { id: userId }],
+          ['tm-1', { id: 'tm-1' }],
+          ['tm-2', { id: 'tm-2' }],
+          ['tm-3', { id: 'tm-3' }],
+          ['tm-4', { id: 'tm-4' }],
+        ]),
+        fetch: async (id) => {
+          const known = ['tm-1', 'tm-2', 'tm-3', 'tm-4', userId];
+          return known.includes(id) ? { id } : null;
+        },
+      },
+    },
+    user: { id: userId },
+    fields: {
+      getTextInputValue: (field) => {
+        if (field === 'team_name') return teamName;
+        if (field === 'player_1') return p1;
+        if (field === 'player_2') return p2;
+        if (field === 'player_3') return p3;
+        if (field === 'player_4') return p4;
+        return '';
+      },
+    },
+    reply: async (payload) => {
+      replyPayload = payload;
+      return payload;
+    },
+    getReply: () => replyPayload,
+  };
+}
+
+function createMockSelectInteraction(tournamentId, userId, values, isServerMember = true) {
+  let replyPayload = null;
+  let updatePayload = null;
+  return {
+    id: `select-${Date.now()}-${Math.random()}`,
+    guildId: 'guild-cfg',
+    guild: {
+      id: 'guild-cfg',
+      members: {
+        cache: new Map([
+          [userId, { id: userId }],
+          ['tm-1', { id: 'tm-1' }],
+          ['tm-2', { id: 'tm-2' }],
+          ['tm-3', { id: 'tm-3' }],
+          ['tm-4', { id: 'tm-4' }],
+        ]),
+        fetch: async (id) => {
+          if (!isServerMember && id === 'non-member-999') return null;
+          const known = ['tm-1', 'tm-2', 'tm-3', 'tm-4', userId];
+          return known.includes(id) ? { id } : null;
+        },
+      },
+    },
+    user: { id: userId },
+    values,
+    reply: async (payload) => {
+      replyPayload = payload;
+      return payload;
+    },
+    update: async (payload) => {
+      updatePayload = payload;
+      return payload;
+    },
+    getReply: () => replyPayload || updatePayload,
+  };
+}
+
+test('Configurable Members - Setting = 1 (Leader only) enrolls team immediately without teammate select menu', async () => {
+  const tour = await saveConfigurableTournament({
+    tournamentId: 'tour-setting-1',
+    guildId: 'guild-cfg',
+    name: 'Solo Leader Tour',
+    requiredDiscordMembers: 1,
+  });
+
+  const modalInt = createMockModalInteraction('tour-setting-1', 'leader-1-only', 'Team Lone Wolf');
+  await handleEnrollModalSubmit(modalInt, 'tour-setting-1');
+
+  assert.match(modalInt.getReply().content, /Squad Enrollment Successful/);
+  assert.ok(!modalInt.getReply().components || modalInt.getReply().components.length === 0, 'No select menu should be prompted');
+
+  const team = await getConfigurableTeamByName('tour-setting-1', 'Team Lone Wolf');
+  assert.ok(team, 'Team must be saved');
+  assert.equal(team.leaderDiscordId, 'leader-1-only');
+  assert.equal(team.players[0].discordId, 'leader-1-only');
+  assert.equal(team.players[1].discordId, null, 'Teammate 2 has no discord ID in setting 1');
+  assert.equal(team.players[2].discordId, null, 'Teammate 3 has no discord ID in setting 1');
+  assert.equal(team.players[3].discordId, null, 'Teammate 4 has no discord ID in setting 1');
+});
+
+test('Configurable Members - Setting = 2 (Leader + 1 teammate)', async () => {
+  await saveConfigurableTournament({
+    tournamentId: 'tour-setting-2',
+    guildId: 'guild-cfg',
+    name: 'Duo Tour',
+    requiredDiscordMembers: 2,
+  });
+
+  const modalInt = createMockModalInteraction('tour-setting-2', 'leader-2', 'Team Duo Dynamic');
+  await handleEnrollModalSubmit(modalInt, 'tour-setting-2');
+
+  assert.ok(modalInt.getReply().components?.length > 0, 'Must prompt user select menu');
+  const userSelect = modalInt.getReply().components[0].components[0];
+  assert.equal(userSelect.data.min_values, 1);
+  assert.equal(userSelect.data.max_values, 1);
+
+  const selectInt = createMockSelectInteraction('tour-setting-2', 'leader-2', ['tm-1']);
+  await handleEnrollUserSelect(selectInt, 'tour-setting-2');
+
+  assert.match(selectInt.getReply().content, /Squad Enrollment Successful/);
+  const team = await getConfigurableTeamByName('tour-setting-2', 'Team Duo Dynamic');
+  assert.ok(team);
+  assert.equal(team.leaderDiscordId, 'leader-2');
+  assert.equal(team.players[0].discordId, 'leader-2');
+  assert.equal(team.players[1].discordId, 'tm-1');
+  assert.equal(team.players[2].discordId, null);
+});
+
+test('Configurable Members - Setting = 3 (Leader + 2 teammates)', async () => {
+  await saveConfigurableTournament({
+    tournamentId: 'tour-setting-3',
+    guildId: 'guild-cfg',
+    name: 'Trio Tour',
+    requiredDiscordMembers: 3,
+  });
+
+  const modalInt = createMockModalInteraction('tour-setting-3', 'leader-3', 'Team Trio Titans');
+  await handleEnrollModalSubmit(modalInt, 'tour-setting-3');
+
+  const userSelect = modalInt.getReply().components[0].components[0];
+  assert.equal(userSelect.data.min_values, 2);
+  assert.equal(userSelect.data.max_values, 2);
+
+  const selectInt = createMockSelectInteraction('tour-setting-3', 'leader-3', ['tm-1', 'tm-2']);
+  await handleEnrollUserSelect(selectInt, 'tour-setting-3');
+
+  assert.match(selectInt.getReply().content, /Squad Enrollment Successful/);
+  const team = await getConfigurableTeamByName('tour-setting-3', 'Team Trio Titans');
+  assert.ok(team);
+  assert.equal(team.players[0].discordId, 'leader-3');
+  assert.equal(team.players[1].discordId, 'tm-1');
+  assert.equal(team.players[2].discordId, 'tm-2');
+  assert.equal(team.players[3].discordId, null);
+});
+
+test('Configurable Members - Setting = 4 (Leader + 3 teammates - Default)', async () => {
+  // Omit requiredDiscordMembers to test default = 4
+  await saveConfigurableTournament({
+    tournamentId: 'tour-setting-4',
+    guildId: 'guild-cfg',
+    name: 'Full Squad Tour',
+  });
+
+  const modalInt = createMockModalInteraction('tour-setting-4', 'leader-4', 'Team Squad 4');
+  await handleEnrollModalSubmit(modalInt, 'tour-setting-4');
+
+  const userSelect = modalInt.getReply().components[0].components[0];
+  assert.equal(userSelect.data.min_values, 3);
+  assert.equal(userSelect.data.max_values, 3);
+
+  const selectInt = createMockSelectInteraction('tour-setting-4', 'leader-4', ['tm-1', 'tm-2', 'tm-3']);
+  await handleEnrollUserSelect(selectInt, 'tour-setting-4');
+
+  assert.match(selectInt.getReply().content, /Squad Enrollment Successful/);
+  const team = await getConfigurableTeamByName('tour-setting-4', 'Team Squad 4');
+  assert.ok(team);
+  assert.equal(team.players[0].discordId, 'leader-4');
+  assert.equal(team.players[1].discordId, 'tm-1');
+  assert.equal(team.players[2].discordId, 'tm-2');
+  assert.equal(team.players[3].discordId, 'tm-3');
+});
+
+test('Tournament Settings UI - Modifying setting from 4 to 2 updates persistent dashboard and MongoDB', async () => {
+  const tour = await saveConfigurableTournament({
+    tournamentId: 'tour-settings-ui',
+    guildId: 'guild-cfg',
+    name: 'Dynamic Settings Tour',
+    setupChannelId: 'setup-chan-ui',
+    requiredDiscordMembers: 4,
+  });
+
+  let dashboardUpdated = false;
+  const mockChannel = {
+    id: 'setup-chan-ui',
+    isTextBased: () => true,
+    messages: {
+      fetch: async () => ({
+        edit: async () => { dashboardUpdated = true; },
+      }),
+    },
+  };
+  tour.dashboardMessageId = 'dash-msg-ui';
+  await saveConfigurableTournament(tour);
+
+  const mockClient = {
+    channels: {
+      fetch: async (id) => (id === 'setup-chan-ui' ? mockChannel : null),
+    },
+  };
+
+  // 1. Open settings panel
+  let settingsReply = null;
+  const settingsBtnInt = {
+    client: mockClient,
+    reply: async (payload) => { settingsReply = payload; },
+  };
+  await handleTournamentSettingsButton(settingsBtnInt, 'tour-settings-ui');
+
+  assert.ok(settingsReply.components?.length > 0);
+  const menu = settingsReply.components[0].components[0];
+  assert.equal(menu.data.custom_id, 'md_cfg_set_req_members_tour-settings-ui');
+  assert.equal(menu.options.length, 4);
+
+  // 2. Select 2 Members
+  let updateReply = null;
+  const selectInt = {
+    client: mockClient,
+    values: ['2'],
+    update: async (payload) => { updateReply = payload; },
+  };
+  await handleSetRequiredMembers(selectInt, 'tour-settings-ui');
+
+  assert.match(updateReply.content, /Required Discord Members updated to 2 Members/);
+  assert.ok(dashboardUpdated, 'Existing persistent dashboard message must be edited in-place');
+
+  // Verify MongoDB updated
+  const updatedTour = await getConfigurableTournament('tour-settings-ui');
+  assert.equal(updatedTour.requiredDiscordMembers, 2);
+});
+
+test('Configurable Members - Existing teams remain unchanged when setting changes', async () => {
+  const tourId = 'tour-unchanged-test';
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    requiredDiscordMembers: 4,
+  });
+
+  // Enroll team under setting = 4
+  const modalInt = createMockModalInteraction(tourId, 'leader-orig', 'Original Team');
+  await handleEnrollModalSubmit(modalInt, tourId);
+  const selectInt = createMockSelectInteraction(tourId, 'leader-orig', ['tm-1', 'tm-2', 'tm-3']);
+  await handleEnrollUserSelect(selectInt, tourId);
+
+  const originalTeam = await getConfigurableTeamByName(tourId, 'Original Team');
+  assert.equal(originalTeam.players.filter((p) => p.discordId).length, 4);
+
+  // Change tournament setting to 1
+  const tour = await getConfigurableTournament(tourId);
+  tour.requiredDiscordMembers = 1;
+  await saveConfigurableTournament(tour);
+
+  // Check original team remains identical
+  const checkedTeam = await getConfigurableTeamByName(tourId, 'Original Team');
+  assert.equal(checkedTeam.players.filter((p) => p.discordId).length, 4);
+});
+
+test('Validation - Duplicate Discord members in teammate selection are rejected', async () => {
+  const tourId = 'tour-dup-members';
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    requiredDiscordMembers: 3,
+  });
+
+  const modalInt = createMockModalInteraction(tourId, 'leader-dup', 'Team Dup');
+  await handleEnrollModalSubmit(modalInt, tourId);
+
+  // User selects the same member 'tm-1' twice
+  const selectInt = createMockSelectInteraction(tourId, 'leader-dup', ['tm-1', 'tm-1']);
+  await handleEnrollUserSelect(selectInt, tourId);
+
+  assert.match(selectInt.getReply().content, /distinct server members/);
+  const team = await getConfigurableTeamByName(tourId, 'Team Dup');
+  assert.equal(team, null, 'Team must NOT be created when duplicate members are selected');
+});
+
+test('Validation - Leader selecting themselves in teammate select menu is rejected', async () => {
+  const tourId = 'tour-leader-again';
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    requiredDiscordMembers: 2,
+  });
+
+  const modalInt = createMockModalInteraction(tourId, 'leader-self', 'Team Self');
+  await handleEnrollModalSubmit(modalInt, tourId);
+
+  // Leader selects their own ID in teammate menu
+  const selectInt = createMockSelectInteraction(tourId, 'leader-self', ['leader-self']);
+  await handleEnrollUserSelect(selectInt, tourId);
+
+  assert.match(selectInt.getReply().content, /already included as Team Leader/);
+  const team = await getConfigurableTeamByName(tourId, 'Team Self');
+  assert.equal(team, null);
+});
+
+test('Validation - Non-server members are rejected', async () => {
+  const tourId = 'tour-non-member';
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    requiredDiscordMembers: 2,
+  });
+
+  const modalInt = createMockModalInteraction(tourId, 'leader-valid', 'Team External');
+  await handleEnrollModalSubmit(modalInt, tourId);
+
+  // Passes an outsider ID that fetch returns null for
+  const selectInt = createMockSelectInteraction(tourId, 'leader-valid', ['non-member-999'], false);
+  await handleEnrollUserSelect(selectInt, tourId);
+
+  assert.match(selectInt.getReply().content, /not a member of this Discord server/);
+  const team = await getConfigurableTeamByName(tourId, 'Team External');
+  assert.equal(team, null);
+});
+
+test('Leader-only IDP Permissions - Preserved regardless of requiredDiscordMembers setting', async () => {
+  const tourId = 'tour-idp-verify-setting';
+  const leaderId = 'leader-idp-test';
+  const teammateId = 'tm-1';
+
+  // Even when 2 Discord members are required
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    requiredDiscordMembers: 2,
+  });
+
+  const modalInt = createMockModalInteraction(tourId, leaderId, 'Team IDP Check');
+  await handleEnrollModalSubmit(modalInt, tourId);
+  const selectInt = createMockSelectInteraction(tourId, leaderId, [teammateId]);
+  await handleEnrollUserSelect(selectInt, tourId);
+
+  const reg = await saveConfigurableRegistration({
+    registrationId: 'reg-idp-check',
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    displayName: 'Match 1',
+    totalSlots: 10,
+    status: 'OPEN',
+    registrationChannelId: 'reg-c-check',
+    idpChannelId: 'idp-c-check',
+  });
+
+  const overwrites = new Map();
+  const mockGuild = {
+    channels: {
+      fetch: async () => ({
+        id: 'idp-c-check',
+        permissionOverwrites: {
+          edit: async (userId, perms) => { overwrites.set(userId, perms); },
+        },
+      }),
+    },
+  };
+
+  const regInt = {
+    guild: mockGuild,
+    guildId: 'guild-cfg',
+    user: { id: leaderId },
+    client: { channels: { fetch: async () => ({ isTextBased: () => true, send: async () => ({ id: 'm' }), messages: { fetch: async () => null } }) } },
+    reply: async () => {},
+  };
+
+  await handleRegisterSquadButtonClick(regInt, 'reg-idp-check');
+
+  assert.equal(overwrites.has(leaderId), true, 'Team Leader MUST receive IDP channel access');
+  assert.equal(overwrites.has(teammateId), false, 'Enrolled teammate MUST NOT receive IDP channel access');
 });
