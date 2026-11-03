@@ -172,6 +172,16 @@ import {
   updateGuildMemberCache,
   removeGuildMemberFromCache,
 } from './memberCacheService.js';
+import {
+  handleSetupTournamentCommand,
+  handleConfigurableTournamentInteraction,
+  handleConfigurableChannelUpdate,
+} from './configurableTournamentService.js';
+import {
+  startRegistrationScheduler,
+  reconcileConfigurableTournaments,
+} from './registrationScheduler.js';
+
 
 export {
   handleListTournamentCommand,
@@ -2356,6 +2366,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log(`[Discord Bot] 🎮 MatchDistrict Bot is active across ${readyClient.guilds.cache.size} server(s).`);
   console.log(`[Discord Bot] ⚡ Command prefix: "${PREFIX}"`);
   startRoleSyncScheduler(readyClient);
+  startRegistrationScheduler(readyClient);
 
   // Verify bot moderation permissions across joined guilds
   for (const guild of readyClient.guilds.cache.values()) {
@@ -2375,6 +2386,11 @@ client.once(Events.ClientReady, async (readyClient) => {
     if (officialGuildId) {
       // Pending deletions resumed for all guilds
       await reconcileManagedBotState(readyClient, officialGuildId);
+    }
+    try {
+      await reconcileConfigurableTournaments(readyClient);
+    } catch (cfgRecErr) {
+      console.warn('[ConfigurableTournament] ⚠️ Error reconciling tournaments:', cfgRecErr.message);
     }
   } catch (recErr) {
     console.warn('[MongoDB] ⚠️ Error in startup recovery and reconciliation:', recErr.message);
@@ -2483,7 +2499,10 @@ client.on(Events.MessageCreate, async (message) => {
 
       if (cmd === 'setup') {
         const subCmd = (args[0] || '').toLowerCase();
-        if (subCmd === 'remove') {
+        if (subCmd === 'tournament') {
+          await handleSetupTournamentCommand(message);
+          return;
+        } else if (subCmd === 'remove') {
           await handleSetupRemoveCommand(message.guild, message.member, (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }));
           return;
         } else if (subCmd === 'confirm') {
@@ -2765,6 +2784,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const handled = await handleTournamentVerificationInteraction(interaction);
     if (handled) return;
   }
+  if (interaction.customId?.startsWith('md_cfg_')) {
+    const handled = await handleConfigurableTournamentInteraction(interaction);
+    if (handled) return;
+  }
+
 
   let dashboardContext = null;
   try {
@@ -2974,6 +2998,7 @@ client.on(Events.GuildRoleUpdate, async (oldRole, newRole) => {
 
 client.on(Events.ChannelUpdate, async (oldChannel, newChannel) => {
   await handleChannelUpdateAuditLog(oldChannel, newChannel);
+  await handleConfigurableChannelUpdate(oldChannel, newChannel);
 });
 
 client.on(Events.GuildMemberAdd, updateGuildMemberCache);

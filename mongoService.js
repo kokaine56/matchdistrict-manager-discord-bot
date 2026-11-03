@@ -225,6 +225,30 @@ async function ensureMongoIndexes() {
     await staffAppCol.createIndex({ guildId: 1, userId: 1 });
     await staffAppCol.createIndex({ status: 1 });
 
+        const cfgTourCol = mongoDb.collection('discord_configurable_tournaments');
+    await cfgTourCol.createIndex({ guildId: 1, categoryId: 1 }, { unique: true });
+    await cfgTourCol.createIndex({ tournamentId: 1 }, { unique: true });
+    await cfgTourCol.createIndex({ setupChannelId: 1 });
+
+    const cfgRegCol = mongoDb.collection('discord_configurable_registrations');
+    await cfgRegCol.createIndex({ tournamentId: 1, registrationNumber: 1 }, { unique: true });
+    await cfgRegCol.createIndex({ registrationId: 1 }, { unique: true });
+    await cfgRegCol.createIndex({ registrationChannelId: 1 });
+    await cfgRegCol.createIndex({ idpChannelId: 1 });
+    await cfgRegCol.createIndex({ status: 1 });
+
+    const cfgTeamCol = mongoDb.collection('discord_configurable_teams');
+    await cfgTeamCol.createIndex({ tournamentId: 1, teamId: 1 }, { unique: true });
+    await cfgTeamCol.createIndex({ tournamentId: 1, teamNameLower: 1 }, { unique: true });
+    await cfgTeamCol.createIndex({ tournamentId: 1, leaderDiscordId: 1 });
+    await cfgTeamCol.createIndex({ tournamentId: 1, 'players.discordId': 1 });
+
+    const cfgEntryCol = mongoDb.collection('discord_configurable_entries');
+    await cfgEntryCol.createIndex({ registrationId: 1, teamId: 1 }, { unique: true });
+    await cfgEntryCol.createIndex({ registrationId: 1, slotNumber: 1 }, { unique: true });
+    await cfgEntryCol.createIndex({ tournamentId: 1, teamId: 1 });
+    await cfgEntryCol.createIndex({ registrationId: 1 });
+
     console.log('[MongoDB] 🔒 Indexes verified across managed collections.');
   } catch (err) {
     console.warn('[MongoDB] ⚠️ Error creating indexes:', err.message);
@@ -1803,3 +1827,5 @@ export async function closeMongo() {
   }
 }
 
+
+export * from './configurableTournamentData.js';
