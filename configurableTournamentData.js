@@ -5,8 +5,9 @@ import { getMongoDb, isMongoConnected } from './mongoService.js';
 const localTournaments = new Map(); // tournamentId -> doc
 const localRegistrations = new Map(); // registrationId -> doc
 const localTeams = new Map(); // teamId -> doc
-const localEntries = new Map(); // `${registrationId}:${teamId}` -> doc
+const localEntries = new Map(); // `${registrationId}:${teamId}` or `${registrationId}:${cycleId}:${teamId}` -> doc
 const localPendingEnrollments = new Map(); // `${tournamentId}:${userId}` -> sessionDoc
+const localDailyCycles = new Map(); // cycleId -> doc
 
 export function clearInMemoryData() {
   localTournaments.clear();
@@ -14,6 +15,7 @@ export function clearInMemoryData() {
   localTeams.clear();
   localEntries.clear();
   localPendingEnrollments.clear();
+  localDailyCycles.clear();
 }
 
 function normalizeTournament(doc) {
@@ -24,6 +26,205 @@ function normalizeTournament(doc) {
   return {
     ...doc,
     requiredDiscordMembers,
+  };
+}
+
+/**
+ * Normalizes reserved slots input into a sorted array of positive integers.
+ * @param {string|Array<number>|number} input
+ * @param {number} [totalSlots]
+ * @returns {Array<number>}
+ */
+export function parseReservedSlots(input, totalSlots = null) {
+  if (!input) return [];
+  const slots = new Set();
+
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      const num = typeof item === 'number' ? item : parseInt(item, 10);
+      if (!isNaN(num) && num >= 1 && (!totalSlots || num <= totalSlots)) {
+        slots.add(num);
+      }
+    }
+  } else if (typeof input === 'number') {
+    for (let i = 1; i <= input; i++) {
+      if (!totalSlots || i <= totalSlots) slots.add(i);
+    }
+  } else if (typeof input === 'string') {
+    const tokens = input.split(/[\s,;]+/).filter(Boolean);
+    for (const token of tokens) {
+      const num = parseInt(token, 10);
+      if (!isNaN(num) && num >= 1 && (!totalSlots || num <= totalSlots)) {
+        slots.add(num);
+      }
+    }
+  }
+
+  return Array.from(slots).sort((a, b) => a - b);
+}
+
+/**
+ * Parses a recurring time string (e.g. "10:00 AM", "18:00", "02:00 AM", "6:00 pm").
+ * @param {string} timeStr
+ * @returns {{ hours: number, minutes: number, formatted: string } | null}
+ */
+export function parseTimeString(timeStr) {
+  if (!timeStr || typeof timeStr !== 'string') return null;
+  const match = timeStr.trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  if (!match) return null;
+
+  let hours = parseInt(match[1], 10);
+  const minutes = match[2] ? parseInt(match[2], 10) : 0;
+  const meridiem = match[3] ? match[3].toLowerCase() : null;
+
+  if (minutes < 0 || minutes > 59) return null;
+
+  if (meridiem) {
+    if (hours < 1 || hours > 12) return null;
+    if (meridiem === 'pm' && hours < 12) hours += 12;
+    if (meridiem === 'am' && hours === 12) hours = 0;
+  } else {
+    if (hours < 0 || hours > 23) return null;
+  }
+
+  const hh = String(hours).padStart(2, '0');
+  const mm = String(minutes).padStart(2, '0');
+  return { hours, minutes, formatted: `${hh}:${mm}` };
+}
+
+/**
+ * Returns current date/time parts in the specified timezone.
+ * @param {string} timezone
+ * @param {Date} [baseDate]
+ */
+export function getCurrentTimeInTimezone(timezone = 'Asia/Kolkata', baseDate = new Date()) {
+  try {
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hourCycle: 'h23',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+    const parts = formatter.formatToParts(baseDate);
+    const map = {};
+    for (const p of parts) map[p.type] = p.value;
+
+    const year = parseInt(map.year, 10);
+    const month = parseInt(map.month, 10);
+    const day = parseInt(map.day, 10);
+    const hour = parseInt(map.hour, 10);
+    const minute = parseInt(map.minute, 10);
+    const second = parseInt(map.second, 10);
+
+    const dateString = `${map.year}-${map.month}-${map.day}`;
+    const totalMinutes = hour * 60 + minute;
+    const timeString = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+
+    return { year, month, day, hour, minute, second, dateString, totalMinutes, timeString };
+  } catch {
+    // Fallback if timezone string is invalid
+    const d = baseDate;
+    const year = d.getUTCFullYear();
+    const month = d.getUTCMonth() + 1;
+    const day = d.getUTCDate();
+    const hour = d.getUTCHours();
+    const minute = d.getUTCMinutes();
+    const second = d.getUTCSeconds();
+    const dateString = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    return { year, month, day, hour, minute, second, dateString, totalMinutes: hour * 60 + minute, timeString: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}` };
+  }
+}
+
+/**
+ * Calculates next calendar cycle date string.
+ * @param {string} timezone
+ * @param {Date} [baseDate]
+ * @returns {string}
+ */
+export function getNextCycleDateString(timezone = 'Asia/Kolkata', baseDate = new Date()) {
+  const nextDay = new Date(baseDate.getTime() + 24 * 60 * 60 * 1000);
+  return getCurrentTimeInTimezone(timezone, nextDay).dateString;
+}
+
+/**
+ * Evaluates whether current clock time in the timezone falls within the daily active cycle.
+ * Handles both same-day (start < reset) and midnight-crossing (reset <= start) configurations.
+ * @param {string} dailyStartTime
+ * @param {string} dailyResetTime
+ * @param {string} timezone
+ * @param {Date} [now]
+ * @returns {{ isOpen: boolean, status: string, cycleDate: string }}
+ */
+export function evaluateDailyCycleStatus(dailyStartTime, dailyResetTime, timezone = 'Asia/Kolkata', now = new Date()) {
+  const parsedStart = parseTimeString(dailyStartTime);
+  const parsedReset = parseTimeString(dailyResetTime);
+
+  const tzInfo = getCurrentTimeInTimezone(timezone, now);
+  if (!parsedStart || !parsedReset) {
+    return {
+      isOpen: true,
+      status: 'OPEN',
+      cycleDate: tzInfo.dateString,
+      activeCycleDate: tzInfo.dateString,
+      endedCycleDate: null,
+    };
+  }
+
+  const startMinutes = parsedStart.hours * 60 + parsedStart.minutes;
+  const resetMinutes = parsedReset.hours * 60 + parsedReset.minutes;
+  const currentMinutes = tzInfo.totalMinutes;
+
+  const yesterdayDate = getCurrentTimeInTimezone(timezone, new Date(now.getTime() - 24 * 60 * 60 * 1000)).dateString;
+  const dayBeforeYesterdayDate = getCurrentTimeInTimezone(timezone, new Date(now.getTime() - 48 * 60 * 60 * 1000)).dateString;
+
+  let isOpen = false;
+  let activeCycleDate = tzInfo.dateString;
+  let endedCycleDate = yesterdayDate;
+
+  if (startMinutes < resetMinutes) {
+    // Same-day cycle (e.g. 10:00 to 22:00)
+    if (currentMinutes < startMinutes) {
+      isOpen = false;
+      activeCycleDate = tzInfo.dateString;
+      endedCycleDate = yesterdayDate;
+    } else if (currentMinutes < resetMinutes) {
+      isOpen = true;
+      activeCycleDate = tzInfo.dateString;
+      endedCycleDate = yesterdayDate;
+    } else {
+      isOpen = false;
+      activeCycleDate = tzInfo.dateString;
+      endedCycleDate = tzInfo.dateString;
+    }
+  } else {
+    // Midnight-crossing cycle (e.g. 10:00 AM to 02:00 AM next day)
+    if (currentMinutes >= startMinutes) {
+      isOpen = true;
+      activeCycleDate = tzInfo.dateString;
+      endedCycleDate = yesterdayDate;
+    } else if (currentMinutes < resetMinutes) {
+      isOpen = true;
+      activeCycleDate = yesterdayDate;
+      endedCycleDate = dayBeforeYesterdayDate;
+    } else {
+      // Between resetMinutes and startMinutes (e.g. 02:00 AM to 10:00 AM):
+      // The cycle that ended at resetMinutes today was yesterday's cycle.
+      isOpen = false;
+      activeCycleDate = tzInfo.dateString;
+      endedCycleDate = yesterdayDate;
+    }
+  }
+
+  return {
+    isOpen,
+    status: isOpen ? 'OPEN' : 'CLOSED',
+    cycleDate: activeCycleDate,
+    activeCycleDate,
+    endedCycleDate,
   };
 }
 
@@ -172,9 +373,16 @@ export async function saveConfigurableRegistration(doc) {
   if (!doc) return null;
   const now = new Date();
   const registrationId = doc.registrationId || crypto.randomUUID();
+  const totalSlots = typeof doc.totalSlots === 'number' && doc.totalSlots > 0 ? doc.totalSlots : 20;
+  const reservedSlots = parseReservedSlots(doc.reservedSlots, totalSlots);
+  const timezone = doc.timezone || 'Asia/Kolkata';
+
   const record = {
     ...doc,
     registrationId,
+    totalSlots,
+    reservedSlots,
+    timezone,
     updatedAt: now,
     createdAt: doc.createdAt || now,
   };
@@ -263,7 +471,7 @@ export async function getAllActiveConfigurableRegistrations() {
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_registrations');
-      const docs = await col.find({ status: { $in: ['UPCOMING', 'OPEN'] } }).toArray();
+      const docs = await col.find({}).toArray();
       for (const d of docs) {
         localRegistrations.set(d.registrationId, d);
       }
@@ -273,9 +481,7 @@ export async function getAllActiveConfigurableRegistrations() {
     }
   }
 
-  return Array.from(localRegistrations.values()).filter(
-    (r) => r.status === 'UPCOMING' || r.status === 'OPEN'
-  );
+  return Array.from(localRegistrations.values());
 }
 
 export async function deleteConfigurableRegistration(registrationId) {
@@ -479,19 +685,20 @@ export async function saveConfigurableEntry(doc) {
   const record = {
     ...doc,
     entryId,
+    cycleId: doc.cycleId || 'default',
     status: doc.status || 'CONFIRMED',
     updatedAt: now,
     registeredAt: doc.registeredAt || now,
   };
 
-  const key = `${record.registrationId}:${record.teamId}`;
-  localEntries.set(key, { ...record });
+  const cycleKey = `${record.registrationId}:${record.cycleId}:${record.teamId}`;
+  localEntries.set(cycleKey, { ...record });
 
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_entries');
       await col.updateOne(
-        { registrationId: record.registrationId, teamId: record.teamId },
+        { registrationId: record.registrationId, cycleId: record.cycleId, teamId: record.teamId },
         { $set: record },
         { upsert: true }
       );
@@ -503,14 +710,16 @@ export async function saveConfigurableEntry(doc) {
   return record;
 }
 
-export async function getConfigurableEntry(registrationId, teamId) {
+export async function getConfigurableEntry(registrationId, teamId, cycleId = null) {
   if (!registrationId || !teamId) return null;
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_entries');
-      const doc = await col.findOne({ registrationId, teamId, status: 'CONFIRMED' });
+      const query = { registrationId, teamId, status: 'CONFIRMED' };
+      if (cycleId) query.cycleId = cycleId;
+      const doc = await col.findOne(query);
       if (doc) {
-        localEntries.set(`${registrationId}:${teamId}`, doc);
+        localEntries.set(`${registrationId}:${doc.cycleId || 'default'}:${teamId}`, doc);
         return doc;
       }
     } catch (err) {
@@ -518,21 +727,31 @@ export async function getConfigurableEntry(registrationId, teamId) {
     }
   }
 
-  const found = localEntries.get(`${registrationId}:${teamId}`);
-  return found && found.status === 'CONFIRMED' ? found : null;
+  if (cycleId) {
+    const cycleEntry = localEntries.get(`${registrationId}:${cycleId}:${teamId}`);
+    if (cycleEntry && cycleEntry.status === 'CONFIRMED') return cycleEntry;
+  }
+  for (const entry of localEntries.values()) {
+    if (entry.registrationId === registrationId && entry.teamId === teamId && entry.status === 'CONFIRMED') {
+      if (!cycleId || entry.cycleId === cycleId) return entry;
+    }
+  }
+  return null;
 }
 
-export async function getConfigurableEntriesForRegistration(registrationId) {
+export async function getConfigurableEntriesForRegistration(registrationId, cycleId = null) {
   if (!registrationId) return [];
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_entries');
+      const query = { registrationId, status: 'CONFIRMED' };
+      if (cycleId) query.cycleId = cycleId;
       const docs = await col
-        .find({ registrationId, status: 'CONFIRMED' })
+        .find(query)
         .sort({ slotNumber: 1 })
         .toArray();
       for (const d of docs) {
-        localEntries.set(`${d.registrationId}:${d.teamId}`, d);
+        localEntries.set(`${d.registrationId}:${d.cycleId || 'default'}:${d.teamId}`, d);
       }
       return docs;
     } catch (err) {
@@ -541,7 +760,11 @@ export async function getConfigurableEntriesForRegistration(registrationId) {
   }
 
   return Array.from(localEntries.values())
-    .filter((e) => e.registrationId === registrationId && e.status === 'CONFIRMED')
+    .filter((e) => {
+      if (e.registrationId !== registrationId || e.status !== 'CONFIRMED') return false;
+      if (cycleId && e.cycleId && e.cycleId !== cycleId) return false;
+      return true;
+    })
     .sort((a, b) => a.slotNumber - b.slotNumber);
 }
 
@@ -552,7 +775,7 @@ export async function getConfigurableEntriesForTeam(teamId) {
       const col = getMongoDb().collection('discord_configurable_entries');
       const docs = await col.find({ teamId, status: 'CONFIRMED' }).toArray();
       for (const d of docs) {
-        localEntries.set(`${d.registrationId}:${d.teamId}`, d);
+        localEntries.set(`${d.registrationId}:${d.cycleId || 'default'}:${d.teamId}`, d);
       }
       return docs;
     } catch (err) {
@@ -565,14 +788,22 @@ export async function getConfigurableEntriesForTeam(teamId) {
   );
 }
 
-export async function deleteConfigurableEntry(registrationId, teamId) {
+export async function deleteConfigurableEntry(registrationId, teamId, cycleId = null) {
   if (!registrationId || !teamId) return false;
-  localEntries.delete(`${registrationId}:${teamId}`);
+  for (const [key, entry] of Array.from(localEntries.entries())) {
+    if (entry.registrationId === registrationId && entry.teamId === teamId) {
+      if (!cycleId || entry.cycleId === cycleId) {
+        localEntries.delete(key);
+      }
+    }
+  }
 
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_entries');
-      await col.deleteOne({ registrationId, teamId });
+      const query = { registrationId, teamId };
+      if (cycleId) query.cycleId = cycleId;
+      await col.deleteOne(query);
     } catch (err) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error deleting entry:`, err.message);
       return false;
@@ -581,38 +812,180 @@ export async function deleteConfigurableEntry(registrationId, teamId) {
   return true;
 }
 
-export async function getRegistrationEntriesCount(registrationId) {
+export async function getRegistrationEntriesCount(registrationId, cycleId = null) {
   if (!registrationId) return 0;
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_entries');
-      return await col.countDocuments({ registrationId, status: 'CONFIRMED' });
+      const query = { registrationId, status: 'CONFIRMED' };
+      if (cycleId) query.cycleId = cycleId;
+      return await col.countDocuments(query);
     } catch (err) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error counting entries:`, err.message);
     }
   }
 
-  return Array.from(localEntries.values()).filter(
-    (e) => e.registrationId === registrationId && e.status === 'CONFIRMED'
-  ).length;
+  return (await getConfigurableEntriesForRegistration(registrationId, cycleId)).length;
 }
 
 /**
- * Finds the lowest unassigned slot number between 1 and totalSlots.
+ * Finds the lowest unassigned slot number between 1 and totalSlots, skipping reserved slots.
  * @param {string} registrationId
  * @param {number} totalSlots
+ * @param {Array<number>|number} [reservedSlots]
+ * @param {string} [cycleId]
  * @returns {Promise<number|null>} Returns null if full.
  */
-export async function getNextAvailableSlot(registrationId, totalSlots) {
-  const entries = await getConfigurableEntriesForRegistration(registrationId);
+export async function getNextAvailableSlot(registrationId, totalSlots, reservedSlots = [], cycleId = null) {
+  const entries = await getConfigurableEntriesForRegistration(registrationId, cycleId);
   const occupiedSlots = new Set(entries.map((e) => e.slotNumber));
+  const reservedSet = new Set(parseReservedSlots(reservedSlots, totalSlots));
 
   for (let slot = 1; slot <= totalSlots; slot++) {
-    if (!occupiedSlots.has(slot)) {
+    if (!reservedSet.has(slot) && !occupiedSlots.has(slot)) {
       return slot;
     }
   }
   return null;
+}
+
+// ----------------------------------------------------
+// DAILY REGISTRATION CYCLES ARCHIVAL CRUD
+// ----------------------------------------------------
+
+export async function saveDailyCycle(doc) {
+  if (!doc || !doc.cycleId) return null;
+  const now = new Date();
+  const record = {
+    ...doc,
+    updatedAt: now,
+    createdAt: doc.createdAt || now,
+  };
+
+  localDailyCycles.set(record.cycleId, { ...record });
+
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_daily_registration_cycles');
+      await col.updateOne(
+        { cycleId: record.cycleId },
+        { $set: record },
+        { upsert: true }
+      );
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error saving daily cycle ${record.cycleId}:`, err.message);
+    }
+  }
+
+  return record;
+}
+
+export async function getDailyCycle(cycleId) {
+  if (!cycleId) return null;
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_daily_registration_cycles');
+      const doc = await col.findOne({ cycleId });
+      if (doc) {
+        localDailyCycles.set(cycleId, doc);
+        return doc;
+      }
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error reading daily cycle ${cycleId}:`, err.message);
+    }
+  }
+  return localDailyCycles.get(cycleId) || null;
+}
+
+export async function getDailyCyclesForRegistration(registrationId, limit = 10) {
+  if (!registrationId) return [];
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_daily_registration_cycles');
+      const docs = await col
+        .find({ registrationId })
+        .sort({ endedAt: -1, createdAt: -1 })
+        .limit(limit)
+        .toArray();
+      for (const d of docs) {
+        localDailyCycles.set(d.cycleId, d);
+      }
+      return docs;
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error listing daily cycles:`, err.message);
+    }
+  }
+
+  return Array.from(localDailyCycles.values())
+    .filter((c) => c.registrationId === registrationId)
+    .sort((a, b) => new Date(b.endedAt || b.createdAt || 0) - new Date(a.endedAt || a.createdAt || 0))
+    .slice(0, limit);
+}
+
+/**
+ * Safely archives active confirmed entries for a registration cycle into discord_daily_registration_cycles,
+ * marks active entries as ARCHIVED so the same team can register again in the next daily cycle,
+ * and clears active slot allocations without touching team enrollments or player data.
+ * @param {string} registrationId
+ * @param {object} [extraData]
+ * @returns {Promise<object|null>}
+ */
+export async function archiveActiveRegistrationCycle(registrationId, extraData = {}) {
+  const reg = await getConfigurableRegistration(registrationId);
+  if (!reg) return null;
+
+  const activeEntries = await getConfigurableEntriesForRegistration(registrationId);
+  const now = new Date();
+  const cycleDate = reg.currentCycleDate || getCurrentTimeInTimezone(reg.timezone || 'Asia/Kolkata', now).dateString;
+  const cycleId = reg.currentCycleId || `${registrationId}:${cycleDate}`;
+
+  const cycleRecord = {
+    cycleId,
+    registrationId: reg.registrationId,
+    tournamentId: reg.tournamentId,
+    guildId: reg.guildId,
+    displayName: reg.displayName,
+    cycleDate,
+    entries: activeEntries.map((e) => ({ ...e })),
+    slotAllocations: activeEntries.map((e) => ({
+      slotNumber: e.slotNumber,
+      teamId: e.teamId,
+      teamName: e.teamName,
+      leaderDiscordId: e.leaderDiscordId,
+      registeredAt: e.registeredAt,
+    })),
+    totalSlots: reg.totalSlots,
+    reservedSlots: Array.isArray(reg.reservedSlots) ? [...reg.reservedSlots] : parseReservedSlots(reg.reservedSlots, reg.totalSlots),
+    status: 'COMPLETED',
+    startedAt: reg.currentCycleStartedAt || null,
+    endedAt: now,
+    archivedAt: now,
+    ...extraData,
+  };
+
+  await saveDailyCycle(cycleRecord);
+
+  // Mark active entries as ARCHIVED
+  for (const entry of activeEntries) {
+    entry.status = 'ARCHIVED';
+    entry.archivedAt = now;
+    const cycleKey = `${entry.registrationId}:${entry.cycleId || 'default'}:${entry.teamId}`;
+    localEntries.set(cycleKey, { ...entry });
+  }
+
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_configurable_entries');
+      await col.updateMany(
+        { registrationId, status: 'CONFIRMED' },
+        { $set: { status: 'ARCHIVED', archivedAt: now } }
+      );
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error archiving entries for ${registrationId}:`, err.message);
+    }
+  }
+
+  return cycleRecord;
 }
 
 // ----------------------------------------------------

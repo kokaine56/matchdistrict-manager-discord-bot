@@ -55,6 +55,12 @@ import {
   handleManageSelectMenu,
   handleToggleStatus,
   handleDeleteRegistration,
+  handleEditRegistrationButton,
+  handleEditRegistrationModalSubmit,
+  handleManageReservedButton,
+  handleManageReservedModalSubmit,
+  handleViewCurrentSlotChart,
+  handleViewPreviousCycles,
 } from './configurableRegistrationService.js';
 import { updateSlotChartMessage } from './slotChartService.js';
 
@@ -769,6 +775,44 @@ export async function handleConfigurableTournamentInteraction(interaction) {
   if (customId.startsWith('md_cfg_toggle_status_')) {
     const registrationId = customId.replace('md_cfg_toggle_status_', '');
     await handleToggleStatus(interaction, registrationId);
+    return true;
+  }
+
+  // 12a. Edit Registration Settings button & modal
+  if (customId.startsWith('md_cfg_edit_reg_modal_')) {
+    const registrationId = customId.replace('md_cfg_edit_reg_modal_', '');
+    await handleEditRegistrationModalSubmit(interaction, registrationId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_edit_reg_')) {
+    const registrationId = customId.replace('md_cfg_edit_reg_', '');
+    await handleEditRegistrationButton(interaction, registrationId);
+    return true;
+  }
+
+  // 12b. Manage Reserved Slots button & modal
+  if (customId.startsWith('md_cfg_manage_res_modal_')) {
+    const registrationId = customId.replace('md_cfg_manage_res_modal_', '');
+    await handleManageReservedModalSubmit(interaction, registrationId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_manage_res_')) {
+    const registrationId = customId.replace('md_cfg_manage_res_', '');
+    await handleManageReservedButton(interaction, registrationId);
+    return true;
+  }
+
+  // 12c. View Current Slot Chart
+  if (customId.startsWith('md_cfg_view_slotchart_')) {
+    const registrationId = customId.replace('md_cfg_view_slotchart_', '');
+    await handleViewCurrentSlotChart(interaction, registrationId);
+    return true;
+  }
+
+  // 12d. View Previous Cycles
+  if (customId.startsWith('md_cfg_view_cycles_')) {
+    const registrationId = customId.replace('md_cfg_view_cycles_', '');
+    await handleViewPreviousCycles(interaction, registrationId);
     return true;
   }
 

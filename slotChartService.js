@@ -3,6 +3,7 @@ import {
   getConfigurableRegistration,
   getConfigurableEntriesForRegistration,
   saveConfigurableRegistration,
+  parseReservedSlots,
 } from './configurableTournamentData.js';
 
 /**
@@ -13,20 +14,31 @@ import {
  */
 export function buildSlotChartEmbed(registration, entries = []) {
   const totalSlots = registration.totalSlots || 20;
+  const reservedSlotsList = parseReservedSlots(registration.reservedSlots, totalSlots);
+  const reservedSet = new Set(reservedSlotsList);
+  const reservedCount = reservedSet.size;
+
   const occupiedMap = new Map();
   for (const entry of entries) {
     occupiedMap.set(entry.slotNumber, entry);
   }
 
   const filledCount = entries.length;
-  const availableCount = Math.max(0, totalSlots - filledCount);
+  const maxAvailable = Math.max(0, totalSlots - reservedCount);
+  const availableCount = Math.max(0, maxAvailable - filledCount);
+  const isOpen = registration.status === 'OPEN';
+
+  const reservedSummary = reservedSlotsList.length > 0 ? reservedSlotsList.join(', ') : 'None';
+  const scheduleLine = (registration.dailyStartTime || registration.dailyResetTime)
+    ? `\n**Daily Cycle:** Opens at \`${registration.dailyStartTime || 'N/A'}\` | Resets at \`${registration.dailyResetTime || 'N/A'}\``
+    : '';
 
   const embed = new EmbedBuilder()
-    .setColor(registration.status === 'OPEN' ? 0x22c55e : registration.status === 'CLOSED' ? 0xef4444 : 0x3b82f6)
+    .setColor(isOpen ? 0x22c55e : registration.status === 'CLOSED' ? 0xef4444 : 0x3b82f6)
     .setTitle(`📋 Slot Chart — ${registration.displayName || 'Tournament'}`)
     .setDescription(
       `**Status:** \`${registration.status || 'OPEN'}\`\n` +
-      `**Filled:** \`${filledCount}/${totalSlots}\` | **Available:** \`${availableCount}\`\n` +
+      `**Filled:** \`${filledCount}/${maxAvailable}\` | **Reserved / Locked:** \`${reservedSummary}\` | **Available:** \`${availableCount}\`${scheduleLine}\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━━━`
     )
     .setTimestamp();
@@ -45,6 +57,8 @@ export function buildSlotChartEmbed(registration, entries = []) {
       const entry = occupiedMap.get(slot);
       if (entry) {
         lines.push(`\`[#${paddedSlot}]\` **${entry.teamName}** (<@${entry.leaderDiscordId}>)`);
+      } else if (reservedSet.has(slot)) {
+        lines.push(`\`[#${paddedSlot}]\` 🔒 *[Reserved / Locked]*`);
       } else {
         lines.push(`\`[#${paddedSlot}]\` *[Available]*`);
       }

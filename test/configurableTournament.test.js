@@ -33,6 +33,15 @@ import {
   savePendingEnrollment,
   getPendingEnrollment,
   deletePendingEnrollment,
+  parseReservedSlots,
+  parseTimeString,
+  evaluateDailyCycleStatus,
+  getCurrentTimeInTimezone,
+  getNextCycleDateString,
+  saveDailyCycle,
+  getDailyCycle,
+  getDailyCyclesForRegistration,
+  archiveActiveRegistrationCycle,
 } from '../configurableTournamentData.js';
 
 import {
@@ -70,16 +79,27 @@ import {
 import {
   buildRegistrationEmbed,
   buildRegistrationComponents,
+  handleAddRegistrationButton,
+  handleAddRegistrationModalSubmit,
   handleRegisterSquadButtonClick,
+  handleManageSelectMenu,
+  handleEditRegistrationButton,
+  handleEditRegistrationModalSubmit,
+  handleManageReservedButton,
+  handleManageReservedModalSubmit,
+  handleViewCurrentSlotChart,
+  handleViewPreviousCycles,
 } from '../configurableRegistrationService.js';
 
 import {
   buildSlotChartEmbed,
+  updateSlotChartMessage,
 } from '../slotChartService.js';
 
 import {
   checkRegistrationLifecycles,
   reconcileConfigurableTournaments,
+  executeDailyCycleReset,
 } from '../registrationScheduler.js';
 
 test.beforeEach(() => {
@@ -973,3 +993,662 @@ test('Multiple Independent Registrations & Leader-only IDP Access', async () => 
   assert.equal(leaderPerms.ViewChannel, true);
   assert.equal(leaderPerms.CreatePublicThreads, false);
 });
+
+// ----------------------------------------------------
+// 6. Simplified Registration Creation & Daily Reset System Tests
+// ----------------------------------------------------
+
+test('Add Registration Modal - Exactly 4 Settings (5 Inputs) & Channel Generation', async () => {
+  const tourId = 'tour-simp-reg';
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-simp',
+    categoryId: 'cat-simp',
+  });
+
+  let shownModal = null;
+  const mockButtonInteraction = {
+    showModal: async (m) => { shownModal = m; },
+  };
+
+  // 1. Open Add Registration modal
+  await handleAddRegistrationButton(mockButtonInteraction, tourId);
+  assert.ok(shownModal, 'Modal was presented');
+
+  // Verify modal asks for ONLY the specified inputs
+  const components = shownModal.components;
+  assert.equal(components.length, 5, 'Exactly 5 action rows in modal');
+
+  const fields = components.map((r) => r.components[0].data);
+  const customIds = fields.map((f) => f.custom_id);
+  assert.deepEqual(customIds, [
+    'registration_name',
+    'total_slots',
+    'reserved_slots',
+    'daily_start_time',
+    'daily_reset_time',
+  ]);
+
+  // 2. Submit Add Registration Modal
+  const createdChannels = [];
+  const mockGuild = {
+    id: 'guild-simp',
+    roles: { everyone: { id: 'everyone-role' } },
+    channels: {
+      create: async (opts) => {
+        const chan = {
+          id: `chan-${opts.name}`,
+          name: opts.name,
+          type: opts.type,
+          parent: opts.parent,
+          isTextBased: () => true,
+          send: async () => ({ id: `msg-${opts.name}` }),
+          messages: { fetch: async () => null },
+        };
+        createdChannels.push(chan);
+        return chan;
+      },
+      fetch: async (id) => createdChannels.find((c) => c.id === id) || null,
+    },
+  };
+
+  let replyPayload = null;
+  const mockSubmitInteraction = {
+    guild: mockGuild,
+    client: { channels: mockGuild.channels },
+    deferReply: async () => {},
+    editReply: async (p) => { replyPayload = p; },
+    fields: {
+      getTextInputValue: (cid) => {
+        switch (cid) {
+          case 'registration_name': return 'BGIS Qualifier A';
+          case 'total_slots': return '32';
+          case 'reserved_slots': return '1, 4, 10';
+          case 'daily_start_time': return '10:00 AM';
+          case 'daily_reset_time': return '02:00 AM';
+          default: return '';
+        }
+      },
+    },
+  };
+
+  await handleAddRegistrationModalSubmit(mockSubmitInteraction, tourId);
+
+  assert.match(replyPayload.content, /Registration Instance Created/);
+  assert.equal(createdChannels.length, 2);
+  assert.equal(createdChannels[0].name, 'bgis-qualifier-a-reg');
+  assert.equal(createdChannels[1].name, 'bgis-qualifier-a-idp');
+
+  // Verify stored registration document
+  const regs = await getConfigurableRegistrationsForTournament(tourId);
+  assert.equal(regs.length, 1);
+  const reg = regs[0];
+  assert.equal(reg.displayName, 'BGIS Qualifier A');
+  assert.equal(reg.totalSlots, 32);
+  assert.deepEqual(reg.reservedSlots, [1, 4, 10]);
+  assert.equal(reg.dailyStartTime, '10:00');
+  assert.equal(reg.dailyResetTime, '02:00');
+  assert.ok(reg.currentCycleId);
+});
+
+test('Slot Allocation - Lowest available non-reserved slot with arbitrary locked slots (1, 4, 10)', async () => {
+  const regId = 'reg-alloc-test';
+
+  // 32 slots with arbitrary locked slots 1, 4, 10
+  const totalSlots = 32;
+  const reservedSlots = [1, 4, 10];
+
+  // First allocation skips slot 1 -> should be 2
+  const slot1 = await getNextAvailableSlot(regId, totalSlots, reservedSlots);
+  assert.equal(slot1, 2);
+
+  // Fill slot 2
+  await saveConfigurableEntry({
+    registrationId: regId,
+    teamId: 'team-a',
+    slotNumber: 2,
+    status: 'CONFIRMED',
+  });
+
+  // Next allocation should be 3
+  const slot2 = await getNextAvailableSlot(regId, totalSlots, reservedSlots);
+  assert.equal(slot2, 3);
+
+  // Fill slot 3
+  await saveConfigurableEntry({
+    registrationId: regId,
+    teamId: 'team-b',
+    slotNumber: 3,
+    status: 'CONFIRMED',
+  });
+
+  // Next allocation skips slot 4 (locked) -> should be 5
+  const slot3 = await getNextAvailableSlot(regId, totalSlots, reservedSlots);
+  assert.equal(slot3, 5);
+
+  // Fill slots 5 through 9
+  for (let s = 5; s <= 9; s++) {
+    await saveConfigurableEntry({
+      registrationId: regId,
+      teamId: `team-${s}`,
+      slotNumber: s,
+      status: 'CONFIRMED',
+    });
+  }
+
+  // Next allocation skips slot 10 (locked) -> should be 11
+  const slot4 = await getNextAvailableSlot(regId, totalSlots, reservedSlots);
+  assert.equal(slot4, 11);
+});
+
+test('Slot Chart Display - Clearly displays locked slots as [Reserved / Locked] and accurate availability', () => {
+  const reg = {
+    displayName: 'BGIS Qualifier A',
+    totalSlots: 32,
+    reservedSlots: [1, 4, 10],
+    dailyStartTime: '10:00',
+    dailyResetTime: '02:00',
+    status: 'OPEN',
+  };
+
+  const entries = [
+    { slotNumber: 2, teamName: 'Soul', leaderDiscordId: 'leader-1' },
+    { slotNumber: 3, teamName: 'GodLike', leaderDiscordId: 'leader-2' },
+  ];
+
+  const embed = buildSlotChartEmbed(reg, entries);
+  const data = embed.toJSON();
+
+  // Description check: Filled: 2/29 | Reserved / Locked: 1, 4, 10 | Available: 27
+  assert.match(data.description, /Filled:.*`2\/29`/);
+  assert.match(data.description, /Reserved \/ Locked:.*`1, 4, 10`/);
+  assert.match(data.description, /Available:.*`27`/);
+
+  // Check first chunk (Slots 01 - 10)
+  const firstChunk = data.fields[0];
+  assert.ok(firstChunk.value.includes('`[#01]` 🔒 *[Reserved / Locked]*'), 'Slot 1 is displayed as Reserved / Locked');
+  assert.ok(firstChunk.value.includes('`[#02]` **Soul**'), 'Slot 2 shows team Soul');
+  assert.ok(firstChunk.value.includes('`[#03]` **GodLike**'), 'Slot 3 shows team GodLike');
+  assert.ok(firstChunk.value.includes('`[#04]` 🔒 *[Reserved / Locked]*'), 'Slot 4 is displayed as Reserved / Locked');
+  assert.ok(firstChunk.value.includes('`[#10]` 🔒 *[Reserved / Locked]*'), 'Slot 10 is displayed as Reserved / Locked');
+  assert.ok(firstChunk.value.includes('`[#05]` *[Available]*'), 'Slot 5 is available');
+});
+
+test('Automatic Close - Automatically closes registration when all available slots are filled', async () => {
+  const tourId = 'tour-autoclose';
+  const regId = 'reg-autoclose';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    requiredDiscordMembers: 1,
+  });
+
+  // 5 total slots with 2 reserved [1, 3] -> exactly 3 available slots (2, 4, 5)
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    displayName: 'Mini Tourney',
+    totalSlots: 5,
+    reservedSlots: [1, 3],
+    status: 'OPEN',
+    registrationChannelId: 'chan-reg-close',
+    idpChannelId: 'chan-idp-close',
+    currentCycleId: `${regId}:2026-11-04`,
+  });
+
+  const mockGuild = {
+    channels: {
+      fetch: async () => ({
+        isTextBased: () => true,
+        permissionOverwrites: { edit: async () => {} },
+        send: async () => ({ id: 'm' }),
+        messages: { fetch: async () => null },
+      }),
+    },
+  };
+
+  const regInteraction = (uid) => ({
+    guild: mockGuild,
+    guildId: 'guild-cfg',
+    user: { id: uid },
+    client: { channels: mockGuild.channels },
+    reply: async (p) => { regInteraction.lastReply = p; },
+  });
+
+  // Enroll 4 teams
+  for (let i = 1; i <= 4; i++) {
+    const leaderId = `ldr-${i}`;
+    await saveConfigurableTeam({
+      teamId: `tm-${i}`,
+      tournamentId: tourId,
+      teamName: `Team ${i}`,
+      leaderDiscordId: leaderId,
+      players: [{ discordId: leaderId, ign: `P${i}`, uid: `U${i}` }],
+    });
+  }
+
+  // Register Team 1 (allocates slot 2)
+  await handleRegisterSquadButtonClick(regInteraction('ldr-1'), regId);
+  assert.match(regInteraction.lastReply.content, /Slot Number:.*`#2`/);
+
+  // Register Team 2 (allocates slot 4)
+  await handleRegisterSquadButtonClick(regInteraction('ldr-2'), regId);
+  assert.match(regInteraction.lastReply.content, /Slot Number:.*`#4`/);
+
+  // Register Team 3 (allocates slot 5 - last available slot!)
+  await handleRegisterSquadButtonClick(regInteraction('ldr-3'), regId);
+  assert.match(regInteraction.lastReply.content, /Slot Number:.*`#5`/);
+
+  // Registration should now be automatically CLOSED
+  const regDoc = await getConfigurableRegistration(regId);
+  assert.equal(regDoc.status, 'CLOSED', 'Registration automatically closed when capacity reached');
+
+  // Attempting to register Team 4 should be rejected
+  await handleRegisterSquadButtonClick(regInteraction('ldr-4'), regId);
+  assert.match(regInteraction.lastReply.content, /Registration is currently/);
+});
+
+test('Daily Data Reset System - Safely archives cycle, clears active slots, preserves team enrollments', async () => {
+  const tourId = 'tour-reset-test';
+  const regId = 'reg-reset-test';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    requiredDiscordMembers: 1,
+  });
+
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    displayName: 'Daily Scrims',
+    totalSlots: 20,
+    reservedSlots: [1, 2],
+    dailyStartTime: '10:00',
+    dailyResetTime: '02:00',
+    timezone: 'Asia/Kolkata',
+    currentCycleId: `${regId}:2026-11-04`,
+    currentCycleDate: '2026-11-04',
+    status: 'OPEN',
+    registrationChannelId: 'chan-reg-reset',
+    idpChannelId: 'chan-idp-reset',
+  });
+
+  // Enroll team
+  const leaderId = 'leader-daily-1';
+  await saveConfigurableTeam({
+    teamId: 'team-daily-1',
+    tournamentId: tourId,
+    teamName: 'Daily Warriors',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'DailyP1', uid: 'U100' }],
+  });
+
+  // Track IDP permissions
+  const idpPermissions = new Map();
+  idpPermissions.set(leaderId, { ViewChannel: true });
+
+  const mockClient = {
+    guilds: {
+      fetch: async () => ({
+        channels: {
+          fetch: async (id) => ({
+            id,
+            isTextBased: () => true,
+            permissionOverwrites: {
+              delete: async (targetId) => { idpPermissions.delete(targetId); },
+              edit: async () => {},
+            },
+            send: async () => ({ id: 'm' }),
+            messages: { fetch: async () => null },
+          }),
+        },
+      }),
+    },
+    channels: {
+      fetch: async () => ({
+        isTextBased: () => true,
+        send: async () => ({ id: 'm' }),
+        messages: { fetch: async () => null },
+      }),
+    },
+  };
+
+  const regInteraction = {
+    guild: {
+      channels: {
+        fetch: async () => ({
+          permissionOverwrites: { edit: async () => {} },
+        }),
+      },
+    },
+    guildId: 'guild-cfg',
+    user: { id: leaderId },
+    client: mockClient,
+    reply: async (p) => { regInteraction.lastReply = p; },
+  };
+
+  // Register team in cycle 2026-11-04
+  await handleRegisterSquadButtonClick(regInteraction, regId);
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed/);
+
+  const activeEntriesBefore = await getConfigurableEntriesForRegistration(regId);
+  assert.equal(activeEntriesBefore.length, 1);
+  assert.equal(activeEntriesBefore[0].teamName, 'Daily Warriors');
+
+  // Trigger daily cycle reset
+  const resetSuccess = await executeDailyCycleReset(mockClient, regId, true);
+  assert.equal(resetSuccess, true);
+
+  // 1. Verify previous cycle was archived
+  const archivedCycles = await getDailyCyclesForRegistration(regId);
+  assert.equal(archivedCycles.length, 1);
+  assert.equal(archivedCycles[0].cycleDate, '2026-11-04');
+  assert.equal(archivedCycles[0].entries.length, 1);
+  assert.equal(archivedCycles[0].entries[0].teamName, 'Daily Warriors');
+  assert.equal(archivedCycles[0].status, 'COMPLETED');
+
+  // 2. Verify team enrollment in database is NEVER deleted
+  const teamDoc = await getConfigurableTeam('team-daily-1');
+  assert.ok(teamDoc, 'Team enrollment doc was preserved');
+  assert.equal(teamDoc.teamName, 'Daily Warriors');
+
+  // 3. Verify active slot allocations for completed cycle are cleared
+  const activeEntriesAfter = await getConfigurableEntriesForRegistration(regId);
+  assert.equal(activeEntriesAfter.length, 0, 'Active confirmed entries cleared');
+
+  // 4. Verify leader IDP access was revoked
+  assert.equal(idpPermissions.has(leaderId), false, 'Leader IDP permission cleared');
+
+  // 5. Verify registration status and cycle update
+  const updatedReg = await getConfigurableRegistration(regId);
+  assert.equal(updatedReg.lastResetCycleDate, '2026-11-04');
+  assert.notEqual(updatedReg.currentCycleId, `${regId}:2026-11-04`);
+});
+
+test('Re-registration in Subsequent Daily Cycle - Same squad can register again in next cycle', async () => {
+  const tourId = 'tour-re-reg';
+  const regId = 'reg-re-reg';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    requiredDiscordMembers: 1,
+  });
+
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    displayName: 'Daily Scrims 2',
+    totalSlots: 10,
+    reservedSlots: [],
+    dailyStartTime: '10:00',
+    dailyResetTime: '02:00',
+    timezone: 'Asia/Kolkata',
+    currentCycleId: `${regId}:2026-11-04`,
+    currentCycleDate: '2026-11-04',
+    status: 'OPEN',
+    registrationChannelId: 'chan-reg-re',
+    idpChannelId: 'chan-idp-re',
+  });
+
+  const leaderId = 'leader-re-reg';
+  await saveConfigurableTeam({
+    teamId: 'team-re-reg',
+    tournamentId: tourId,
+    teamName: 'Team Evergreen',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'Evergreen', uid: 'U999' }],
+  });
+
+  const mockGuild = {
+    channels: {
+      fetch: async () => ({
+        isTextBased: () => true,
+        permissionOverwrites: { edit: async () => {}, delete: async () => {} },
+        send: async () => ({ id: 'm' }),
+        messages: { fetch: async () => null },
+      }),
+    },
+  };
+
+  const regInteraction = {
+    guild: mockGuild,
+    guildId: 'guild-cfg',
+    user: { id: leaderId },
+    client: { channels: mockGuild.channels, guilds: { fetch: async () => mockGuild } },
+    reply: async (p) => { regInteraction.lastReply = p; },
+  };
+
+  // Register in cycle 1
+  await handleRegisterSquadButtonClick(regInteraction, regId);
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed/);
+
+  // Reset cycle 1
+  await executeDailyCycleReset(regInteraction.client, regId, true);
+
+  // Prepare next cycle 2026-11-05 and set OPEN
+  const reg = await getConfigurableRegistration(regId);
+  reg.status = 'OPEN';
+  reg.currentCycleId = `${regId}:2026-11-05`;
+  reg.currentCycleDate = '2026-11-05';
+  await saveConfigurableRegistration(reg);
+
+  // Same team registers again in cycle 2 -> MUST succeed!
+  await handleRegisterSquadButtonClick(regInteraction, regId);
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed/);
+
+  const entriesCycle2 = await getConfigurableEntriesForRegistration(regId);
+  assert.equal(entriesCycle2.length, 1);
+  assert.equal(entriesCycle2[0].teamName, 'Team Evergreen');
+  assert.equal(entriesCycle2[0].cycleId, `${regId}:2026-11-05`);
+});
+
+test('Multiple Registrations Reset Independently', async () => {
+  const tourId = 'tour-multi-reg-indep';
+  const regAId = 'reg-alpha';
+  const regBId = 'reg-beta';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+  });
+
+  await saveConfigurableRegistration({
+    registrationId: regAId,
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    displayName: 'Registration Alpha (Reset at 02:00 AM)',
+    totalSlots: 20,
+    dailyStartTime: '10:00',
+    dailyResetTime: '02:00',
+    currentCycleId: `${regAId}:2026-11-04`,
+    currentCycleDate: '2026-11-04',
+    status: 'OPEN',
+  });
+
+  await saveConfigurableRegistration({
+    registrationId: regBId,
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    displayName: 'Registration Beta (Reset at 04:00 AM)',
+    totalSlots: 20,
+    dailyStartTime: '18:00',
+    dailyResetTime: '04:00',
+    currentCycleId: `${regBId}:2026-11-04`,
+    currentCycleDate: '2026-11-04',
+    status: 'OPEN',
+  });
+
+  // Add entry to Reg A
+  await saveConfigurableEntry({
+    registrationId: regAId,
+    teamId: 'team-a',
+    teamName: 'Alpha Squad',
+    slotNumber: 1,
+    status: 'CONFIRMED',
+    cycleId: `${regAId}:2026-11-04`,
+  });
+
+  // Add entry to Reg B
+  await saveConfigurableEntry({
+    registrationId: regBId,
+    teamId: 'team-b',
+    teamName: 'Beta Squad',
+    slotNumber: 1,
+    status: 'CONFIRMED',
+    cycleId: `${regBId}:2026-11-04`,
+  });
+
+  // Reset only Registration Alpha
+  await executeDailyCycleReset(null, regAId, true);
+
+  // Registration Alpha active entries cleared
+  const entriesA = await getConfigurableEntriesForRegistration(regAId);
+  assert.equal(entriesA.length, 0);
+
+  // Registration Beta active entries MUST remain confirmed and unaffected
+  const entriesB = await getConfigurableEntriesForRegistration(regBId);
+  assert.equal(entriesB.length, 1);
+  assert.equal(entriesB[0].teamName, 'Beta Squad');
+});
+
+test('Bot Restart Recovery - Catches up pending reset idempotently', async () => {
+  const tourId = 'tour-reconcile-test';
+  const regId = 'reg-reconcile-test';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    setupChannelId: 'chan-setup-rec',
+  });
+
+  // Registration that missed its reset
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    displayName: 'Nightly Scrim',
+    totalSlots: 20,
+    reservedSlots: [],
+    dailyStartTime: '10:00',
+    dailyResetTime: '02:00',
+    currentCycleId: `${regId}:2026-11-03`,
+    currentCycleDate: '2026-11-03',
+    lastResetCycleDate: '2026-11-02', // Last reset was 2 days ago!
+    status: 'OPEN',
+    registrationChannelId: 'chan-reg-rec',
+    idpChannelId: 'chan-idp-rec',
+  });
+
+  await saveConfigurableEntry({
+    registrationId: regId,
+    teamId: 'team-rec-1',
+    teamName: 'Recovery Team',
+    slotNumber: 1,
+    status: 'CONFIRMED',
+    cycleId: `${regId}:2026-11-03`,
+  });
+
+  const mockClient = {
+    guilds: {
+      fetch: async () => ({
+        channels: {
+          fetch: async () => ({
+            isTextBased: () => true,
+            send: async () => ({ id: 'm' }),
+            messages: { fetch: async () => null },
+            permissionOverwrites: { delete: async () => {}, edit: async () => {} },
+          }),
+        },
+      }),
+    },
+    channels: {
+      fetch: async () => ({
+        isTextBased: () => true,
+        send: async () => ({ id: 'm' }),
+        messages: { fetch: async () => null },
+      }),
+    },
+  };
+
+  // Bot restarts and reconciles
+  await reconcileConfigurableTournaments(mockClient);
+
+  // Missed cycle should have been archived
+  const cycles = await getDailyCyclesForRegistration(regId);
+  assert.equal(cycles.length, 1, 'Missed cycle was safely archived on restart');
+
+  // Second restart reconcile should NOT produce duplicate archive
+  await reconcileConfigurableTournaments(mockClient);
+  const cyclesAfterSecond = await getDailyCyclesForRegistration(regId);
+  assert.equal(cyclesAfterSecond.length, 1, 'Idempotent: no duplicate archived cycles created');
+});
+
+test('Management Controls - Safeguards for capacity reduction and slot reservation', async () => {
+  const tourId = 'tour-safeguards';
+  const regId = 'reg-safeguards';
+
+  await saveConfigurableTournament({ tournamentId: tourId, guildId: 'guild-cfg' });
+
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    displayName: 'Safeguard Tourney',
+    totalSlots: 10,
+    reservedSlots: [1],
+    dailyStartTime: '10:00',
+    dailyResetTime: '02:00',
+    status: 'OPEN',
+  });
+
+  // Add 3 registered teams (occupying slots 2, 3, 4)
+  for (let i = 2; i <= 4; i++) {
+    await saveConfigurableEntry({
+      registrationId: regId,
+      teamId: `team-${i}`,
+      teamName: `Team ${i}`,
+      slotNumber: i,
+      status: 'CONFIRMED',
+    });
+  }
+
+  // 1. Safeguard: cannot reduce capacity below currently allocated slots
+  let editReply = null;
+  const mockEditInteraction = {
+    deferReply: async () => {},
+    editReply: async (p) => { editReply = p; },
+    fields: {
+      getTextInputValue: (cid) => {
+        switch (cid) {
+          case 'registration_name': return 'Safeguard Tourney';
+          case 'total_slots': return '2'; // Attempting to reduce below 3 active teams!
+          case 'daily_start_time': return '10:00';
+          case 'daily_reset_time': return '02:00';
+          default: return '';
+        }
+      },
+    },
+  };
+
+  await handleEditRegistrationModalSubmit(mockEditInteraction, regId);
+  assert.match(editReply.content, /Capacity cannot be reduced below already allocated slots/);
+
+  // 2. Safeguard: cannot reserve a slot that is already occupied
+  let reservedReply = null;
+  const mockReservedInteraction = {
+    deferReply: async () => {},
+    editReply: async (p) => { reservedReply = p; },
+    fields: {
+      getTextInputValue: (cid) => '1, 3', // Slot 3 is already occupied by Team 3!
+    },
+  };
+
+  await handleManageReservedModalSubmit(mockReservedInteraction, regId);
+  assert.match(reservedReply.content, /cannot be reserved because they are already occupied/);
+});
+

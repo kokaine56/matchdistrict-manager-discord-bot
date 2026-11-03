@@ -244,10 +244,21 @@ async function ensureMongoIndexes() {
     await cfgTeamCol.createIndex({ tournamentId: 1, 'players.discordId': 1 });
 
     const cfgEntryCol = mongoDb.collection('discord_configurable_entries');
-    await cfgEntryCol.createIndex({ registrationId: 1, teamId: 1 }, { unique: true });
-    await cfgEntryCol.createIndex({ registrationId: 1, slotNumber: 1 }, { unique: true });
+    try {
+      await cfgEntryCol.dropIndex('registrationId_1_teamId_1');
+    } catch {}
+    try {
+      await cfgEntryCol.dropIndex('registrationId_1_slotNumber_1');
+    } catch {}
+    await cfgEntryCol.createIndex({ registrationId: 1, cycleId: 1, teamId: 1 }, { unique: true });
+    await cfgEntryCol.createIndex({ registrationId: 1, cycleId: 1, slotNumber: 1 });
     await cfgEntryCol.createIndex({ tournamentId: 1, teamId: 1 });
-    await cfgEntryCol.createIndex({ registrationId: 1 });
+    await cfgEntryCol.createIndex({ registrationId: 1, status: 1 });
+
+    const dailyCycleCol = mongoDb.collection('discord_daily_registration_cycles');
+    await dailyCycleCol.createIndex({ cycleId: 1 }, { unique: true });
+    await dailyCycleCol.createIndex({ registrationId: 1, cycleDate: 1 });
+    await dailyCycleCol.createIndex({ registrationId: 1, endedAt: -1 });
 
     const cfgPendingCol = mongoDb.collection('discord_pending_enrollments');
     await cfgPendingCol.createIndex({ tournamentId: 1, userId: 1 }, { unique: true });
