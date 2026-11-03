@@ -30,7 +30,7 @@ import {
   evaluateDailyCycleStatus,
   getDailyCyclesForRegistration,
 } from './configurableTournamentData.js';
-import { updateSlotChartMessage, buildSlotChartEmbed } from './slotChartService.js';
+import { updateSlotChartMessage, buildSlotChartEmbed, buildSlotListText } from './slotChartService.js';
 import { TOURNAMENT_DENIED_PERMISSIONS } from './configurableTournamentService.js';
 
 /**
@@ -850,10 +850,11 @@ export async function handleViewCurrentSlotChart(interaction, registrationId) {
     return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
   }
 
+  const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
   const entries = await getConfigurableEntriesForRegistration(registrationId, registration.currentCycleId);
-  const embed = buildSlotChartEmbed(registration, entries);
+  const text = buildSlotListText(tournament, registration, entries);
 
-  await interaction.reply({ embeds: [embed], ephemeral: true });
+  await interaction.reply({ content: text, ephemeral: true });
 }
 
 /**

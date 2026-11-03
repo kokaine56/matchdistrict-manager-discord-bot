@@ -251,7 +251,7 @@ async function ensureMongoIndexes() {
       await cfgEntryCol.dropIndex('registrationId_1_slotNumber_1');
     } catch {}
     await cfgEntryCol.createIndex({ registrationId: 1, cycleId: 1, teamId: 1 }, { unique: true });
-    await cfgEntryCol.createIndex({ registrationId: 1, cycleId: 1, slotNumber: 1 });
+    await cfgEntryCol.createIndex({ registrationId: 1, cycleId: 1, slotNumber: 1 }, { unique: true });
     await cfgEntryCol.createIndex({ tournamentId: 1, teamId: 1 });
     await cfgEntryCol.createIndex({ registrationId: 1, status: 1 });
 

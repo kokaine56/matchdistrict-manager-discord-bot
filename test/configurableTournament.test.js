@@ -94,6 +94,12 @@ import {
 import {
   buildSlotChartEmbed,
   updateSlotChartMessage,
+  buildSlotListText,
+  buildSlotListTitle,
+  getFilledSlotCounter,
+  buildSlotListChunks,
+  changeTeamSlot,
+  removeTeamFromRegistration,
 } from '../slotChartService.js';
 
 import {
@@ -1141,37 +1147,61 @@ test('Slot Allocation - Lowest available non-reserved slot with arbitrary locked
   assert.equal(slot4, 11);
 });
 
-test('Slot Chart Display - Clearly displays locked slots as [Reserved / Locked] and accurate availability', () => {
+test('Slot List Display Format - Exact title, sequential slots, status rules, and filled counter', () => {
+  const tournament = { name: 'T3' };
   const reg = {
-    displayName: 'BGIS Qualifier A',
-    totalSlots: 32,
-    reservedSlots: [1, 4, 10],
-    dailyStartTime: '10:00',
-    dailyResetTime: '02:00',
-    status: 'OPEN',
+    displayName: '10PM',
+    totalSlots: 18,
+    reservedSlots: [1, 2],
   };
 
   const entries = [
-    { slotNumber: 2, teamName: 'Soul', leaderDiscordId: 'leader-1' },
-    { slotNumber: 3, teamName: 'GodLike', leaderDiscordId: 'leader-2' },
+    { slotNumber: 3, teamName: 'Team guardians' },
+    { slotNumber: 4, teamName: 'NEMESIS ESPORTS' },
+    { slotNumber: 5, teamName: 'TEAM RAGE' },
+    { slotNumber: 6, teamName: 'Arc8 Esports' },
+    { slotNumber: 7, teamName: 'ETERNIX ESPORTS' },
+    { slotNumber: 8, teamName: 'Elite Falcons' },
+    { slotNumber: 9, teamName: 'Team demonx eSports' },
+    { slotNumber: 10, teamName: 'team white rage' },
+    { slotNumber: 11, teamName: 'MEGNITE' },
+    { slotNumber: 12, teamName: 'Team ZEROFRAME' },
+    { slotNumber: 13, teamName: 'ENDLESS TEMPEST ESPORTS' },
+    { slotNumber: 14, teamName: 'TRYTAN ESPORTS' },
+    { slotNumber: 15, teamName: 'Team Alpha Nemesis' },
+    { slotNumber: 16, teamName: 'TEAM ASHENBORN ESPORTS' },
+    { slotNumber: 17, teamName: 'Fearless Legends' },
+    { slotNumber: 18, teamName: 'TNR eSports' },
   ];
 
-  const embed = buildSlotChartEmbed(reg, entries);
-  const data = embed.toJSON();
+  const slotListText = buildSlotListText(tournament, reg, entries);
+  const lines = slotListText.split('\n');
 
-  // Description check: Filled: 2/29 | Reserved / Locked: 1, 4, 10 | Available: 27
-  assert.match(data.description, /Filled:.*`2\/29`/);
-  assert.match(data.description, /Reserved \/ Locked:.*`1, 4, 10`/);
-  assert.match(data.description, /Available:.*`27`/);
+  // Title: Tournament Name + Registration Name + Slotlist
+  assert.equal(lines[0], 'T3 10PM Slotlist');
 
-  // Check first chunk (Slots 01 - 10)
-  const firstChunk = data.fields[0];
-  assert.ok(firstChunk.value.includes('`[#01]` 🔒 *[Reserved / Locked]*'), 'Slot 1 is displayed as Reserved / Locked');
-  assert.ok(firstChunk.value.includes('`[#02]` **Soul**'), 'Slot 2 shows team Soul');
-  assert.ok(firstChunk.value.includes('`[#03]` **GodLike**'), 'Slot 3 shows team GodLike');
-  assert.ok(firstChunk.value.includes('`[#04]` 🔒 *[Reserved / Locked]*'), 'Slot 4 is displayed as Reserved / Locked');
-  assert.ok(firstChunk.value.includes('`[#10]` 🔒 *[Reserved / Locked]*'), 'Slot 10 is displayed as Reserved / Locked');
-  assert.ok(firstChunk.value.includes('`[#05]` *[Available]*'), 'Slot 5 is available');
+  // Locked slots
+  assert.equal(lines[1], 'Slot 01 → 🔒 LOCKED');
+  assert.equal(lines[2], 'Slot 02 → 🔒 LOCKED');
+
+  // Occupied slots (preserve exact team names)
+  assert.equal(lines[3], 'Slot 03 → Team guardians');
+  assert.equal(lines[4], 'Slot 04 → NEMESIS ESPORTS');
+  assert.equal(lines[18], 'Slot 18 → TNR eSports');
+
+  // Counter at the bottom: 16/16 filled (green)
+  assert.equal(lines[19], '🟢 16/16 filled');
+
+  // Test counter states
+  assert.equal(getFilledSlotCounter(0, 16), '⚪ 0/16 filled');
+  assert.equal(getFilledSlotCounter(10, 16), '🟡 10/16 filled');
+  assert.equal(getFilledSlotCounter(16, 16), '🟢 16/16 filled');
+
+  // Available slot rendering when partially filled
+  const partialEntries = [{ slotNumber: 3, teamName: 'Team guardians' }];
+  const partialText = buildSlotListText(tournament, reg, partialEntries);
+  assert.ok(partialText.includes('Slot 04 → AVAILABLE'));
+  assert.ok(partialText.includes('🟡 1/16 filled'));
 });
 
 test('Automatic Close - Automatically closes registration when all available slots are filled', async () => {
@@ -1651,4 +1681,122 @@ test('Management Controls - Safeguards for capacity reduction and slot reservati
   await handleManageReservedModalSubmit(mockReservedInteraction, regId);
   assert.match(reservedReply.content, /cannot be reserved because they are already occupied/);
 });
+
+test('Persistent Message In-Place Editing - Updates existing message ID without sending duplicates', async () => {
+  const tourId = 'tour-persist-idp';
+  const regId = 'reg-persist-idp';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    name: 'T3',
+  });
+
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    displayName: '10PM',
+    totalSlots: 10,
+    reservedSlots: [1],
+    idpChannelId: 'chan-idp-persist',
+    slotChartMessageId: null,
+  });
+
+  let sentMessages = [];
+  let editedMessages = [];
+
+  const mockChannel = {
+    id: 'chan-idp-persist',
+    isTextBased: () => true,
+    send: async (payload) => {
+      const msg = {
+        id: `msg-${sentMessages.length + 1}`,
+        content: payload.content,
+        edit: async (newPayload) => {
+          msg.content = newPayload.content;
+          editedMessages.push({ id: msg.id, content: newPayload.content });
+          return msg;
+        },
+      };
+      sentMessages.push(msg);
+      return msg;
+    },
+    messages: {
+      fetch: async (id) => sentMessages.find((m) => m.id === id) || null,
+    },
+  };
+
+  const mockClient = {
+    channels: {
+      fetch: async (id) => (id === 'chan-idp-persist' ? mockChannel : null),
+    },
+  };
+
+  // 1. Initial creation of slot list message
+  await updateSlotChartMessage(mockClient, regId);
+  assert.equal(sentMessages.length, 1, 'Sent exactly 1 initial message');
+  assert.match(sentMessages[0].content, /T3 10PM Slotlist/);
+  assert.match(sentMessages[0].content, /Slot 01 → 🔒 LOCKED/);
+  assert.match(sentMessages[0].content, /Slot 02 → AVAILABLE/);
+  assert.match(sentMessages[0].content, /⚪ 0\/9 filled/);
+
+  const initialMsgId = sentMessages[0].id;
+
+  // 2. Add an entry
+  await saveConfigurableEntry({
+    registrationId: regId,
+    teamId: 'tm-guardians',
+    teamName: 'Team guardians',
+    slotNumber: 2,
+    status: 'CONFIRMED',
+  });
+
+  // 3. Update slot chart: must edit existing message in place!
+  await updateSlotChartMessage(mockClient, regId);
+  assert.equal(sentMessages.length, 1, 'Did not send a second message');
+  assert.equal(editedMessages.length, 1, 'Edited existing message in place');
+  assert.equal(editedMessages[0].id, initialMsgId);
+  assert.match(editedMessages[0].content, /Slot 02 → Team guardians/);
+  assert.match(editedMessages[0].content, /🟡 1\/9 filled/);
+
+  // 4. Organiser changes team slot from 2 to 3
+  const changeRes = await changeTeamSlot(regId, 'tm-guardians', 3, mockClient);
+  assert.equal(changeRes.success, true);
+  assert.equal(sentMessages.length, 1, 'Still only 1 message sent');
+  assert.match(sentMessages[0].content, /Slot 02 → AVAILABLE/);
+  assert.match(sentMessages[0].content, /Slot 03 → Team guardians/);
+
+  // 5. Organiser removes team
+  const removeRes = await removeTeamFromRegistration(regId, 'tm-guardians', mockClient);
+  assert.equal(removeRes.success, true);
+  assert.match(sentMessages[0].content, /Slot 03 → AVAILABLE/);
+  assert.match(sentMessages[0].content, /⚪ 0\/9 filled/);
+});
+
+test('Discord Character Limit Chunking - Splits 100 slots cleanly without exceeding limits', () => {
+  const reg = {
+    displayName: 'Mega 100 Slotlist',
+    totalSlots: 100,
+    reservedSlots: [1, 2, 3, 4],
+  };
+
+  const entries = [];
+  for (let s = 5; s <= 60; s++) {
+    entries.push({ slotNumber: s, teamName: `Pro Team Long Name Esports Club ${s}` });
+  }
+
+  const chunks = buildSlotListChunks({ name: 'BGIS' }, reg, entries);
+  assert.ok(chunks.length > 1, 'Chunks into multiple messages when exceeding character limit');
+
+  for (const chunk of chunks) {
+    assert.ok(chunk.length <= 1900, `Each chunk is <= 1900 chars (actual: ${chunk.length})`);
+  }
+
+  // First chunk has title
+  assert.ok(chunks[0].startsWith('BGIS Mega 100 Slotlist'));
+
+  // Last chunk has counter at the bottom
+  const lastChunk = chunks[chunks.length - 1];
+  assert.ok(lastChunk.endsWith('filled'), 'Counter is at the bottom of the final chunk');
+});
+
 
