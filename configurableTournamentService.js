@@ -17,13 +17,36 @@ import {
   getEnrolledTeamsCount,
   getRegistrationEntriesCount,
   findConfigurableRegistrationByChannelId,
+  getPendingEnrollment,
+  deletePendingEnrollment,
 } from './configurableTournamentData.js';
 import {
   sendOrUpdateEnrollmentMessage,
   handleEnrollButtonClick,
-  handleEnrollModalSubmit,
-  handleEnrollUserSelect,
+  showStep1Modal,
+  handleStep1ModalSubmit,
+  showStep2Modal,
+  handleStep2ModalSubmit,
+  showStep3Modal,
+  handleStep3ModalSubmit,
+  handleSkipSubstitutes,
+  showStep5DiscordSelection,
+  handleStep5UserSelect,
+  handleManageMySquadButton,
+  handleEditSquadButtonClick,
+  handleDeleteSquadPrompt,
+  handleDeleteSquadConfirm,
+  handleDeleteSquadCancel,
 } from './teamEnrollmentService.js';
+
+export const TOURNAMENT_DENIED_PERMISSIONS = [
+  PermissionFlagsBits.CreatePublicThreads,
+  PermissionFlagsBits.CreatePrivateThreads,
+  PermissionFlagsBits.SendMessagesInThreads,
+  PermissionFlagsBits.ManageThreads,
+  PermissionFlagsBits.ManageChannels,
+  PermissionFlagsBits.ManageRoles,
+];
 import {
   handleAddRegistrationButton,
   handleAddRegistrationModalSubmit,
@@ -194,6 +217,18 @@ export async function handleSetupTournamentCommand(message) {
     );
   }
 
+  // Deny thread creation at category level
+  if (typeof category.permissionOverwrites?.edit === 'function') {
+    await category.permissionOverwrites.edit(message.guild.roles.everyone.id, {
+      CreatePublicThreads: false,
+      CreatePrivateThreads: false,
+      SendMessagesInThreads: false,
+      ManageThreads: false,
+      ManageChannels: false,
+      ManageRoles: false,
+    }).catch(() => {});
+  }
+
   const guildId = message.guild.id;
   const categoryId = category.id;
   const setupChannelId = message.channel.id;
@@ -264,6 +299,19 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
   try {
     const prefix = 'T3';
 
+    // Deny thread permissions at category level
+    const category = interaction.channel?.parent || (await guild.channels.fetch(categoryId).catch(() => null));
+    if (category && typeof category.permissionOverwrites?.edit === 'function') {
+      await category.permissionOverwrites.edit(guild.roles.everyone.id, {
+        CreatePublicThreads: false,
+        CreatePrivateThreads: false,
+        SendMessagesInThreads: false,
+        ManageThreads: false,
+        ManageChannels: false,
+        ManageRoles: false,
+      }).catch(() => {});
+    }
+
     // 1. T3-Verify (Shared squad enrollment)
     const verifyChannel = await guild.channels.create({
       name: `${prefix}-verify`,
@@ -273,7 +321,7 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
         {
           id: guild.roles.everyone.id,
           allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-          deny: [PermissionFlagsBits.SendMessages],
+          deny: [PermissionFlagsBits.SendMessages, ...TOURNAMENT_DENIED_PERMISSIONS],
         },
       ],
     });
@@ -287,7 +335,7 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
         {
           id: guild.roles.everyone.id,
           allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-          deny: [PermissionFlagsBits.SendMessages],
+          deny: [PermissionFlagsBits.SendMessages, ...TOURNAMENT_DENIED_PERMISSIONS],
         },
       ],
     });
@@ -301,7 +349,7 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
         {
           id: guild.roles.everyone.id,
           allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-          deny: [PermissionFlagsBits.SendMessages],
+          deny: [PermissionFlagsBits.SendMessages, ...TOURNAMENT_DENIED_PERMISSIONS],
         },
       ],
     });
@@ -554,7 +602,7 @@ export async function handleConfigurableTournamentInteraction(interaction) {
     return true;
   }
 
-  // 4. Enroll Squad button (opens modal)
+  // 4. Enroll Squad button (opens modal or manages squad)
   if (
     customId.startsWith('md_cfg_enroll_') &&
     !customId.startsWith('md_cfg_enroll_modal_') &&
@@ -565,17 +613,120 @@ export async function handleConfigurableTournamentInteraction(interaction) {
     return true;
   }
 
-  // 5. Enroll Squad modal submit
-  if (customId.startsWith('md_cfg_enroll_modal_')) {
-    const tournamentId = customId.replace('md_cfg_enroll_modal_', '');
-    await handleEnrollModalSubmit(interaction, tournamentId);
+  // Manage Squad button
+  if (customId.startsWith('md_cfg_my_squad_')) {
+    const tournamentId = customId.replace('md_cfg_my_squad_', '');
+    await handleManageMySquadButton(interaction, tournamentId);
     return true;
   }
 
-  // 6. Enroll Squad user select menu
-  if (customId.startsWith('md_cfg_enroll_users_')) {
-    const tournamentId = customId.replace('md_cfg_enroll_users_', '');
-    await handleEnrollUserSelect(interaction, tournamentId);
+  // Step 1 modal submit (or legacy enroll modal)
+  if (customId.startsWith('md_cfg_step1_modal_') || customId.startsWith('md_cfg_enroll_modal_')) {
+    const tournamentId = customId.startsWith('md_cfg_step1_modal_')
+      ? customId.replace('md_cfg_step1_modal_', '')
+      : customId.replace('md_cfg_enroll_modal_', '');
+    await handleStep1ModalSubmit(interaction, tournamentId);
+    return true;
+  }
+
+  // Navigation to Step 2
+  if (customId.startsWith('md_cfg_goto_step2_')) {
+    const tournamentId = customId.replace('md_cfg_goto_step2_', '');
+    await showStep2Modal(interaction, tournamentId);
+    return true;
+  }
+
+  // Step 2 modal submit
+  if (customId.startsWith('md_cfg_step2_modal_')) {
+    const tournamentId = customId.replace('md_cfg_step2_modal_', '');
+    await handleStep2ModalSubmit(interaction, tournamentId);
+    return true;
+  }
+
+  // Navigation back to Step 1
+  if (customId.startsWith('md_cfg_back_to_step1_')) {
+    const tournamentId = customId.replace('md_cfg_back_to_step1_', '');
+    const session = await getPendingEnrollment(tournamentId, interaction.user.id);
+    await showStep1Modal(interaction, tournamentId, session);
+    return true;
+  }
+
+  // Navigation to Step 3 (Substitutes)
+  if (customId.startsWith('md_cfg_goto_step3_')) {
+    const tournamentId = customId.replace('md_cfg_goto_step3_', '');
+    await showStep3Modal(interaction, tournamentId);
+    return true;
+  }
+
+  // Skip Step 3 (Substitutes)
+  if (customId.startsWith('md_cfg_skip_step3_')) {
+    const tournamentId = customId.replace('md_cfg_skip_step3_', '');
+    await handleSkipSubstitutes(interaction, tournamentId);
+    return true;
+  }
+
+  // Step 3 modal submit
+  if (customId.startsWith('md_cfg_step3_modal_')) {
+    const tournamentId = customId.replace('md_cfg_step3_modal_', '');
+    await handleStep3ModalSubmit(interaction, tournamentId);
+    return true;
+  }
+
+  // Navigation back to Step 2
+  if (customId.startsWith('md_cfg_back_to_step2_')) {
+    const tournamentId = customId.replace('md_cfg_back_to_step2_', '');
+    await showStep2Modal(interaction, tournamentId);
+    return true;
+  }
+
+  // Navigation to Step 5 (Discord Member Mentions)
+  if (customId.startsWith('md_cfg_goto_step5_')) {
+    const tournamentId = customId.replace('md_cfg_goto_step5_', '');
+    await showStep5DiscordSelection(interaction, tournamentId);
+    return true;
+  }
+
+  // Step 5 user select menu submit (or legacy enroll users)
+  if (customId.startsWith('md_cfg_step5_users_') || customId.startsWith('md_cfg_enroll_users_')) {
+    const tournamentId = customId.startsWith('md_cfg_step5_users_')
+      ? customId.replace('md_cfg_step5_users_', '')
+      : customId.replace('md_cfg_enroll_users_', '');
+    await handleStep5UserSelect(interaction, tournamentId);
+    return true;
+  }
+
+  // Cancel enrollment
+  if (customId.startsWith('md_cfg_cancel_enroll_')) {
+    const tournamentId = customId.replace('md_cfg_cancel_enroll_', '');
+    await deletePendingEnrollment(tournamentId, interaction.user.id);
+    await interaction.update({ content: '❌ Enrollment cancelled.', embeds: [], components: [] });
+    return true;
+  }
+
+  // Edit Squad button
+  if (customId.startsWith('md_cfg_edit_squad_btn_')) {
+    const teamId = customId.replace('md_cfg_edit_squad_btn_', '');
+    await handleEditSquadButtonClick(interaction, teamId);
+    return true;
+  }
+
+  // Delete Squad prompt
+  if (customId.startsWith('md_cfg_del_squad_prompt_')) {
+    const teamId = customId.replace('md_cfg_del_squad_prompt_', '');
+    await handleDeleteSquadPrompt(interaction, teamId);
+    return true;
+  }
+
+  // Delete Squad confirm
+  if (customId.startsWith('md_cfg_del_squad_confirm_')) {
+    const teamId = customId.replace('md_cfg_del_squad_confirm_', '');
+    await handleDeleteSquadConfirm(interaction, teamId);
+    return true;
+  }
+
+  // Delete Squad cancel
+  if (customId.startsWith('md_cfg_del_squad_cancel_')) {
+    await handleDeleteSquadCancel(interaction);
     return true;
   }
 

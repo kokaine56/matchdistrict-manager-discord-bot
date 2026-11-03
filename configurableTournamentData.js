@@ -6,12 +6,14 @@ const localTournaments = new Map(); // tournamentId -> doc
 const localRegistrations = new Map(); // registrationId -> doc
 const localTeams = new Map(); // teamId -> doc
 const localEntries = new Map(); // `${registrationId}:${teamId}` -> doc
+const localPendingEnrollments = new Map(); // `${tournamentId}:${userId}` -> sessionDoc
 
 export function clearInMemoryData() {
   localTournaments.clear();
   localRegistrations.clear();
   localTeams.clear();
   localEntries.clear();
+  localPendingEnrollments.clear();
 }
 
 function normalizeTournament(doc) {
@@ -611,5 +613,75 @@ export async function getNextAvailableSlot(registrationId, totalSlots) {
     }
   }
   return null;
+}
+
+// ----------------------------------------------------
+// PENDING ENROLLMENT SESSION CRUD (Multi-step form)
+// ----------------------------------------------------
+
+export async function savePendingEnrollment(session) {
+  if (!session || !session.tournamentId || !session.userId) return null;
+  const key = `${session.tournamentId}:${session.userId}`;
+  const record = {
+    ...session,
+    updatedAt: new Date(),
+    expiresAt: session.expiresAt || (Date.now() + 15 * 60 * 1000),
+  };
+  localPendingEnrollments.set(key, record);
+
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_pending_enrollments');
+      await col.updateOne(
+        { tournamentId: session.tournamentId, userId: session.userId },
+        { $set: record },
+        { upsert: true }
+      );
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error saving pending enrollment:`, err.message);
+    }
+  }
+  return record;
+}
+
+export async function getPendingEnrollment(tournamentId, userId) {
+  if (!tournamentId || !userId) return null;
+  const key = `${tournamentId}:${userId}`;
+
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_pending_enrollments');
+      const doc = await col.findOne({ tournamentId, userId });
+      if (doc && doc.expiresAt > Date.now()) {
+        localPendingEnrollments.set(key, doc);
+        return doc;
+      }
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error reading pending enrollment:`, err.message);
+    }
+  }
+
+  const local = localPendingEnrollments.get(key);
+  if (local && local.expiresAt > Date.now()) {
+    return local;
+  }
+  return null;
+}
+
+export async function deletePendingEnrollment(tournamentId, userId) {
+  if (!tournamentId || !userId) return false;
+  const key = `${tournamentId}:${userId}`;
+  localPendingEnrollments.delete(key);
+
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_pending_enrollments');
+      await col.deleteOne({ tournamentId, userId });
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error deleting pending enrollment:`, err.message);
+      return false;
+    }
+  }
+  return true;
 }
 

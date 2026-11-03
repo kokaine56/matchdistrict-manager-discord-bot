@@ -26,6 +26,7 @@ import {
   deleteConfigurableEntry,
 } from './configurableTournamentData.js';
 import { updateSlotChartMessage } from './slotChartService.js';
+import { TOURNAMENT_DENIED_PERMISSIONS } from './configurableTournamentService.js';
 
 /**
  * Builds the Embed for a public Registration Channel.
@@ -238,7 +239,7 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
         {
           id: guild.roles.everyone.id,
           allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-          deny: [PermissionFlagsBits.SendMessages],
+          deny: [PermissionFlagsBits.SendMessages, ...TOURNAMENT_DENIED_PERMISSIONS],
         },
       ],
     });
@@ -251,7 +252,7 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
       permissionOverwrites: [
         {
           id: guild.roles.everyone.id,
-          deny: [PermissionFlagsBits.ViewChannel],
+          deny: [PermissionFlagsBits.ViewChannel, ...TOURNAMENT_DENIED_PERMISSIONS],
         },
       ],
     });
@@ -393,6 +394,12 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
         ViewChannel: true,
         ReadMessageHistory: true,
         SendMessages: true,
+        CreatePublicThreads: false,
+        CreatePrivateThreads: false,
+        SendMessagesInThreads: false,
+        ManageThreads: false,
+        ManageChannels: false,
+        ManageRoles: false,
       });
     }
   } catch (err) {

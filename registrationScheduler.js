@@ -87,6 +87,17 @@ export async function reconcileConfigurableTournaments(client) {
             const guild = await client.guilds.fetch(reg.guildId).catch(() => null);
             const idpChannel = guild ? await guild.channels.fetch(reg.idpChannelId).catch(() => null) : null;
             if (idpChannel) {
+              if (typeof idpChannel.permissionOverwrites?.edit === 'function' && guild.roles?.everyone?.id) {
+                await idpChannel.permissionOverwrites.edit(guild.roles.everyone.id, {
+                  ViewChannel: false,
+                  CreatePublicThreads: false,
+                  CreatePrivateThreads: false,
+                  SendMessagesInThreads: false,
+                  ManageThreads: false,
+                  ManageChannels: false,
+                  ManageRoles: false,
+                }).catch(() => {});
+              }
               const entries = await getConfigurableEntriesForRegistration(reg.registrationId);
               for (const entry of entries) {
                 if (entry.leaderDiscordId) {
@@ -95,6 +106,12 @@ export async function reconcileConfigurableTournaments(client) {
                       ViewChannel: true,
                       ReadMessageHistory: true,
                       SendMessages: true,
+                      CreatePublicThreads: false,
+                      CreatePrivateThreads: false,
+                      SendMessagesInThreads: false,
+                      ManageThreads: false,
+                      ManageChannels: false,
+                      ManageRoles: false,
                     })
                     .catch(() => {});
                 }

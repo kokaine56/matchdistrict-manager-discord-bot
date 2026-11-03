@@ -249,6 +249,10 @@ async function ensureMongoIndexes() {
     await cfgEntryCol.createIndex({ tournamentId: 1, teamId: 1 });
     await cfgEntryCol.createIndex({ registrationId: 1 });
 
+    const cfgPendingCol = mongoDb.collection('discord_pending_enrollments');
+    await cfgPendingCol.createIndex({ tournamentId: 1, userId: 1 }, { unique: true });
+    await cfgPendingCol.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
     console.log('[MongoDB] 🔒 Indexes verified across managed collections.');
   } catch (err) {
     console.warn('[MongoDB] ⚠️ Error creating indexes:', err.message);
