@@ -403,7 +403,7 @@ export async function saveConfigurableRegistration(doc) {
   return record;
 }
 
-export async function getConfigurableRegistration(registrationId) {
+export async function getConfigurableRegistration(registrationId, includeDeleted = false) {
   if (!registrationId) return null;
   if (isMongoConnected()) {
     try {
@@ -411,21 +411,33 @@ export async function getConfigurableRegistration(registrationId) {
       const doc = await col.findOne({ registrationId });
       if (doc) {
         localRegistrations.set(registrationId, doc);
+        if (!includeDeleted && (doc.status === 'DELETED' || doc.isDeleted === true)) {
+          return null;
+        }
         return doc;
       }
     } catch (err) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error reading registration ${registrationId}:`, err.message);
     }
   }
-  return localRegistrations.get(registrationId) || null;
+  const local = localRegistrations.get(registrationId) || null;
+  if (local && !includeDeleted && (local.status === 'DELETED' || local.isDeleted === true)) {
+    return null;
+  }
+  return local;
 }
 
-export async function getConfigurableRegistrationsForTournament(tournamentId) {
+export async function getConfigurableRegistrationsForTournament(tournamentId, includeDeleted = false) {
   if (!tournamentId) return [];
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_registrations');
-      const docs = await col.find({ tournamentId }).sort({ registrationNumber: 1 }).toArray();
+      const query = { tournamentId };
+      if (!includeDeleted) {
+        query.status = { $ne: 'DELETED' };
+        query.isDeleted = { $ne: true };
+      }
+      const docs = await col.find(query).sort({ registrationNumber: 1 }).toArray();
       for (const d of docs) {
         localRegistrations.set(d.registrationId, d);
       }
@@ -436,18 +448,27 @@ export async function getConfigurableRegistrationsForTournament(tournamentId) {
   }
 
   return Array.from(localRegistrations.values())
-    .filter((r) => r.tournamentId === tournamentId)
+    .filter((r) => {
+      if (r.tournamentId !== tournamentId) return false;
+      if (!includeDeleted && (r.status === 'DELETED' || r.isDeleted === true)) return false;
+      return true;
+    })
     .sort((a, b) => (a.registrationNumber || 0) - (b.registrationNumber || 0));
 }
 
-export async function findConfigurableRegistrationByChannelId(channelId) {
+export async function findConfigurableRegistrationByChannelId(channelId, includeDeleted = false) {
   if (!channelId) return null;
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_registrations');
-      const doc = await col.findOne({
+      const query = {
         $or: [{ registrationChannelId: channelId }, { idpChannelId: channelId }],
-      });
+      };
+      if (!includeDeleted) {
+        query.status = { $ne: 'DELETED' };
+        query.isDeleted = { $ne: true };
+      }
+      const doc = await col.findOne(query);
       if (doc) {
         localRegistrations.set(doc.registrationId, doc);
         return doc;
@@ -459,6 +480,7 @@ export async function findConfigurableRegistrationByChannelId(channelId) {
 
   for (const reg of localRegistrations.values()) {
     if (reg.registrationChannelId === channelId || reg.idpChannelId === channelId) {
+      if (!includeDeleted && (reg.status === 'DELETED' || reg.isDeleted === true)) continue;
       return reg;
     }
   }
@@ -469,7 +491,10 @@ export async function getAllActiveConfigurableRegistrations() {
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_registrations');
-      const docs = await col.find({}).toArray();
+      const docs = await col.find({
+        status: { $ne: 'DELETED' },
+        isDeleted: { $ne: true },
+      }).toArray();
       for (const d of docs) {
         localRegistrations.set(d.registrationId, d);
       }
@@ -479,32 +504,88 @@ export async function getAllActiveConfigurableRegistrations() {
     }
   }
 
-  return Array.from(localRegistrations.values());
+  return Array.from(localRegistrations.values()).filter(
+    (r) => r.status !== 'DELETED' && !r.isDeleted
+  );
 }
 
-export async function deleteConfigurableRegistration(registrationId) {
+export async function deleteConfigurableRegistration(registrationId, client = null) {
   if (!registrationId) return false;
-  localRegistrations.delete(registrationId);
+  const reg = await getConfigurableRegistration(registrationId, true);
+  const now = new Date();
 
-  // Delete all entries in this registration
-  for (const [key, entry] of localEntries.entries()) {
-    if (entry.registrationId === registrationId) {
-      localEntries.delete(key);
-    }
+  // 1. Get active entries before archiving
+  const activeEntries = await getConfigurableEntriesForRegistration(registrationId);
+
+  // 2. Revoke IDP channel permissions for this registration's entries
+  if (client && reg && reg.idpChannelId) {
+    try {
+      const idpChannel = await client.channels.fetch(reg.idpChannelId).catch(() => null);
+      if (idpChannel && idpChannel.permissionOverwrites) {
+        for (const entry of activeEntries) {
+          if (entry.leaderDiscordId) {
+            await idpChannel.permissionOverwrites.delete(entry.leaderDiscordId).catch(() => {});
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 3. Archive active entries to daily registration cycles (never hard delete)
+  if (reg) {
+    await archiveActiveRegistrationCycle(registrationId, {
+      reason: 'REGISTRATION_DELETED',
+      archivedAt: now,
+    }).catch(() => {});
+  }
+
+  // 4. Mark active entries as ARCHIVED in localEntries and MongoDB
+  for (const entry of activeEntries) {
+    entry.status = 'ARCHIVED';
+    entry.archivedAt = now;
+    const cycleKey = `${entry.registrationId}:${entry.cycleId || 'default'}:${entry.teamId}`;
+    localEntries.set(cycleKey, { ...entry });
+  }
+
+  // 5. Update localRegistration to DELETED and clear persistent message IDs
+  if (reg) {
+    reg.status = 'DELETED';
+    reg.isDeleted = true;
+    reg.deletedAt = now;
+    reg.registrationMessageId = null;
+    reg.slotChartMessageId = null;
+    localRegistrations.set(registrationId, { ...reg });
+  } else {
+    localRegistrations.delete(registrationId);
   }
 
   if (isMongoConnected()) {
     try {
       const regCol = getMongoDb().collection('discord_configurable_registrations');
-      await regCol.deleteOne({ registrationId });
+      await regCol.updateOne(
+        { registrationId },
+        {
+          $set: {
+            status: 'DELETED',
+            isDeleted: true,
+            deletedAt: now,
+            registrationMessageId: null,
+            slotChartMessageId: null,
+          },
+        }
+      );
 
       const entryCol = getMongoDb().collection('discord_configurable_entries');
-      await entryCol.deleteMany({ registrationId });
+      await entryCol.updateMany(
+        { registrationId, status: { $in: ['CONFIRMED', 'REGISTERED'] } },
+        { $set: { status: 'ARCHIVED', archivedAt: now } }
+      );
     } catch (err) {
-      console.warn(`[ConfigurableTournament] ⚠️ Mongo error deleting registration ${registrationId}:`, err.message);
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error soft deleting registration ${registrationId}:`, err.message);
       return false;
     }
   }
+
   return true;
 }
 
@@ -708,12 +789,14 @@ export async function saveConfigurableEntry(doc) {
   return record;
 }
 
+const ACTIVE_ENTRY_STATUSES = ['CONFIRMED', 'REGISTERED'];
+
 export async function getConfigurableEntry(registrationId, teamId, cycleId = null) {
   if (!registrationId || !teamId) return null;
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_entries');
-      const query = { registrationId, teamId, status: 'CONFIRMED' };
+      const query = { registrationId, teamId, status: { $in: ACTIVE_ENTRY_STATUSES } };
       if (cycleId) query.cycleId = cycleId;
       const doc = await col.findOne(query);
       if (doc) {
@@ -727,10 +810,10 @@ export async function getConfigurableEntry(registrationId, teamId, cycleId = nul
 
   if (cycleId) {
     const cycleEntry = localEntries.get(`${registrationId}:${cycleId}:${teamId}`);
-    if (cycleEntry && cycleEntry.status === 'CONFIRMED') return cycleEntry;
+    if (cycleEntry && ACTIVE_ENTRY_STATUSES.includes(cycleEntry.status)) return cycleEntry;
   }
   for (const entry of localEntries.values()) {
-    if (entry.registrationId === registrationId && entry.teamId === teamId && entry.status === 'CONFIRMED') {
+    if (entry.registrationId === registrationId && entry.teamId === teamId && ACTIVE_ENTRY_STATUSES.includes(entry.status)) {
       if (!cycleId || entry.cycleId === cycleId) return entry;
     }
   }
@@ -742,7 +825,7 @@ export async function getConfigurableEntriesForRegistration(registrationId, cycl
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_entries');
-      const query = { registrationId, status: 'CONFIRMED' };
+      const query = { registrationId, status: { $in: ACTIVE_ENTRY_STATUSES } };
       if (cycleId) query.cycleId = cycleId;
       const docs = await col
         .find(query)
@@ -759,7 +842,7 @@ export async function getConfigurableEntriesForRegistration(registrationId, cycl
 
   return Array.from(localEntries.values())
     .filter((e) => {
-      if (e.registrationId !== registrationId || e.status !== 'CONFIRMED') return false;
+      if (e.registrationId !== registrationId || !ACTIVE_ENTRY_STATUSES.includes(e.status)) return false;
       if (cycleId && e.cycleId && e.cycleId !== cycleId) return false;
       return true;
     })
@@ -771,7 +854,7 @@ export async function getConfigurableEntriesForTeam(teamId) {
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_entries');
-      const docs = await col.find({ teamId, status: 'CONFIRMED' }).toArray();
+      const docs = await col.find({ teamId, status: { $in: ACTIVE_ENTRY_STATUSES } }).toArray();
       for (const d of docs) {
         localEntries.set(`${d.registrationId}:${d.cycleId || 'default'}:${d.teamId}`, d);
       }
@@ -782,7 +865,7 @@ export async function getConfigurableEntriesForTeam(teamId) {
   }
 
   return Array.from(localEntries.values()).filter(
-    (e) => e.teamId === teamId && e.status === 'CONFIRMED'
+    (e) => e.teamId === teamId && ACTIVE_ENTRY_STATUSES.includes(e.status)
   );
 }
 
@@ -815,7 +898,7 @@ export async function getRegistrationEntriesCount(registrationId, cycleId = null
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_entries');
-      const query = { registrationId, status: 'CONFIRMED' };
+      const query = { registrationId, status: { $in: ACTIVE_ENTRY_STATUSES } };
       if (cycleId) query.cycleId = cycleId;
       return await col.countDocuments(query);
     } catch (err) {
@@ -1058,4 +1141,98 @@ export async function deletePendingEnrollment(tournamentId, userId) {
   }
   return true;
 }
+
+/**
+ * One-time and bot startup reconciliation cleanup:
+ * 1. Finds active registrations whose registration or IDP channel no longer exists in Discord,
+ *    and marks them DELETED while archiving active entries and releasing slots.
+ * 2. Finds any active entries (CONFIRMED/REGISTERED) whose registration is deleted,
+ *    missing, or whose channels are deleted, and archives them with slots released.
+ *    (Clears stale Slot #3 entries like 4Crows).
+ */
+export async function cleanUpStaleConfigurableRegistrationsAndEntries(client = null) {
+  const now = new Date();
+  let cleanedRegistrations = 0;
+  let cleanedEntries = 0;
+
+  try {
+    // 1. Check all non-deleted registrations against Discord channels (if client provided)
+    if (client) {
+      const allActiveRegs = await getAllActiveConfigurableRegistrations();
+      for (const reg of allActiveRegs) {
+        let channelsValid = true;
+        try {
+          if (reg.guildId) {
+            const guild = client.guilds?.cache?.get(reg.guildId) || await client.guilds?.fetch(reg.guildId).catch(() => null);
+            if (guild) {
+              if (reg.registrationChannelId) {
+                const regCh = guild.channels?.cache?.get(reg.registrationChannelId) || await guild.channels?.fetch(reg.registrationChannelId).catch(() => null);
+                if (!regCh) channelsValid = false;
+              }
+              if (reg.idpChannelId) {
+                const idpCh = guild.channels?.cache?.get(reg.idpChannelId) || await guild.channels?.fetch(reg.idpChannelId).catch(() => null);
+                if (!idpCh) channelsValid = false;
+              }
+            }
+          }
+        } catch {
+          channelsValid = false;
+        }
+
+        if (!channelsValid) {
+          console.log(`[ConfigurableTournament] 🧹 Cleaning up orphaned registration "${reg.displayName}" (${reg.registrationId}) - channels missing in Discord.`);
+          await deleteConfigurableRegistration(reg.registrationId, client);
+          cleanedRegistrations++;
+        }
+      }
+    }
+
+    // 2. Clean up any active entries belonging to DELETED or missing registrations
+    if (isMongoConnected()) {
+      const regCol = getMongoDb().collection('discord_configurable_registrations');
+      const entryCol = getMongoDb().collection('discord_configurable_entries');
+
+      // Get all active or non-deleted registration IDs
+      const activeRegDocs = await regCol.find({
+        status: { $ne: 'DELETED' },
+        isDeleted: { $ne: true },
+      }, { projection: { registrationId: 1 } }).toArray();
+      const validRegIds = new Set(activeRegDocs.map((r) => r.registrationId));
+
+      // Find any confirmed entries whose registrationId is not in validRegIds
+      const orphanedEntries = await entryCol.find({
+        status: { $in: ACTIVE_ENTRY_STATUSES },
+        registrationId: { $nin: Array.from(validRegIds) },
+      }).toArray();
+
+      if (orphanedEntries.length > 0) {
+        console.log(`[ConfigurableTournament] 🧹 Found ${orphanedEntries.length} orphaned active entry/entries to archive.`);
+        const orphanedIds = orphanedEntries.map((e) => e._id);
+        await entryCol.updateMany(
+          { _id: { $in: orphanedIds } },
+          { $set: { status: 'ARCHIVED', archivedAt: now, archiveReason: 'STALE_REGISTRATION_CLEANUP' } }
+        );
+        cleanedEntries += orphanedEntries.length;
+      }
+    }
+
+    // Also clean up in local memory
+    for (const [key, entry] of localEntries.entries()) {
+      if (ACTIVE_ENTRY_STATUSES.includes(entry.status)) {
+        const reg = localRegistrations.get(entry.registrationId);
+        if (!reg || reg.status === 'DELETED' || reg.isDeleted === true) {
+          entry.status = 'ARCHIVED';
+          entry.archivedAt = now;
+          localEntries.set(key, { ...entry });
+          cleanedEntries++;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(`[ConfigurableTournament] ⚠️ Error in cleanUpStaleConfigurableRegistrationsAndEntries:`, err.message);
+  }
+
+  return { cleanedRegistrations, cleanedEntries };
+}
+
 

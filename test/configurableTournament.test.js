@@ -42,6 +42,7 @@ import {
   getDailyCycle,
   getDailyCyclesForRegistration,
   archiveActiveRegistrationCycle,
+  cleanUpStaleConfigurableRegistrationsAndEntries,
 } from '../configurableTournamentData.js';
 
 import {
@@ -50,6 +51,7 @@ import {
   handleSetupTournamentCommand,
   handleCreateStandardChannels,
   handleConfigurableChannelUpdate,
+  handleConfigurableChannelDelete,
   handleTournamentSettingsButton,
   handleSetRequiredMembers,
   TOURNAMENT_DENIED_PERMISSIONS,
@@ -89,6 +91,7 @@ import {
   handleEditRegistrationButton,
   handleEditRegistrationModalSubmit,
   handleViewCurrentSlotChart,
+  handleDeleteRegistration,
 } from '../configurableRegistrationService.js';
 
 import {
@@ -2184,6 +2187,315 @@ test('Same Team Multiple Registrations - Team can register across multiple regis
   // 3. Attempting to register in Morning registration again in the same cycle -> rejected as already registered
   await handleRegisterSquadButtonClick(regInteraction, regIdMorning);
   assert.match(regInteraction.lastReply.content, /already registered in this daily cycle/);
+});
+
+test('Deleted Registration Cleanup & Re-registration - Team registered in deleted channel can register in new channel without duplicate error', async () => {
+  const tourId = 'tour-del-reg-bug';
+  const regIdOld = 'reg-old-chan';
+  const regIdNew = 'reg-new-chan';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    requiredDiscordMembers: 1,
+  });
+
+  // Old registration channel
+  await saveConfigurableRegistration({
+    registrationId: regIdOld,
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    displayName: 'Old T3 10PM',
+    registrationNumber: 1,
+    totalSlots: 16,
+    reservedSlots: 2,
+    status: 'OPEN',
+    registrationChannelId: 'chan-old-reg',
+    idpChannelId: 'chan-old-idp',
+    currentCycleId: `${regIdOld}:cycle-1`,
+  });
+
+  // Team "4Crows"
+  const leaderId = 'ldr-4crows';
+  await saveConfigurableTeam({
+    teamId: 'team-4crows',
+    tournamentId: tourId,
+    teamName: 'Team Name 4Crows',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'CrowLead', uid: '998877' }],
+  });
+
+  const mockGuild = {
+    channels: {
+      fetch: async (id) => ({
+        id,
+        isTextBased: () => true,
+        delete: async () => {},
+        permissionOverwrites: {
+          edit: async () => {},
+          delete: async () => {},
+        },
+        send: async () => ({ id: 'm' }),
+        messages: { fetch: async () => null },
+      }),
+    },
+  };
+
+  const regInteraction = {
+    guild: mockGuild,
+    guildId: 'guild-cfg',
+    user: { id: leaderId },
+    client: { channels: mockGuild.channels },
+    reply: async (p) => { regInteraction.lastReply = p; },
+  };
+
+  // 1. Team registers in Old registration -> assigned Slot #3 (2 reserved slots)
+  await handleRegisterSquadButtonClick(regInteraction, regIdOld);
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed!/);
+  assert.match(regInteraction.lastReply.content, /Slot Number:.*`#3`/);
+
+  // 2. Old registration channel is deleted (via handleDeleteRegistration or handleConfigurableChannelDelete)
+  const delInteraction = {
+    guild: mockGuild,
+    client: { channels: mockGuild.channels },
+    reply: async (p) => { delInteraction.lastReply = p; },
+  };
+  await handleDeleteRegistration(delInteraction, regIdOld);
+
+  // Verify old registration is marked DELETED
+  const oldRegAfter = await getConfigurableRegistration(regIdOld);
+  assert.equal(oldRegAfter, null, 'Deleted registration should not be returned by default');
+
+  const oldEntries = await getConfigurableEntriesForRegistration(regIdOld);
+  assert.equal(oldEntries.length, 0, 'No active confirmed entries should remain in deleted registration');
+
+  // 3. New registration is created for the tournament
+  await saveConfigurableRegistration({
+    registrationId: regIdNew,
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    displayName: 'New T3 10PM',
+    registrationNumber: 2,
+    totalSlots: 16,
+    reservedSlots: 2,
+    status: 'OPEN',
+    registrationChannelId: 'chan-new-reg',
+    idpChannelId: 'chan-new-idp',
+    currentCycleId: `${regIdNew}:cycle-new-1`,
+  });
+
+  // 4. Team "4Crows" registers in the NEW registration channel
+  // MUST NOT receive "already registered in this daily cycle" error with old channel reference!
+  await handleRegisterSquadButtonClick(regInteraction, regIdNew);
+  assert.match(
+    regInteraction.lastReply.content,
+    /Registration Confirmed!/,
+    'Team must be allowed to register in new registration channel without being blocked by old deleted channel'
+  );
+  assert.match(regInteraction.lastReply.content, /Slot Number:.*`#3`/);
+});
+
+test('Discord Channel Deletion Cleanup - Events.ChannelDelete cleans up registration, archives active entries and revokes IDP access', async () => {
+  const tourId = 'tour-chan-del';
+  const regId = 'reg-chan-del-1';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    requiredDiscordMembers: 1,
+  });
+
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    displayName: 'Scrims Direct Delete',
+    registrationNumber: 1,
+    totalSlots: 10,
+    reservedSlots: 0,
+    status: 'OPEN',
+    registrationChannelId: 'chan-direct-reg',
+    idpChannelId: 'chan-direct-idp',
+    currentCycleId: `${regId}:cycle-1`,
+  });
+
+  const leaderId = 'ldr-direct-del';
+  await saveConfigurableTeam({
+    teamId: 'team-direct',
+    tournamentId: tourId,
+    teamName: 'Direct Team',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'DirectLead', uid: '334455' }],
+  });
+
+  let deletedOverwrites = [];
+  let pairedChannelDeleted = false;
+
+  const mockClient = {
+    guilds: {
+      fetch: async () => ({ id: 'guild-cfg' }),
+    },
+    channels: {
+      fetch: async (id) => ({
+        id,
+        isTextBased: () => true,
+        delete: async () => { pairedChannelDeleted = true; },
+        send: async () => ({ id: 'm' }),
+        messages: { fetch: async () => null },
+        permissionOverwrites: {
+          delete: async (targetId) => { deletedOverwrites.push(targetId); },
+        },
+      }),
+    },
+  };
+
+  const regInteraction = {
+    guild: { channels: mockClient.channels },
+    guildId: 'guild-cfg',
+    user: { id: leaderId },
+    client: mockClient,
+    reply: async (p) => { regInteraction.lastReply = p; },
+  };
+
+  // Register team
+  await handleRegisterSquadButtonClick(regInteraction, regId);
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed!/);
+
+  // Simulate Discord channel delete event for the registration channel
+  const deletedChannelMock = {
+    id: 'chan-direct-reg',
+    name: 'scrims-direct-delete-reg',
+    guild: {
+      channels: {
+        cache: {
+          get: (id) => ({
+            id,
+            delete: async () => { pairedChannelDeleted = true; },
+          }),
+        },
+      },
+    },
+    client: mockClient,
+  };
+
+  await handleConfigurableChannelDelete(deletedChannelMock);
+
+  // Verify registration is soft-deleted
+  const regAfter = await getConfigurableRegistration(regId);
+  assert.equal(regAfter, null);
+
+  // Verify IDP permission was revoked
+  assert.ok(deletedOverwrites.includes(leaderId), 'Leader IDP permission overwrite must be revoked');
+  assert.equal(pairedChannelDeleted, true, 'Paired IDP channel must be deleted');
+});
+
+test('Monotonically Increasing Registration Numbers - Deleted registration numbers are never reused', async () => {
+  const tourId = 'tour-mono-nums';
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+  });
+
+  const createdChannels = [];
+  const mockGuild = {
+    id: 'guild-cfg',
+    roles: { everyone: { id: 'role-everyone' } },
+    channels: {
+      create: async (opts) => {
+        const ch = {
+          id: `chan-${opts.name}`,
+          name: opts.name,
+          isTextBased: () => true,
+          delete: async () => {},
+          send: async () => ({ id: 'm' }),
+          messages: { fetch: async () => null },
+        };
+        createdChannels.push(ch);
+        return ch;
+      },
+      fetch: async (id) => createdChannels.find((c) => c.id === id) || null,
+    },
+  };
+
+  const createInteraction = (name) => ({
+    guild: mockGuild,
+    guildId: 'guild-cfg',
+    user: { id: 'admin-user' },
+    deferReply: async () => {},
+    fields: {
+      getTextInputValue: (field) => {
+        if (field === 'registration_name' || field === 'display_name') return name;
+        if (field === 'total_slots') return '16';
+        if (field === 'reserved_slots') return '2';
+        if (field === 'daily_start_time') return '10:00 AM';
+        if (field === 'daily_reset_time') return '02:00 AM';
+        return '';
+      },
+    },
+    editReply: async (p) => { createInteraction.lastReply = p; },
+    client: { channels: mockGuild.channels },
+  });
+
+  // Create Registration 1
+  await handleAddRegistrationModalSubmit(createInteraction('T3 10PM'), tourId);
+  const regs1 = await getConfigurableRegistrationsForTournament(tourId, true);
+  assert.equal(regs1.length, 1);
+  assert.equal(regs1[0].registrationNumber, 1);
+
+  // Delete Registration 1
+  await deleteConfigurableRegistration(regs1[0].registrationId);
+
+  // Create Registration 2
+  await handleAddRegistrationModalSubmit(createInteraction('T3 11PM'), tourId);
+  const regs2 = await getConfigurableRegistrationsForTournament(tourId, true);
+  assert.equal(regs2.length, 2);
+  const newReg = regs2.find((r) => r.status !== 'DELETED');
+  assert.equal(newReg.registrationNumber, 2, 'New registration must have number 2, never reusing 1');
+});
+
+test('Startup Reconciliation Cleanup - Stale active entries belonging to deleted registrations or channels are archived', async () => {
+  const tourId = 'tour-startup-cleanup';
+  const regIdStale = 'reg-stale-orphaned';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+  });
+
+  // Stale registration already marked DELETED
+  await saveConfigurableRegistration({
+    registrationId: regIdStale,
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    displayName: 'Deleted Channel Reg',
+    registrationNumber: 1,
+    totalSlots: 16,
+    status: 'DELETED',
+    isDeleted: true,
+  });
+
+  // Stale active entry for "Team Name 4Crows" in that deleted registration
+  await saveConfigurableEntry({
+    registrationId: regIdStale,
+    cycleId: `${regIdStale}:cycle-stale`,
+    tournamentId: tourId,
+    teamId: 'team-4crows-stale',
+    teamName: 'Team Name 4Crows',
+    slotNumber: 3,
+    status: 'CONFIRMED',
+  });
+
+  // Verify entry is initially active
+  const initialEntry = await getConfigurableEntry(regIdStale, 'team-4crows-stale', `${regIdStale}:cycle-stale`);
+  assert.ok(initialEntry, 'Stale entry starts active');
+
+  // Run startup reconciliation cleanup
+  const cleanupResult = await cleanUpStaleConfigurableRegistrationsAndEntries(null);
+  assert.ok(cleanupResult.cleanedEntries >= 1, 'Should have cleaned up at least 1 orphaned entry');
+
+  // Verify entry is now ARCHIVED and no longer active
+  const entryAfter = await getConfigurableEntry(regIdStale, 'team-4crows-stale', `${regIdStale}:cycle-stale`);
+  assert.equal(entryAfter, null, 'Orphaned entry must be archived and no longer returned as active confirmed');
 });
 
 

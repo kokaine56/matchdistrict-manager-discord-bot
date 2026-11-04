@@ -250,8 +250,23 @@ async function ensureMongoIndexes() {
     try {
       await cfgEntryCol.dropIndex('registrationId_1_slotNumber_1');
     } catch {}
-    await cfgEntryCol.createIndex({ registrationId: 1, cycleId: 1, teamId: 1 }, { unique: true });
-    await cfgEntryCol.createIndex({ registrationId: 1, cycleId: 1, slotNumber: 1 }, { unique: true });
+    try {
+      await cfgEntryCol.dropIndex('registrationId_1_cycleId_1_teamId_1');
+    } catch {}
+    try {
+      await cfgEntryCol.dropIndex('registrationId_1_cycleId_1_slotNumber_1');
+    } catch {}
+    try {
+      await cfgEntryCol.dropIndex('tournamentId_1_teamId_1');
+    } catch {}
+    await cfgEntryCol.createIndex(
+      { registrationId: 1, cycleId: 1, teamId: 1 },
+      { unique: true, partialFilterExpression: { status: { $in: ['CONFIRMED', 'REGISTERED'] } } }
+    );
+    await cfgEntryCol.createIndex(
+      { registrationId: 1, cycleId: 1, slotNumber: 1 },
+      { unique: true, partialFilterExpression: { status: { $in: ['CONFIRMED', 'REGISTERED'] } } }
+    );
     await cfgEntryCol.createIndex({ tournamentId: 1, teamId: 1 });
     await cfgEntryCol.createIndex({ registrationId: 1, status: 1 });
 

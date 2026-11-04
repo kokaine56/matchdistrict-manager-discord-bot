@@ -17,6 +17,7 @@ import {
   getEnrolledTeamsCount,
   getRegistrationEntriesCount,
   findConfigurableRegistrationByChannelId,
+  deleteConfigurableRegistration,
   getPendingEnrollment,
   deletePendingEnrollment,
 } from './configurableTournamentData.js';
@@ -476,6 +477,56 @@ export async function handleConfigurableChannelUpdate(oldChannel, newChannel) {
     }
   } catch (err) {
     console.warn(`[ConfigurableTournament] ⚠️ Failed to rename linked IDP channel:`, err.message);
+  }
+}
+
+/**
+ * Handles automatic cleanup when a configurable tournament registration channel
+ * or linked IDP channel is deleted directly in Discord.
+ * - Marks registration as DELETED (status = 'DELETED', isDeleted = true)
+ * - Archives current cycle entries (status = 'ARCHIVED', releases slots, never hard deletes)
+ * - Revokes IDP access for that registration only
+ * - Removes persistent message stored IDs
+ * - Updates central dashboard
+ * - Ensures nothing from the deleted registration counts in allocations or counters
+ * @param {import('discord.js').GuildChannel} channel
+ */
+export async function handleConfigurableChannelDelete(channel) {
+  if (!channel || !channel.id) return;
+  try {
+    const registration = await findConfigurableRegistrationByChannelId(channel.id, false);
+    if (!registration) return;
+
+    console.log(`[ConfigurableTournament] 🗑️ Detected deletion of channel #${channel.name || channel.id} for registration "${registration.displayName}" (${registration.registrationId}). Cleaning up...`);
+
+    const client = channel.client;
+
+    // Delete and cleanup registration (archives entries, revokes IDP access, marks DELETED)
+    await deleteConfigurableRegistration(registration.registrationId, client);
+
+    // Also delete the paired channel if it still exists in the guild
+    const otherChannelId = registration.registrationChannelId === channel.id
+      ? registration.idpChannelId
+      : registration.registrationChannelId;
+
+    if (otherChannelId && channel.guild) {
+      try {
+        const otherChan = channel.guild.channels.cache?.get?.(otherChannelId) ||
+          await channel.guild.channels.fetch(otherChannelId).catch(() => null);
+        if (otherChan) {
+          await otherChan.delete('Configurable tournament paired channel cleanup').catch(() => null);
+        }
+      } catch (err) {
+        console.warn(`[ConfigurableTournament] ⚠️ Error cleaning up paired channel ${otherChannelId}:`, err.message);
+      }
+    }
+
+    // Refresh central dashboard
+    if (client && registration.tournamentId) {
+      await refreshDashboard(client, registration.tournamentId).catch(() => {});
+    }
+  } catch (err) {
+    console.warn(`[ConfigurableTournament] ⚠️ Error handling channel deletion for #${channel.id}:`, err.message);
   }
 }
 

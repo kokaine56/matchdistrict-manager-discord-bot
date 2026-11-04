@@ -261,8 +261,11 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
   const status = cycleEval.status;
   const currentCycleDate = cycleEval.cycleDate;
 
-  const existingRegs = await getConfigurableRegistrationsForTournament(tournamentId);
-  const regNumber = existingRegs.length + 1;
+  // Monotonically increment registration number across all registrations (including deleted)
+  // Never reuse the registration number of a deleted registration
+  const allRegs = await getConfigurableRegistrationsForTournament(tournamentId, true);
+  const highestRegNumber = allRegs.reduce((max, r) => Math.max(max, r.registrationNumber || 0), 0);
+  const regNumber = highestRegNumber + 1;
 
   // Generate channel slugs
   const slug = displayName
@@ -306,6 +309,7 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
     });
 
     const registrationId = crypto.randomUUID();
+    const currentCycleId = `${registrationId}:cycle-${crypto.randomUUID()}`;
     const registrationDoc = {
       registrationId,
       tournamentId,
@@ -323,7 +327,7 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
       dailyResetTime: parsedReset.formatted,
       rawDailyResetTime: rawReset,
       timezone,
-      currentCycleId: `${registrationId}:${currentCycleDate}`,
+      currentCycleId,
       currentCycleDate,
       currentCycleStartedAt: cycleEval.isOpen ? now : null,
       lastResetAt: null,
@@ -408,11 +412,16 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
   }
 
   const team = leaderTeams[0]; // Leader's enrolled team
-  const currentCycleId = registration.currentCycleId || `${registrationId}:${registration.currentCycleDate || 'default'}`;
+  if (!registration.currentCycleId) {
+    registration.currentCycleId = `${registrationId}:cycle-${crypto.randomUUID()}`;
+    await saveConfigurableRegistration(registration);
+  }
+  const currentCycleId = registration.currentCycleId;
 
   // 2. Check if team is ALREADY registered in THIS registration cycle
+  // Strictly matches: registrationId + currentCycleId + teamId with active status
   const existingEntry = await getConfigurableEntry(registrationId, team.teamId, currentCycleId);
-  if (existingEntry) {
+  if (existingEntry && existingEntry.registrationId === registrationId) {
     return interaction.reply({
       content:
         `❌ Your team **${team.teamName}** is already registered in this daily cycle!\n` +
@@ -1066,6 +1075,21 @@ export async function handleDeleteRegistration(interaction, registrationId) {
     return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
   }
 
+  // Revoke IDP access for active leaders before deleting channels
+  const activeEntries = await getConfigurableEntriesForRegistration(registrationId);
+  if (registration.idpChannelId && interaction.guild) {
+    try {
+      const idpChan = await interaction.guild.channels.fetch(registration.idpChannelId).catch(() => null);
+      if (idpChan && idpChan.permissionOverwrites) {
+        for (const entry of activeEntries) {
+          if (entry.leaderDiscordId) {
+            await idpChan.permissionOverwrites.delete(entry.leaderDiscordId).catch(() => {});
+          }
+        }
+      }
+    } catch {}
+  }
+
   try {
     if (registration.registrationChannelId) {
       const regChan = await interaction.guild.channels.fetch(registration.registrationChannelId).catch(() => null);
@@ -1079,7 +1103,7 @@ export async function handleDeleteRegistration(interaction, registrationId) {
     console.warn(`[ConfigurableRegistration] ⚠️ Error cleaning up channels:`, err.message);
   }
 
-  await deleteConfigurableRegistration(registrationId);
+  await deleteConfigurableRegistration(registrationId, interaction.client);
 
   if (interaction.client) {
     await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});

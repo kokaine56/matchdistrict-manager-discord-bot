@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import {
   getAllActiveConfigurableRegistrations,
   getAllConfigurableTournaments,
@@ -10,6 +11,7 @@ import {
   getCurrentTimeInTimezone,
   parseTimeString,
   parseReservedSlots,
+  cleanUpStaleConfigurableRegistrationsAndEntries,
 } from './configurableTournamentData.js';
 import { updateRegistrationMessage } from './configurableRegistrationService.js';
 import { updateSlotChartMessage } from './slotChartService.js';
@@ -53,7 +55,7 @@ export async function executeDailyCycleReset(client, registrationId, force = fal
   // 2. Archive to discord_daily_registration_cycles and mark entries ARCHIVED
   await archiveActiveRegistrationCycle(registrationId, {
     cycleDate: cycleDateToArchive,
-    cycleId: `${registrationId}:${cycleDateToArchive}`,
+    cycleId: reg.currentCycleId || `${registrationId}:cycle-${crypto.randomUUID()}`,
     reason: 'SCHEDULED_DAILY_RESET',
   });
 
@@ -148,7 +150,7 @@ export async function checkRegistrationLifecycles(client) {
             if (entries.length < maxAvailable) {
               reg.status = 'OPEN';
               reg.currentCycleDate = activeCycle;
-              reg.currentCycleId = `${reg.registrationId}:${activeCycle}`;
+              reg.currentCycleId = `${reg.registrationId}:cycle-${crypto.randomUUID()}`;
               if (!reg.currentCycleStartedAt) reg.currentCycleStartedAt = now;
               stateChanged = true;
               console.log(`[RegistrationScheduler] 🟢 Daily cycle opened for "${reg.displayName}" (${reg.registrationId}).`);
@@ -218,6 +220,9 @@ export async function checkRegistrationLifecycles(client) {
 export async function reconcileConfigurableTournaments(client) {
   console.log('[ConfigurableTournament] 🔄 Reconciling configurable tournaments, daily cycles and permissions...');
   try {
+    // 0. Clean up stale or orphaned registrations/entries on startup
+    await cleanUpStaleConfigurableRegistrationsAndEntries(client);
+
     const tournaments = await getAllConfigurableTournaments();
 
     // Catch up any lifecycle transitions/resets that occurred while bot was offline

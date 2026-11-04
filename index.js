@@ -176,6 +176,7 @@ import {
   handleSetupTournamentCommand,
   handleConfigurableTournamentInteraction,
   handleConfigurableChannelUpdate,
+  handleConfigurableChannelDelete,
 } from './configurableTournamentService.js';
 import {
   startRegistrationScheduler,
@@ -2981,6 +2982,7 @@ client.on(Events.ChannelCreate, async (channel) => {
 
 client.on(Events.ChannelDelete, async (channel) => {
   await handleChannelDeleteAuditLog(channel);
+  await handleConfigurableChannelDelete(channel);
 });
 
 // Role creation and deletion audit listeners
