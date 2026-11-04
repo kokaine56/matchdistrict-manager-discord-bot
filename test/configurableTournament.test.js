@@ -135,6 +135,7 @@ async function registerSquadFull(interaction, registrationId) {
 import {
   buildSlotChartEmbed,
   updateSlotChartMessage,
+  updateRegistrationSlotList,
   buildSlotListText,
   buildSlotListTitle,
   getFilledSlotCounter,
@@ -4099,6 +4100,267 @@ test('Confirmation Timeout Fix - Repeated confirmation attempts after successful
   await handleConfirmRegistrationButtonClick(int2, regId, teamId);
   assert.match(int2.getPayload().content, /already registered in this daily cycle/);
 });
+
+// ---------------------------------------------------------------------------
+// REAL-TIME SLOT LIST & CONFIRMATION WORKFLOW TESTS
+// ---------------------------------------------------------------------------
+
+test('Real-Time Slot List & Confirmation - Complete Lifecycle & In-Place Message Sync', async () => {
+  const tourId = 'tour-rt-sync';
+  const regId = 'reg-rt-sync';
+  const team1Id = 'team-rt-1';
+  const team2Id = 'team-rt-2';
+  const leader1Id = 'ldr-rt-1';
+  const leader2Id = 'ldr-rt-2';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    name: 'T3 Scrims',
+  });
+
+  await saveConfigurableRegistration({
+    tournamentId: tourId,
+    registrationId: regId,
+    displayName: '10PM',
+    totalSlots: 6,
+    reservedSlots: 2, // Slot 01 and Slot 02 are LOCKED
+    status: 'OPEN',
+    idpChannelId: 'chan-idp-rt',
+    registrationChannelId: 'chan-reg-rt',
+    currentCycleId: `${regId}:cycle-rt`,
+  });
+
+  await saveConfigurableTeam({
+    teamId: team1Id,
+    tournamentId: tourId,
+    teamName: 'Team Alpha',
+    leaderDiscordId: leader1Id,
+    players: [{ discordId: leader1Id, ign: 'AlphaLead', uid: '111' }],
+  });
+
+  await saveConfigurableTeam({
+    teamId: team2Id,
+    tournamentId: tourId,
+    teamName: 'Team Bravo',
+    leaderDiscordId: leader2Id,
+    players: [{ discordId: leader2Id, ign: 'BravoLead', uid: '222' }],
+  });
+
+  let idpMessages = [];
+  const mockIdpChannel = {
+    id: 'chan-idp-rt',
+    isTextBased: () => true,
+    send: async (payload) => {
+      const msg = {
+        id: `idp-msg-${idpMessages.length + 1}`,
+        content: payload.content,
+        edit: async (newP) => {
+          msg.content = newP.content;
+          return msg;
+        },
+      };
+      idpMessages.push(msg);
+      return msg;
+    },
+    messages: {
+      fetch: async (id) => idpMessages.find((m) => m.id === id) || null,
+    },
+  };
+
+  const mockClient = {
+    channels: {
+      fetch: async (id) => (id === 'chan-idp-rt' ? mockIdpChannel : null),
+    },
+  };
+
+  // 1. Initial slot list generation
+  await updateRegistrationSlotList(regId, `${regId}:cycle-rt`, mockClient);
+  assert.equal(idpMessages.length, 1, 'Initial message created');
+  const initialContent = idpMessages[0].content;
+  assert.match(initialContent, /T3 Scrims 10PM Slotlist/);
+  assert.match(initialContent, /Slot 01 → 🔒 LOCKED/);
+  assert.match(initialContent, /Slot 02 → 🔒 LOCKED/);
+  assert.match(initialContent, /Slot 03 → AVAILABLE/);
+  assert.match(initialContent, /Slot 04 → AVAILABLE/);
+  assert.match(initialContent, /Slot 05 → AVAILABLE/);
+  assert.match(initialContent, /Slot 06 → AVAILABLE/);
+  assert.match(initialContent, /⚪ 0\/4 filled/);
+
+  // 2. First squad registers: Team Alpha
+  let interaction1Payload = null;
+  let interaction1DeferredUpdate = false;
+  const mockInteraction1 = {
+    id: 'int-confirm-1',
+    isButton: () => true,
+    guildId: 'guild-rt',
+    user: { id: leader1Id },
+    client: mockClient,
+    deferUpdate: async () => {
+      interaction1DeferredUpdate = true;
+      mockInteraction1.deferred = true;
+    },
+    editReply: async (p) => {
+      interaction1Payload = p;
+    },
+  };
+
+  await handleConfirmRegistrationButtonClick(mockInteraction1, regId, team1Id);
+
+  // Verification of ephemeral confirmation response
+  assert.equal(interaction1DeferredUpdate, true, 'Acknowledged immediately with deferUpdate');
+  assert.ok(interaction1Payload, 'Returned Registration Successful payload');
+  assert.match(interaction1Payload.content, /Registration Successful/);
+  assert.match(interaction1Payload.content, /Team Alpha/);
+  assert.match(interaction1Payload.content, /Slot Number:.*`#3`/);
+  assert.deepEqual(interaction1Payload.components, [], 'Confirm and Cancel buttons are completely removed');
+
+  // Verification of real-time slot list update
+  assert.equal(idpMessages.length, 1, 'Did not duplicate IDP message; edited in-place');
+  const updatedContent1 = idpMessages[0].content;
+  assert.match(updatedContent1, /Slot 01 → 🔒 LOCKED/);
+  assert.match(updatedContent1, /Slot 02 → 🔒 LOCKED/);
+  assert.match(updatedContent1, /Slot 03 → Team Alpha/);
+  assert.match(updatedContent1, /Slot 04 → AVAILABLE/);
+  assert.match(updatedContent1, /🟡 1\/4 filled/);
+
+  // 3. Second squad registers: Team Bravo
+  let interaction2Payload = null;
+  const mockInteraction2 = {
+    id: 'int-confirm-2',
+    isButton: () => true,
+    guildId: 'guild-rt',
+    user: { id: leader2Id },
+    client: mockClient,
+    deferUpdate: async () => {
+      mockInteraction2.deferred = true;
+    },
+    editReply: async (p) => {
+      interaction2Payload = p;
+    },
+  };
+
+  await handleConfirmRegistrationButtonClick(mockInteraction2, regId, team2Id);
+
+  assert.ok(interaction2Payload);
+  assert.match(interaction2Payload.content, /Registration Successful/);
+  assert.match(interaction2Payload.content, /Team Bravo/);
+  assert.match(interaction2Payload.content, /Slot Number:.*`#4`/);
+  assert.deepEqual(interaction2Payload.components, [], 'Buttons removed');
+
+  // Verification of real-time slot list update
+  assert.equal(idpMessages.length, 1, 'Still exactly 1 persistent IDP message');
+  const updatedContent2 = idpMessages[0].content;
+  assert.match(updatedContent2, /Slot 03 → Team Alpha/);
+  assert.match(updatedContent2, /Slot 04 → Team Bravo/);
+  assert.match(updatedContent2, /Slot 05 → AVAILABLE/);
+  assert.match(updatedContent2, /🟡 2\/4 filled/);
+
+  // 4. Cancellation test
+  let cancelPayload = null;
+  let cancelDeferred = false;
+  const mockCancelInteraction = {
+    id: 'int-cancel-rt',
+    isButton: () => true,
+    user: { id: leader1Id },
+    deferUpdate: async () => {
+      cancelDeferred = true;
+      mockCancelInteraction.deferred = true;
+    },
+    editReply: async (p) => {
+      cancelPayload = p;
+    },
+    update: async (p) => {
+      cancelPayload = p;
+    },
+  };
+
+  await handleCancelRegistrationButtonClick(mockCancelInteraction, regId, team1Id);
+  assert.equal(cancelDeferred, true);
+  assert.ok(cancelPayload);
+  assert.match(cancelPayload.content, /Registration cancelled/);
+  assert.deepEqual(cancelPayload.components, [], 'Cancel buttons removed');
+});
+
+test('Real-Time Slot List - Multiple registrations remain strictly independent', async () => {
+  const tourId = 'tour-indep-slot';
+  const reg1Id = 'reg-indep-1';
+  const reg2Id = 'reg-indep-2';
+
+  await saveConfigurableTournament({ tournamentId: tourId, name: 'Independent Tour' });
+
+  await saveConfigurableRegistration({
+    tournamentId: tourId,
+    registrationId: reg1Id,
+    displayName: '10 PM',
+    totalSlots: 4,
+    reservedSlots: 1,
+    status: 'OPEN',
+    idpChannelId: 'chan-idp-indep-1',
+    currentCycleId: `${reg1Id}:cycle-1`,
+  });
+
+  await saveConfigurableRegistration({
+    tournamentId: tourId,
+    registrationId: reg2Id,
+    displayName: '11 PM',
+    totalSlots: 4,
+    reservedSlots: 0,
+    status: 'OPEN',
+    idpChannelId: 'chan-idp-indep-2',
+    currentCycleId: `${reg2Id}:cycle-2`,
+  });
+
+  // Register Team Phoenix only in reg1
+  await saveConfigurableEntry({
+    entryId: 'ent-indep-1',
+    registrationId: reg1Id,
+    cycleId: `${reg1Id}:cycle-1`,
+    teamId: 'tm-phoenix',
+    teamName: 'Team Phoenix',
+    slotNumber: 2,
+    status: 'CONFIRMED',
+  });
+
+  let msg1 = null;
+  let msg2 = null;
+
+  const client = {
+    channels: {
+      fetch: async (chanId) => {
+        if (chanId === 'chan-idp-indep-1') {
+          return {
+            id: chanId,
+            isTextBased: () => true,
+            send: async (p) => { msg1 = p.content; return { id: 'm1', content: p.content, edit: async (np) => { msg1 = np.content; } }; },
+            messages: { fetch: async () => null },
+          };
+        }
+        if (chanId === 'chan-idp-indep-2') {
+          return {
+            id: chanId,
+            isTextBased: () => true,
+            send: async (p) => { msg2 = p.content; return { id: 'm2', content: p.content, edit: async (np) => { msg2 = np.content; } }; },
+            messages: { fetch: async () => null },
+          };
+        }
+        return null;
+      },
+    },
+  };
+
+  await updateRegistrationSlotList(reg1Id, `${reg1Id}:cycle-1`, client);
+  await updateRegistrationSlotList(reg2Id, `${reg2Id}:cycle-2`, client);
+
+  // Reg 1 contains Team Phoenix on slot 2 and slot 1 locked
+  assert.match(msg1, /Slot 01 → 🔒 LOCKED/);
+  assert.match(msg1, /Slot 02 → Team Phoenix/);
+  assert.match(msg1, /Slot 03 → AVAILABLE/);
+
+  // Reg 2 does NOT contain Team Phoenix; slot 1 is available
+  assert.match(msg2, /Slot 01 → AVAILABLE/);
+  assert.doesNotMatch(msg2, /Team Phoenix/);
+});
+
 
 
 

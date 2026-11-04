@@ -174,17 +174,73 @@ export function buildSlotChartEmbed(registration, entries = [], tournament = nul
     .setTimestamp();
 }
 
+let activeDiscordClient = null;
+
+/**
+ * Sets the active Discord client reference for slot list updates.
+ * @param {import('discord.js').Client} client
+ */
+export function setSlotChartClient(client) {
+  activeDiscordClient = client;
+}
+
+/**
+ * Gets the active Discord client reference.
+ * @returns {import('discord.js').Client|null}
+ */
+export function getSlotChartClient() {
+  return activeDiscordClient;
+}
+
 /**
  * Updates or creates the persistent slot list message in the registration's IDP channel.
- * Edits the existing message in-place using its stored Discord message ID.
- * Avoids unnecessary embeds or decorative content to ensure maximum mobile readability.
+ * Real-time synchronization service:
+ * 1. Retrieves registration.
+ * 2. Retrieves current cycle.
+ * 3. Retrieves all active registration entries from MongoDB.
+ * 4. Retrieves reserved slot configuration.
+ * 5. Builds every slot sequentially from 01 through total capacity.
+ * 6. Marks reserved slots 🔒 LOCKED.
+ * 7. Marks occupied slots with their team names.
+ * 8. Marks remaining slots AVAILABLE.
+ * 9. Updates the existing Discord message in-place without duplicates.
  *
- * @param {import('discord.js').Client} client
- * @param {string} registrationId
+ * Supports flexible signatures:
+ * - updateRegistrationSlotList(registrationId, [cycleId], [client])
+ * - updateRegistrationSlotList(client, registrationId, [cycleId])
+ *
+ * @param {string|import('discord.js').Client} firstArg
+ * @param {string|import('discord.js').Client} [secondArg]
+ * @param {string|import('discord.js').Client} [thirdArg]
  * @returns {Promise<boolean>}
  */
-export async function updateSlotChartMessage(client, registrationId) {
+export async function updateRegistrationSlotList(firstArg, secondArg = null, thirdArg = null) {
+  let client = null;
+  let registrationId = null;
+  let cycleId = null;
+
+  if (typeof firstArg === 'string') {
+    registrationId = firstArg;
+    if (secondArg && typeof secondArg === 'object' && (secondArg.channels || secondArg.guilds || secondArg.user)) {
+      client = secondArg;
+      cycleId = typeof thirdArg === 'string' ? thirdArg : null;
+    } else {
+      cycleId = typeof secondArg === 'string' ? secondArg : null;
+      client = thirdArg || activeDiscordClient;
+    }
+  } else {
+    client = firstArg || activeDiscordClient;
+    registrationId = secondArg;
+    cycleId = typeof thirdArg === 'string' ? thirdArg : null;
+  }
+
+  if (!client) {
+    client = activeDiscordClient;
+  }
+
   try {
+    if (!registrationId) return false;
+
     const registration = await getConfigurableRegistration(registrationId);
     if (!registration || !registration.idpChannelId) {
       return false;
@@ -194,14 +250,35 @@ export async function updateSlotChartMessage(client, registrationId) {
       ? await getConfigurableTournament(registration.tournamentId)
       : null;
 
-    const currentCycleId = registration.currentCycleId || null;
+    const currentCycleId = cycleId || registration.currentCycleId || null;
+    // Always fetch latest entries directly from MongoDB for this registration instance and cycle
     const entries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
 
-    const channel = await client.channels.fetch(registration.idpChannelId).catch(() => null);
-    if (!channel || !channel.isTextBased()) {
+    if (!client) {
+      console.warn(`[SlotChart] ⚠️ Discord client not available for updating slot list of ${registrationId}`);
       return false;
     }
 
+    let channel = null;
+    if (client.channels?.fetch) {
+      channel = await client.channels.fetch(registration.idpChannelId).catch(() => null);
+    }
+    if (!channel && registration.guildId && client.guilds?.fetch) {
+      const guild = await client.guilds.fetch(registration.guildId).catch(() => null);
+      if (guild?.channels?.fetch) {
+        channel = await guild.channels.fetch(registration.idpChannelId).catch(() => null);
+      }
+    }
+
+    if (!channel) {
+      return false;
+    }
+    const isText = typeof channel.isTextBased === 'function' ? channel.isTextBased() : Boolean(channel.send);
+    if (!isText) {
+      return false;
+    }
+
+    const title = buildSlotListTitle(tournament?.name, registration.displayName || registration.name);
     const chunks = buildSlotListChunks(tournament, registration, entries);
 
     const storedMessageIds = Array.isArray(registration.slotChartMessageIds) && registration.slotChartMessageIds.length > 0
@@ -212,22 +289,36 @@ export async function updateSlotChartMessage(client, registrationId) {
 
     for (let i = 0; i < chunks.length; i++) {
       const chunkText = chunks[i];
+      let existingMsg = null;
       const existingId = storedMessageIds[i];
 
       if (existingId) {
         try {
-          const existingMsg = await channel.messages.fetch(existingId).catch(() => null);
-          if (existingMsg) {
-            await existingMsg.edit({ content: chunkText, embeds: [] });
-            updatedMessageIds.push(existingId);
-            continue;
+          existingMsg = await channel.messages.fetch(existingId).catch(() => null);
+        } catch {}
+      }
+
+      // If stored message was missing or not found, check recent channel messages before sending to prevent duplicates
+      if (!existingMsg && i === 0 && channel.messages?.fetch) {
+        try {
+          const recent = await channel.messages.fetch({ limit: 10 }).catch(() => null);
+          if (recent) {
+            existingMsg = recent.find((m) => m.content && (m.content.startsWith(title) || m.content.includes('Slot 01')));
           }
+        } catch {}
+      }
+
+      if (existingMsg) {
+        try {
+          await existingMsg.edit({ content: chunkText, embeds: [] });
+          updatedMessageIds.push(existingMsg.id);
+          continue;
         } catch (err) {
-          console.warn(`[SlotChart] ⚠️ Could not edit existing message ${existingId}:`, err.message);
+          console.warn(`[SlotChart] ⚠️ Could not edit existing message ${existingMsg.id}:`, err.message);
         }
       }
 
-      // Send new persistent message
+      // Send new persistent message only if no existing message was found
       const newMsg = await channel.send({ content: chunkText });
       updatedMessageIds.push(newMsg.id);
     }
@@ -252,6 +343,11 @@ export async function updateSlotChartMessage(client, registrationId) {
     return false;
   }
 }
+
+/**
+ * Alias for updateRegistrationSlotList to ensure 100% backward compatibility.
+ */
+export const updateSlotChartMessage = updateRegistrationSlotList;
 
 /**
  * Organiser tool: changes an allocated team's slot number within the current cycle.
@@ -291,8 +387,9 @@ export async function changeTeamSlot(registrationId, teamId, newSlotNumber, clie
   teamEntry.slotNumber = newSlotNumber;
   await saveConfigurableEntry(teamEntry);
 
-  if (client) {
-    await updateSlotChartMessage(client, registrationId);
+  const resolvedClient = client || activeDiscordClient;
+  if (resolvedClient) {
+    await updateRegistrationSlotList(registrationId, currentCycleId, resolvedClient);
   }
 
   return { success: true };
@@ -320,9 +417,10 @@ export async function removeTeamFromRegistration(registrationId, teamId, client 
   await deleteConfigurableEntry(registrationId, teamId, currentCycleId);
 
   // Revoke IDP access
-  if (client && reg.idpChannelId && entry.leaderDiscordId) {
+  const resolvedClient = client || activeDiscordClient;
+  if (resolvedClient && reg.idpChannelId && entry.leaderDiscordId) {
     try {
-      const guild = await client.guilds.fetch(reg.guildId).catch(() => null);
+      const guild = await resolvedClient.guilds.fetch(reg.guildId).catch(() => null);
       const idpChannel = guild ? await guild.channels.fetch(reg.idpChannelId).catch(() => null) : null;
       if (idpChannel && typeof idpChannel.permissionOverwrites?.delete === 'function') {
         await idpChannel.permissionOverwrites.delete(entry.leaderDiscordId).catch(() => {});
@@ -330,8 +428,8 @@ export async function removeTeamFromRegistration(registrationId, teamId, client 
     } catch {}
   }
 
-  if (client) {
-    await updateSlotChartMessage(client, registrationId);
+  if (resolvedClient) {
+    await updateRegistrationSlotList(registrationId, currentCycleId, resolvedClient);
   }
 
   return { success: true };

@@ -34,7 +34,12 @@ import {
   getDailyCyclesForRegistration,
 } from './configurableTournamentData.js';
 import { acquireLock, releaseLock } from './mongoService.js';
-import { updateSlotChartMessage, buildSlotChartEmbed, buildSlotListText } from './slotChartService.js';
+import {
+  updateSlotChartMessage,
+  updateRegistrationSlotList,
+  buildSlotChartEmbed,
+  buildSlotListText,
+} from './slotChartService.js';
 import {
   TOURNAMENT_DENIED_PERMISSIONS,
   refreshDashboard,
@@ -634,18 +639,34 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
   const interactionId = interaction?.id || 'unknown';
   console.log(`[ConfigurableRegistration] 📥 Confirmation button clicked [interactionId: ${interactionId}, regId: ${registrationId}, teamId: ${teamId}, user: ${interaction?.user?.id}]`);
 
-  // Step 2: Immediately acknowledge the interaction using deferReply
-  if (typeof interaction.deferReply === 'function' && !interaction.deferred && !interaction.replied) {
-    try {
-      await interaction.deferReply({ ephemeral: true });
-      interaction.deferred = true;
-      console.log(`[ConfigurableRegistration] ⏱️ Interaction acknowledged via deferReply [interactionId: ${interactionId}, regId: ${registrationId}]`);
-    } catch (err) {
-      if (err?.code === 40060) {
-        console.warn(`[ConfigurableRegistration] ⚠️ Interaction already acknowledged [interactionId: ${interactionId}]:`, err.message);
-        return;
+  // Step 2: Immediately acknowledge the interaction using deferUpdate (<3s deadline)
+  // deferUpdate keeps the interaction tied to the existing ephemeral confirmation message,
+  // allowing editReply to update it in-place and remove its buttons.
+  if (!interaction.deferred && !interaction.replied) {
+    if (typeof interaction.deferUpdate === 'function') {
+      try {
+        await interaction.deferUpdate();
+        interaction.deferred = true;
+        console.log(`[ConfigurableRegistration] ⏱️ Interaction acknowledged via deferUpdate [interactionId: ${interactionId}, regId: ${registrationId}]`);
+      } catch (err) {
+        if (err?.code === 40060) {
+          console.warn(`[ConfigurableRegistration] ⚠️ Interaction already acknowledged [interactionId: ${interactionId}]:`, err.message);
+          return;
+        }
+        console.warn(`[ConfigurableRegistration] ⚠️ Failed to deferUpdate [interactionId: ${interactionId}]:`, err.message);
       }
-      console.warn(`[ConfigurableRegistration] ⚠️ Failed to deferReply [interactionId: ${interactionId}]:`, err.message);
+    } else if (typeof interaction.deferReply === 'function') {
+      try {
+        await interaction.deferReply({ ephemeral: true });
+        interaction.deferred = true;
+        console.log(`[ConfigurableRegistration] ⏱️ Interaction acknowledged via deferReply [interactionId: ${interactionId}, regId: ${registrationId}]`);
+      } catch (err) {
+        if (err?.code === 40060) {
+          console.warn(`[ConfigurableRegistration] ⚠️ Interaction already acknowledged [interactionId: ${interactionId}]:`, err.message);
+          return;
+        }
+        console.warn(`[ConfigurableRegistration] ⚠️ Failed to deferReply [interactionId: ${interactionId}]:`, err.message);
+      }
     }
   }
 
@@ -872,23 +893,34 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
     }
 
     // Step 14 & 15: Update existing slot chart, registration message & dashboard
-    if (interaction.client?.channels) {
-      await updateSlotChartMessage(interaction.client, registrationId).catch((err) => {
-        console.warn(`[ConfigurableRegistration] ⚠️ Error updating slot chart [interactionId: ${interactionId}]:`, err.message);
-      });
-      console.log(`[ConfigurableRegistration] 📊 Slot chart updated [interactionId: ${interactionId}, regId: ${registrationId}]`);
-      await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
+    try {
+      await updateRegistrationSlotList(registrationId, currentCycleId, interaction.client);
+      console.log(`[ConfigurableRegistration] 📊 Slot list updated in real-time [interactionId: ${interactionId}, regId: ${registrationId}]`);
+    } catch (err) {
+      console.warn(`[ConfigurableRegistration] ⚠️ Error updating slot list [interactionId: ${interactionId}]:`, err.message);
     }
 
-    // Step 16: Edit deferred ephemeral reply with result via editReply
+    if (interaction.client) {
+      await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
+      await updateManageDashboardMessage(interaction.client, registrationId).catch(() => {});
+      await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
+    }
+
+    // Step 16: Edit deferred ephemeral confirmation message to show Registration Successful with buttons REMOVED
+    const tournament = registration.tournamentId
+      ? await getConfigurableTournament(registration.tournamentId)
+      : null;
+    const tournamentName = tournament?.name || 'Tournament';
+    const regName = registration.displayName || registration.name;
     const successPayload = {
       content:
-        `🎉 **Your squad has been successfully registered!**\n\n` +
-        `**Team:** **${team.teamName}**\n` +
-        `**Registration:** **${registration.displayName || registration.name}**\n` +
-        `**Slot Number:** \`#${slotNumber}\`\n` +
-        `**IDP Channel:** <#${registration.idpChannelId}>\n\n` +
-        `🔒 *You (<@${interaction.user.id}>) have been granted access to the private IDP channel above. Room ID and Password will be posted there prior to match start!*`,
+        `🎉 **Registration Successful**\n` +
+        `Your squad has been successfully registered!\n\n` +
+        `🏆 **Tournament:** **${tournamentName}**\n` +
+        `📝 **Registration:** **${regName}**\n` +
+        `🛡️ **Team:** **${team.teamName}**\n` +
+        `🎯 **Allocated Slot Number:** \`#${slotNumber}\`\n` +
+        (registration.idpChannelId ? `🔒 **IDP Channel:** <#${registration.idpChannelId}>\n\n*(You have been granted access to the private IDP channel above. Room ID and Password will be posted there!)*` : ''),
       embeds: [],
       components: [],
     };

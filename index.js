@@ -182,6 +182,7 @@ import {
   startRegistrationScheduler,
   reconcileConfigurableTournaments,
 } from './registrationScheduler.js';
+import { setSlotChartClient } from './slotChartService.js';
 
 
 export {
@@ -2368,6 +2369,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   console.log(`[Discord Bot] ⚡ Command prefix: "${PREFIX}"`);
   startRoleSyncScheduler(readyClient);
   startRegistrationScheduler(readyClient);
+  setSlotChartClient(readyClient);
 
   // Verify bot moderation permissions across joined guilds
   for (const guild of readyClient.guilds.cache.values()) {
