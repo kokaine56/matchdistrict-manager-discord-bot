@@ -15,6 +15,7 @@ import { updateRegistrationMessage } from './configurableRegistrationService.js'
 import { updateSlotChartMessage } from './slotChartService.js';
 import { refreshDashboard } from './configurableTournamentService.js';
 import { sendOrUpdateEnrollmentMessage } from './teamEnrollmentService.js';
+import { updateManageDashboardMessage } from './configurableRegistrationService.js';
 
 let schedulerInterval = null;
 
@@ -100,6 +101,7 @@ export async function executeDailyCycleReset(client, registrationId, force = fal
     if (reg.tournamentId) {
       await refreshDashboard(client, reg.tournamentId).catch(() => {});
     }
+    await updateManageDashboardMessage(client, registrationId).catch(() => {});
   }
 
   console.log(`[RegistrationScheduler] ✅ Reset completed for "${reg.displayName}". Status: ${reg.status}, Next Cycle: ${nextCycleDate}.`);
@@ -177,8 +179,28 @@ export async function checkRegistrationLifecycles(client) {
       if (stateChanged) {
         await saveConfigurableRegistration(reg);
         if (client) {
+          // Sync channel permissions and closing message
+          try {
+            const regChan = reg.registrationChannelId ? await client.channels.fetch(reg.registrationChannelId).catch(() => null) : null;
+            if (regChan && regChan.guild) {
+              if (reg.status === 'OPEN') {
+                await regChan.permissionOverwrites.edit(regChan.guild.roles.everyone.id, {
+                  ViewChannel: true,
+                  ReadMessageHistory: true,
+                  SendMessages: true,
+                }).catch(() => {});
+              } else if (reg.status === 'CLOSED') {
+                await regChan.permissionOverwrites.edit(regChan.guild.roles.everyone.id, {
+                  SendMessages: false,
+                }).catch(() => {});
+                await regChan.send('🔒 **Registration is now closed.**').catch(() => {});
+              }
+            }
+          } catch {}
+
           await updateRegistrationMessage(client, reg.registrationId).catch(() => {});
           await updateSlotChartMessage(client, reg.registrationId).catch(() => {});
+          await updateManageDashboardMessage(client, reg.registrationId).catch(() => {});
           await refreshDashboard(client, reg.tournamentId).catch(() => {});
         }
       }

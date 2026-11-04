@@ -7646,15 +7646,16 @@ export async function handleConfirmStartRound(interaction, tournamentId, roundId
           }
         }
 
-        // Slots after configured capacity up to 25 are UNUSED
+        // Remaining slots up to 25 are available team slots
         for (let s = maxAssignableSlot + 1; s <= 25; s++) {
           slots.push({
             slotNumber: s,
-            status: 'UNUSED',
-            label: 'UNUSED',
+            status: 'EMPTY',
+            label: 'EMPTY',
             teamId: null,
             teamName: null,
             members: [],
+            qualificationStatus: 'Pending',
           });
         }
 
@@ -8475,22 +8476,18 @@ export async function handleRefreshSubmissionsButton(interaction, tournamentId, 
 
 /**
  * Generates initial empty groups following the 25-slot structure:
- * - Slots 01-02: LOCKED
- * - Slots 03-18: 16 team positions (initially EMPTY)
- * - Slots 19-25: UNUSED / RESERVED
+ * - Slots 01-N: LOCKED (reserved slots, default 2)
+ * - Slots N+1 to 25: team positions (initially EMPTY)
  */
-export function generateEmptyRoundGroups(count = 4, roundName = 'Round 2') {
+export function generateEmptyRoundGroups(count = 4, roundName = 'Round 2', reservedSlotsCount = 2) {
   const groups = [];
   for (let g = 1; g <= count; g++) {
     const slots = [];
-    for (let s = 1; s <= 2; s++) {
+    for (let s = 1; s <= reservedSlotsCount; s++) {
       slots.push({ slotNumber: s, status: 'LOCKED', label: 'LOCKED', teamId: null, teamName: null, members: [] });
     }
-    for (let s = 3; s <= 18; s++) {
+    for (let s = reservedSlotsCount + 1; s <= 25; s++) {
       slots.push({ slotNumber: s, status: 'EMPTY', label: 'EMPTY', teamId: null, teamName: null, members: [], qualificationStatus: 'Pending' });
-    }
-    for (let s = 19; s <= 25; s++) {
-      slots.push({ slotNumber: s, status: 'UNUSED', label: 'UNUSED', teamId: null, teamName: null, members: [] });
     }
     groups.push({
       groupId: `group-${g}-${Date.now().toString(36)}`,
@@ -8579,7 +8576,6 @@ function buildQualifyGroupScreen(round, group) {
     const slot = slotsByNumber.get(slotNumber);
     const slotLabel = `Slot ${String(slotNumber).padStart(2, '0')}`;
     if (slot?.status === 'LOCKED' || slotNumber <= 2) return `Slot ${String(slotNumber).padStart(2, '0')} → 🔒 LOCKED`;
-    if (slot?.status === 'UNUSED' || slot?.status === 'RESERVED') return null;
     if (slot?.status === 'OCCUPIED' && slot.teamName) {
       return `Slot ${String(slotNumber).padStart(2, '0')} → ${slot.teamName}`;
     }

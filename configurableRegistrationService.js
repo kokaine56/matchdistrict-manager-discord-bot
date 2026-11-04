@@ -475,6 +475,23 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
   if (filledCount + 1 >= maxAvailable) {
     registration.status = 'CLOSED';
     await saveConfigurableRegistration(registration);
+
+    // Lock registration channel for sending and post closing message
+    try {
+      const regChannel = await interaction.guild.channels.fetch(registration.registrationChannelId).catch(() => null);
+      if (regChannel) {
+        await regChannel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, {
+          SendMessages: false,
+        }).catch(() => {});
+        await regChannel.send('🔒 **Registration is now closed (All available slots are filled).**').catch(() => {});
+      }
+    } catch {}
+
+    // Auto-update dashboard messages in place from MongoDB without pressing Refresh
+    await updateManageDashboardMessage(interaction.client, registrationId).catch(() => {});
+    if (interaction.client) {
+      await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
+    }
   }
 
   // 6. STRICT IDP PERMISSIONS: Grant ViewChannel access ONLY to the Team Leader
@@ -622,6 +639,37 @@ export function buildManageDashboardPayload(registration, filledCount = 0) {
 }
 
 /**
+ * Updates the persistent manage dashboard message in place from MongoDB.
+ * Reads latest state from MongoDB and re-renders the current screen without pressing Refresh.
+ * @param {import('discord.js').Client} client
+ * @param {string} registrationId
+ * @returns {Promise<boolean>}
+ */
+export async function updateManageDashboardMessage(client, registrationId) {
+  try {
+    if (!client || !registrationId) return false;
+    const registration = await getConfigurableRegistration(registrationId);
+    if (!registration || !registration.manageChannelId || !registration.manageMessageId) return false;
+
+    const channel = await client.channels.fetch(registration.manageChannelId).catch(() => null);
+    if (!channel || !channel.isTextBased()) return false;
+
+    const message = await channel.messages.fetch(registration.manageMessageId).catch(() => null);
+    if (!message) return false;
+
+    const currentCycleId = registration.currentCycleId || null;
+    const filledCount = await getRegistrationEntriesCount(registrationId, currentCycleId);
+    const payload = buildManageDashboardPayload(registration, filledCount);
+
+    await message.edit(payload).catch(() => null);
+    return true;
+  } catch (err) {
+    console.warn(`[ConfigurableRegistration] ⚠️ Could not update manage dashboard message for ${registrationId}:`, err.message);
+    return false;
+  }
+}
+
+/**
  * Handles selecting an instance from the manage registrations select menu.
  * Displays Name, Total Slots, Reserved Slots count, Registered Count, Available Slots,
  * Daily Start Time, Daily Reset Time, Current Cycle Status, and compact 5-button controls.
@@ -635,6 +683,13 @@ export async function handleManageSelectMenu(interaction, tournamentId) {
 
   if (!registration) {
     return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
+  }
+
+  // Record manage channel and message IDs in MongoDB to enable in-place live updates
+  if (interaction.channelId && interaction.message?.id) {
+    registration.manageChannelId = interaction.channelId;
+    registration.manageMessageId = interaction.message.id;
+    await saveConfigurableRegistration(registration);
   }
 
   const currentCycleId = registration.currentCycleId || null;
@@ -678,7 +733,12 @@ export async function handleRefreshRegistration(interaction, registrationId) {
 }
 
 /**
- * Toggles a registration instance between OPEN and CLOSED.
+ * Toggles a registration instance between OPEN and CLOSED in real time.
+ * - Clicking Open Registration: Immediately starts registration (channel created/unlocked to accept registrations)
+ *   and dashboard message re-renders right away: status shows "Open" and button becomes "Close Registration".
+ * - Clicking Close Registration: Immediately stops registration (channel locked for sending, closing message posted)
+ *   and dashboard re-renders right away: status shows "Closed" and button becomes "Open Registration".
+ *
  * @param {import('discord.js').ButtonInteraction} interaction
  * @param {string} registrationId
  */
@@ -695,6 +755,7 @@ export async function handleToggleStatus(interaction, registrationId) {
   const maxAvailable = Math.max(0, totalSlots - reservedCount);
 
   const isOpening = registration.status !== 'OPEN';
+  const guild = interaction.guild;
 
   if (isOpening) {
     if (filledCount >= maxAvailable) {
@@ -703,13 +764,65 @@ export async function handleToggleStatus(interaction, registrationId) {
         ephemeral: true,
       });
     }
+
+    // Ensure registration channel exists or recreate it
+    let regChannel = null;
+    if (registration.registrationChannelId && guild) {
+      regChannel = await guild.channels.fetch(registration.registrationChannelId).catch(() => null);
+    }
+    if (!regChannel && guild) {
+      const tournament = await getConfigurableTournament(registration.tournamentId);
+      const slug = (registration.displayName || 'reg')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 20) || `group-${registration.registrationNumber || 1}`;
+      regChannel = await guild.channels.create({
+        name: `${slug}-reg`,
+        type: ChannelType.GuildText,
+        parent: tournament?.categoryId || null,
+        permissionOverwrites: [
+          {
+            id: guild.roles.everyone.id,
+            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessages],
+            deny: TOURNAMENT_DENIED_PERMISSIONS,
+          },
+        ],
+      });
+      registration.registrationChannelId = regChannel.id;
+    } else if (regChannel) {
+      // Unlock registration channel for sending
+      await regChannel.permissionOverwrites.edit(guild.roles.everyone.id, {
+        ViewChannel: true,
+        ReadMessageHistory: true,
+        SendMessages: true,
+      }).catch(() => {});
+    }
+
     registration.status = 'OPEN';
     registration.manualOverride = 'OPEN';
     registration.manualOverrideCycleDate = registration.currentCycleDate;
   } else {
+    // Lock registration channel for sending and post closing message
+    if (registration.registrationChannelId && guild) {
+      const regChannel = await guild.channels.fetch(registration.registrationChannelId).catch(() => null);
+      if (regChannel) {
+        await regChannel.permissionOverwrites.edit(guild.roles.everyone.id, {
+          SendMessages: false,
+        }).catch(() => {});
+        await regChannel.send('🔒 **Registration is now closed.**').catch(() => {});
+      }
+    }
+
     registration.status = 'CLOSED';
     registration.manualOverride = 'CLOSED';
     registration.manualOverrideCycleDate = registration.currentCycleDate;
+  }
+
+  // Preserve manage channel and message IDs for live in-place updating
+  if (interaction.channelId && interaction.message?.id) {
+    registration.manageChannelId = interaction.channelId;
+    registration.manageMessageId = interaction.message.id;
   }
 
   await saveConfigurableRegistration(registration);
@@ -720,6 +833,7 @@ export async function handleToggleStatus(interaction, registrationId) {
     await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
   }
 
+  // Re-render the dashboard message right away
   const payload = buildManageDashboardPayload(registration, filledCount);
   if (interaction.isButton && interaction.isButton()) {
     await interaction.update(payload);
@@ -864,7 +978,6 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
   }
 
   // Rename Discord channels if registration name changed
-  let channelRenameWarning = null;
   if (newName !== registration.displayName) {
     const slug = newName
       .toLowerCase()
@@ -878,23 +991,27 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
     try {
       if (registration.registrationChannelId && interaction.guild) {
         const regChan = await interaction.guild.channels.fetch(registration.registrationChannelId).catch(() => null);
-        if (regChan && typeof regChan.setName === 'function') {
+        if (regChan && regChan.name !== newRegChannelName && typeof regChan.setName === 'function') {
           await regChan.setName(newRegChannelName, 'Registration name updated');
         }
       }
       if (registration.idpChannelId && interaction.guild) {
         const idpChan = await interaction.guild.channels.fetch(registration.idpChannelId).catch(() => null);
-        if (idpChan && typeof idpChan.setName === 'function') {
+        if (idpChan && idpChan.name !== newIdpChannelName && typeof idpChan.setName === 'function') {
           await idpChan.setName(newIdpChannelName, 'Registration name updated');
         }
       }
     } catch (renameErr) {
-      console.warn(`[ConfigurableRegistration] ⚠️ Failed to rename Discord channels for ${registrationId}:`, renameErr.message);
-      channelRenameWarning = `⚠️ Note: Could not rename Discord channel(s) (${renameErr.message}). Channel mapping was retained.`;
+      console.error(`[ConfigurableRegistration] ❌ Channel rename failed:`, renameErr);
+      // Keep old name in MongoDB and show real error to admin
+      return interaction.editReply({
+        content: `❌ Could not rename registration: Discord channel rename failed (${renameErr.message || renameErr}). The old name "${registration.displayName}" was kept.`,
+      });
     }
+
+    registration.displayName = newName;
   }
 
-  registration.displayName = newName;
   registration.totalSlots = rawSlots;
   registration.reservedSlots = newReservedCount;
   registration.dailyStartTime = parsedStart.formatted;
@@ -905,93 +1022,19 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
   if (interaction.client) {
     await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
     await updateSlotChartMessage(interaction.client, registrationId).catch(() => {});
+    await updateManageDashboardMessage(interaction.client, registrationId).catch(() => {});
     await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
   }
 
   const responseText =
     `✅ **Registration Settings Updated!**\n\n` +
-    `• **Name:** ${newName}\n` +
+    `• **Name:** ${registration.displayName}\n` +
     `• **Total Slots:** ${rawSlots}\n` +
     `• **Reserved Slots:** ${newReservedCount > 0 ? `${newReservedCount} (01-${String(newReservedCount).padStart(2, '0')})` : 'None'}\n` +
     `• **Daily Start:** ${parsedStart.formatted}\n` +
-    `• **Daily Reset:** ${parsedReset.formatted}` +
-    (channelRenameWarning ? `\n\n${channelRenameWarning}` : '');
+    `• **Daily Reset:** ${parsedReset.formatted}`;
 
   await interaction.editReply({ content: responseText });
-}
-
-/**
- * Legacy/fallback modal to manage reserved slot count for a registration instance.
- * @param {import('discord.js').ButtonInteraction} interaction
- * @param {string} registrationId
- */
-export async function handleManageReservedButton(interaction, registrationId) {
-  const registration = await getConfigurableRegistration(registrationId);
-  if (!registration) {
-    return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
-  }
-
-  const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
-  const modal = new ModalBuilder()
-    .setCustomId(`md_cfg_manage_res_modal_${registrationId}`)
-    .setTitle('Manage Reserved Slots');
-
-  const reservedInput = new TextInputBuilder()
-    .setCustomId('reserved_slots')
-    .setLabel('Reserved Slots Count (from Slot 01)')
-    .setStyle(TextInputStyle.Short)
-    .setPlaceholder('e.g. 2')
-    .setValue(String(reservedCount))
-    .setRequired(false);
-
-  modal.addComponents(new ActionRowBuilder().addComponents(reservedInput));
-  await interaction.showModal(modal);
-}
-
-/**
- * Legacy/fallback submission of Manage Reserved Slots modal.
- * @param {import('discord.js').ModalSubmitInteraction} interaction
- * @param {string} registrationId
- */
-export async function handleManageReservedModalSubmit(interaction, registrationId) {
-  await interaction.deferReply({ ephemeral: true });
-
-  const registration = await getConfigurableRegistration(registrationId);
-  if (!registration) {
-    return interaction.editReply({ content: '❌ Registration instance not found.' });
-  }
-
-  const rawReserved = interaction.fields.getTextInputValue('reserved_slots')?.trim() || '';
-  const newReservedCount = parseReservedSlots(rawReserved, registration.totalSlots);
-
-  // Check if any newly reserved slot is occupied by an active registered team
-  const entries = await getConfigurableEntriesForRegistration(registrationId, registration.currentCycleId);
-  const conflictingEntries = entries.filter((e) => e.slotNumber <= newReservedCount);
-
-  if (conflictingEntries.length > 0) {
-    return interaction.editReply({
-      content: `❌ Slot(s) ${conflictingEntries.map((e) => `#${e.slotNumber}`).join(', ')} cannot be reserved because they are already occupied by registered teams in the current cycle.`,
-    });
-  }
-
-  if (newReservedCount >= registration.totalSlots) {
-    return interaction.editReply({
-      content: '❌ Reserved slots cannot equal or exceed total capacity.',
-    });
-  }
-
-  registration.reservedSlots = newReservedCount;
-  await saveConfigurableRegistration(registration);
-
-  if (interaction.client) {
-    await updateSlotChartMessage(interaction.client, registrationId).catch(() => {});
-    await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
-    await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
-  }
-
-  await interaction.editReply({
-    content: `✅ Reserved slots updated to: \`${newReservedCount > 0 ? `${newReservedCount} (Slots 01-${String(newReservedCount).padStart(2, '0')})` : 'None'}\`.`,
-  });
 }
 
 /**
@@ -1010,44 +1053,6 @@ export async function handleViewCurrentSlotChart(interaction, registrationId) {
   const text = buildSlotListText(tournament, registration, entries);
 
   await interaction.reply({ content: text, ephemeral: true });
-}
-
-/**
- * Shows archived previous cycles for a registration instance.
- * @param {import('discord.js').ButtonInteraction} interaction
- * @param {string} registrationId
- */
-export async function handleViewPreviousCycles(interaction, registrationId) {
-  const registration = await getConfigurableRegistration(registrationId);
-  if (!registration) {
-    return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
-  }
-
-  const cycles = await getDailyCyclesForRegistration(registrationId, 10);
-  if (cycles.length === 0) {
-    return interaction.reply({
-      content: `ℹ️ No archived cycles found yet for **${registration.displayName}**. Cycles are archived daily at ${registration.dailyResetTime || 'scheduled reset time'}.`,
-      ephemeral: true,
-    });
-  }
-
-  const embed = new EmbedBuilder()
-    .setColor(0x3b82f6)
-    .setTitle(`📜 Previous Cycles — ${registration.displayName}`)
-    .setDescription(`Showing the last ${cycles.length} completed daily registration cycles:\n━━━━━━━━━━━━━━━━━━━━━━━━━━━`)
-    .setTimestamp();
-
-  for (const c of cycles) {
-    const teamCount = (c.entries || []).length;
-    const endedAtStr = c.endedAt ? new Date(c.endedAt).toLocaleString('en-US', { timeZone: registration.timezone || 'Asia/Kolkata' }) : 'N/A';
-    embed.addFields({
-      name: `Cycle: ${c.cycleDate || c.cycleId}`,
-      value: `• **Teams Registered:** ${teamCount}/${c.totalSlots}\n• **Status:** \`${c.status || 'COMPLETED'}\`\n• **Archived:** ${endedAtStr}`,
-      inline: false,
-    });
-  }
-
-  await interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
 /**

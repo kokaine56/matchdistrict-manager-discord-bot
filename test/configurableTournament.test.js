@@ -88,10 +88,7 @@ import {
   handleRefreshRegistration,
   handleEditRegistrationButton,
   handleEditRegistrationModalSubmit,
-  handleManageReservedButton,
-  handleManageReservedModalSubmit,
   handleViewCurrentSlotChart,
-  handleViewPreviousCycles,
 } from '../configurableRegistrationService.js';
 
 import {
@@ -1693,19 +1690,6 @@ test('Management Controls - Safeguards for capacity reduction and slot reservati
 
   await handleEditRegistrationModalSubmit(mockEditReservedInteraction, regId);
   assert.match(editReservedReply.content, /cannot be reserved because they are already occupied/);
-
-  // 3. Safeguard in fallback modal: cannot reserve slots overlapping occupied slots
-  let reservedReply = null;
-  const mockReservedInteraction = {
-    deferReply: async () => {},
-    editReply: async (p) => { reservedReply = p; },
-    fields: {
-      getTextInputValue: (cid) => '3', // Locks 1, 2, 3
-    },
-  };
-
-  await handleManageReservedModalSubmit(mockReservedInteraction, regId);
-  assert.match(reservedReply.content, /cannot be reserved because they are already occupied/);
 });
 
 test('Persistent Message In-Place Editing - Updates existing message ID without sending duplicates', async () => {
@@ -2113,9 +2097,9 @@ test('Registration Name Editing & Discord Channel Renaming', async () => {
   };
 
   await handleEditRegistrationModalSubmit(mockFailInteraction, regId);
-  assert.match(failReply.content, /Could not rename Discord channel\(s\) \(Missing Permissions\)/);
+  assert.match(failReply.content, /Discord channel rename failed \(Missing Permissions\)/);
   const stillValidReg = await getConfigurableRegistration(regId);
-  assert.equal(stillValidReg.displayName, 'Super Cup');
+  assert.equal(stillValidReg.displayName, 'Champions League', 'Old name is kept when Discord channel rename fails');
   assert.equal(stillValidReg.registrationChannelId, 'chan-reg-rename');
 });
 
