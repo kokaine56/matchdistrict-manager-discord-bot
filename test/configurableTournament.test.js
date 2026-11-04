@@ -64,12 +64,14 @@ import {
   handleConfigurableChannelDelete,
   handleTournamentSettingsButton,
   handleSetRequiredMembers,
+  handleConfigurableTournamentInteraction,
   TOURNAMENT_DENIED_PERMISSIONS,
 } from '../configurableTournamentService.js';
 
 import {
   buildEnrollmentEmbed,
   buildEnrollmentComponents,
+  sendOrUpdateEnrollmentMessage,
   handleEnrollButtonClick,
   showStep1Modal,
   handleStep1ModalSubmit,
@@ -2845,5 +2847,314 @@ test('One Source of Truth - Register button and slot chart never disagree', asyn
   assert.equal(updatedSlotChartEntries[0].teamName, 'Team Name 4Crows');
   assert.equal(updatedSlotChartEntries[0].slotNumber, 1);
 });
+
+test('Enroll Squad Button - Immediate response with showModal on first click (<3s rule)', async () => {
+  const tourId = 'tour-enroll-fast';
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-fast',
+    name: 'Fast Scrims',
+  });
+
+  let modalShown = null;
+  const mockInteraction = {
+    guildId: 'guild-fast',
+    user: { id: 'user-enroll-fast' },
+    showModal: async (modal) => {
+      modalShown = modal;
+    },
+    reply: async () => {},
+  };
+
+  // Calling handleEnrollButtonClick must directly call showModal without delaying
+  await handleEnrollButtonClick(mockInteraction, tourId);
+
+  assert.ok(modalShown, 'Modal must be shown immediately');
+  assert.equal(modalShown.data.custom_id, `md_cfg_step1_modal_${tourId}`);
+  assert.equal(modalShown.data.title, 'Team Enrollment — Step 1 of 5');
+});
+
+test('Manage Squad Button - Immediately calls deferReply first before database lookups', async () => {
+  const tourId = 'tour-manage-defer';
+  const leaderId = 'leader-manage-defer';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-defer',
+    name: 'Defer Scrims',
+  });
+
+  await saveConfigurableTeam({
+    teamId: 'team-defer-1',
+    tournamentId: tourId,
+    guildId: 'guild-defer',
+    teamName: 'Squad Defer',
+    leaderDiscordId: leaderId,
+    players: [
+      { discordId: leaderId, ign: 'LeaderP1', uid: '111' },
+      { discordId: null, ign: 'P2', uid: '222' },
+      { discordId: null, ign: 'P3', uid: '333' },
+      { discordId: null, ign: 'P4', uid: '444' },
+    ],
+  });
+
+  const callOrder = [];
+  const mockInteraction = {
+    guildId: 'guild-defer',
+    user: { id: leaderId },
+    deferred: false,
+    replied: false,
+    deferReply: async (opts) => {
+      callOrder.push('deferReply');
+      mockInteraction.deferred = true;
+    },
+    editReply: async (payload) => {
+      callOrder.push('editReply');
+      mockInteraction.lastEdit = payload;
+    },
+    reply: async (payload) => {
+      callOrder.push('reply');
+    },
+  };
+
+  await handleManageMySquadButton(mockInteraction, tourId);
+
+  assert.equal(callOrder[0], 'deferReply', 'Must call deferReply before anything else');
+  assert.equal(callOrder[1], 'editReply', 'Must edit reply with squad management info');
+  assert.ok(mockInteraction.lastEdit.embeds?.length > 0, 'Embed must be displayed');
+  assert.match(mockInteraction.lastEdit.embeds[0].data.title, /Squad Management — Squad Defer/);
+});
+
+test('Step 1 Submission - Directs user already leading an enrolled squad to Manage Squad', async () => {
+  const tourId = 'tour-already-enrolled';
+  const leaderId = 'leader-already';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-enrolled',
+    name: 'Enrolled Cup',
+  });
+
+  // User already enrolled Team Alpha
+  await saveConfigurableTeam({
+    teamId: 'team-alpha-id',
+    tournamentId: tourId,
+    guildId: 'guild-enrolled',
+    teamName: 'Team Alpha',
+    leaderDiscordId: leaderId,
+    players: [
+      { discordId: leaderId, ign: 'Alpha1', uid: '111' },
+      { discordId: null, ign: 'Alpha2', uid: '222' },
+      { discordId: null, ign: 'Alpha3', uid: '333' },
+      { discordId: null, ign: 'Alpha4', uid: '444' },
+    ],
+  });
+
+  let replyPayload = null;
+  const mockInteraction = {
+    guildId: 'guild-enrolled',
+    user: { id: leaderId },
+    fields: {
+      getTextInputValue: (id) => {
+        if (id === 'team_name') return 'Team Beta';
+        if (id === 'p1_ign') return 'Beta1';
+        if (id === 'p1_uid') return '111';
+        if (id === 'p2_ign') return 'Beta2';
+        if (id === 'p2_uid') return '222';
+        return '';
+      },
+    },
+    reply: async (payload) => {
+      replyPayload = payload;
+    },
+  };
+
+  await handleStep1ModalSubmit(mockInteraction, tourId);
+
+  assert.ok(replyPayload, 'Must reply to user');
+  assert.equal(replyPayload.ephemeral, true);
+  assert.match(replyPayload.content, /already enrolled squad \*\*Team Alpha\*\*/);
+  assert.match(replyPayload.content, /Click \*\*Manage Squad\*\*/);
+
+  // Original team is NOT modified or duplicated
+  const teams = await getConfigurableTeamsForUser(tourId, leaderId);
+  assert.equal(teams.length, 1);
+  assert.equal(teams[0].teamName, 'Team Alpha');
+});
+
+test('Interaction Router - Routes legacy custom IDs (enroll_squad, md_cfg_enroll) and resolves tournament', async () => {
+  const tourId = 'tour-legacy-id';
+  const verifyChanId = 'chan-verify-legacy';
+  const verifyMsgId = 'msg-verify-legacy';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-legacy',
+    name: 'Legacy Cup',
+    setupChannelId: 'chan-setup-legacy',
+    standardChannels: {
+      verifyChannelId: verifyChanId,
+      verifyMessageId: verifyMsgId,
+    },
+  });
+
+  // 1. Interaction with customId: 'enroll_squad' in verify channel
+  let modalShown1 = null;
+  const interaction1 = {
+    customId: 'enroll_squad',
+    channelId: verifyChanId,
+    guildId: 'guild-legacy',
+    user: { id: 'user-legacy-1' },
+    showModal: async (m) => { modalShown1 = m; },
+    reply: async () => {},
+  };
+
+  const handled1 = await handleConfigurableTournamentInteraction(interaction1);
+  assert.equal(handled1, true);
+  assert.ok(modalShown1);
+  assert.equal(modalShown1.data.custom_id, `md_cfg_step1_modal_${tourId}`);
+
+  // 2. Interaction with customId: 'md_cfg_enroll' resolving via verify message
+  let modalShown2 = null;
+  const interaction2 = {
+    customId: 'md_cfg_enroll',
+    message: { id: verifyMsgId },
+    guildId: 'guild-legacy',
+    user: { id: 'user-legacy-2' },
+    showModal: async (m) => { modalShown2 = m; },
+    reply: async () => {},
+  };
+
+  const handled2 = await handleConfigurableTournamentInteraction(interaction2);
+  assert.equal(handled2, true);
+  assert.ok(modalShown2);
+  assert.equal(modalShown2.data.custom_id, `md_cfg_step1_modal_${tourId}`);
+
+  // 3. Interaction with customId: 'my_squad' in verify channel
+  const interaction3 = {
+    customId: 'my_squad',
+    channelId: verifyChanId,
+    guildId: 'guild-legacy',
+    user: { id: 'user-legacy-3' },
+    deferred: false,
+    replied: false,
+    deferReply: async () => { interaction3.deferred = true; },
+    editReply: async (p) => { interaction3.lastEdit = p; },
+    reply: async (p) => { interaction3.lastReply = p; },
+  };
+
+  const handled3 = await handleConfigurableTournamentInteraction(interaction3);
+  assert.equal(handled3, true);
+  assert.equal(interaction3.deferred, true);
+});
+
+test('Enrollment Message - Startup re-editing via verifyMessageId without duplicate posting', async () => {
+  const tourId = 'tour-startup-edit';
+  const verifyChanId = 'chan-verify-startup';
+  const existingMsgId = 'msg-existing-456';
+
+  let editPayload = null;
+  let sendCalled = false;
+
+  const mockChannel = {
+    id: verifyChanId,
+    isTextBased: () => true,
+    messages: {
+      fetch: async (id) => {
+        if (id === existingMsgId) {
+          return {
+            id: existingMsgId,
+            edit: async (payload) => {
+              editPayload = payload;
+            },
+          };
+        }
+        return null;
+      },
+    },
+    send: async () => {
+      sendCalled = true;
+      return { id: 'msg-new-not-expected' };
+    },
+  };
+
+  const mockClient = {
+    user: { id: 'bot-1' },
+    channels: {
+      fetch: async (id) => (id === verifyChanId ? mockChannel : null),
+    },
+  };
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-startup',
+    name: 'Startup Tour',
+    standardChannels: {
+      verifyChannelId: verifyChanId,
+      verifyMessageId: existingMsgId,
+    },
+  });
+
+  const updated = await sendOrUpdateEnrollmentMessage(mockClient, tourId);
+  assert.equal(updated, true);
+  assert.equal(sendCalled, false, 'send must NOT be called when existing message exists');
+  assert.ok(editPayload, 'Existing message must be re-edited');
+
+  // Verify buttons have the current tournamentId custom IDs
+  const row = editPayload.components[0];
+  const enrollBtn = row.components[0];
+  const manageBtn = row.components[1];
+  assert.equal(enrollBtn.data.custom_id, `md_cfg_enroll_${tourId}`);
+  assert.equal(manageBtn.data.custom_id, `md_cfg_my_squad_${tourId}`);
+});
+
+test('Enrollment Error Handling - Catches unexpected errors in handlers and replies with ephemeral error', async () => {
+  let replyReceived = null;
+  const mockInteraction = {
+    showModal: async () => {
+      throw new Error('Discord socket timeout simulation');
+    },
+    replied: false,
+    deferred: false,
+    reply: async (p) => {
+      mockInteraction.replied = true;
+      replyReceived = p;
+    },
+  };
+
+  await handleEnrollButtonClick(mockInteraction, 'any-tour');
+  assert.ok(replyReceived, 'Must catch error and reply to user');
+  assert.equal(replyReceived.ephemeral, true);
+  assert.match(replyReceived.content, /Could not display Step 1 modal|Could not open squad enrollment form/);
+  assert.match(replyReceived.content, /Discord socket timeout simulation/);
+});
+
+test('Pending Enrollment Persistence - Saves wizard progress with Date expiry', async () => {
+  const tourId = 'tour-persist-wizard';
+  const userId = 'user-persist-wizard';
+
+  const session = {
+    tournamentId: tourId,
+    userId,
+    teamName: 'Persistent Wolves',
+    p1: { ign: 'Wolf1', uid: '111' },
+    p2: { ign: 'Wolf2', uid: '222' },
+    step: 1,
+    expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+  };
+
+  await savePendingEnrollment(session);
+
+  const retrieved = await getPendingEnrollment(tourId, userId);
+  assert.ok(retrieved);
+  assert.equal(retrieved.teamName, 'Persistent Wolves');
+  assert.equal(retrieved.p1.ign, 'Wolf1');
+  assert.ok(retrieved.expiresAt instanceof Date || typeof retrieved.expiresAt === 'number');
+
+  await deletePendingEnrollment(tourId, userId);
+  const deleted = await getPendingEnrollment(tourId, userId);
+  assert.equal(deleted, null);
+});
+
 
 

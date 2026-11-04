@@ -1228,10 +1228,15 @@ export async function archiveActiveRegistrationCycle(registrationId, extraData =
 export async function savePendingEnrollment(session) {
   if (!session || !session.tournamentId || !session.userId) return null;
   const key = `${session.tournamentId}:${session.userId}`;
+  const now = new Date();
+  const expiresAt = session.expiresAt instanceof Date
+    ? session.expiresAt
+    : new Date(session.expiresAt || (Date.now() + 15 * 60 * 1000));
+
   const record = {
     ...session,
-    updatedAt: new Date(),
-    expiresAt: session.expiresAt || (Date.now() + 15 * 60 * 1000),
+    updatedAt: now,
+    expiresAt,
   };
   localPendingEnrollments.set(key, record);
 
@@ -1254,23 +1259,37 @@ export async function getPendingEnrollment(tournamentId, userId) {
   if (!tournamentId || !userId) return null;
   const key = `${tournamentId}:${userId}`;
 
+  // 1. Fast path: check in-memory cache first (< 1ms)
+  const local = localPendingEnrollments.get(key);
+  if (local) {
+    const expTime = local.expiresAt instanceof Date ? local.expiresAt.getTime() : new Date(local.expiresAt).getTime();
+    if (expTime > Date.now()) {
+      return local;
+    }
+    localPendingEnrollments.delete(key);
+  }
+
+  // 2. Persistent path: check MongoDB (e.g. after bot restart)
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_pending_enrollments');
       const doc = await col.findOne({ tournamentId, userId });
-      if (doc && doc.expiresAt > Date.now()) {
-        localPendingEnrollments.set(key, doc);
-        return doc;
+      if (doc) {
+        const expTime = doc.expiresAt instanceof Date ? doc.expiresAt.getTime() : new Date(doc.expiresAt).getTime();
+        if (expTime > Date.now()) {
+          localPendingEnrollments.set(key, doc);
+          return doc;
+        } else {
+          localPendingEnrollments.delete(key);
+          await col.deleteOne({ tournamentId, userId }).catch(() => {});
+          return null;
+        }
       }
     } catch (err) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error reading pending enrollment:`, err.message);
     }
   }
 
-  const local = localPendingEnrollments.get(key);
-  if (local && local.expiresAt > Date.now()) {
-    return local;
-  }
   return null;
 }
 

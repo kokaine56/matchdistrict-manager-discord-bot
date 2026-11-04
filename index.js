@@ -2785,7 +2785,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const handled = await handleTournamentVerificationInteraction(interaction);
     if (handled) return;
   }
-  if (interaction.customId?.startsWith('md_cfg_')) {
+
+  const customId = interaction.customId || '';
+  const isConfigurableInteraction =
+    customId.startsWith('md_cfg_') ||
+    customId === 'enroll_squad' ||
+    customId.startsWith('enroll_squad_') ||
+    customId.startsWith('md_enroll_') ||
+    customId === 'md_enroll' ||
+    customId.startsWith('enroll_') ||
+    customId === 'enroll' ||
+    customId === 'my_squad' ||
+    customId.startsWith('my_squad_') ||
+    customId === 'manage_squad' ||
+    customId.startsWith('manage_squad_') ||
+    customId.startsWith('md_my_squad_') ||
+    customId.startsWith('md_manage_squad_');
+
+  if (isConfigurableInteraction) {
     const handled = await handleConfigurableTournamentInteraction(interaction);
     if (handled) return;
   }

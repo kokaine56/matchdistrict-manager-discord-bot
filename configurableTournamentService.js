@@ -17,6 +17,7 @@ import {
   getConfigurableTournamentByCategory,
   getConfigurableTournamentByName,
   getConfigurableTournamentBySetupChannel,
+  getAllConfigurableTournaments,
   getConfigurableRegistrationsForTournament,
   getEnrolledTeamsCount,
   getRegistrationEntriesCount,
@@ -1163,20 +1164,116 @@ export async function handleConfigurableTournamentInteraction(interaction) {
     return true;
   }
 
+/**
+ * Resolves tournamentId from rawId or contextual fallbacks (message, channel, category, guild).
+ * @param {import('discord.js').Interaction} interaction
+ * @param {string} [rawId]
+ * @returns {Promise<string|null>}
+ */
+async function resolveTournamentId(interaction, rawId) {
+  const cleanRawId = (rawId || '').trim();
+  if (cleanRawId) {
+    const tour = await getConfigurableTournament(cleanRawId);
+    if (tour && tour.status !== 'DELETED' && !tour.isDeleted) return tour.tournamentId;
+  }
+
+  // 1. Check if interaction message matches a tournament verifyMessageId or dashboard message
+  if (interaction.message?.id) {
+    const allTournaments = await getAllConfigurableTournaments(interaction.guildId || null);
+    const matched = allTournaments.find(
+      (t) =>
+        t.standardChannels?.verifyMessageId === interaction.message.id ||
+        t.dashboardMessageId === interaction.message.id
+    );
+    if (matched) return matched.tournamentId;
+  }
+
+  // 2. Check channel ID (verify channel, setup channel, etc.)
+  if (interaction.channelId) {
+    const allTournaments = await getAllConfigurableTournaments(interaction.guildId || null);
+    const matchedChannel = allTournaments.find(
+      (t) =>
+        t.standardChannels?.verifyChannelId === interaction.channelId ||
+        t.standardChannels?.updatesChannelId === interaction.channelId ||
+        t.standardChannels?.infoChannelId === interaction.channelId ||
+        t.setupChannelId === interaction.channelId
+    );
+    if (matchedChannel) return matchedChannel.tournamentId;
+  }
+
+  // 3. Check category / parentId
+  const parentId = interaction.channel?.parentId;
+  if (parentId && interaction.guildId) {
+    const tourByCategory = await getConfigurableTournamentByCategory(interaction.guildId, parentId);
+    if (tourByCategory) return tourByCategory.tournamentId;
+  }
+
+  // 4. If guild has only 1 active tournament, resolve to it
+  if (interaction.guildId) {
+    const allTournaments = await getAllConfigurableTournaments(interaction.guildId);
+    const active = allTournaments.filter((t) => t.status !== 'DELETED' && !t.isDeleted);
+    if (active.length === 1) {
+      return active[0].tournamentId;
+    }
+  }
+
+  return cleanRawId || null;
+}
+
   // 4. Enroll Squad button (opens modal or manages squad)
-  if (
-    customId.startsWith('md_cfg_enroll_') &&
-    !customId.startsWith('md_cfg_enroll_modal_') &&
-    !customId.startsWith('md_cfg_enroll_users_')
-  ) {
-    const tournamentId = customId.replace('md_cfg_enroll_', '');
+  const isEnrollButton =
+    (customId.startsWith('md_cfg_enroll_') &&
+      !customId.startsWith('md_cfg_enroll_modal_') &&
+      !customId.startsWith('md_cfg_enroll_users_')) ||
+    customId === 'md_cfg_enroll' ||
+    customId === 'enroll_squad' ||
+    customId.startsWith('enroll_squad_') ||
+    customId.startsWith('md_enroll_') ||
+    customId === 'md_enroll' ||
+    customId.startsWith('enroll_') ||
+    customId === 'enroll';
+
+  if (isEnrollButton) {
+    let rawTournamentId = '';
+    if (customId.startsWith('md_cfg_enroll_')) {
+      rawTournamentId = customId.replace('md_cfg_enroll_', '');
+    } else if (customId.startsWith('enroll_squad_')) {
+      rawTournamentId = customId.replace('enroll_squad_', '');
+    } else if (customId.startsWith('md_enroll_')) {
+      rawTournamentId = customId.replace('md_enroll_', '');
+    } else if (customId.startsWith('enroll_')) {
+      rawTournamentId = customId.replace('enroll_', '');
+    }
+    const tournamentId = await resolveTournamentId(interaction, rawTournamentId);
     await handleEnrollButtonClick(interaction, tournamentId);
     return true;
   }
 
   // Manage Squad button
-  if (customId.startsWith('md_cfg_my_squad_')) {
-    const tournamentId = customId.replace('md_cfg_my_squad_', '');
+  const isManageSquadButton =
+    customId.startsWith('md_cfg_my_squad_') ||
+    customId === 'md_cfg_my_squad' ||
+    customId === 'my_squad' ||
+    customId.startsWith('my_squad_') ||
+    customId === 'manage_squad' ||
+    customId.startsWith('manage_squad_') ||
+    customId.startsWith('md_my_squad_') ||
+    customId.startsWith('md_manage_squad_');
+
+  if (isManageSquadButton) {
+    let rawTournamentId = '';
+    if (customId.startsWith('md_cfg_my_squad_')) {
+      rawTournamentId = customId.replace('md_cfg_my_squad_', '');
+    } else if (customId.startsWith('my_squad_')) {
+      rawTournamentId = customId.replace('my_squad_', '');
+    } else if (customId.startsWith('manage_squad_')) {
+      rawTournamentId = customId.replace('manage_squad_', '');
+    } else if (customId.startsWith('md_my_squad_')) {
+      rawTournamentId = customId.replace('md_my_squad_', '');
+    } else if (customId.startsWith('md_manage_squad_')) {
+      rawTournamentId = customId.replace('md_manage_squad_', '');
+    }
+    const tournamentId = await resolveTournamentId(interaction, rawTournamentId);
     await handleManageMySquadButton(interaction, tournamentId);
     return true;
   }
