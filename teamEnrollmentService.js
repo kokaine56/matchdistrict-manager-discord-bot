@@ -157,6 +157,7 @@ export async function handleEnrollButtonClick(interaction, tournamentId) {
     // Database lookups and duplicate team checks run upon Step 1 modal submission
     await showStep1Modal(interaction, tournamentId, null);
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error opening enrollment modal:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({
@@ -241,6 +242,7 @@ export async function showStep1Modal(interaction, tournamentId, existingSession 
 
     await interaction.showModal(modal);
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in showStep1Modal:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({
@@ -334,6 +336,7 @@ export async function handleStep1ModalSubmit(interaction, tournamentId) {
 
     return await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in handleStep1ModalSubmit:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({
@@ -409,6 +412,7 @@ export async function showStep2Modal(interaction, tournamentId) {
 
     await interaction.showModal(modal);
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in showStep2Modal:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: `❌ Could not display Step 2 form: ${err.message || err}`, ephemeral: true }).catch(() => { });
@@ -470,6 +474,7 @@ export async function handleStep2ModalSubmit(interaction, tournamentId) {
 
     await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in handleStep2ModalSubmit:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: `❌ An error occurred during Step 2 submission: ${err.message || err}`, ephemeral: true }).catch(() => { });
@@ -542,6 +547,7 @@ export async function showStep3Modal(interaction, tournamentId) {
 
     await interaction.showModal(modal);
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in showStep3Modal:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: `❌ Could not display Step 3 form: ${err.message || err}`, ephemeral: true }).catch(() => { });
@@ -577,6 +583,7 @@ export async function handleStep3ModalSubmit(interaction, tournamentId) {
 
     await showStep4Confirmation(interaction, tournamentId, session);
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in handleStep3ModalSubmit:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: `❌ An error occurred during Step 3 submission: ${err.message || err}`, ephemeral: true }).catch(() => { });
@@ -603,6 +610,7 @@ export async function handleSkipSubstitutes(interaction, tournamentId) {
 
     await showStep4Confirmation(interaction, tournamentId, session);
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in handleSkipSubstitutes:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: `❌ An error occurred: ${err.message || err}`, ephemeral: true }).catch(() => { });
@@ -656,6 +664,7 @@ export async function showStep4Confirmation(interaction, tournamentId, session) 
       await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
     }
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in showStep4Confirmation:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: `❌ An error occurred displaying confirmation: ${err.message || err}`, ephemeral: true }).catch(() => { });
@@ -697,6 +706,7 @@ export async function showStep5DiscordSelection(interaction, tournamentId) {
       components: [row],
     });
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in showStep5DiscordSelection:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: `❌ Could not display member selection: ${err.message || err}`, ephemeral: true }).catch(() => { });
@@ -887,6 +897,7 @@ export async function handleStep5UserSelect(interaction, tournamentId) {
       });
     }
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in handleStep5UserSelect:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: `❌ An error occurred finalizing squad enrollment: ${err.message || err}`, ephemeral: true }).catch(() => { });
@@ -971,6 +982,7 @@ export async function handleManageMySquadButton(interaction, tournamentId) {
     }
     return await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in handleManageMySquadButton:`, err);
     const msg = `❌ Failed to open squad management: ${err.message || err}`;
     if (interaction.deferred) {
@@ -1018,6 +1030,7 @@ export async function handleEditSquadButtonClick(interaction, teamId) {
 
     await showStep1Modal(interaction, team.tournamentId, session);
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in handleEditSquadButtonClick:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: `❌ Could not open edit form: ${err.message || err}`, ephemeral: true }).catch(() => { });
@@ -1078,6 +1091,7 @@ export async function handleDeleteSquadPrompt(interaction, teamId) {
       ephemeral: true,
     });
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in handleDeleteSquadPrompt:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: `❌ Could not open delete prompt: ${err.message || err}`, ephemeral: true }).catch(() => { });
@@ -1144,6 +1158,7 @@ export async function handleDeleteSquadConfirm(interaction, teamId) {
       components: [],
     });
   } catch (err) {
+    if (err?.code === 40060) return;
     console.error(`[TeamEnrollment] ❌ Error in handleDeleteSquadConfirm:`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: `❌ Error deleting squad: ${err.message || err}`, ephemeral: true }).catch(() => { });

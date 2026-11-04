@@ -328,6 +328,10 @@ export async function refreshDashboard(client, tournamentId) {
     await saveConfigurableTournament(tournament);
     return true;
   } catch (err) {
+    if (err?.code === 10003 || err?.code === 50001 || err?.code === 50013) {
+      // 10003: Unknown Channel, 50001: Missing Access, 50013: Missing Permissions
+      return false;
+    }
     console.error(`[ConfigurableTournament] ❌ Error refreshing dashboard for ${tournamentId}:`, err);
     return false;
   }
