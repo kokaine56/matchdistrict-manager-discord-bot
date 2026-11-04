@@ -125,7 +125,7 @@ export async function sendOrUpdateEnrollmentMessage(client, tournament) {
         return true;
       }
     }
-  } catch {}
+  } catch { }
 
   // 3. Only if no existing message exists at all, post a new one
   const msg = await channel.send({ embeds: [embed], components: [row] });
@@ -162,7 +162,7 @@ export async function handleEnrollButtonClick(interaction, tournamentId) {
       await interaction.reply({
         content: `❌ Could not open squad enrollment form: ${err.message || err}`,
         ephemeral: true,
-      }).catch(() => {});
+      }).catch(() => { });
     }
   }
 }
@@ -184,42 +184,52 @@ export async function showStep1Modal(interaction, tournamentId, existingSession 
       .setLabel('Team Name')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('e.g. Phoenix Esports')
-      .setValue(existingSession?.teamName || '')
       .setMinLength(2)
       .setMaxLength(32)
       .setRequired(true);
+    if (existingSession?.teamName) {
+      teamNameInput.setValue(existingSession.teamName);
+    }
 
     const p1Ign = new TextInputBuilder()
       .setCustomId('p1_ign')
       .setLabel('Player 1 — In-Game Name (IGN)')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('e.g. PhoenixKing')
-      .setValue(existingSession?.p1?.ign || '')
       .setRequired(true);
+    if (existingSession?.p1?.ign) {
+      p1Ign.setValue(existingSession.p1.ign);
+    }
 
     const p1Uid = new TextInputBuilder()
       .setCustomId('p1_uid')
       .setLabel('Player 1 — BGMI UID')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('e.g. 512345678')
-      .setValue(existingSession?.p1?.uid || '')
       .setRequired(true);
+    if (existingSession?.p1?.uid) {
+      p1Uid.setValue(existingSession.p1.uid);
+    }
 
     const p2Ign = new TextInputBuilder()
       .setCustomId('p2_ign')
       .setLabel('Player 2 — In-Game Name (IGN)')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('e.g. SniperPro')
-      .setValue(existingSession?.p2?.ign || '')
       .setRequired(true);
+    if (existingSession?.p2?.ign) {
+      p2Ign.setValue(existingSession.p2.ign);
+    }
 
     const p2Uid = new TextInputBuilder()
       .setCustomId('p2_uid')
       .setLabel('Player 2 — BGMI UID')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('e.g. 512345679')
-      .setValue(existingSession?.p2?.uid || '')
       .setRequired(true);
+    if (existingSession?.p2?.uid) {
+      p2Uid.setValue(existingSession.p2.uid);
+    }
 
     modal.addComponents(
       new ActionRowBuilder().addComponents(teamNameInput),
@@ -236,7 +246,7 @@ export async function showStep1Modal(interaction, tournamentId, existingSession 
       await interaction.reply({
         content: `❌ Could not display Step 1 modal: ${err.message || err}`,
         ephemeral: true,
-      }).catch(() => {});
+      }).catch(() => { });
     }
   }
 }
@@ -329,7 +339,7 @@ export async function handleStep1ModalSubmit(interaction, tournamentId) {
       await interaction.reply({
         content: `❌ An error occurred during Step 1 submission: ${err.message || err}`,
         ephemeral: true,
-      }).catch(() => {});
+      }).catch(() => { });
     }
   }
 }
@@ -355,32 +365,40 @@ export async function showStep2Modal(interaction, tournamentId) {
       .setLabel('Player 3 — In-Game Name (IGN)')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('e.g. Rusher007')
-      .setValue(session.p3?.ign || '')
       .setRequired(true);
+    if (session.p3?.ign) {
+      p3Ign.setValue(session.p3.ign);
+    }
 
     const p3Uid = new TextInputBuilder()
       .setCustomId('p3_uid')
       .setLabel('Player 3 — BGMI UID')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('e.g. 512345680')
-      .setValue(session.p3?.uid || '')
       .setRequired(true);
+    if (session.p3?.uid) {
+      p3Uid.setValue(session.p3.uid);
+    }
 
     const p4Ign = new TextInputBuilder()
       .setCustomId('p4_ign')
       .setLabel('Player 4 — In-Game Name (IGN)')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('e.g. SupportGod')
-      .setValue(session.p4?.ign || '')
       .setRequired(true);
+    if (session.p4?.ign) {
+      p4Ign.setValue(session.p4.ign);
+    }
 
     const p4Uid = new TextInputBuilder()
       .setCustomId('p4_uid')
       .setLabel('Player 4 — BGMI UID')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('e.g. 512345681')
-      .setValue(session.p4?.uid || '')
       .setRequired(true);
+    if (session.p4?.uid) {
+      p4Uid.setValue(session.p4.uid);
+    }
 
     modal.addComponents(
       new ActionRowBuilder().addComponents(p3Ign),
@@ -393,7 +411,7 @@ export async function showStep2Modal(interaction, tournamentId) {
   } catch (err) {
     console.error(`[TeamEnrollment] ❌ Error in showStep2Modal:`, err);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: `❌ Could not display Step 2 form: ${err.message || err}`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `❌ Could not display Step 2 form: ${err.message || err}`, ephemeral: true }).catch(() => { });
     }
   }
 }
@@ -454,7 +472,7 @@ export async function handleStep2ModalSubmit(interaction, tournamentId) {
   } catch (err) {
     console.error(`[TeamEnrollment] ❌ Error in handleStep2ModalSubmit:`, err);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: `❌ An error occurred during Step 2 submission: ${err.message || err}`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `❌ An error occurred during Step 2 submission: ${err.message || err}`, ephemeral: true }).catch(() => { });
     }
   }
 }
@@ -480,32 +498,40 @@ export async function showStep3Modal(interaction, tournamentId) {
       .setLabel('Substitute 1 — In-Game Name (Optional)')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('Leave blank if none')
-      .setValue(session.substitutes?.[0]?.ign || '')
       .setRequired(false);
+    if (session.substitutes?.[0]?.ign) {
+      sub1Ign.setValue(session.substitutes[0].ign);
+    }
 
     const sub1Uid = new TextInputBuilder()
       .setCustomId('sub1_uid')
       .setLabel('Substitute 1 — BGMI UID (Optional)')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('Leave blank if none')
-      .setValue(session.substitutes?.[0]?.uid || '')
       .setRequired(false);
+    if (session.substitutes?.[0]?.uid && session.substitutes[0].uid !== 'N/A') {
+      sub1Uid.setValue(session.substitutes[0].uid);
+    }
 
     const sub2Ign = new TextInputBuilder()
       .setCustomId('sub2_ign')
       .setLabel('Substitute 2 — In-Game Name (Optional)')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('Leave blank if none')
-      .setValue(session.substitutes?.[1]?.ign || '')
       .setRequired(false);
+    if (session.substitutes?.[1]?.ign) {
+      sub2Ign.setValue(session.substitutes[1].ign);
+    }
 
     const sub2Uid = new TextInputBuilder()
       .setCustomId('sub2_uid')
       .setLabel('Substitute 2 — BGMI UID (Optional)')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('Leave blank if none')
-      .setValue(session.substitutes?.[1]?.uid || '')
       .setRequired(false);
+    if (session.substitutes?.[1]?.uid && session.substitutes[1].uid !== 'N/A') {
+      sub2Uid.setValue(session.substitutes[1].uid);
+    }
 
     modal.addComponents(
       new ActionRowBuilder().addComponents(sub1Ign),
@@ -518,7 +544,7 @@ export async function showStep3Modal(interaction, tournamentId) {
   } catch (err) {
     console.error(`[TeamEnrollment] ❌ Error in showStep3Modal:`, err);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: `❌ Could not display Step 3 form: ${err.message || err}`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `❌ Could not display Step 3 form: ${err.message || err}`, ephemeral: true }).catch(() => { });
     }
   }
 }
@@ -553,7 +579,7 @@ export async function handleStep3ModalSubmit(interaction, tournamentId) {
   } catch (err) {
     console.error(`[TeamEnrollment] ❌ Error in handleStep3ModalSubmit:`, err);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: `❌ An error occurred during Step 3 submission: ${err.message || err}`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `❌ An error occurred during Step 3 submission: ${err.message || err}`, ephemeral: true }).catch(() => { });
     }
   }
 }
@@ -579,7 +605,7 @@ export async function handleSkipSubstitutes(interaction, tournamentId) {
   } catch (err) {
     console.error(`[TeamEnrollment] ❌ Error in handleSkipSubstitutes:`, err);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: `❌ An error occurred: ${err.message || err}`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `❌ An error occurred: ${err.message || err}`, ephemeral: true }).catch(() => { });
     }
   }
 }
@@ -632,7 +658,7 @@ export async function showStep4Confirmation(interaction, tournamentId, session) 
   } catch (err) {
     console.error(`[TeamEnrollment] ❌ Error in showStep4Confirmation:`, err);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: `❌ An error occurred displaying confirmation: ${err.message || err}`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `❌ An error occurred displaying confirmation: ${err.message || err}`, ephemeral: true }).catch(() => { });
     }
   }
 }
@@ -673,7 +699,7 @@ export async function showStep5DiscordSelection(interaction, tournamentId) {
   } catch (err) {
     console.error(`[TeamEnrollment] ❌ Error in showStep5DiscordSelection:`, err);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: `❌ Could not display member selection: ${err.message || err}`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `❌ Could not display member selection: ${err.message || err}`, ephemeral: true }).catch(() => { });
     }
   }
 }
@@ -863,7 +889,7 @@ export async function handleStep5UserSelect(interaction, tournamentId) {
   } catch (err) {
     console.error(`[TeamEnrollment] ❌ Error in handleStep5UserSelect:`, err);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: `❌ An error occurred finalizing squad enrollment: ${err.message || err}`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `❌ An error occurred finalizing squad enrollment: ${err.message || err}`, ephemeral: true }).catch(() => { });
     }
   }
 }
@@ -948,9 +974,9 @@ export async function handleManageMySquadButton(interaction, tournamentId) {
     console.error(`[TeamEnrollment] ❌ Error in handleManageMySquadButton:`, err);
     const msg = `❌ Failed to open squad management: ${err.message || err}`;
     if (interaction.deferred) {
-      await interaction.editReply({ content: msg }).catch(() => {});
+      await interaction.editReply({ content: msg }).catch(() => { });
     } else if (!interaction.replied) {
-      await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: msg, ephemeral: true }).catch(() => { });
     }
   }
 }
@@ -994,7 +1020,7 @@ export async function handleEditSquadButtonClick(interaction, teamId) {
   } catch (err) {
     console.error(`[TeamEnrollment] ❌ Error in handleEditSquadButtonClick:`, err);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: `❌ Could not open edit form: ${err.message || err}`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `❌ Could not open edit form: ${err.message || err}`, ephemeral: true }).catch(() => { });
     }
   }
 }
@@ -1054,7 +1080,7 @@ export async function handleDeleteSquadPrompt(interaction, teamId) {
   } catch (err) {
     console.error(`[TeamEnrollment] ❌ Error in handleDeleteSquadPrompt:`, err);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: `❌ Could not open delete prompt: ${err.message || err}`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `❌ Could not open delete prompt: ${err.message || err}`, ephemeral: true }).catch(() => { });
     }
   }
 }
@@ -1099,7 +1125,7 @@ export async function handleDeleteSquadConfirm(interaction, teamId) {
         try {
           const idpChan = await interaction.guild.channels.fetch(reg.idpChannelId).catch(() => null);
           if (idpChan && typeof idpChan.permissionOverwrites?.delete === 'function') {
-            await idpChan.permissionOverwrites.delete(interaction.user.id).catch(() => {});
+            await idpChan.permissionOverwrites.delete(interaction.user.id).catch(() => { });
           }
         } catch (err) {
           console.warn(`[ConfigurableTournament] ⚠️ Error revoking IDP overwrite for deleted squad:`, err.message);
@@ -1120,7 +1146,7 @@ export async function handleDeleteSquadConfirm(interaction, teamId) {
   } catch (err) {
     console.error(`[TeamEnrollment] ❌ Error in handleDeleteSquadConfirm:`, err);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: `❌ Error deleting squad: ${err.message || err}`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `❌ Error deleting squad: ${err.message || err}`, ephemeral: true }).catch(() => { });
     }
   }
 }

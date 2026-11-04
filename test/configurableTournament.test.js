@@ -2872,6 +2872,22 @@ test('Enroll Squad Button - Immediate response with showModal on first click (<3
   assert.ok(modalShown, 'Modal must be shown immediately');
   assert.equal(modalShown.data.custom_id, `md_cfg_step1_modal_${tourId}`);
   assert.equal(modalShown.data.title, 'Team Enrollment — Step 1 of 5');
+
+  // Verify that team_name input does NOT have empty string value when no session exists
+  // (Prevents Discord API error: data.components[0].components[0].value[BASE_TYPE_MIN_LENGTH]: Must be 2 or more in length)
+  const teamNameComponent = modalShown.components[0].components[0];
+  assert.equal(teamNameComponent.data.value, undefined, 'Empty value must not be prefilled when minLength is set');
+
+  // When existingSession has a teamName, verify it is pre-filled properly
+  let prefilledModal = null;
+  const mockPrefillInteraction = {
+    guildId: 'guild-fast',
+    user: { id: 'user-enroll-fast' },
+    showModal: async (modal) => { prefilledModal = modal; },
+    reply: async () => {},
+  };
+  await showStep1Modal(mockPrefillInteraction, tourId, { teamName: 'Phoenix Wolves' });
+  assert.equal(prefilledModal.components[0].components[0].data.value, 'Phoenix Wolves');
 });
 
 test('Manage Squad Button - Immediately calls deferReply first before database lookups', async () => {
