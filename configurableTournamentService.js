@@ -61,6 +61,7 @@ import {
   handleManageReservedModalSubmit,
   handleViewCurrentSlotChart,
   handleViewPreviousCycles,
+  handleRefreshRegistration,
 } from './configurableRegistrationService.js';
 import { updateSlotChartMessage } from './slotChartService.js';
 
@@ -816,13 +817,15 @@ export async function handleConfigurableTournamentInteraction(interaction) {
     return true;
   }
 
-  // 13. Refresh slot chart
+  // 13. Refresh registration management dashboard or slot chart
+  if (customId.startsWith('md_cfg_refresh_reg_')) {
+    const registrationId = customId.replace('md_cfg_refresh_reg_', '');
+    await handleRefreshRegistration(interaction, registrationId);
+    return true;
+  }
   if (customId.startsWith('md_cfg_refresh_slotchart_')) {
     const registrationId = customId.replace('md_cfg_refresh_slotchart_', '');
-    await updateSlotChartMessage(interaction.client, registrationId);
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: '✅ Slot chart refreshed.', ephemeral: true });
-    }
+    await handleRefreshRegistration(interaction, registrationId);
     return true;
   }
 

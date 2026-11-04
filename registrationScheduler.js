@@ -9,6 +9,7 @@ import {
   evaluateDailyCycleStatus,
   getCurrentTimeInTimezone,
   parseTimeString,
+  parseReservedSlots,
 } from './configurableTournamentData.js';
 import { updateRegistrationMessage } from './configurableRegistrationService.js';
 import { updateSlotChartMessage } from './slotChartService.js';
@@ -85,6 +86,10 @@ export async function executeDailyCycleReset(client, registrationId, force = fal
   reg.currentCycleId = `${registrationId}:${nextCycleDate}`;
   reg.status = cycleEval.isOpen ? 'OPEN' : 'CLOSED';
   reg.currentCycleStartedAt = cycleEval.isOpen ? now : null;
+  // Clear manual override when scheduled reset rolls over to next cycle
+  reg.manualOverride = null;
+  reg.manualOverrideCycleDate = null;
+  reg.manualOverrideAt = null;
 
   await saveConfigurableRegistration(reg);
 
@@ -128,18 +133,24 @@ export async function checkRegistrationLifecycles(client) {
 
         // 2. Check if Daily Start is due (transition CLOSED -> OPEN when in active window)
         if (cycleEval.isOpen && reg.status === 'CLOSED') {
-          // Check if not full
-          const entries = await getConfigurableEntriesForRegistration(reg.registrationId);
-          const reservedCount = (reg.reservedSlots || []).length;
-          const maxAvailable = reg.totalSlots - reservedCount;
+          const activeCycle = cycleEval.activeCycleDate || cycleEval.cycleDate;
+          // Precedence: If organiser explicitly manually closed for this cycle, do not auto-reopen!
+          if (reg.manualOverride === 'CLOSED' && reg.manualOverrideCycleDate === activeCycle) {
+            // Respect manual close action
+          } else {
+            // Check if not full
+            const entries = await getConfigurableEntriesForRegistration(reg.registrationId, reg.currentCycleId);
+            const reservedCount = parseReservedSlots(reg.reservedSlots, reg.totalSlots);
+            const maxAvailable = reg.totalSlots - reservedCount;
 
-          if (entries.length < maxAvailable) {
-            reg.status = 'OPEN';
-            reg.currentCycleDate = cycleEval.activeCycleDate || cycleEval.cycleDate;
-            reg.currentCycleId = `${reg.registrationId}:${reg.currentCycleDate}`;
-            if (!reg.currentCycleStartedAt) reg.currentCycleStartedAt = now;
-            stateChanged = true;
-            console.log(`[RegistrationScheduler] 🟢 Daily cycle opened for "${reg.displayName}" (${reg.registrationId}).`);
+            if (entries.length < maxAvailable) {
+              reg.status = 'OPEN';
+              reg.currentCycleDate = activeCycle;
+              reg.currentCycleId = `${reg.registrationId}:${activeCycle}`;
+              if (!reg.currentCycleStartedAt) reg.currentCycleStartedAt = now;
+              stateChanged = true;
+              console.log(`[RegistrationScheduler] 🟢 Daily cycle opened for "${reg.displayName}" (${reg.registrationId}).`);
+            }
           }
         }
       }

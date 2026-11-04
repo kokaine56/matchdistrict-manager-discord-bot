@@ -30,37 +30,35 @@ function normalizeTournament(doc) {
 }
 
 /**
- * Normalizes reserved slots input into a sorted array of positive integers.
+ * Normalizes reserved slots input into an integer count of locked slots starting from Slot 01.
  * @param {string|Array<number>|number} input
  * @param {number} [totalSlots]
- * @returns {Array<number>}
+ * @returns {number}
  */
 export function parseReservedSlots(input, totalSlots = null) {
-  if (!input) return [];
-  const slots = new Set();
+  if (input === null || input === undefined || input === '') return 0;
+  let count = 0;
 
-  if (Array.isArray(input)) {
-    for (const item of input) {
-      const num = typeof item === 'number' ? item : parseInt(item, 10);
-      if (!isNaN(num) && num >= 1 && (!totalSlots || num <= totalSlots)) {
-        slots.add(num);
-      }
-    }
-  } else if (typeof input === 'number') {
-    for (let i = 1; i <= input; i++) {
-      if (!totalSlots || i <= totalSlots) slots.add(i);
-    }
+  if (typeof input === 'number') {
+    count = isNaN(input) ? 0 : Math.max(0, Math.floor(input));
+  } else if (Array.isArray(input)) {
+    count = input.length;
   } else if (typeof input === 'string') {
-    const tokens = input.split(/[\s,;]+/).filter(Boolean);
-    for (const token of tokens) {
-      const num = parseInt(token, 10);
-      if (!isNaN(num) && num >= 1 && (!totalSlots || num <= totalSlots)) {
-        slots.add(num);
-      }
+    const trimmed = input.trim();
+    const num = parseInt(trimmed, 10);
+    if (!isNaN(num) && /^\d+$/.test(trimmed)) {
+      count = Math.max(0, num);
+    } else {
+      const tokens = trimmed.split(/[\s,;]+/).filter(Boolean);
+      count = tokens.length;
     }
   }
 
-  return Array.from(slots).sort((a, b) => a - b);
+  if (typeof totalSlots === 'number' && totalSlots > 0) {
+    count = Math.min(totalSlots, count);
+  }
+
+  return count;
 }
 
 /**
@@ -829,20 +827,23 @@ export async function getRegistrationEntriesCount(registrationId, cycleId = null
 }
 
 /**
- * Finds the lowest unassigned slot number between 1 and totalSlots, skipping reserved slots.
+ * Finds the lowest unassigned slot number between 1 and totalSlots.
+ * Reserved slots always occupy the beginning (Slot 01 to Slot reservedSlots).
+ * Formula: firstAvailableSlot = reservedSlots + 1
+ *
  * @param {string} registrationId
  * @param {number} totalSlots
- * @param {Array<number>|number} [reservedSlots]
+ * @param {number} [reservedSlotsCount]
  * @param {string} [cycleId]
  * @returns {Promise<number|null>} Returns null if full.
  */
-export async function getNextAvailableSlot(registrationId, totalSlots, reservedSlots = [], cycleId = null) {
+export async function getNextAvailableSlot(registrationId, totalSlots, reservedSlotsCount = 0, cycleId = null) {
   const entries = await getConfigurableEntriesForRegistration(registrationId, cycleId);
   const occupiedSlots = new Set(entries.map((e) => e.slotNumber));
-  const reservedSet = new Set(parseReservedSlots(reservedSlots, totalSlots));
+  const rCount = parseReservedSlots(reservedSlotsCount, totalSlots);
 
-  for (let slot = 1; slot <= totalSlots; slot++) {
-    if (!reservedSet.has(slot) && !occupiedSlots.has(slot)) {
+  for (let slot = rCount + 1; slot <= totalSlots; slot++) {
+    if (!occupiedSlots.has(slot)) {
       return slot;
     }
   }
@@ -955,7 +956,7 @@ export async function archiveActiveRegistrationCycle(registrationId, extraData =
       registeredAt: e.registeredAt,
     })),
     totalSlots: reg.totalSlots,
-    reservedSlots: Array.isArray(reg.reservedSlots) ? [...reg.reservedSlots] : parseReservedSlots(reg.reservedSlots, reg.totalSlots),
+    reservedSlots: parseReservedSlots(reg.reservedSlots, reg.totalSlots),
     status: 'COMPLETED',
     startedAt: reg.currentCycleStartedAt || null,
     endedAt: now,

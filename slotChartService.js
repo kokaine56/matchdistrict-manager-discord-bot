@@ -80,9 +80,8 @@ export function getFilledSlotCounter(occupiedCount, unlockedTotal) {
  */
 export function buildSlotListText(tournament, registration, entries = []) {
   const totalSlots = registration.totalSlots || 20;
-  const reservedSlotsList = parseReservedSlots(registration.reservedSlots, totalSlots);
-  const reservedSet = new Set(reservedSlotsList);
-  const unlockedTotal = Math.max(0, totalSlots - reservedSet.size);
+  const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
+  const unlockedTotal = Math.max(0, totalSlots - reservedCount);
 
   const occupiedMap = new Map();
   for (const entry of entries) {
@@ -96,7 +95,7 @@ export function buildSlotListText(tournament, registration, entries = []) {
 
   for (let slot = 1; slot <= totalSlots; slot++) {
     const padded = String(slot).padStart(2, '0');
-    if (reservedSet.has(slot)) {
+    if (slot <= reservedCount) {
       lines.push(`Slot ${padded} → 🔒 LOCKED`);
     } else {
       const entry = occupiedMap.get(slot);
@@ -272,8 +271,8 @@ export async function changeTeamSlot(registrationId, teamId, newSlotNumber, clie
     return { success: false, message: `Slot number must be between 1 and ${reg.totalSlots}` };
   }
 
-  const reservedList = parseReservedSlots(reg.reservedSlots, reg.totalSlots);
-  if (reservedList.includes(newSlotNumber)) {
+  const reservedCount = parseReservedSlots(reg.reservedSlots, reg.totalSlots);
+  if (newSlotNumber <= reservedCount) {
     return { success: false, message: `Slot ${newSlotNumber} is LOCKED / Reserved.` };
   }
 

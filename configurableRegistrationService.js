@@ -31,7 +31,7 @@ import {
   getDailyCyclesForRegistration,
 } from './configurableTournamentData.js';
 import { updateSlotChartMessage, buildSlotChartEmbed, buildSlotListText } from './slotChartService.js';
-import { TOURNAMENT_DENIED_PERMISSIONS } from './configurableTournamentService.js';
+import { TOURNAMENT_DENIED_PERMISSIONS, refreshDashboard } from './configurableTournamentService.js';
 
 /**
  * Builds the Embed for a public Registration Channel.
@@ -41,13 +41,14 @@ import { TOURNAMENT_DENIED_PERMISSIONS } from './configurableTournamentService.j
  */
 export function buildRegistrationEmbed(registration, filledCount = 0) {
   const totalSlots = registration.totalSlots || 20;
-  const reservedSlotsList = parseReservedSlots(registration.reservedSlots, totalSlots);
-  const reservedCount = reservedSlotsList.length;
+  const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
   const maxAvailable = Math.max(0, totalSlots - reservedCount);
   const availableSlots = Math.max(0, maxAvailable - filledCount);
   const isOpen = registration.status === 'OPEN';
 
-  const reservedSummary = reservedSlotsList.length > 0 ? reservedSlotsList.join(', ') : 'None';
+  const reservedSummary = reservedCount > 0
+    ? `${reservedCount} (01-${String(reservedCount).padStart(2, '0')})`
+    : 'None';
   const scheduleLine = (registration.dailyStartTime || registration.dailyResetTime)
     ? `\n**Daily Schedule:** Opens at \`${registration.dailyStartTime || 'N/A'}\` | Resets at \`${registration.dailyResetTime || 'N/A'}\``
     : '';
@@ -160,9 +161,9 @@ export async function handleAddRegistrationButton(interaction, tournamentId) {
 
   const reservedInput = new TextInputBuilder()
     .setCustomId('reserved_slots')
-    .setLabel('Reserved Slots')
+    .setLabel('Reserved Slots (Count from Slot 01)')
     .setStyle(TextInputStyle.Short)
-    .setPlaceholder('e.g. 1, 4, 10 (or leave empty)')
+    .setPlaceholder('e.g. 2 (locks Slot 01 and Slot 02, or 0 for none)')
     .setRequired(false);
 
   const startInput = new TextInputBuilder()
@@ -224,7 +225,7 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
   const rawReserved = interaction.fields.getTextInputValue('reserved_slots')?.trim() || '';
   const reservedSlots = parseReservedSlots(rawReserved, totalSlots);
 
-  if (reservedSlots.length >= totalSlots) {
+  if (reservedSlots >= totalSlots) {
     return interaction.editReply({ content: '❌ Reserved slots count cannot equal or exceed total capacity.' });
   }
 
@@ -316,7 +317,7 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
       idpChannelId: idpChannel.id,
       slotChartMessageId: null,
       totalSlots,
-      reservedSlots, // Array<number>
+      reservedSlots, // integer count (e.g. 2)
       dailyStartTime: parsedStart.formatted,
       rawDailyStartTime: rawStart,
       dailyResetTime: parsedReset.formatted,
@@ -339,7 +340,12 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
     // 4. Post Persistent Slot Chart Message in IDP channel
     await updateSlotChartMessage(interaction.client, registrationId);
 
-    const reservedDisplay = reservedSlots.length > 0 ? reservedSlots.join(', ') : 'None';
+    // 5. Refresh Setup Dashboard
+    if (interaction.client) {
+      await refreshDashboard(interaction.client, tournamentId).catch(() => {});
+    }
+
+    const reservedDisplay = reservedSlots > 0 ? `${reservedSlots} (01-${String(reservedSlots).padStart(2, '0')})` : 'None';
 
     await interaction.editReply({
       content:
@@ -418,8 +424,8 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
   // 3. Check capacity against non-reserved slots
   const activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
   const filledCount = activeEntries.length;
-  const reservedSlotsList = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
-  const maxAvailable = Math.max(0, registration.totalSlots - reservedSlotsList.length);
+  const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
+  const maxAvailable = Math.max(0, registration.totalSlots - reservedCount);
 
   if (filledCount >= maxAvailable) {
     if (registration.status === 'OPEN') {
@@ -427,6 +433,9 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
       await saveConfigurableRegistration(registration);
       await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
       await updateSlotChartMessage(interaction.client, registrationId).catch(() => {});
+      if (interaction.client) {
+        await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
+      }
     }
     return interaction.reply({
       content: '❌ Sorry, all available slots for this registration instance are currently full!',
@@ -434,8 +443,8 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
     });
   }
 
-  // 4. Allocate lowest non-reserved, non-occupied slot number
-  const slotNumber = await getNextAvailableSlot(registrationId, registration.totalSlots, reservedSlotsList, currentCycleId);
+  // 4. Allocate lowest non-reserved, non-occupied slot number (starting from reservedCount + 1)
+  const slotNumber = await getNextAvailableSlot(registrationId, registration.totalSlots, reservedCount, currentCycleId);
   if (!slotNumber) {
     return interaction.reply({
       content: '❌ No available slot number could be allocated.',
@@ -539,9 +548,83 @@ export async function handleManageRegistrationsButton(interaction, tournamentId)
 }
 
 /**
+ * Builds the compact 1-row management dashboard payload for a registration instance.
+ * Exactly 1 ActionRow with 5 buttons:
+ * 1. Edit Settings
+ * 2. Open / Close Registration
+ * 3. View Current Slot Chart
+ * 4. Refresh
+ * 5. Delete Registration
+ *
+ * @param {object} registration
+ * @param {number} filledCount
+ * @returns {{ content: string, components: ActionRowBuilder[] }}
+ */
+export function buildManageDashboardPayload(registration, filledCount = 0) {
+  const totalSlots = registration.totalSlots || 20;
+  const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
+  const maxAvailable = Math.max(0, totalSlots - reservedCount);
+  const availableSlots = Math.max(0, maxAvailable - filledCount);
+  const isOpen = registration.status === 'OPEN';
+
+  const editSettingsBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_edit_reg_${registration.registrationId}`)
+    .setLabel('Edit Settings')
+    .setEmoji('✏️')
+    .setStyle(ButtonStyle.Primary);
+
+  const toggleStatusBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_toggle_status_${registration.registrationId}`)
+    .setLabel(isOpen ? 'Close Registration' : 'Open Registration')
+    .setEmoji(isOpen ? '🔒' : '🔓')
+    .setStyle(isOpen ? ButtonStyle.Danger : ButtonStyle.Success);
+
+  const viewSlotChartBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_view_slotchart_${registration.registrationId}`)
+    .setLabel('View Current Slot Chart')
+    .setEmoji('📋')
+    .setStyle(ButtonStyle.Secondary);
+
+  const refreshBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_refresh_reg_${registration.registrationId}`)
+    .setLabel('Refresh')
+    .setEmoji('🔄')
+    .setStyle(ButtonStyle.Secondary);
+
+  const deleteBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_delete_reg_${registration.registrationId}`)
+    .setLabel('Delete Registration')
+    .setEmoji('🗑️')
+    .setStyle(ButtonStyle.Danger);
+
+  const row = new ActionRowBuilder().addComponents(
+    editSettingsBtn,
+    toggleStatusBtn,
+    viewSlotChartBtn,
+    refreshBtn,
+    deleteBtn
+  );
+
+  const content =
+    `🛠️ **Managing: ${registration.displayName}**\n\n` +
+    `• **Name:** ${registration.displayName}\n` +
+    `• **Current Cycle Status:** \`${registration.status}\` (Cycle: \`${registration.currentCycleDate || 'N/A'}\`)\n` +
+    `• **Total Slots:** \`${totalSlots}\`\n` +
+    `• **Reserved Slots:** \`${reservedCount}\`\n` +
+    `• **Registered Teams:** \`${filledCount}/${maxAvailable}\`\n` +
+    `• **Available Slots:** \`${availableSlots}\`\n` +
+    `• **Daily Start Time:** \`${registration.dailyStartTime || 'N/A'}\` (${registration.timezone || 'IST'})\n` +
+    `• **Daily Reset Time:** \`${registration.dailyResetTime || 'N/A'}\` (${registration.timezone || 'IST'})\n` +
+    `• **Registration Channel:** <#${registration.registrationChannelId}>\n` +
+    `• **IDP Channel:** <#${registration.idpChannelId}>\n`;
+
+  return { content, components: [row] };
+}
+
+/**
  * Handles selecting an instance from the manage registrations select menu.
- * Displays Name, Total Slots, Reserved Slots list, Registered Count, Available Slots,
- * Daily Start Time, Daily Reset Time, Current Cycle Status, and full management controls.
+ * Displays Name, Total Slots, Reserved Slots count, Registered Count, Available Slots,
+ * Daily Start Time, Daily Reset Time, Current Cycle Status, and compact 5-button controls.
  *
  * @param {import('discord.js').StringSelectMenuInteraction} interaction
  * @param {string} tournamentId
@@ -556,76 +639,42 @@ export async function handleManageSelectMenu(interaction, tournamentId) {
 
   const currentCycleId = registration.currentCycleId || null;
   const filledCount = await getRegistrationEntriesCount(registrationId, currentCycleId);
-  const reservedSlotsList = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
-  const maxAvailable = Math.max(0, registration.totalSlots - reservedSlotsList.length);
-  const availableSlots = Math.max(0, maxAvailable - filledCount);
-  const reservedDisplay = reservedSlotsList.length > 0 ? reservedSlotsList.join(', ') : 'None';
+  const payload = buildManageDashboardPayload(registration, filledCount);
 
-  // Controls row 1: Edit Settings, Manage Reserved Slots, Open/Close, View Current Slot Chart
-  const editSettingsBtn = new ButtonBuilder()
-    .setCustomId(`md_cfg_edit_reg_${registrationId}`)
-    .setLabel('Edit Settings')
-    .setEmoji('✏️')
-    .setStyle(ButtonStyle.Primary);
+  if (interaction.update) {
+    await interaction.update(payload);
+  } else {
+    await interaction.reply({ ...payload, ephemeral: true });
+  }
+}
 
-  const manageReservedBtn = new ButtonBuilder()
-    .setCustomId(`md_cfg_manage_res_${registrationId}`)
-    .setLabel('Manage Reserved Slots')
-    .setEmoji('🔒')
-    .setStyle(ButtonStyle.Secondary);
+/**
+ * Refreshes the registration management dashboard in place.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ */
+export async function handleRefreshRegistration(interaction, registrationId) {
+  const registration = await getConfigurableRegistration(registrationId);
+  if (!registration) {
+    return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
+  }
 
-  const toggleStatusBtn = new ButtonBuilder()
-    .setCustomId(`md_cfg_toggle_status_${registrationId}`)
-    .setLabel(registration.status === 'OPEN' ? 'Close Registration' : 'Open Registration')
-    .setEmoji(registration.status === 'OPEN' ? '🔒' : '🔓')
-    .setStyle(registration.status === 'OPEN' ? ButtonStyle.Danger : ButtonStyle.Success);
+  const currentCycleId = registration.currentCycleId || null;
+  const filledCount = await getRegistrationEntriesCount(registrationId, currentCycleId);
 
-  const viewSlotChartBtn = new ButtonBuilder()
-    .setCustomId(`md_cfg_view_slotchart_${registrationId}`)
-    .setLabel('View Current Slot Chart')
-    .setEmoji('📋')
-    .setStyle(ButtonStyle.Secondary);
+  if (interaction.client) {
+    await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
+    await updateSlotChartMessage(interaction.client, registrationId).catch(() => {});
+  }
 
-  const row1 = new ActionRowBuilder().addComponents(editSettingsBtn, manageReservedBtn, toggleStatusBtn, viewSlotChartBtn);
-
-  // Controls row 2: View Previous Cycles, Refresh, Delete
-  const viewCyclesBtn = new ButtonBuilder()
-    .setCustomId(`md_cfg_view_cycles_${registrationId}`)
-    .setLabel('View Previous Cycles')
-    .setEmoji('📜')
-    .setStyle(ButtonStyle.Secondary);
-
-  const refreshSlotChartBtn = new ButtonBuilder()
-    .setCustomId(`md_cfg_refresh_slotchart_${registrationId}`)
-    .setLabel('Refresh')
-    .setEmoji('🔄')
-    .setStyle(ButtonStyle.Secondary);
-
-  const deleteBtn = new ButtonBuilder()
-    .setCustomId(`md_cfg_delete_reg_${registrationId}`)
-    .setLabel('Delete Registration')
-    .setEmoji('🗑️')
-    .setStyle(ButtonStyle.Danger);
-
-  const row2 = new ActionRowBuilder().addComponents(viewCyclesBtn, refreshSlotChartBtn, deleteBtn);
-
-  const content =
-    `🛠️ **Managing: ${registration.displayName}**\n\n` +
-    `• **Name:** ${registration.displayName}\n` +
-    `• **Current Cycle Status:** \`${registration.status}\` (Cycle: \`${registration.currentCycleDate || 'N/A'}\`)\n` +
-    `• **Total Slots:** \`${registration.totalSlots}\`\n` +
-    `• **Reserved Slots:** \`${reservedDisplay}\`\n` +
-    `• **Registered Teams:** \`${filledCount}/${maxAvailable}\`\n` +
-    `• **Available Slots:** \`${availableSlots}\`\n` +
-    `• **Daily Start Time:** \`${registration.dailyStartTime || 'N/A'}\` (${registration.timezone || 'IST'})\n` +
-    `• **Daily Reset Time:** \`${registration.dailyResetTime || 'N/A'}\` (${registration.timezone || 'IST'})\n` +
-    `• **Registration Channel:** <#${registration.registrationChannelId}>\n` +
-    `• **IDP Channel:** <#${registration.idpChannelId}>\n`;
-
-  await interaction.update({
-    content,
-    components: [row1, row2],
-  });
+  const payload = buildManageDashboardPayload(registration, filledCount);
+  if (interaction.isButton && interaction.isButton()) {
+    await interaction.update(payload);
+  } else if (interaction.update) {
+    await interaction.update(payload);
+  } else {
+    await interaction.reply({ ...payload, ephemeral: true });
+  }
 }
 
 /**
@@ -639,20 +688,59 @@ export async function handleToggleStatus(interaction, registrationId) {
     return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
   }
 
-  registration.status = registration.status === 'OPEN' ? 'CLOSED' : 'OPEN';
+  const currentCycleId = registration.currentCycleId || null;
+  const filledCount = await getRegistrationEntriesCount(registrationId, currentCycleId);
+  const totalSlots = registration.totalSlots || 20;
+  const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
+  const maxAvailable = Math.max(0, totalSlots - reservedCount);
+
+  const isOpening = registration.status !== 'OPEN';
+
+  if (isOpening) {
+    if (filledCount >= maxAvailable) {
+      return interaction.reply({
+        content: `❌ Cannot open registration: all available slots are filled (${filledCount}/${maxAvailable}).`,
+        ephemeral: true,
+      });
+    }
+    registration.status = 'OPEN';
+    registration.manualOverride = 'OPEN';
+    registration.manualOverrideCycleDate = registration.currentCycleDate;
+  } else {
+    registration.status = 'CLOSED';
+    registration.manualOverride = 'CLOSED';
+    registration.manualOverrideCycleDate = registration.currentCycleDate;
+  }
+
   await saveConfigurableRegistration(registration);
 
-  await updateRegistrationMessage(interaction.client, registrationId);
-  await updateSlotChartMessage(interaction.client, registrationId);
+  if (interaction.client) {
+    await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
+    await updateSlotChartMessage(interaction.client, registrationId).catch(() => {});
+    await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
+  }
 
-  await interaction.reply({
-    content: `✅ Registration status updated to **${registration.status}**.`,
-    ephemeral: true,
-  });
+  const payload = buildManageDashboardPayload(registration, filledCount);
+  if (interaction.isButton && interaction.isButton()) {
+    await interaction.update(payload);
+    if (interaction.followUp) {
+      await interaction.followUp({
+        content: `✅ Registration is now **${registration.status}**.`,
+        ephemeral: true,
+      }).catch(() => {});
+    }
+  } else if (interaction.update) {
+    await interaction.update(payload);
+  } else {
+    await interaction.reply({
+      content: `✅ Registration status updated to **${registration.status}**.`,
+      ephemeral: true,
+    });
+  }
 }
 
 /**
- * Opens modal to edit registration settings (Name, Total Slots, Daily Start Time, Daily Reset Time).
+ * Opens modal to edit registration settings (Name, Total Slots, Reserved Slots, Daily Start Time, Daily Reset Time).
  * @param {import('discord.js').ButtonInteraction} interaction
  * @param {string} registrationId
  */
@@ -662,6 +750,7 @@ export async function handleEditRegistrationButton(interaction, registrationId) 
     return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
   }
 
+  const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
   const modal = new ModalBuilder()
     .setCustomId(`md_cfg_edit_reg_modal_${registrationId}`)
     .setTitle(`Edit ${registration.displayName}`.slice(0, 45));
@@ -680,6 +769,14 @@ export async function handleEditRegistrationButton(interaction, registrationId) 
     .setValue(String(registration.totalSlots || 20))
     .setRequired(true);
 
+  const reservedInput = new TextInputBuilder()
+    .setCustomId('reserved_slots')
+    .setLabel('Reserved Slots (Count from Slot 01)')
+    .setStyle(TextInputStyle.Short)
+    .setValue(String(reservedCount))
+    .setPlaceholder('e.g. 2 (locks Slot 01 and Slot 02)')
+    .setRequired(false);
+
   const startInput = new TextInputBuilder()
     .setCustomId('daily_start_time')
     .setLabel('Daily Start Time')
@@ -697,6 +794,7 @@ export async function handleEditRegistrationButton(interaction, registrationId) 
   modal.addComponents(
     new ActionRowBuilder().addComponents(nameInput),
     new ActionRowBuilder().addComponents(capacityInput),
+    new ActionRowBuilder().addComponents(reservedInput),
     new ActionRowBuilder().addComponents(startInput),
     new ActionRowBuilder().addComponents(resetInput)
   );
@@ -706,7 +804,8 @@ export async function handleEditRegistrationButton(interaction, registrationId) 
 
 /**
  * Handles submission of Edit Registration Settings modal.
- * Enforces rule: "Do not allow capacity to be reduced below already allocated slots."
+ * Enforces capacity and reserved slot occupancy safeguards, updates MongoDB,
+ * renames Discord channels, and updates persistent messages and dashboards.
  * @param {import('discord.js').ModalSubmitInteraction} interaction
  * @param {string} registrationId
  */
@@ -720,6 +819,7 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
 
   const newName = interaction.fields.getTextInputValue('registration_name').trim();
   const rawSlots = parseInt(interaction.fields.getTextInputValue('total_slots').trim(), 10);
+  const rawReserved = interaction.fields.getTextInputValue('reserved_slots')?.trim() || '0';
   const rawStart = interaction.fields.getTextInputValue('daily_start_time').trim();
   const rawReset = interaction.fields.getTextInputValue('daily_reset_time').trim();
 
@@ -727,11 +827,29 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
     return interaction.editReply({ content: '❌ Total slots must be a positive integer.' });
   }
 
-  // Check allocated slots: do not allow capacity to be reduced below already allocated slots
-  const filledCount = await getRegistrationEntriesCount(registrationId, registration.currentCycleId);
+  const newReservedCount = parseReservedSlots(rawReserved, rawSlots);
+  if (newReservedCount >= rawSlots) {
+    return interaction.editReply({
+      content: '❌ Reserved slots count cannot equal or exceed total capacity.',
+    });
+  }
+
+  // Check allocated slots and check if newly reserved slots overlap with occupied slots
+  const entries = await getConfigurableEntriesForRegistration(registrationId, registration.currentCycleId);
+  const filledCount = entries.length;
+
   if (rawSlots < filledCount) {
     return interaction.editReply({
       content: `❌ Capacity cannot be reduced below already allocated slots (${filledCount} teams currently registered).`,
+    });
+  }
+
+  // Safeguard: newly reserved slots occupy 1..newReservedCount.
+  // Check if any existing team is assigned to slotNumber <= newReservedCount
+  const conflictingEntries = entries.filter((e) => e.slotNumber <= newReservedCount);
+  if (conflictingEntries.length > 0) {
+    return interaction.editReply({
+      content: `❌ Slot(s) ${conflictingEntries.map((e) => `#${e.slotNumber}`).join(', ')} cannot be reserved because they are already occupied by registered teams (${conflictingEntries.map((e) => e.teamName).join(', ')}).`,
     });
   }
 
@@ -745,29 +863,65 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
     return interaction.editReply({ content: `❌ Invalid daily reset time "${rawReset}". Use format like "02:00 AM" or "04:00".` });
   }
 
+  // Rename Discord channels if registration name changed
+  let channelRenameWarning = null;
+  if (newName !== registration.displayName) {
+    const slug = newName
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 20) || `group-${registration.registrationNumber || 1}`;
+
+    const newRegChannelName = `${slug}-reg`;
+    const newIdpChannelName = `${slug}-idp`;
+
+    try {
+      if (registration.registrationChannelId && interaction.guild) {
+        const regChan = await interaction.guild.channels.fetch(registration.registrationChannelId).catch(() => null);
+        if (regChan && typeof regChan.setName === 'function') {
+          await regChan.setName(newRegChannelName, 'Registration name updated');
+        }
+      }
+      if (registration.idpChannelId && interaction.guild) {
+        const idpChan = await interaction.guild.channels.fetch(registration.idpChannelId).catch(() => null);
+        if (idpChan && typeof idpChan.setName === 'function') {
+          await idpChan.setName(newIdpChannelName, 'Registration name updated');
+        }
+      }
+    } catch (renameErr) {
+      console.warn(`[ConfigurableRegistration] ⚠️ Failed to rename Discord channels for ${registrationId}:`, renameErr.message);
+      channelRenameWarning = `⚠️ Note: Could not rename Discord channel(s) (${renameErr.message}). Channel mapping was retained.`;
+    }
+  }
+
   registration.displayName = newName;
   registration.totalSlots = rawSlots;
+  registration.reservedSlots = newReservedCount;
   registration.dailyStartTime = parsedStart.formatted;
   registration.dailyResetTime = parsedReset.formatted;
-  registration.reservedSlots = parseReservedSlots(registration.reservedSlots, rawSlots);
 
   await saveConfigurableRegistration(registration);
 
-  await updateRegistrationMessage(interaction.client, registrationId);
-  await updateSlotChartMessage(interaction.client, registrationId);
+  if (interaction.client) {
+    await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
+    await updateSlotChartMessage(interaction.client, registrationId).catch(() => {});
+    await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
+  }
 
-  await interaction.editReply({
-    content:
-      `✅ **Registration Settings Updated!**\n\n` +
-      `• **Name:** ${newName}\n` +
-      `• **Total Slots:** ${rawSlots}\n` +
-      `• **Daily Start:** ${parsedStart.formatted}\n` +
-      `• **Daily Reset:** ${parsedReset.formatted}`,
-  });
+  const responseText =
+    `✅ **Registration Settings Updated!**\n\n` +
+    `• **Name:** ${newName}\n` +
+    `• **Total Slots:** ${rawSlots}\n` +
+    `• **Reserved Slots:** ${newReservedCount > 0 ? `${newReservedCount} (01-${String(newReservedCount).padStart(2, '0')})` : 'None'}\n` +
+    `• **Daily Start:** ${parsedStart.formatted}\n` +
+    `• **Daily Reset:** ${parsedReset.formatted}` +
+    (channelRenameWarning ? `\n\n${channelRenameWarning}` : '');
+
+  await interaction.editReply({ content: responseText });
 }
 
 /**
- * Opens modal to manage reserved slot numbers for a registration instance.
+ * Legacy/fallback modal to manage reserved slot count for a registration instance.
  * @param {import('discord.js').ButtonInteraction} interaction
  * @param {string} registrationId
  */
@@ -777,17 +931,17 @@ export async function handleManageReservedButton(interaction, registrationId) {
     return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
   }
 
-  const reservedList = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
+  const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
   const modal = new ModalBuilder()
     .setCustomId(`md_cfg_manage_res_modal_${registrationId}`)
     .setTitle('Manage Reserved Slots');
 
   const reservedInput = new TextInputBuilder()
     .setCustomId('reserved_slots')
-    .setLabel('Reserved Slot Numbers (comma/space-separated)')
+    .setLabel('Reserved Slots Count (from Slot 01)')
     .setStyle(TextInputStyle.Short)
-    .setPlaceholder('e.g. 1, 4, 10')
-    .setValue(reservedList.join(', '))
+    .setPlaceholder('e.g. 2')
+    .setValue(String(reservedCount))
     .setRequired(false);
 
   modal.addComponents(new ActionRowBuilder().addComponents(reservedInput));
@@ -795,8 +949,7 @@ export async function handleManageReservedButton(interaction, registrationId) {
 }
 
 /**
- * Handles submission of Manage Reserved Slots modal.
- * Ensures newly reserved slots are not already occupied by an active registered team.
+ * Legacy/fallback submission of Manage Reserved Slots modal.
  * @param {import('discord.js').ModalSubmitInteraction} interaction
  * @param {string} registrationId
  */
@@ -809,33 +962,35 @@ export async function handleManageReservedModalSubmit(interaction, registrationI
   }
 
   const rawReserved = interaction.fields.getTextInputValue('reserved_slots')?.trim() || '';
-  const newReservedList = parseReservedSlots(rawReserved, registration.totalSlots);
+  const newReservedCount = parseReservedSlots(rawReserved, registration.totalSlots);
 
   // Check if any newly reserved slot is occupied by an active registered team
   const entries = await getConfigurableEntriesForRegistration(registrationId, registration.currentCycleId);
-  const occupiedSlots = new Set(entries.map((e) => e.slotNumber));
-  const conflictingSlots = newReservedList.filter((s) => occupiedSlots.has(s));
+  const conflictingEntries = entries.filter((e) => e.slotNumber <= newReservedCount);
 
-  if (conflictingSlots.length > 0) {
+  if (conflictingEntries.length > 0) {
     return interaction.editReply({
-      content: `❌ Slot(s) ${conflictingSlots.join(', ')} cannot be reserved because they are already occupied by registered teams in the current cycle.`,
+      content: `❌ Slot(s) ${conflictingEntries.map((e) => `#${e.slotNumber}`).join(', ')} cannot be reserved because they are already occupied by registered teams in the current cycle.`,
     });
   }
 
-  if (newReservedList.length >= registration.totalSlots) {
+  if (newReservedCount >= registration.totalSlots) {
     return interaction.editReply({
       content: '❌ Reserved slots cannot equal or exceed total capacity.',
     });
   }
 
-  registration.reservedSlots = newReservedList;
+  registration.reservedSlots = newReservedCount;
   await saveConfigurableRegistration(registration);
 
-  await updateSlotChartMessage(interaction.client, registrationId);
-  await updateRegistrationMessage(interaction.client, registrationId);
+  if (interaction.client) {
+    await updateSlotChartMessage(interaction.client, registrationId).catch(() => {});
+    await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
+    await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
+  }
 
   await interaction.editReply({
-    content: `✅ Reserved slots updated to: \`${newReservedList.length > 0 ? newReservedList.join(', ') : 'None'}\`.`,
+    content: `✅ Reserved slots updated to: \`${newReservedCount > 0 ? `${newReservedCount} (Slots 01-${String(newReservedCount).padStart(2, '0')})` : 'None'}\`.`,
   });
 }
 
@@ -920,6 +1075,10 @@ export async function handleDeleteRegistration(interaction, registrationId) {
   }
 
   await deleteConfigurableRegistration(registrationId);
+
+  if (interaction.client) {
+    await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
+  }
 
   await interaction.reply({
     content: `✅ Registration instance **${registration.displayName}** and its associated channels have been deleted.`,
