@@ -235,9 +235,13 @@ export async function saveConfigurableTournament(doc) {
   const now = new Date();
   const tournamentId = doc.tournamentId || crypto.randomUUID();
   const normalized = normalizeTournament(doc);
+  const nameLower = (doc.name || '').trim().toLowerCase();
   const record = {
     ...normalized,
     tournamentId,
+    nameLower,
+    prefix: doc.prefix || null,
+    boldPrefix: doc.boldPrefix || null,
     updatedAt: now,
     createdAt: doc.createdAt || now,
   };
@@ -260,7 +264,7 @@ export async function saveConfigurableTournament(doc) {
   return record;
 }
 
-export async function getConfigurableTournament(tournamentId) {
+export async function getConfigurableTournament(tournamentId, includeDeleted = false) {
   if (!tournamentId) return null;
   if (isMongoConnected()) {
     try {
@@ -269,6 +273,9 @@ export async function getConfigurableTournament(tournamentId) {
       if (doc) {
         const normalized = normalizeTournament(doc);
         localTournaments.set(tournamentId, normalized);
+        if (!includeDeleted && (doc.status === 'DELETED' || doc.isDeleted === true)) {
+          return null;
+        }
         return normalized;
       }
     } catch (err) {
@@ -276,15 +283,24 @@ export async function getConfigurableTournament(tournamentId) {
     }
   }
   const local = localTournaments.get(tournamentId);
-  return local ? normalizeTournament(local) : null;
+  if (!local) return null;
+  if (!includeDeleted && (local.status === 'DELETED' || local.isDeleted === true)) {
+    return null;
+  }
+  return normalizeTournament(local);
 }
 
-export async function getConfigurableTournamentByCategory(guildId, categoryId) {
+export async function getConfigurableTournamentByCategory(guildId, categoryId, includeDeleted = false) {
   if (!guildId || !categoryId) return null;
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_tournaments');
-      const doc = await col.findOne({ guildId, categoryId });
+      const query = { guildId, categoryId };
+      if (!includeDeleted) {
+        query.status = { $ne: 'DELETED' };
+        query.isDeleted = { $ne: true };
+      }
+      const doc = await col.findOne(query);
       if (doc) {
         const normalized = normalizeTournament(doc);
         localTournaments.set(doc.tournamentId, normalized);
@@ -297,18 +313,65 @@ export async function getConfigurableTournamentByCategory(guildId, categoryId) {
 
   for (const doc of localTournaments.values()) {
     if (doc.guildId === guildId && doc.categoryId === categoryId) {
+      if (!includeDeleted && (doc.status === 'DELETED' || doc.isDeleted === true)) continue;
       return normalizeTournament(doc);
     }
   }
   return null;
 }
 
-export async function getConfigurableTournamentBySetupChannel(setupChannelId) {
+export async function getConfigurableTournamentByName(guildId, name, includeDeleted = false) {
+  if (!guildId || !name) return null;
+  const nameLower = name.trim().toLowerCase();
+
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_configurable_tournaments');
+      const query = {
+        guildId,
+        $or: [
+          { nameLower },
+          { name: { $regex: new RegExp(`^${nameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') } },
+        ],
+      };
+      if (!includeDeleted) {
+        query.status = { $ne: 'DELETED' };
+        query.isDeleted = { $ne: true };
+      }
+      const doc = await col.findOne(query);
+      if (doc) {
+        const normalized = normalizeTournament(doc);
+        localTournaments.set(doc.tournamentId, normalized);
+        return normalized;
+      }
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error reading tournament by name:`, err.message);
+    }
+  }
+
+  for (const doc of localTournaments.values()) {
+    if (doc.guildId === guildId) {
+      const docNameLower = (doc.nameLower || doc.name || '').trim().toLowerCase();
+      if (docNameLower === nameLower) {
+        if (!includeDeleted && (doc.status === 'DELETED' || doc.isDeleted === true)) continue;
+        return normalizeTournament(doc);
+      }
+    }
+  }
+  return null;
+}
+
+export async function getConfigurableTournamentBySetupChannel(setupChannelId, includeDeleted = false) {
   if (!setupChannelId) return null;
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_tournaments');
-      const doc = await col.findOne({ setupChannelId });
+      const query = { setupChannelId };
+      if (!includeDeleted) {
+        query.status = { $ne: 'DELETED' };
+        query.isDeleted = { $ne: true };
+      }
+      const doc = await col.findOne(query);
       if (doc) {
         const normalized = normalizeTournament(doc);
         localTournaments.set(doc.tournamentId, normalized);
@@ -321,17 +384,22 @@ export async function getConfigurableTournamentBySetupChannel(setupChannelId) {
 
   for (const doc of localTournaments.values()) {
     if (doc.setupChannelId === setupChannelId) {
+      if (!includeDeleted && (doc.status === 'DELETED' || doc.isDeleted === true)) continue;
       return normalizeTournament(doc);
     }
   }
   return null;
 }
 
-export async function getAllConfigurableTournaments(guildId = null) {
+export async function getAllConfigurableTournaments(guildId = null, includeDeleted = false) {
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_tournaments');
       const query = guildId ? { guildId } : {};
+      if (!includeDeleted) {
+        query.status = { $ne: 'DELETED' };
+        query.isDeleted = { $ne: true };
+      }
       const docs = await col.find(query).toArray();
       const normalizedDocs = docs.map(normalizeTournament);
       for (const d of normalizedDocs) {
@@ -343,20 +411,59 @@ export async function getAllConfigurableTournaments(guildId = null) {
     }
   }
 
-  const all = Array.from(localTournaments.values()).map(normalizeTournament);
+  const all = Array.from(localTournaments.values())
+    .filter((d) => includeDeleted || (d.status !== 'DELETED' && !d.isDeleted))
+    .map(normalizeTournament);
   return guildId ? all.filter((d) => d.guildId === guildId) : all;
 }
 
-export async function deleteConfigurableTournament(tournamentId) {
+export async function deleteConfigurableTournament(tournamentId, client = null) {
   if (!tournamentId) return false;
-  localTournaments.delete(tournamentId);
+  const tour = await getConfigurableTournament(tournamentId, true);
+  if (!tour) return false;
+
+  const now = new Date();
+
+  // 1. Soft-delete and cleanup all registrations belonging to this tournament
+  const registrations = await getConfigurableRegistrationsForTournament(tournamentId, true);
+  for (const reg of registrations) {
+    if (reg.status !== 'DELETED') {
+      await deleteConfigurableRegistration(reg.registrationId, client);
+    }
+  }
+
+  // 2. Mark tournament as soft-deleted and remove stored channel and message IDs
+  tour.status = 'DELETED';
+  tour.isDeleted = true;
+  tour.deletedAt = now;
+  tour.setupChannelId = null;
+  tour.dashboardMessageId = null;
+  tour.standardChannels = null;
+  tour.categoryId = null;
+  tour.updatedAt = now;
+
+  localTournaments.set(tournamentId, { ...tour });
 
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_tournaments');
-      await col.deleteOne({ tournamentId });
+      await col.updateOne(
+        { tournamentId },
+        {
+          $set: {
+            status: 'DELETED',
+            isDeleted: true,
+            deletedAt: now,
+            setupChannelId: null,
+            dashboardMessageId: null,
+            standardChannels: null,
+            categoryId: null,
+            updatedAt: now,
+          },
+        }
+      );
     } catch (err) {
-      console.warn(`[ConfigurableTournament] ⚠️ Mongo error deleting tournament ${tournamentId}:`, err.message);
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error soft-deleting tournament ${tournamentId}:`, err.message);
       return false;
     }
   }
@@ -585,6 +692,8 @@ export async function deleteConfigurableRegistration(registrationId, client = nu
     reg.deletedAt = now;
     reg.registrationMessageId = null;
     reg.slotChartMessageId = null;
+    reg.registrationChannelId = null;
+    reg.idpChannelId = null;
     localRegistrations.set(registrationId, { ...reg });
   } else {
     localRegistrations.delete(registrationId);
@@ -602,6 +711,8 @@ export async function deleteConfigurableRegistration(registrationId, client = nu
             deletedAt: now,
             registrationMessageId: null,
             slotChartMessageId: null,
+            registrationChannelId: null,
+            idpChannelId: null,
           },
         }
       );

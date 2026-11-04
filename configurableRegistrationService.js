@@ -33,7 +33,13 @@ import {
   getDailyCyclesForRegistration,
 } from './configurableTournamentData.js';
 import { updateSlotChartMessage, buildSlotChartEmbed, buildSlotListText } from './slotChartService.js';
-import { TOURNAMENT_DENIED_PERMISSIONS, refreshDashboard } from './configurableTournamentService.js';
+import {
+  TOURNAMENT_DENIED_PERMISSIONS,
+  refreshDashboard,
+  buildTournamentPrefix,
+  toMathematicalBold,
+  createTournamentChannel,
+} from './configurableTournamentService.js';
 
 /**
  * Builds the Embed for a public Registration Channel.
@@ -276,16 +282,18 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
     .replace(/^-+|-+$/g, '')
     .slice(0, 20) || `group-${regNumber}`;
 
-  const regChannelName = `${slug}-reg`;
-  const idpChannelName = `${slug}-idp`;
+  const rawPrefix = tournament.prefix || (tournament.name ? buildTournamentPrefix(tournament.name) : 'md');
+  const boldPrefix = tournament.boldPrefix || toMathematicalBold(rawPrefix);
 
   const guild = interaction.guild;
   const categoryId = tournament.categoryId;
 
   try {
     // 1. Create Public Registration Channel (Viewable by everyone, SendMessages disabled)
-    const regChannel = await guild.channels.create({
-      name: regChannelName,
+    const regChannel = await createTournamentChannel(guild, {
+      boldPrefix,
+      rawPrefix,
+      fallbackSuffix: `${slug}-reg`,
       type: ChannelType.GuildText,
       parent: categoryId,
       permissionOverwrites: [
@@ -298,8 +306,10 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
     });
 
     // 2. Create Private IDP Channel (Hidden from everyone by default)
-    const idpChannel = await guild.channels.create({
-      name: idpChannelName,
+    const idpChannel = await createTournamentChannel(guild, {
+      boldPrefix,
+      rawPrefix,
+      fallbackSuffix: `${slug}-idp`,
       type: ChannelType.GuildText,
       parent: categoryId,
       permissionOverwrites: [
@@ -797,13 +807,17 @@ export async function handleToggleStatus(interaction, registrationId) {
     }
     if (!regChannel && guild) {
       const tournament = await getConfigurableTournament(registration.tournamentId);
+      const rawPrefix = tournament?.prefix || (tournament?.name ? buildTournamentPrefix(tournament.name) : 'md');
+      const boldPrefix = tournament?.boldPrefix || toMathematicalBold(rawPrefix);
       const slug = (registration.displayName || 'reg')
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-+|-+$/g, '')
         .slice(0, 20) || `group-${registration.registrationNumber || 1}`;
-      regChannel = await guild.channels.create({
-        name: `${slug}-reg`,
+      regChannel = await createTournamentChannel(guild, {
+        boldPrefix,
+        rawPrefix,
+        fallbackSuffix: `${slug}-reg`,
         type: ChannelType.GuildText,
         parent: tournament?.categoryId || null,
         permissionOverwrites: [
@@ -1010,20 +1024,36 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
       .replace(/^-+|-+$/g, '')
       .slice(0, 20) || `group-${registration.registrationNumber || 1}`;
 
-    const newRegChannelName = `${slug}-reg`;
-    const newIdpChannelName = `${slug}-idp`;
+    const tournament = await getConfigurableTournament(registration.tournamentId);
+    const rawPrefix = tournament?.prefix || (tournament?.name ? buildTournamentPrefix(tournament.name) : 'md');
+    const boldPrefix = tournament?.boldPrefix || toMathematicalBold(rawPrefix);
+
+    const primaryRegName = `${boldPrefix}\uFF5C${slug}-reg`;
+    const fallbackRegName = `${rawPrefix.toLowerCase()}-${slug}-reg`;
+    const primaryIdpName = `${boldPrefix}\uFF5C${slug}-idp`;
+    const fallbackIdpName = `${rawPrefix.toLowerCase()}-${slug}-idp`;
+
+    const renameChannelSafely = async (chan, primaryName, fallbackName) => {
+      if (!chan || typeof chan.setName !== 'function') return;
+      try {
+        await chan.setName(primaryName, 'Registration name updated');
+      } catch (err) {
+        console.warn(`[ConfigurableRegistration] ⚠️ Failed to rename channel to ${primaryName}: ${err.message}. Retrying with ${fallbackName}...`);
+        await chan.setName(fallbackName, 'Registration name updated');
+      }
+    };
 
     try {
       if (registration.registrationChannelId && interaction.guild) {
         const regChan = await interaction.guild.channels.fetch(registration.registrationChannelId).catch(() => null);
-        if (regChan && regChan.name !== newRegChannelName && typeof regChan.setName === 'function') {
-          await regChan.setName(newRegChannelName, 'Registration name updated');
+        if (regChan && regChan.name !== primaryRegName && regChan.name !== fallbackRegName) {
+          await renameChannelSafely(regChan, primaryRegName, fallbackRegName);
         }
       }
       if (registration.idpChannelId && interaction.guild) {
         const idpChan = await interaction.guild.channels.fetch(registration.idpChannelId).catch(() => null);
-        if (idpChan && idpChan.name !== newIdpChannelName && typeof idpChan.setName === 'function') {
-          await idpChan.setName(newIdpChannelName, 'Registration name updated');
+        if (idpChan && idpChan.name !== primaryIdpName && idpChan.name !== fallbackIdpName) {
+          await renameChannelSafely(idpChan, primaryIdpName, fallbackIdpName);
         }
       }
     } catch (renameErr) {

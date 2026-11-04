@@ -6,12 +6,16 @@ import {
   ChannelType,
   PermissionFlagsBits,
   StringSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } from 'discord.js';
 import crypto from 'node:crypto';
 import {
   saveConfigurableTournament,
   getConfigurableTournament,
   getConfigurableTournamentByCategory,
+  getConfigurableTournamentByName,
   getConfigurableTournamentBySetupChannel,
   getConfigurableRegistrationsForTournament,
   getEnrolledTeamsCount,
@@ -19,9 +23,11 @@ import {
   findConfigurableRegistrationByChannelId,
   findConfigurableRegistrationByMessageId,
   deleteConfigurableRegistration,
+  deleteConfigurableTournament,
   getPendingEnrollment,
   deletePendingEnrollment,
 } from './configurableTournamentData.js';
+import { queueChannelDelete } from './discordQueue.js';
 import {
   sendOrUpdateEnrollmentMessage,
   handleEnrollButtonClick,
@@ -114,6 +120,122 @@ export function buildDashboardEmbed(tournament, registrations = [], enrolledCoun
 }
 
 /**
+ * Builds tournament prefix from category name:
+ * - If first word is a short code (up to 4 chars with digit, e.g. T3), use that word;
+ * - Otherwise use initials of words ignoring pure numbers and years ("Champions Trophy S01" -> CTS);
+ * - If single word, use that word ("Apex" -> Apex).
+ * @param {string} name
+ * @returns {string}
+ */
+export function buildTournamentPrefix(name) {
+  if (!name || typeof name !== 'string') return 'MD';
+  const trimmed = name.trim();
+  if (!trimmed) return 'MD';
+
+  const rawWords = trimmed.split(/\s+/).filter(Boolean);
+  if (rawWords.length === 0) return 'MD';
+
+  const words = rawWords
+    .map((w) => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ''))
+    .filter(Boolean);
+
+  if (words.length === 0) return 'MD';
+
+  if (words.length === 1) {
+    return words[0];
+  }
+
+  const firstWord = words[0];
+  if (firstWord.length <= 4 && /\d/.test(firstWord)) {
+    return firstWord;
+  }
+
+  const nonNumberWords = words.filter((w) => !/^\d+$/.test(w));
+  if (nonNumberWords.length === 0) {
+    return firstWord;
+  }
+
+  if (nonNumberWords.length === 1) {
+    return nonNumberWords[0];
+  }
+
+  const initials = nonNumberWords
+    .map((w) => {
+      const match = w.match(/[\p{L}\p{N}]/u);
+      return match ? match[0].toUpperCase() : '';
+    })
+    .filter(Boolean)
+    .join('');
+
+  return initials || firstWord;
+}
+
+/**
+ * Converts alphanumeric characters into Unicode Mathematical Bold:
+ * A-Z -> 𝐀-𝐙 [offset 0x1D400-65], a-z -> 𝐚-𝐳 [offset 0x1D41A-97], 0-9 -> 𝟎-𝟗 [offset 0x1D7CE-48].
+ * @param {string} str
+ * @returns {string}
+ */
+export function toMathematicalBold(str) {
+  if (!str || typeof str !== 'string') return '';
+  let result = '';
+  for (const ch of str) {
+    const code = ch.charCodeAt(0);
+    if (code >= 65 && code <= 90) {
+      result += String.fromCodePoint(0x1D400 + (code - 65));
+    } else if (code >= 97 && code <= 122) {
+      result += String.fromCodePoint(0x1D41A + (code - 97));
+    } else if (code >= 48 && code <= 57) {
+      result += String.fromCodePoint(0x1D7CE + (code - 48));
+    } else {
+      result += ch;
+    }
+  }
+  return result;
+}
+
+/**
+ * Creates a Discord channel formatted with `<bold prefix>｜<fallbackSuffix>`.
+ * On Discord rejection, logs exact error and retries once with plain fallback `${cleanPrefix}-${cleanSuffix}`.
+ * @param {import('discord.js').Guild} guild
+ * @param {object} options
+ * @returns {Promise<import('discord.js').GuildChannel>}
+ */
+export async function createTournamentChannel(guild, {
+  boldPrefix,
+  rawPrefix,
+  fallbackSuffix,
+  type = ChannelType.GuildText,
+  parent,
+  permissionOverwrites = [],
+  topic = '',
+}) {
+  const cleanSuffix = (fallbackSuffix || '').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+  const cleanPrefix = (rawPrefix || 'md').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'md';
+  const plainFallback = `${cleanPrefix}-${cleanSuffix}`;
+  const primaryName = `${boldPrefix}\uFF5C${cleanSuffix}`;
+
+  try {
+    return await guild.channels.create({
+      name: primaryName,
+      type,
+      parent,
+      permissionOverwrites,
+      topic,
+    });
+  } catch (err) {
+    console.warn(`[ConfigurableTournament] ⚠️ Discord rejected channel creation with name "${primaryName}": ${err.message}. Retrying once with plain fallback "${plainFallback}"...`);
+    return await guild.channels.create({
+      name: plainFallback,
+      type,
+      parent,
+      permissionOverwrites,
+      topic,
+    });
+  }
+}
+
+/**
  * Builds the dashboard interactive button rows.
  * @param {string} tournamentId
  * @returns {Array<ActionRowBuilder>}
@@ -155,7 +277,15 @@ export function buildDashboardButtons(tournamentId) {
       .setStyle(ButtonStyle.Secondary)
   );
 
-  return [row1, row2];
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`md_cfg_delete_tournament_${tournamentId}`)
+      .setLabel('Delete Tournament')
+      .setEmoji('🗑️')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  return [row1, row2, row3];
 }
 
 /**
@@ -200,82 +330,211 @@ export async function refreshDashboard(client, tournamentId) {
   }
 }
 
+const activeCreationLocks = new Set();
+
 /**
  * Handles the `.setup tournament` text command.
- * Must be executed in a setup channel located within a Discord category.
- * Idempotently initializes the tournament and generates the persistent dashboard.
+ * Admin-only command that can be run in any channel.
+ * Step 1: Replies with a short message and an "Enter Category Name" button.
  * @param {import('discord.js').Message} message
  */
 export async function handleSetupTournamentCommand(message) {
   // Check organizer / admin permissions
   const hasPerm =
-    message.member?.permissions.has(PermissionFlagsBits.Administrator) ||
-    message.member?.permissions.has(PermissionFlagsBits.ManageGuild);
+    message.member?.permissions?.has?.(PermissionFlagsBits.Administrator) ||
+    message.member?.permissions?.has?.(PermissionFlagsBits.ManageGuild);
 
   if (!hasPerm) {
     return message.reply('❌ You need `Manage Server` or `Administrator` permissions to setup a tournament.');
   }
 
-  const category = message.channel.parent;
-  if (!category || category.type !== ChannelType.GuildCategory) {
-    return message.reply(
-      '❌ **Invalid Location:** The `.setup tournament` command must be executed within a setup channel inside a **Discord Category**.'
-    );
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('md_cfg_btn_enter_category_name')
+      .setLabel('Enter Category Name')
+      .setEmoji('📝')
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  return message.reply({
+    content: '🏆 **Tournament Setup**\nClick the button below to enter your tournament category name.',
+    components: [row],
+  });
+}
+
+/**
+ * Handles "Enter Category Name" button click.
+ * Opens the modal form asking for category name.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ */
+export async function handleEnterCategoryNameButton(interaction) {
+  const hasPerm =
+    interaction.member?.permissions?.has?.(PermissionFlagsBits.Administrator) ||
+    interaction.member?.permissions?.has?.(PermissionFlagsBits.ManageGuild);
+
+  if (!hasPerm) {
+    return interaction.reply({
+      content: '❌ You need `Manage Server` or `Administrator` permissions to setup a tournament.',
+      ephemeral: true,
+    });
   }
 
-  // Deny thread creation at category level
-  if (typeof category.permissionOverwrites?.edit === 'function') {
-    await category.permissionOverwrites.edit(message.guild.roles.everyone.id, {
-      CreatePublicThreads: false,
-      CreatePrivateThreads: false,
-      SendMessagesInThreads: false,
-      ManageThreads: false,
-      ManageChannels: false,
-      ManageRoles: false,
-    }).catch(() => {});
+  const modal = new ModalBuilder()
+    .setCustomId('md_cfg_modal_category_name')
+    .setTitle('Tournament Setup');
+
+  const nameInput = new TextInputBuilder()
+    .setCustomId('category_name')
+    .setLabel('Category Name')
+    .setPlaceholder('e.g. T3 Scrims or Champions Trophy S01')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(100);
+
+  modal.addComponents(new ActionRowBuilder().addComponents(nameInput));
+  return interaction.showModal(modal);
+}
+
+/**
+ * Handles tournament creation modal submission (Step 2).
+ * Creates Discord category, setup channel, saves tournament in MongoDB,
+ * posts the central dashboard, and replies with a link to setup channel.
+ * @param {import('discord.js').ModalSubmitInteraction} interaction
+ */
+export async function handleCreateTournamentModalSubmit(interaction) {
+  const hasPerm =
+    interaction.member?.permissions?.has?.(PermissionFlagsBits.Administrator) ||
+    interaction.member?.permissions?.has?.(PermissionFlagsBits.ManageGuild);
+
+  if (!hasPerm) {
+    return interaction.reply({
+      content: '❌ You need `Manage Server` or `Administrator` permissions to setup a tournament.',
+      ephemeral: true,
+    });
   }
 
-  const guildId = message.guild.id;
-  const categoryId = category.id;
-  const setupChannelId = message.channel.id;
+  const categoryName = interaction.fields?.getTextInputValue?.('category_name')?.trim();
+  if (!categoryName) {
+    return interaction.reply({
+      content: '❌ Category name cannot be empty.',
+      ephemeral: true,
+    });
+  }
 
-  // Retrieve existing tournament or create a new record
-  let tournament = await getConfigurableTournamentByCategory(guildId, categoryId);
+  const guild = interaction.guild;
+  if (!guild) {
+    return interaction.reply({
+      content: '❌ This command can only be used within a server.',
+      ephemeral: true,
+    });
+  }
 
-  if (!tournament) {
-    tournament = {
+  // Refuse if a tournament with this category name already exists on this server
+  const existingTour = await getConfigurableTournamentByName(guild.id, categoryName);
+  if (existingTour) {
+    return interaction.reply({
+      content: `❌ A tournament with the category name "${categoryName}" already exists on this server.`,
+      ephemeral: true,
+    });
+  }
+
+  const lockKey = `${guild.id}:${categoryName.toLowerCase()}`;
+  if (activeCreationLocks.has(lockKey)) {
+    return interaction.reply({
+      content: `⚠️ Tournament setup for "${categoryName}" is already in progress. Please wait.`,
+      ephemeral: true,
+    });
+  }
+  activeCreationLocks.add(lockKey);
+
+  try {
+    await interaction.deferReply({ ephemeral: true });
+
+    // Step 2: Create category
+    const category = await guild.channels.create({
+      name: categoryName,
+      type: ChannelType.GuildCategory,
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone.id,
+          deny: TOURNAMENT_DENIED_PERMISSIONS,
+        },
+      ],
+    });
+
+    const rawPrefix = buildTournamentPrefix(categoryName);
+    const boldPrefix = toMathematicalBold(rawPrefix);
+
+    const botId = interaction.client?.user?.id || guild.members?.me?.id;
+    const overwrites = [
+      {
+        id: guild.roles.everyone.id,
+        deny: [PermissionFlagsBits.ViewChannel],
+      },
+    ];
+    if (botId) {
+      overwrites.push({
+        id: botId,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.EmbedLinks,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.ManageChannels,
+        ],
+      });
+    }
+
+    // Create private setup channel visible only to administrators and bot
+    const setupChannel = await createTournamentChannel(guild, {
+      boldPrefix,
+      rawPrefix,
+      fallbackSuffix: 'setup',
+      type: ChannelType.GuildText,
+      parent: category.id,
+      permissionOverwrites: overwrites,
+    });
+
+    const tournament = {
       tournamentId: crypto.randomUUID(),
-      guildId,
-      categoryId,
-      setupChannelId,
+      guildId: guild.id,
+      categoryId: category.id,
+      setupChannelId: setupChannel.id,
       dashboardMessageId: null,
-      name: category.name,
+      name: categoryName,
+      nameLower: categoryName.toLowerCase(),
+      prefix: rawPrefix,
+      boldPrefix,
+      requiredDiscordMembers: 4,
       standardChannels: null,
-      createdBy: message.author.id,
+      createdBy: interaction.user.id,
       createdAt: new Date(),
     };
-  } else {
-    // Update setup channel to current channel if changed
-    tournament.setupChannelId = setupChannelId;
-    tournament.name = category.name;
-  }
 
-  await saveConfigurableTournament(tournament);
+    await saveConfigurableTournament(tournament);
 
-  // Send or update the persistent dashboard
-  await refreshDashboard(message.client, tournament.tournamentId);
+    // Post persistent dashboard in setup channel
+    await refreshDashboard(interaction.client, tournament.tournamentId);
 
-  // Delete triggering user command to keep setup channel clean
-  try {
-    await message.delete().catch(() => {});
-  } catch {
-    // Ignore deletion errors
+    // Reply to admin with link to setup channel
+    return await interaction.editReply({
+      content: `✅ Tournament **${categoryName}** created successfully! Head over to <#${setupChannel.id}> to manage it.`,
+    });
+  } catch (err) {
+    console.error(`[ConfigurableTournament] ❌ Error creating tournament "${categoryName}":`, err);
+    const errorMsg = `❌ Failed to create tournament: ${err.message || err}`;
+    if (interaction.deferred || interaction.replied) {
+      return await interaction.editReply({ content: errorMsg });
+    }
+    return await interaction.reply({ content: errorMsg, ephemeral: true });
+  } finally {
+    activeCreationLocks.delete(lockKey);
   }
 }
 
 /**
  * Handles "Create Standard Channels" button click.
- * Creates T3-Verify, T3-Updates, T3-Info in the category if they don't already exist.
+ * Creates verify, updates, and info channels in the category if they don't already exist.
  * The setup channel itself is NEVER deleted or recreated.
  * @param {import('discord.js').ButtonInteraction} interaction
  * @param {string} tournamentId
@@ -303,7 +562,8 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
   }
 
   try {
-    const prefix = 'T3';
+    const rawPrefix = tournament.prefix || buildTournamentPrefix(tournament.name);
+    const boldPrefix = tournament.boldPrefix || toMathematicalBold(rawPrefix);
 
     // Deny thread permissions at category level
     const category = interaction.channel?.parent || (await guild.channels.fetch(categoryId).catch(() => null));
@@ -318,9 +578,11 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
       }).catch(() => {});
     }
 
-    // 1. T3-Verify (Shared squad enrollment)
-    const verifyChannel = await guild.channels.create({
-      name: `${prefix}-verify`,
+    // 1. Verify channel (Shared squad enrollment)
+    const verifyChannel = await createTournamentChannel(guild, {
+      boldPrefix,
+      rawPrefix,
+      fallbackSuffix: 'verify',
       type: ChannelType.GuildText,
       parent: categoryId,
       permissionOverwrites: [
@@ -332,9 +594,11 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
       ],
     });
 
-    // 2. T3-Updates (Announcements)
-    const updatesChannel = await guild.channels.create({
-      name: `${prefix}-updates`,
+    // 2. Updates channel (Announcements)
+    const updatesChannel = await createTournamentChannel(guild, {
+      boldPrefix,
+      rawPrefix,
+      fallbackSuffix: 'updates',
       type: ChannelType.GuildText,
       parent: categoryId,
       permissionOverwrites: [
@@ -346,9 +610,11 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
       ],
     });
 
-    // 3. T3-Info (Rules & Information)
-    const infoChannel = await guild.channels.create({
-      name: `${prefix}-info`,
+    // 3. Info channel (Rules & Information)
+    const infoChannel = await createTournamentChannel(guild, {
+      boldPrefix,
+      rawPrefix,
+      fallbackSuffix: 'info',
       type: ChannelType.GuildText,
       parent: categoryId,
       permissionOverwrites: [
@@ -365,7 +631,7 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
       updatesChannelId: updatesChannel.id,
       infoChannelId: infoChannel.id,
       verifyMessageId: null,
-      prefix,
+      prefix: rawPrefix,
     };
 
     await saveConfigurableTournament(tournament);
@@ -502,13 +768,13 @@ export async function handleConfigurableChannelDelete(channel) {
 
     const client = channel.client;
 
-    // Delete and cleanup registration (archives entries, revokes IDP access, marks DELETED)
-    await deleteConfigurableRegistration(registration.registrationId, client);
-
-    // Also delete the paired channel if it still exists in the guild
+    // Get the paired channel before deleting/clearing stored IDs
     const otherChannelId = registration.registrationChannelId === channel.id
       ? registration.idpChannelId
       : registration.registrationChannelId;
+
+    // Delete and cleanup registration (archives entries, revokes IDP access, marks DELETED)
+    await deleteConfigurableRegistration(registration.registrationId, client);
 
     if (otherChannelId && channel.guild) {
       try {
@@ -627,12 +893,251 @@ export async function handleSetRequiredMembers(interaction, tournamentId) {
 }
 
 /**
+ * Handles "Delete Tournament" button click.
+ * Displays the confirmation screen.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} tournamentId
+ */
+export async function handleDeleteTournamentButton(interaction, tournamentId) {
+  const hasPerm =
+    interaction.member?.permissions?.has?.(PermissionFlagsBits.Administrator) ||
+    interaction.member?.permissions?.has?.(PermissionFlagsBits.ManageGuild);
+
+  if (!hasPerm) {
+    return interaction.reply({
+      content: '❌ Only administrators can delete this tournament.',
+      ephemeral: true,
+    });
+  }
+
+  const tournament = await getConfigurableTournament(tournamentId);
+  if (!tournament) {
+    return interaction.reply({
+      content: '❌ Tournament configuration not found or already deleted.',
+      ephemeral: true,
+    });
+  }
+
+  const guild = interaction.guild;
+  const categoryId = tournament.categoryId;
+  let channelCount = 0;
+  if (guild && categoryId) {
+    if (typeof guild.channels?.cache?.filter === 'function') {
+      channelCount = guild.channels.cache.filter((c) => c && c.parentId === categoryId).size;
+    } else if (guild.channels?.cache) {
+      channelCount = Array.from(guild.channels.cache.values()).filter((c) => c && c.parentId === categoryId).length;
+    }
+  }
+
+  const confirmationText = `Delete **${tournament.name}**? This permanently deletes the category and all **${channelCount}** channels inside it, including every registration channel and IDP channel. This can't be undone.`;
+
+  const confirmEmbed = new EmbedBuilder()
+    .setColor(0xed4245)
+    .setTitle(`⚠️ Delete Tournament Confirmation`)
+    .setDescription(confirmationText);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`md_cfg_del_tour_confirm_${tournamentId}`)
+      .setLabel('Confirm Delete')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`md_cfg_del_tour_cancel_${tournamentId}`)
+      .setLabel('Cancel')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  return interaction.update({
+    content: `Delete ${tournament.name}? This permanently deletes the category and all ${channelCount} channels inside it, including every registration channel and IDP channel. This can't be undone.`,
+    embeds: [confirmEmbed],
+    components: [row],
+  });
+}
+
+/**
+ * Handles "Cancel" button on Delete Tournament confirmation.
+ * Restores the dashboard.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} tournamentId
+ */
+export async function handleDeleteTournamentCancel(interaction, tournamentId) {
+  const hasPerm =
+    interaction.member?.permissions?.has?.(PermissionFlagsBits.Administrator) ||
+    interaction.member?.permissions?.has?.(PermissionFlagsBits.ManageGuild);
+
+  if (!hasPerm) {
+    return interaction.reply({
+      content: '❌ Only administrators can manage this tournament.',
+      ephemeral: true,
+    });
+  }
+
+  const tournament = await getConfigurableTournament(tournamentId);
+  if (!tournament) {
+    return interaction.update({
+      content: '❌ Tournament not found or already deleted.',
+      embeds: [],
+      components: [],
+    });
+  }
+
+  const registrations = await getConfigurableRegistrationsForTournament(tournamentId);
+  const enrolledCount = await getEnrolledTeamsCount(tournamentId);
+
+  const embed = buildDashboardEmbed(tournament, registrations, enrolledCount);
+  const components = buildDashboardButtons(tournamentId);
+
+  return interaction.update({ content: null, embeds: [embed], components });
+}
+
+/**
+ * Handles "Confirm Delete" on Delete Tournament confirmation.
+ * Deletes all channels in category (setup channel last) via queueChannelDelete,
+ * deletes category, cleans MongoDB, and sends ephemeral follow-up summary.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} tournamentId
+ */
+export async function handleDeleteTournamentConfirm(interaction, tournamentId) {
+  const hasPerm =
+    interaction.member?.permissions?.has?.(PermissionFlagsBits.Administrator) ||
+    interaction.member?.permissions?.has?.(PermissionFlagsBits.ManageGuild);
+
+  if (!hasPerm) {
+    return interaction.reply({
+      content: '❌ Only administrators can delete this tournament.',
+      ephemeral: true,
+    });
+  }
+
+  const tournament = await getConfigurableTournament(tournamentId, true);
+  if (!tournament || tournament.status === 'DELETED') {
+    return interaction.reply({
+      content: '❌ Tournament not found or already deleted.',
+      ephemeral: true,
+    });
+  }
+
+  if (!interaction.deferred && !interaction.replied) {
+    if (typeof interaction.deferReply === 'function') {
+      await interaction.deferReply({ ephemeral: true });
+    } else if (typeof interaction.deferUpdate === 'function') {
+      await interaction.deferUpdate();
+    }
+  }
+
+  const guild = interaction.guild;
+  const categoryId = tournament.categoryId;
+  const setupChannelId = tournament.setupChannelId;
+
+  let deletedChannelsCount = 0;
+  const failures = [];
+
+  if (guild && categoryId) {
+    let childChannels = [];
+    if (guild.channels?.cache) {
+      childChannels = Array.from(guild.channels.cache.values()).filter((c) => c && c.parentId === categoryId);
+    }
+    if (childChannels.length === 0 && typeof guild.channels?.fetch === 'function') {
+      try {
+        const fetched = await guild.channels.fetch();
+        childChannels = Array.from(fetched.values()).filter((c) => c && c.parentId === categoryId);
+      } catch {}
+    }
+
+    // Setup channel deleted last
+    const nonSetupChannels = childChannels.filter((c) => c.id !== setupChannelId);
+    const setupChannel = childChannels.find((c) => c.id === setupChannelId) || (setupChannelId && guild.channels?.cache?.get?.(setupChannelId));
+
+    for (const channel of nonSetupChannels) {
+      try {
+        await queueChannelDelete(channel, `Tournament deletion: ${tournament.name}`);
+        deletedChannelsCount++;
+      } catch (err) {
+        console.error(`[ConfigurableTournament] ❌ Failed to delete channel ${channel.name || channel.id}:`, err);
+        failures.push(channel.name || channel.id);
+      }
+    }
+
+    if (setupChannel) {
+      try {
+        await queueChannelDelete(setupChannel, `Tournament deletion: ${tournament.name}`);
+        deletedChannelsCount++;
+      } catch (err) {
+        console.error(`[ConfigurableTournament] ❌ Failed to delete setup channel ${setupChannel.name || setupChannel.id}:`, err);
+        failures.push(setupChannel.name || setupChannel.id);
+      }
+    }
+
+    // Now delete category
+    const category = guild.channels?.cache?.get?.(categoryId) || (await guild.channels.fetch(categoryId).catch(() => null));
+    if (category) {
+      try {
+        await queueChannelDelete(category, `Tournament deletion: ${tournament.name}`);
+      } catch (err) {
+        console.error(`[ConfigurableTournament] ❌ Failed to delete category ${category.name || categoryId}:`, err);
+        failures.push(category.name || categoryId);
+      }
+    }
+  }
+
+  // Clean MongoDB (soft-delete tournament, soft-delete registrations, archive active entries with slots released, revoke IDP access)
+  await deleteConfigurableTournament(tournamentId, interaction.client);
+
+  const summary =
+    `🗑️ **Tournament "${tournament.name}" Deleted**\n` +
+    `• Successfully deleted **${deletedChannelsCount}** channel(s) and category.\n` +
+    (failures.length > 0 ? `• ⚠️ Failed to delete: ${failures.join(', ')}\n` : '') +
+    `• All tournament data, registrations, and slots have been safely cleaned and archived.`;
+
+  if (typeof interaction.editReply === 'function') {
+    return await interaction.editReply({ content: summary });
+  } else if (typeof interaction.followUp === 'function') {
+    return await interaction.followUp({ content: summary, ephemeral: true });
+  } else if (typeof interaction.reply === 'function') {
+    return await interaction.reply({ content: summary, ephemeral: true });
+  }
+}
+
+/**
  * Main dispatcher for all md_cfg_ interactions (buttons, modals, selects).
  * @param {import('discord.js').Interaction} interaction
  * @returns {Promise<boolean>}
  */
 export async function handleConfigurableTournamentInteraction(interaction) {
   const customId = interaction.customId || '';
+
+  // 0a. Enter Category Name button (Step 1 of .setup tournament)
+  if (customId === 'md_cfg_btn_enter_category_name') {
+    await handleEnterCategoryNameButton(interaction);
+    return true;
+  }
+
+  // 0b. Create Tournament modal submit (Step 2 of .setup tournament)
+  if (customId === 'md_cfg_modal_category_name') {
+    await handleCreateTournamentModalSubmit(interaction);
+    return true;
+  }
+
+  // 0c. Delete Tournament button
+  if (customId.startsWith('md_cfg_delete_tournament_')) {
+    const tournamentId = customId.replace('md_cfg_delete_tournament_', '');
+    await handleDeleteTournamentButton(interaction, tournamentId);
+    return true;
+  }
+
+  // 0d. Delete Tournament Confirm
+  if (customId.startsWith('md_cfg_del_tour_confirm_')) {
+    const tournamentId = customId.replace('md_cfg_del_tour_confirm_', '');
+    await handleDeleteTournamentConfirm(interaction, tournamentId);
+    return true;
+  }
+
+  // 0e. Delete Tournament Cancel
+  if (customId.startsWith('md_cfg_del_tour_cancel_')) {
+    const tournamentId = customId.replace('md_cfg_del_tour_cancel_', '');
+    await handleDeleteTournamentCancel(interaction, tournamentId);
+    return true;
+  }
 
   // 1. Create standard channels
   if (customId.startsWith('md_cfg_create_channels_')) {

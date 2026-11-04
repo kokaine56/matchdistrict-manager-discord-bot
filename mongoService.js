@@ -226,9 +226,13 @@ async function ensureMongoIndexes() {
     await staffAppCol.createIndex({ status: 1 });
 
         const cfgTourCol = mongoDb.collection('discord_configurable_tournaments');
-    await cfgTourCol.createIndex({ guildId: 1, categoryId: 1 }, { unique: true });
+    try {
+      await cfgTourCol.dropIndex('guildId_1_categoryId_1');
+    } catch {}
+    await cfgTourCol.createIndex({ guildId: 1, categoryId: 1 }, { sparse: true });
     await cfgTourCol.createIndex({ tournamentId: 1 }, { unique: true });
     await cfgTourCol.createIndex({ setupChannelId: 1 });
+    await cfgTourCol.createIndex({ guildId: 1, nameLower: 1 });
 
     const cfgRegCol = mongoDb.collection('discord_configurable_registrations');
     await cfgRegCol.createIndex({ tournamentId: 1, registrationNumber: 1 }, { unique: true });

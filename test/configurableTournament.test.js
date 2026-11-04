@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { ChannelType, PermissionFlagsBits } from 'discord.js';
+import { ChannelType, PermissionFlagsBits, ButtonStyle } from 'discord.js';
 
 import {
   clearInMemoryData,
@@ -44,12 +44,21 @@ import {
   getDailyCyclesForRegistration,
   archiveActiveRegistrationCycle,
   cleanUpStaleConfigurableRegistrationsAndEntries,
+  getConfigurableTournamentByName,
 } from '../configurableTournamentData.js';
 
 import {
   buildDashboardEmbed,
   buildDashboardButtons,
+  buildTournamentPrefix,
+  toMathematicalBold,
+  createTournamentChannel,
   handleSetupTournamentCommand,
+  handleEnterCategoryNameButton,
+  handleCreateTournamentModalSubmit,
+  handleDeleteTournamentButton,
+  handleDeleteTournamentCancel,
+  handleDeleteTournamentConfirm,
   handleCreateStandardChannels,
   handleConfigurableChannelUpdate,
   handleConfigurableChannelDelete,
@@ -120,34 +129,11 @@ test.beforeEach(() => {
 // 1. Initial Setup Command & Dashboard Tests
 // ----------------------------------------------------
 
-test('Setup Command - Rejects execution outside of a Discord Category', async () => {
-  let replyMessage = null;
-  const mockMessage = {
-    guild: { id: 'guild-123' },
-    channel: { id: 'channel-123', parent: null },
-    author: { id: 'user-admin' },
-    member: {
-      permissions: {
-        has: (flag) => flag === PermissionFlagsBits.Administrator,
-      },
-    },
-    reply: async (msg) => {
-      replyMessage = typeof msg === 'string' ? msg : msg.content;
-    },
-  };
-
-  await handleSetupTournamentCommand(mockMessage);
-  assert.match(replyMessage, /Invalid Location/);
-});
-
 test('Setup Command - Rejects users without Manage Server or Administrator permissions', async () => {
   let replyMessage = null;
   const mockMessage = {
     guild: { id: 'guild-123' },
-    channel: {
-      id: 'channel-123',
-      parent: { id: 'cat-123', type: ChannelType.GuildCategory },
-    },
+    channel: { id: 'channel-123' },
     author: { id: 'user-normal' },
     member: {
       permissions: {
@@ -163,69 +149,171 @@ test('Setup Command - Rejects users without Manage Server or Administrator permi
   assert.match(replyMessage, /You need `Manage Server` or `Administrator`/);
 });
 
-test('Setup Command - Auto-detects category and generates persistent dashboard', async () => {
-  const categoryId = 'cat-scrims-999';
-  const setupChannelId = 'setup-chan-111';
-  let sentMessage = null;
-  let categoryOverwrites = null;
-
-  const mockCategory = {
-    id: categoryId,
-    name: 'T3 Daily Scrims',
-    type: ChannelType.GuildCategory,
-    permissionOverwrites: {
-      edit: async (roleId, perms) => {
-        categoryOverwrites = { roleId, perms };
-      },
-    },
-  };
-
-  const mockChannel = {
-    id: setupChannelId,
-    parent: mockCategory,
-    isTextBased: () => true,
-    send: async (payload) => {
-      sentMessage = { id: 'dash-msg-1', ...payload };
-      return sentMessage;
-    },
-    messages: {
-      fetch: async () => null,
-    },
-  };
-
-  const mockClient = {
-    channels: {
-      fetch: async (id) => (id === setupChannelId ? mockChannel : null),
-    },
-  };
-
+test('Setup Command - Step 1: Executable in any channel and replies with Enter Category Name button', async () => {
+  let replyPayload = null;
   const mockMessage = {
-    guild: { id: 'guild-123', roles: { everyone: { id: 'role-everyone' } } },
-    channel: mockChannel,
+    guild: { id: 'guild-123' },
+    channel: { id: 'channel-random-anywhere' }, // No category needed
     author: { id: 'user-admin' },
-    client: mockClient,
     member: {
       permissions: {
         has: (flag) => flag === PermissionFlagsBits.Administrator,
       },
     },
-    delete: async () => {},
+    reply: async (payload) => {
+      replyPayload = payload;
+    },
   };
 
   await handleSetupTournamentCommand(mockMessage);
-
-  const tour = await getConfigurableTournamentByCategory('guild-123', categoryId);
-  assert.ok(tour, 'Tournament should be created in database');
-  assert.equal(tour.categoryId, categoryId);
-  assert.equal(tour.setupChannelId, setupChannelId);
-  assert.equal(tour.name, 'T3 Daily Scrims');
-  assert.equal(tour.dashboardMessageId, 'dash-msg-1');
-  assert.ok(sentMessage, 'Dashboard message must be sent');
-  assert.ok(categoryOverwrites, 'Category permissions must be edited');
-  assert.equal(categoryOverwrites.perms.CreatePublicThreads, false);
+  assert.ok(replyPayload);
+  assert.match(replyPayload.content, /Tournament Setup/);
+  assert.equal(replyPayload.components.length, 1);
+  const btn = replyPayload.components[0].components[0];
+  assert.equal(btn.data.custom_id, 'md_cfg_btn_enter_category_name');
+  assert.equal(btn.data.label, 'Enter Category Name');
 });
 
-test('Dashboard Layout - ActionRows and Embed generation', () => {
+test('Setup Command - Step 2: Modal submission creates category, setup channel, posts dashboard, and returns channel link', async () => {
+  const createdChannels = [];
+  const mockGuild = {
+    id: 'guild-step2-test',
+    roles: { everyone: { id: 'everyone-role-id' } },
+    members: { me: { id: 'bot-id-123' } },
+    channels: {
+      create: async (spec) => {
+        const chan = {
+          id: `chan-${createdChannels.length + 1}`,
+          name: spec.name,
+          type: spec.type,
+          parent: spec.parent,
+          isTextBased: () => true,
+          send: async (msg) => ({ id: `dash-msg-1`, ...msg }),
+          messages: { fetch: async () => null },
+        };
+        createdChannels.push(chan);
+        return chan;
+      },
+      fetch: async (id) => createdChannels.find((c) => c.id === id) || null,
+    },
+  };
+
+  const mockClient = {
+    user: { id: 'bot-id-123' },
+    channels: {
+      fetch: async (id) => createdChannels.find((c) => c.id === id) || null,
+    },
+  };
+
+  let deferred = false;
+  let replyPayload = null;
+  const mockModalInteraction = {
+    guild: mockGuild,
+    client: mockClient,
+    user: { id: 'admin-user-id' },
+    member: {
+      permissions: {
+        has: (flag) => flag === PermissionFlagsBits.Administrator,
+      },
+    },
+    fields: {
+      getTextInputValue: (cid) => (cid === 'category_name' ? 'T3 Scrims' : ''),
+    },
+    deferReply: async (opts) => { deferred = true; },
+    editReply: async (p) => { replyPayload = p; },
+  };
+
+  await handleCreateTournamentModalSubmit(mockModalInteraction);
+
+  assert.ok(deferred, 'Interaction was deferred');
+  assert.match(replyPayload.content, /Tournament \*\*T3 Scrims\*\* created successfully/);
+  assert.match(replyPayload.content, /<#chan-2>/); // Link to setup channel
+
+  // Verify created channels: 1st is category, 2nd is setup channel
+  assert.equal(createdChannels.length, 2);
+  assert.equal(createdChannels[0].name, 'T3 Scrims');
+  assert.equal(createdChannels[0].type, ChannelType.GuildCategory);
+  assert.equal(createdChannels[1].name, '𝐓𝟑｜setup');
+  assert.equal(createdChannels[1].type, ChannelType.GuildText);
+  assert.equal(createdChannels[1].parent, createdChannels[0].id);
+
+  // Verify saved in DB
+  const tour = await getConfigurableTournamentByName('guild-step2-test', 'T3 Scrims');
+  assert.ok(tour, 'Tournament saved to DB');
+  assert.equal(tour.name, 'T3 Scrims');
+  assert.equal(tour.prefix, 'T3');
+  assert.equal(tour.boldPrefix, '𝐓𝟑');
+  assert.equal(tour.categoryId, createdChannels[0].id);
+  assert.equal(tour.setupChannelId, createdChannels[1].id);
+  assert.equal(tour.dashboardMessageId, 'dash-msg-1');
+});
+
+test('Setup Command - Refuses creation if category name already exists on server', async () => {
+  await saveConfigurableTournament({
+    tournamentId: 'existing-tour-id',
+    guildId: 'guild-dup-check',
+    name: 'Champions Trophy S01',
+  });
+
+  let replyPayload = null;
+  const mockModalInteraction = {
+    guild: { id: 'guild-dup-check' },
+    user: { id: 'admin-user-id' },
+    member: {
+      permissions: {
+        has: () => true,
+      },
+    },
+    fields: {
+      getTextInputValue: (cid) => (cid === 'category_name' ? 'champions trophy s01' : ''),
+    },
+    reply: async (p) => { replyPayload = p; },
+  };
+
+  await handleCreateTournamentModalSubmit(mockModalInteraction);
+  assert.ok(replyPayload);
+  assert.match(replyPayload.content, /already exists on this server/);
+});
+
+test('Prefix Font & Channel Naming - Mathematical Bold and plain retry fallback', async () => {
+  // Test Prefix generation logic
+  assert.equal(buildTournamentPrefix('T3 Scrims'), 'T3');
+  assert.equal(buildTournamentPrefix('Champions Trophy S01'), 'CTS');
+  assert.equal(buildTournamentPrefix('Apex'), 'Apex');
+  assert.equal(buildTournamentPrefix('Champions Trophy 2024'), 'CT');
+
+  // Test Unicode Mathematical Bold
+  assert.equal(toMathematicalBold('T3'), '𝐓𝟑');
+  assert.equal(toMathematicalBold('CTS'), '𝐂𝐓𝐒');
+  assert.equal(toMathematicalBold('Apex'), '𝐀𝐩𝐞𝐱');
+
+  // Test channel creation with retry fallback on Discord rejection
+  let attempt = 0;
+  const created = [];
+  const mockGuild = {
+    channels: {
+      create: async (spec) => {
+        attempt++;
+        if (attempt === 1) {
+          throw new Error('Discord rejected Unicode Mathematical Bold');
+        }
+        created.push(spec);
+        return { id: 'chan-fallback', ...spec };
+      },
+    },
+  };
+
+  const chan = await createTournamentChannel(mockGuild, {
+    boldPrefix: '𝐓𝟑',
+    rawPrefix: 'T3',
+    fallbackSuffix: 'setup',
+  });
+
+  assert.equal(attempt, 2, 'Retried once on rejection');
+  assert.equal(chan.name, 't3-setup', 'Fell back to plain lowercase channel name');
+});
+
+test('Dashboard Layout - ActionRows, Delete Tournament button, and Embed generation', () => {
   const tour = {
     tournamentId: 'tour-1',
     name: 'T3 Scrims',
@@ -259,7 +347,7 @@ test('Dashboard Layout - ActionRows and Embed generation', () => {
   assert.match(json.description, /<#v-1>/);
 
   const rows = buildDashboardButtons('tour-1');
-  assert.equal(rows.length, 2);
+  assert.equal(rows.length, 3, 'Must have 3 ActionRows including Delete Tournament');
   const row1Buttons = rows[0].components;
   assert.equal(row1Buttons.length, 3);
   assert.equal(row1Buttons[0].data.custom_id, 'md_cfg_create_channels_tour-1');
@@ -271,6 +359,165 @@ test('Dashboard Layout - ActionRows and Embed generation', () => {
   assert.equal(row2Buttons[0].data.custom_id, 'md_cfg_add_reg_tour-1');
   assert.equal(row2Buttons[1].data.custom_id, 'md_cfg_manage_regs_tour-1');
   assert.equal(row2Buttons[2].data.custom_id, 'md_cfg_settings_tour-1');
+
+  const row3Buttons = rows[2].components;
+  assert.equal(row3Buttons.length, 1);
+  assert.equal(row3Buttons[0].data.custom_id, 'md_cfg_delete_tournament_tour-1');
+  assert.equal(row3Buttons[0].data.label, 'Delete Tournament');
+  assert.equal(row3Buttons[0].data.style, ButtonStyle.Danger);
+});
+
+test('Delete Tournament Button - Confirmation screen and Cancel restores dashboard', async () => {
+  const tourId = 'tour-del-confirm-test';
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-del',
+    name: 'Apex Legends Scrims',
+    categoryId: 'cat-del-1',
+    setupChannelId: 'setup-del-1',
+  });
+
+  const mockGuild = {
+    id: 'guild-del',
+    channels: {
+      cache: new Map([
+        ['c1', { id: 'c1', parentId: 'cat-del-1' }],
+        ['c2', { id: 'c2', parentId: 'cat-del-1' }],
+        ['setup-del-1', { id: 'setup-del-1', parentId: 'cat-del-1' }],
+      ]),
+    },
+  };
+
+  let updatePayload = null;
+  const mockBtnInteraction = {
+    guild: mockGuild,
+    member: {
+      permissions: {
+        has: () => true,
+      },
+    },
+    update: async (p) => { updatePayload = p; },
+  };
+
+  // 1. Click Delete Tournament button
+  await handleDeleteTournamentButton(mockBtnInteraction, tourId);
+  assert.ok(updatePayload);
+  assert.match(updatePayload.content, /Delete Apex Legends Scrims\? This permanently deletes the category and all 3 channels inside it/);
+  assert.equal(updatePayload.components.length, 1);
+  const confirmBtn = updatePayload.components[0].components[0];
+  const cancelBtn = updatePayload.components[0].components[1];
+  assert.equal(confirmBtn.data.custom_id, `md_cfg_del_tour_confirm_${tourId}`);
+  assert.equal(confirmBtn.data.style, ButtonStyle.Danger);
+  assert.equal(cancelBtn.data.custom_id, `md_cfg_del_tour_cancel_${tourId}`);
+
+  // 2. Click Cancel button -> Restores dashboard
+  let restorePayload = null;
+  const mockCancelInteraction = {
+    member: { permissions: { has: () => true } },
+    update: async (p) => { restorePayload = p; },
+  };
+  await handleDeleteTournamentCancel(mockCancelInteraction, tourId);
+  assert.ok(restorePayload);
+  assert.equal(restorePayload.components.length, 3, 'Restores full dashboard rows');
+});
+
+test('Delete Tournament Button - Confirm deletes channels (setup last), deletes category, cleans MongoDB', async () => {
+  const tourId = 'tour-full-delete-exec';
+  const catId = 'cat-full-delete';
+  const setupId = 'setup-full-delete';
+  const regChanId = 'reg-chan-del';
+  const idpChanId = 'idp-chan-del';
+  const regId = 'reg-full-del';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-full-del',
+    name: 'CTS Qualifier',
+    categoryId: catId,
+    setupChannelId: setupId,
+  });
+
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    displayName: 'CTS Reg 1',
+    registrationChannelId: regChanId,
+    idpChannelId: idpChanId,
+    currentCycleId: `${regId}:cycle-1`,
+  });
+
+  const deletedOrder = [];
+  const makeChan = (id, parentId, isCat = false) => ({
+    id,
+    parentId,
+    type: isCat ? ChannelType.GuildCategory : ChannelType.GuildText,
+    name: id,
+    guild: {
+      channels: {
+        cache: {
+          has: () => true,
+        },
+      },
+    },
+    delete: async () => {
+      deletedOrder.push(id);
+    },
+  });
+
+  const allChannelsMap = new Map([
+    [regChanId, makeChan(regChanId, catId)],
+    [idpChanId, makeChan(idpChanId, catId)],
+    [setupId, makeChan(setupId, catId)],
+    [catId, makeChan(catId, null, true)],
+  ]);
+
+  const mockGuild = {
+    id: 'guild-full-del',
+    channels: {
+      cache: allChannelsMap,
+      fetch: async (id) => allChannelsMap.get(id) || null,
+    },
+  };
+
+  let deferred = false;
+  let replyPayload = null;
+  const mockConfirmInteraction = {
+    guild: mockGuild,
+    client: {
+      channels: { fetch: async (id) => allChannelsMap.get(id) || null },
+    },
+    member: { permissions: { has: () => true } },
+    deferReply: async () => { deferred = true; },
+    editReply: async (p) => { replyPayload = p; },
+  };
+
+  await handleDeleteTournamentConfirm(mockConfirmInteraction, tourId);
+
+  assert.ok(deferred, 'Confirm deferred reply');
+  assert.match(replyPayload.content, /Tournament "CTS Qualifier" Deleted/);
+
+  // Verify setup channel was deleted LAST among child channels before category
+  const setupIndex = deletedOrder.indexOf(setupId);
+  const regIndex = deletedOrder.indexOf(regChanId);
+  const idpIndex = deletedOrder.indexOf(idpChanId);
+  const catIndex = deletedOrder.indexOf(catId);
+
+  assert.ok(setupIndex > regIndex, 'Setup channel deleted after reg channel');
+  assert.ok(setupIndex > idpIndex, 'Setup channel deleted after idp channel');
+  assert.ok(catIndex > setupIndex, 'Category deleted after setup channel');
+
+  // Verify MongoDB cleaned
+  const tourAfter = await getConfigurableTournament(tourId);
+  assert.equal(tourAfter, null, 'Tournament soft-deleted and filtered out');
+
+  const tourRaw = await getConfigurableTournament(tourId, true);
+  assert.equal(tourRaw.status, 'DELETED');
+  assert.equal(tourRaw.isDeleted, true);
+  assert.equal(tourRaw.setupChannelId, null);
+  assert.equal(tourRaw.categoryId, null);
+
+  const regAfter = await getConfigurableRegistration(regId);
+  assert.equal(regAfter, null, 'Registration soft-deleted');
 });
 
 // ----------------------------------------------------
@@ -318,9 +565,9 @@ test('Standard Channels - Creates T3-Verify, T3-Updates, T3-Info with threads di
   assert.ok(deferred);
   assert.match(replyText, /Standard channels created successfully/);
   assert.equal(createdChannels.length, 3);
-  assert.equal(createdChannels[0].name, 'T3-verify');
-  assert.equal(createdChannels[1].name, 'T3-updates');
-  assert.equal(createdChannels[2].name, 'T3-info');
+  assert.equal(createdChannels[0].name, '𝐓𝟑｜verify');
+  assert.equal(createdChannels[1].name, '𝐓𝟑｜updates');
+  assert.equal(createdChannels[2].name, '𝐓𝟑｜info');
 
   // Verify threads are explicitly denied on standard channels
   for (const chan of createdChannels) {
@@ -1086,8 +1333,8 @@ test('Add Registration Modal - Exactly 4 Settings (5 Inputs) & Channel Generatio
 
   assert.match(replyPayload.content, /Registration Instance Created/);
   assert.equal(createdChannels.length, 2);
-  assert.equal(createdChannels[0].name, 'bgis-qualifier-a-reg');
-  assert.equal(createdChannels[1].name, 'bgis-qualifier-a-idp');
+  assert.match(createdChannels[0].name, /bgis-qualifier-a-reg/);
+  assert.match(createdChannels[1].name, /bgis-qualifier-a-idp/);
 
   // Verify stored registration document
   const regs = await getConfigurableRegistrationsForTournament(tourId);
@@ -2063,8 +2310,8 @@ test('Registration Name Editing & Discord Channel Renaming', async () => {
   assert.equal(updatedReg.reservedSlots, 3);
 
   // Verify Discord channels were renamed
-  assert.equal(regChannelName, 'champions-league-reg');
-  assert.equal(idpChannelName, 'champions-league-idp');
+  assert.match(regChannelName, /champions-league-reg/);
+  assert.match(idpChannelName, /champions-league-idp/);
   assert.match(editReply.content, /Registration Settings Updated/);
 
   // Test Discord API failure handling: reports warning without throwing
