@@ -60,6 +60,8 @@ import {
   handleAddRegistrationButton,
   handleAddRegistrationModalSubmit,
   handleRegisterSquadButtonClick,
+  handleConfirmRegistrationButtonClick,
+  handleCancelRegistrationButtonClick,
   handleManageRegistrationsButton,
   handleManageSelectMenu,
   handleToggleStatus,
@@ -1425,6 +1427,27 @@ async function resolveTournamentId(interaction, rawId) {
     }
 
     await handleRegisterSquadButtonClick(interaction, registration.registrationId);
+    return true;
+  }
+
+  // 9a. Confirm Registration button
+  if (customId.startsWith('md_cfg_reg_confirm_')) {
+    const payload = customId.replace('md_cfg_reg_confirm_', '');
+    let registrationId, teamId;
+    if (payload.includes(':')) {
+      [registrationId, teamId] = payload.split(':');
+    } else {
+      const parts = payload.split('_');
+      registrationId = parts[0];
+      teamId = parts.slice(1).join('_');
+    }
+    await handleConfirmRegistrationButtonClick(interaction, registrationId, teamId);
+    return true;
+  }
+
+  // 9b. Cancel Registration button
+  if (customId.startsWith('md_cfg_reg_cancel_')) {
+    await handleCancelRegistrationButtonClick(interaction);
     return true;
   }
 

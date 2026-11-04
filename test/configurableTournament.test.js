@@ -97,6 +97,8 @@ import {
   handleAddRegistrationButton,
   handleAddRegistrationModalSubmit,
   handleRegisterSquadButtonClick,
+  handleConfirmRegistrationButtonClick,
+  handleCancelRegistrationButtonClick,
   handleManageSelectMenu,
   handleToggleStatus,
   handleRefreshRegistration,
@@ -105,6 +107,30 @@ import {
   handleViewCurrentSlotChart,
   handleDeleteRegistration,
 } from '../configurableRegistrationService.js';
+
+/**
+ * Simulates clicking Register Squad, followed by clicking Confirm Registration if confirmation is shown.
+ */
+async function registerSquadFull(interaction, registrationId) {
+  let replyObj = null;
+  const originalReply = interaction.reply;
+  interaction.reply = async (p) => {
+    replyObj = p;
+    interaction.lastReply = p;
+    if (typeof originalReply === 'function') {
+      await originalReply(p);
+    }
+  };
+  await handleRegisterSquadButtonClick(interaction, registrationId);
+  const confirmBtn = (replyObj || interaction.lastReply)?.components?.[0]?.components?.find((b) =>
+    b.data?.custom_id?.startsWith('md_cfg_reg_confirm_')
+  );
+  if (confirmBtn) {
+    const payload = confirmBtn.data.custom_id.replace('md_cfg_reg_confirm_', '');
+    const [regId, teamId] = payload.includes(':') ? payload.split(':') : payload.split('_');
+    await handleConfirmRegistrationButtonClick(interaction, regId, teamId);
+  }
+}
 
 import {
   buildSlotChartEmbed,
@@ -1237,13 +1263,13 @@ test('Multiple Independent Registrations & Leader-only IDP Access', async () => 
 
   // Register in Group 1 -> Success
   const int1 = regInteraction('reg-group-1', leaderId);
-  await handleRegisterSquadButtonClick(int1, 'reg-group-1');
-  assert.match(regInteraction.lastReply.content, /Registration Confirmed/);
+  await registerSquadFull(int1, 'reg-group-1');
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed|successfully registered/);
 
   // Register in Group 2 -> Success (Multiple Registrations allowed for same squad)
   const int2 = regInteraction('reg-group-2', leaderId);
-  await handleRegisterSquadButtonClick(int2, 'reg-group-2');
-  assert.match(regInteraction.lastReply.content, /Registration Confirmed/);
+  await registerSquadFull(int2, 'reg-group-2');
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed|successfully registered/);
 
   // Verify only leader received IDP overwrites with threads disabled
   assert.equal(idpOverwrites.has('chan-idp-1:leader-multi-x'), true);
@@ -1513,15 +1539,15 @@ test('Automatic Close - Automatically closes registration when all available slo
   }
 
   // Register Team 1 (allocates slot 3: firstAvailableSlot = 2 + 1 = 3)
-  await handleRegisterSquadButtonClick(regInteraction('ldr-1'), regId);
+  await registerSquadFull(regInteraction('ldr-1'), regId);
   assert.match(regInteraction.lastReply.content, /Slot Number:.*`#3`/);
 
   // Register Team 2 (allocates slot 4)
-  await handleRegisterSquadButtonClick(regInteraction('ldr-2'), regId);
+  await registerSquadFull(regInteraction('ldr-2'), regId);
   assert.match(regInteraction.lastReply.content, /Slot Number:.*`#4`/);
 
   // Register Team 3 (allocates slot 5 - last available slot!)
-  await handleRegisterSquadButtonClick(regInteraction('ldr-3'), regId);
+  await registerSquadFull(regInteraction('ldr-3'), regId);
   assert.match(regInteraction.lastReply.content, /Slot Number:.*`#5`/);
 
   // Registration should now be automatically CLOSED
@@ -1529,7 +1555,7 @@ test('Automatic Close - Automatically closes registration when all available slo
   assert.equal(regDoc.status, 'CLOSED', 'Registration automatically closed when capacity reached');
 
   // Attempting to register Team 4 should be rejected
-  await handleRegisterSquadButtonClick(regInteraction('ldr-4'), regId);
+  await registerSquadFull(regInteraction('ldr-4'), regId);
   assert.match(regInteraction.lastReply.content, /Registration is currently/);
 });
 
@@ -1615,8 +1641,8 @@ test('Daily Data Reset System - Safely archives cycle, clears active slots, pres
   };
 
   // Register team in cycle 2026-11-04
-  await handleRegisterSquadButtonClick(regInteraction, regId);
-  assert.match(regInteraction.lastReply.content, /Registration Confirmed/);
+  await registerSquadFull(regInteraction, regId);
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed|successfully registered/);
 
   const activeEntriesBefore = await getConfigurableEntriesForRegistration(regId);
   assert.equal(activeEntriesBefore.length, 1);
@@ -1708,8 +1734,8 @@ test('Re-registration in Subsequent Daily Cycle - Same squad can register again 
   };
 
   // Register in cycle 1
-  await handleRegisterSquadButtonClick(regInteraction, regId);
-  assert.match(regInteraction.lastReply.content, /Registration Confirmed/);
+  await registerSquadFull(regInteraction, regId);
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed|successfully registered/);
 
   // Reset cycle 1
   await executeDailyCycleReset(regInteraction.client, regId, true);
@@ -1722,8 +1748,8 @@ test('Re-registration in Subsequent Daily Cycle - Same squad can register again 
   await saveConfigurableRegistration(reg);
 
   // Same team registers again in cycle 2 -> MUST succeed!
-  await handleRegisterSquadButtonClick(regInteraction, regId);
-  assert.match(regInteraction.lastReply.content, /Registration Confirmed/);
+  await registerSquadFull(regInteraction, regId);
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed|successfully registered/);
 
   const entriesCycle2 = await getConfigurableEntriesForRegistration(regId);
   assert.equal(entriesCycle2.length, 1);
@@ -2425,17 +2451,17 @@ test('Same Team Multiple Registrations - Team can register across multiple regis
   };
 
   // 1. Team registers in Morning registration -> succeeds
-  await handleRegisterSquadButtonClick(regInteraction, regIdMorning);
-  assert.match(regInteraction.lastReply.content, /Registration Confirmed!/);
+  await registerSquadFull(regInteraction, regIdMorning);
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed|successfully registered/);
   assert.match(regInteraction.lastReply.content, /Slot Number:.*`#2`/);
 
   // 2. SAME Team registers in Evening registration in the SAME tournament -> succeeds!
-  await handleRegisterSquadButtonClick(regInteraction, regIdEvening);
-  assert.match(regInteraction.lastReply.content, /Registration Confirmed!/);
+  await registerSquadFull(regInteraction, regIdEvening);
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed|successfully registered/);
   assert.match(regInteraction.lastReply.content, /Slot Number:.*`#2`/);
 
   // 3. Attempting to register in Morning registration again in the same cycle -> rejected as already registered
-  await handleRegisterSquadButtonClick(regInteraction, regIdMorning);
+  await registerSquadFull(regInteraction, regIdMorning);
   assert.match(regInteraction.lastReply.content, /already registered in this daily cycle/);
 });
 
@@ -2500,8 +2526,8 @@ test('Deleted Registration Cleanup & Re-registration - Team registered in delete
   };
 
   // 1. Team registers in Old registration -> assigned Slot #3 (2 reserved slots)
-  await handleRegisterSquadButtonClick(regInteraction, regIdOld);
-  assert.match(regInteraction.lastReply.content, /Registration Confirmed!/);
+  await registerSquadFull(regInteraction, regIdOld);
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed|successfully registered/);
   assert.match(regInteraction.lastReply.content, /Slot Number:.*`#3`/);
 
   // 2. Old registration channel is deleted (via handleDeleteRegistration or handleConfigurableChannelDelete)
@@ -2536,10 +2562,10 @@ test('Deleted Registration Cleanup & Re-registration - Team registered in delete
 
   // 4. Team "4Crows" registers in the NEW registration channel
   // MUST NOT receive "already registered in this daily cycle" error with old channel reference!
-  await handleRegisterSquadButtonClick(regInteraction, regIdNew);
+  await registerSquadFull(regInteraction, regIdNew);
   assert.match(
     regInteraction.lastReply.content,
-    /Registration Confirmed!/,
+    /Registration Confirmed|successfully registered/,
     'Team must be allowed to register in new registration channel without being blocked by old deleted channel'
   );
   assert.match(regInteraction.lastReply.content, /Slot Number:.*`#3`/);
@@ -2608,8 +2634,8 @@ test('Discord Channel Deletion Cleanup - Events.ChannelDelete cleans up registra
   };
 
   // Register team
-  await handleRegisterSquadButtonClick(regInteraction, regId);
-  assert.match(regInteraction.lastReply.content, /Registration Confirmed!/);
+  await registerSquadFull(regInteraction, regId);
+  assert.match(regInteraction.lastReply.content, /Registration Confirmed|successfully registered/);
 
   // Simulate Discord channel delete event for the registration channel
   const deletedChannelMock = {
@@ -2833,10 +2859,10 @@ test('One Source of Truth - Register button and slot chart never disagree', asyn
   };
 
   // Register button clicked - resolves from channel ID / message ID and checks exact same source of truth
-  await handleRegisterSquadButtonClick(buttonInteraction, 'some-wrong-or-stale-id');
+  await registerSquadFull(buttonInteraction, 'some-wrong-or-stale-id');
   assert.match(
     buttonInteraction.lastReply.content,
-    /Registration Confirmed!/,
+    /Registration Confirmed|successfully registered/,
     'Register button must NOT claim already registered when slot chart was empty'
   );
   assert.match(buttonInteraction.lastReply.content, /Slot Number:.*`#1`/);
@@ -3171,6 +3197,433 @@ test('Pending Enrollment Persistence - Saves wizard progress with Date expiry', 
   const deleted = await getPendingEnrollment(tourId, userId);
   assert.equal(deleted, null);
 });
+
+test('Registration Confirmation - Initial click opens ephemeral confirmation with required details and does not register', async () => {
+  const tourId = 'tour-confirm-init';
+  const regId = 'reg-confirm-init';
+  const leaderId = 'ldr-confirm-init';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-confirm',
+    name: 'Champions Arena',
+  });
+
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    guildId: 'guild-confirm',
+    displayName: 'T3 10PM Qualifier',
+    totalSlots: 20,
+    reservedSlots: 2,
+    status: 'OPEN',
+    registrationChannelId: 'chan-reg-conf',
+    idpChannelId: 'chan-idp-conf',
+    currentCycleId: `${regId}:cycle-conf-1`,
+  });
+
+  await saveConfigurableTeam({
+    teamId: 'team-conf-1',
+    tournamentId: tourId,
+    teamName: 'Glory Hunters',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'Hunter1', uid: '9001' }],
+  });
+
+  let replyPayload = null;
+  const mockInteraction = {
+    guild: {
+      channels: {
+        fetch: async () => ({ isTextBased: () => true, send: async () => ({ id: 'm' }) }),
+      },
+    },
+    guildId: 'guild-confirm',
+    user: { id: leaderId },
+    client: { channels: { fetch: async () => null } },
+    reply: async (p) => { replyPayload = p; },
+  };
+
+  // 1. Click Register Squad
+  await handleRegisterSquadButtonClick(mockInteraction, regId);
+
+  // Must reply ephemerally with confirmation message
+  assert.ok(replyPayload);
+  assert.equal(replyPayload.ephemeral, true);
+  assert.ok(replyPayload.embeds?.length > 0);
+
+  const embed = replyPayload.embeds[0].data;
+  assert.equal(embed.title, 'Confirm Squad Registration');
+  assert.match(embed.description, /Champions Arena/, 'Tournament name must be displayed');
+  assert.match(embed.description, /T3 10PM Qualifier/, 'Registration name must be displayed');
+  assert.match(embed.description, /Glory Hunters/, 'Team name must be displayed');
+  assert.match(embed.description, /Total Available Slots/, 'Total available slots must be displayed');
+  assert.match(embed.description, /OPEN/, 'Registration status must be displayed');
+
+  // Verify buttons
+  const buttons = replyPayload.components[0].components;
+  assert.equal(buttons.length, 2);
+  const confirmBtn = buttons[0];
+  const cancelBtn = buttons[1];
+  assert.equal(confirmBtn.data.label, 'Confirm Registration');
+  assert.equal(confirmBtn.data.custom_id, `md_cfg_reg_confirm_${regId}:team-conf-1`);
+  assert.equal(cancelBtn.data.label, 'Cancel');
+  assert.equal(cancelBtn.data.custom_id, `md_cfg_reg_cancel_${regId}:team-conf-1`);
+
+  // Crucial requirement: No entry in database yet!
+  const entries = await getConfigurableEntriesForRegistration(regId);
+  assert.equal(entries.length, 0, 'No registration entry must be created on initial click');
+});
+
+test('Registration Confirmation - Cancel button cancels registration without creating entry or IDP access', async () => {
+  const regId = 'reg-cancel-test';
+  let updatePayload = null;
+  let idpAccessGranted = false;
+
+  const mockInteraction = {
+    isButton: () => true,
+    user: { id: 'user-cancel' },
+    update: async (p) => { updatePayload = p; },
+    reply: async (p) => { updatePayload = p; },
+  };
+
+  await handleCancelRegistrationButtonClick(mockInteraction);
+
+  assert.ok(updatePayload);
+  assert.match(updatePayload.content, /Registration cancelled/);
+  assert.equal(updatePayload.components.length, 0, 'Components must be cleared');
+  assert.equal(updatePayload.embeds.length, 0, 'Embeds must be cleared');
+
+  // Verify no entries exist
+  const entries = await getConfigurableEntriesForRegistration(regId);
+  assert.equal(entries.length, 0);
+  assert.equal(idpAccessGranted, false);
+});
+
+test('Registration Confirmation - Confirm button allocates slot, grants IDP, updates slot chart & returns success message', async () => {
+  const tourId = 'tour-confirm-success';
+  const regId = 'reg-confirm-success';
+  const leaderId = 'ldr-conf-success';
+  const teamId = 'team-conf-success';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-conf-succ',
+    name: 'National Series',
+  });
+
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    guildId: 'guild-conf-succ',
+    displayName: 'Tier 1 Scrims',
+    totalSlots: 16,
+    reservedSlots: 1, // Slot 1 reserved, teams start at Slot 2
+    status: 'OPEN',
+    registrationChannelId: 'chan-reg-succ',
+    idpChannelId: 'chan-idp-succ',
+    currentCycleId: `${regId}:cycle-succ-1`,
+  });
+
+  await saveConfigurableTeam({
+    teamId,
+    tournamentId: tourId,
+    teamName: 'Titan Force',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'TitanLead', uid: '5566' }],
+  });
+
+  let idpGrantedTo = null;
+  const mockGuild = {
+    channels: {
+      fetch: async (id) => ({
+        id,
+        isTextBased: () => true,
+        send: async () => ({ id: 'm' }),
+        messages: { fetch: async () => null },
+        permissionOverwrites: {
+          edit: async (userId, perms) => {
+            if (id === 'chan-idp-succ') {
+              idpGrantedTo = userId;
+            }
+          },
+        },
+      }),
+    },
+  };
+
+  let replyPayload = null;
+  const mockInteraction = {
+    isButton: () => true,
+    guild: mockGuild,
+    guildId: 'guild-conf-succ',
+    user: { id: leaderId },
+    client: { channels: mockGuild.channels },
+    update: async (p) => { replyPayload = p; },
+    reply: async (p) => { replyPayload = p; },
+  };
+
+  await handleConfirmRegistrationButtonClick(mockInteraction, regId, teamId);
+
+  // 1. Verify Success confirmation message
+  assert.ok(replyPayload);
+  assert.match(replyPayload.content, /Your squad has been successfully registered!/);
+  assert.match(replyPayload.content, /Titan Force/, 'Team name displayed');
+  assert.match(replyPayload.content, /Tier 1 Scrims/, 'Registration name displayed');
+  assert.match(replyPayload.content, /Slot Number:.*`#2`/, 'Allocated slot displayed');
+
+  // 2. Verify MongoDB entry
+  const entries = await getConfigurableEntriesForRegistration(regId, `${regId}:cycle-succ-1`);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].teamId, teamId);
+  assert.equal(entries[0].slotNumber, 2);
+  assert.equal(entries[0].status, 'CONFIRMED');
+
+  // 3. Verify IDP access granted to leader
+  assert.equal(idpGrantedTo, leaderId);
+});
+
+test('Registration Confirmation - Revalidates if registration closes while confirmation was open', async () => {
+  const tourId = 'tour-reval-close';
+  const regId = 'reg-reval-close';
+  const leaderId = 'ldr-reval-close';
+  const teamId = 'team-reval-close';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-reval',
+    name: 'Closing Cup',
+  });
+
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    guildId: 'guild-reval',
+    displayName: 'Evening Scrims',
+    totalSlots: 10,
+    status: 'CLOSED', // Closed in background before Confirm was clicked!
+    registrationChannelId: 'chan-reg-rc',
+    idpChannelId: 'chan-idp-rc',
+    currentCycleId: `${regId}:cycle-rc-1`,
+  });
+
+  await saveConfigurableTeam({
+    teamId,
+    tournamentId: tourId,
+    teamName: 'Late Comers',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'Late1', uid: '123' }],
+  });
+
+  let replyPayload = null;
+  const mockInteraction = {
+    isButton: () => true,
+    guildId: 'guild-reval',
+    user: { id: leaderId },
+    update: async (p) => { replyPayload = p; },
+    reply: async (p) => { replyPayload = p; },
+  };
+
+  await handleConfirmRegistrationButtonClick(mockInteraction, regId, teamId);
+
+  assert.ok(replyPayload);
+  assert.match(replyPayload.content, /Registration is no longer open/);
+
+  // Must not create entry
+  const entries = await getConfigurableEntriesForRegistration(regId);
+  assert.equal(entries.length, 0);
+});
+
+test('Registration Confirmation - Revalidates capacity if another team fills last slot while confirmation was open', async () => {
+  const tourId = 'tour-reval-cap';
+  const regId = 'reg-reval-cap';
+  const leaderId = 'ldr-reval-cap';
+  const teamId = 'team-reval-cap';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-reval',
+    name: 'Fast Fill Tour',
+  });
+
+  const currentCycleId = `${regId}:cycle-cap-1`;
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    guildId: 'guild-reval',
+    displayName: 'Rush Hour',
+    totalSlots: 2,
+    reservedSlots: 0,
+    status: 'OPEN',
+    registrationChannelId: 'chan-reg-cap',
+    idpChannelId: 'chan-idp-cap',
+    currentCycleId,
+  });
+
+  // Pre-fill all 2 slots by other teams
+  await saveConfigurableEntry({
+    entryId: 'e1',
+    registrationId: regId,
+    cycleId: currentCycleId,
+    teamId: 'other-1',
+    teamName: 'Other 1',
+    slotNumber: 1,
+    status: 'CONFIRMED',
+  });
+  await saveConfigurableEntry({
+    entryId: 'e2',
+    registrationId: regId,
+    cycleId: currentCycleId,
+    teamId: 'other-2',
+    teamName: 'Other 2',
+    slotNumber: 2,
+    status: 'CONFIRMED',
+  });
+
+  await saveConfigurableTeam({
+    teamId,
+    tournamentId: tourId,
+    teamName: 'Too Late Squad',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'TL1', uid: '321' }],
+  });
+
+  let replyPayload = null;
+  const mockInteraction = {
+    isButton: () => true,
+    guildId: 'guild-reval',
+    user: { id: leaderId },
+    update: async (p) => { replyPayload = p; },
+    reply: async (p) => { replyPayload = p; },
+  };
+
+  await handleConfirmRegistrationButtonClick(mockInteraction, regId, teamId);
+
+  assert.ok(replyPayload);
+  assert.match(replyPayload.content, /all available slots for this registration instance have just been filled/);
+
+  // Status must be automatically set to CLOSED
+  const regAfter = await getConfigurableRegistration(regId);
+  assert.equal(regAfter.status, 'CLOSED');
+});
+
+test('Registration Confirmation - Revalidates team leader permissions if changed before confirm', async () => {
+  const tourId = 'tour-reval-ldr';
+  const regId = 'reg-reval-ldr';
+  const originalLeader = 'ldr-orig';
+  const newLeader = 'ldr-new';
+  const teamId = 'team-reval-ldr';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-reval',
+    name: 'Leadership Cup',
+  });
+
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    guildId: 'guild-reval',
+    displayName: 'Reg 1',
+    totalSlots: 10,
+    status: 'OPEN',
+    registrationChannelId: 'chan-reg-l',
+    idpChannelId: 'chan-idp-l',
+    currentCycleId: `${regId}:cycle-l-1`,
+  });
+
+  // Team leader was changed to newLeader
+  await saveConfigurableTeam({
+    teamId,
+    tournamentId: tourId,
+    teamName: 'Mutiny Esports',
+    leaderDiscordId: newLeader,
+    players: [
+      { discordId: newLeader, ign: 'NewBoss', uid: '111' },
+      { discordId: originalLeader, ign: 'ExBoss', uid: '222' },
+    ],
+  });
+
+  // originalLeader tries to confirm
+  let replyPayload = null;
+  const mockInteraction = {
+    isButton: () => true,
+    guildId: 'guild-reval',
+    user: { id: originalLeader },
+    update: async (p) => { replyPayload = p; },
+    reply: async (p) => { replyPayload = p; },
+  };
+
+  await handleConfirmRegistrationButtonClick(mockInteraction, regId, teamId);
+
+  assert.ok(replyPayload);
+  assert.match(replyPayload.content, /Only the original verified team leader can confirm registration/);
+});
+
+test('Registration Router - Global interaction router dispatches confirm and cancel button clicks', async () => {
+  const tourId = 'tour-router-dispatch';
+  const regId = 'reg-router-dispatch';
+  const leaderId = 'ldr-router-dispatch';
+  const teamId = 'team-router-dispatch';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-router',
+    name: 'Dispatch Tour',
+  });
+
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    guildId: 'guild-router',
+    displayName: 'Dispatch Reg',
+    totalSlots: 10,
+    status: 'OPEN',
+    registrationChannelId: 'chan-reg-rd',
+    idpChannelId: 'chan-idp-rd',
+    currentCycleId: `${regId}:cycle-rd-1`,
+  });
+
+  await saveConfigurableTeam({
+    teamId,
+    tournamentId: tourId,
+    teamName: 'Router Runners',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'Runner1', uid: '444' }],
+  });
+
+  // 1. Confirm through handleConfigurableTournamentInteraction
+  let confirmReply = null;
+  const confirmInteraction = {
+    customId: `md_cfg_reg_confirm_${regId}:${teamId}`,
+    isButton: () => true,
+    guildId: 'guild-router',
+    user: { id: leaderId },
+    client: { channels: { fetch: async () => null } },
+    update: async (p) => { confirmReply = p; },
+    reply: async (p) => { confirmReply = p; },
+  };
+
+  const handledConfirm = await handleConfigurableTournamentInteraction(confirmInteraction);
+  assert.equal(handledConfirm, true);
+  assert.ok(confirmReply);
+  assert.match(confirmReply.content, /Your squad has been successfully registered!/);
+
+  // 2. Cancel through handleConfigurableTournamentInteraction
+  let cancelReply = null;
+  const cancelInteraction = {
+    customId: `md_cfg_reg_cancel_${regId}:${teamId}`,
+    isButton: () => true,
+    user: { id: leaderId },
+    update: async (p) => { cancelReply = p; },
+    reply: async (p) => { cancelReply = p; },
+  };
+
+  const handledCancel = await handleConfigurableTournamentInteraction(cancelInteraction);
+  assert.equal(handledCancel, true);
+  assert.ok(cancelReply);
+  assert.match(cancelReply.content, /Registration cancelled/);
+});
+
 
 
 

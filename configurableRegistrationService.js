@@ -20,6 +20,7 @@ import {
   saveConfigurableRegistration,
   deleteConfigurableRegistration,
   getConfigurableTeamsForUser,
+  getConfigurableTeam,
   getConfigurableEntry,
   getConfigurableEntriesForRegistration,
   getRegistrationEntriesCount,
@@ -32,6 +33,7 @@ import {
   evaluateDailyCycleStatus,
   getDailyCyclesForRegistration,
 } from './configurableTournamentData.js';
+import { acquireLock, releaseLock } from './mongoService.js';
 import { updateSlotChartMessage, buildSlotChartEmbed, buildSlotListText } from './slotChartService.js';
 import {
   TOURNAMENT_DENIED_PERMISSIONS,
@@ -382,12 +384,36 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
 }
 
 /**
+ * Helper to reply, edit, or update confirmation interactions uniformly.
+ * @param {import('discord.js').Interaction} interaction
+ * @param {object} payload
+ */
+async function respondToConfirmationInteraction(interaction, payload) {
+  if (interaction.deferred) {
+    if (typeof interaction.editReply === 'function') {
+      return await interaction.editReply(payload);
+    }
+  }
+  if (typeof interaction.update === 'function' && interaction.isButton?.()) {
+    return await interaction.update(payload);
+  }
+  if (!interaction.replied && typeof interaction.reply === 'function') {
+    return await interaction.reply({ ...payload, ephemeral: true });
+  }
+  if (typeof interaction.editReply === 'function') {
+    return await interaction.editReply(payload);
+  }
+  if (typeof interaction.followUp === 'function') {
+    return await interaction.followUp({ ...payload, ephemeral: true });
+  }
+}
+
+const inFlightConfirmations = new Set();
+
+/**
  * Handles the "Register Squad" button click in a registration channel.
- * - Strict IDP Permissions: ONLY the Team Leader receives access to the IDP channel.
- * - Multiple Registrations: Enrolled team CAN register in multiple instances of the tournament.
- * - Daily Reset Cycle: Teams can re-register in subsequent cycles.
- * - Locked Slots: Lowest non-reserved, non-occupied slot number is allocated.
- * - Auto-close: Closes automatically when all available slots are filled.
+ * Opens an ephemeral confirmation message with squad details, available slots,
+ * and Confirm / Cancel buttons. Does NOT immediately register the team.
  *
  * @param {import('discord.js').ButtonInteraction} interaction
  * @param {string} registrationId
@@ -443,9 +469,7 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
   }
   const currentCycleId = registration.currentCycleId;
 
-  // 2. ONE SOURCE OF TRUTH: Fetch active entries of THIS registrationId and currentCycleId
-  // The duplicate check, the slot allocation, the filled counter, the registration message
-  // and the slot chart all read from this exact same data!
+  // 2. Fetch active entries of THIS registrationId and currentCycleId to check duplicate
   const activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
   const existingEntry = activeEntries.find((e) => e.teamId === team.teamId);
   if (existingEntry && existingEntry.registrationId === registrationId) {
@@ -478,90 +502,266 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
     });
   }
 
-  // 4. Allocate lowest non-reserved, non-occupied slot number (starting from reservedCount + 1)
-  const slotNumber = await getNextAvailableSlot(registrationId, registration.totalSlots, reservedCount, currentCycleId);
-  if (!slotNumber) {
-    return interaction.reply({
-      content: '❌ No available slot number could be allocated.',
-      ephemeral: true,
+  // 4. Retrieve tournament name for confirmation embed
+  const tournament = await getConfigurableTournament(registration.tournamentId);
+
+  // 5. Build compact, mobile-friendly Confirmation Message
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('Confirm Squad Registration')
+    .setDescription(
+      `You are about to register your enrolled squad for this registration.\n` +
+      `Please confirm that you want to proceed.\n\n` +
+      `🏆 **Tournament:** **${tournament?.name || 'Tournament'}**\n` +
+      `📝 **Registration:** **${registration.displayName || registration.name}**\n` +
+      `🛡️ **Team:** **${team.teamName}**\n` +
+      `📊 **Total Available Slots:** **${maxAvailable}**\n` +
+      `🟢 **Status:** **${registration.status}**`
+    );
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`md_cfg_reg_confirm_${registrationId}:${team.teamId}`)
+      .setLabel('Confirm Registration')
+      .setEmoji('✅')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`md_cfg_reg_cancel_${registrationId}:${team.teamId}`)
+      .setLabel('Cancel')
+      .setEmoji('✖️')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  return interaction.reply({
+    embeds: [embed],
+    components: [row],
+    ephemeral: true,
+  });
+}
+
+/**
+ * Handles the "Cancel" button on the registration confirmation message.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ */
+export async function handleCancelRegistrationButtonClick(interaction) {
+  try {
+    const payload = {
+      content: '❌ Registration cancelled.',
+      embeds: [],
+      components: [],
+    };
+    await respondToConfirmationInteraction(interaction, payload);
+    return true;
+  } catch (err) {
+    console.error('[ConfigurableRegistration] ❌ Error in handleCancelRegistrationButtonClick:', err);
+  }
+}
+
+/**
+ * Handles the "Confirm Registration" button click.
+ * Revalidates all preconditions, allocates slot atomically, creates MongoDB entry,
+ * grants team leader IDP channel access, updates messages/dashboards, and displays success.
+ *
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ * @param {string} teamId
+ */
+export async function handleConfirmRegistrationButtonClick(interaction, registrationId, teamId) {
+  const idempotencyKey = `${registrationId}:${teamId}`;
+  if (inFlightConfirmations.has(idempotencyKey)) {
+    return respondToConfirmationInteraction(interaction, {
+      content: '⏳ Registration is already being processed. Please wait...',
+      embeds: [],
+      components: [],
     });
   }
 
-  // 5. Save confirmed entry with cycleId
-  const now = new Date();
-  const entryDoc = {
-    entryId: crypto.randomUUID(),
-    registrationId,
-    cycleId: currentCycleId,
-    cycleDate: registration.currentCycleDate || getCurrentTimeInTimezone(registration.timezone || 'Asia/Kolkata', now).dateString,
-    tournamentId: registration.tournamentId,
-    guildId: interaction.guildId,
-    teamId: team.teamId,
-    teamName: team.teamName,
-    leaderDiscordId: interaction.user.id,
-    slotNumber,
-    status: 'CONFIRMED',
-    registeredAt: now,
-  };
+  inFlightConfirmations.add(idempotencyKey);
+  const lockKey = `lock:reg_confirm:${registrationId}`;
+  await acquireLock(lockKey, 10, 3000);
 
-  await saveConfigurableEntry(entryDoc);
-
-  // If this filled the last available slot, auto-close
-  if (filledCount + 1 >= maxAvailable) {
-    registration.status = 'CLOSED';
-    await saveConfigurableRegistration(registration);
-
-    // Lock registration channel for sending and post closing message
-    try {
-      const regChannel = await interaction.guild.channels.fetch(registration.registrationChannelId).catch(() => null);
-      if (regChannel) {
-        await regChannel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, {
-          SendMessages: false,
-        }).catch(() => {});
-        await regChannel.send('🔒 **Registration is now closed (All available slots are filled).**').catch(() => {});
-      }
-    } catch {}
-
-    // Auto-update dashboard messages in place from MongoDB without pressing Refresh
-    await updateManageDashboardMessage(interaction.client, registrationId).catch(() => {});
-    if (interaction.client) {
-      await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
-    }
-  }
-
-  // 6. STRICT IDP PERMISSIONS: Grant ViewChannel access ONLY to the Team Leader
   try {
-    const idpChannel = await interaction.guild.channels.fetch(registration.idpChannelId).catch(() => null);
-    if (idpChannel && typeof idpChannel.permissionOverwrites?.edit === 'function') {
-      await idpChannel.permissionOverwrites.edit(interaction.user.id, {
-        ViewChannel: true,
-        ReadMessageHistory: true,
-        SendMessages: true,
-        CreatePublicThreads: false,
-        CreatePrivateThreads: false,
-        SendMessagesInThreads: false,
-        ManageThreads: false,
-        ManageChannels: false,
-        ManageRoles: false,
+    // 1. Fetch fresh registration record from DB
+    const registration = await getConfigurableRegistration(registrationId);
+    if (!registration || registration.status === 'DELETED' || registration.isDeleted) {
+      return respondToConfirmationInteraction(interaction, {
+        content: '❌ Registration instance not found or has been deleted.',
+        embeds: [],
+        components: [],
       });
     }
+
+    // 2. Verify registration is still OPEN
+    if (registration.status !== 'OPEN') {
+      return respondToConfirmationInteraction(interaction, {
+        content: `❌ Registration is no longer open (Current status: **${registration.status || 'CLOSED'}**).`,
+        embeds: [],
+        components: [],
+      });
+    }
+
+    // 3. Verify valid daily cycle
+    if (!registration.currentCycleId) {
+      registration.currentCycleId = `${registrationId}:cycle-${crypto.randomUUID()}`;
+      await saveConfigurableRegistration(registration);
+    }
+    const currentCycleId = registration.currentCycleId;
+
+    // 4. Verify team exists, is enrolled in this tournament, and user is still the leader
+    const team = await getConfigurableTeam(teamId);
+    if (!team || team.tournamentId !== registration.tournamentId) {
+      return respondToConfirmationInteraction(interaction, {
+        content: '❌ Team record not found or no longer enrolled in this tournament.',
+        embeds: [],
+        components: [],
+      });
+    }
+    if (team.leaderDiscordId !== interaction.user.id) {
+      return respondToConfirmationInteraction(interaction, {
+        content: '❌ Only the original verified team leader can confirm registration for this squad.',
+        embeds: [],
+        components: [],
+      });
+    }
+
+    // 5. Verify team has not already registered in this registration cycle
+    const activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
+    const existingEntry = activeEntries.find((e) => e.teamId === team.teamId);
+    if (existingEntry) {
+      return respondToConfirmationInteraction(interaction, {
+        content:
+          `❌ Your team **${team.teamName}** is already registered in this daily cycle!\n` +
+          `Assigned to **Slot #${existingEntry.slotNumber}** in <#${registration.idpChannelId}>.`,
+        embeds: [],
+        components: [],
+      });
+    }
+
+    // 6. Check that an available, unlocked slot exists
+    const filledCount = activeEntries.length;
+    const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
+    const maxAvailable = Math.max(0, registration.totalSlots - reservedCount);
+
+    if (filledCount >= maxAvailable) {
+      if (registration.status === 'OPEN') {
+        registration.status = 'CLOSED';
+        await saveConfigurableRegistration(registration);
+        if (interaction.client?.channels) {
+          await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
+          await updateSlotChartMessage(interaction.client, registrationId).catch(() => {});
+          await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
+        }
+      }
+      return respondToConfirmationInteraction(interaction, {
+        content: '❌ Sorry, all available slots for this registration instance have just been filled!',
+        embeds: [],
+        components: [],
+      });
+    }
+
+    // 7. Allocate slot atomically
+    const slotNumber = await getNextAvailableSlot(registrationId, registration.totalSlots, reservedCount, currentCycleId);
+    if (!slotNumber) {
+      return respondToConfirmationInteraction(interaction, {
+        content: '❌ No available slot number could be allocated.',
+        embeds: [],
+        components: [],
+      });
+    }
+
+    // 8. Create the registration entry in MongoDB
+    const now = new Date();
+    const entryDoc = {
+      entryId: crypto.randomUUID(),
+      registrationId,
+      cycleId: currentCycleId,
+      cycleDate: registration.currentCycleDate || getCurrentTimeInTimezone(registration.timezone || 'Asia/Kolkata', now).dateString,
+      tournamentId: registration.tournamentId,
+      guildId: interaction.guildId || registration.guildId,
+      teamId: team.teamId,
+      teamName: team.teamName,
+      leaderDiscordId: interaction.user.id,
+      slotNumber,
+      status: 'CONFIRMED',
+      registeredAt: now,
+    };
+
+    await saveConfigurableEntry(entryDoc);
+
+    // Auto-close if this was the last slot
+    if (filledCount + 1 >= maxAvailable) {
+      registration.status = 'CLOSED';
+      await saveConfigurableRegistration(registration);
+
+      try {
+        const regChannel = interaction.guild ? await interaction.guild.channels.fetch(registration.registrationChannelId).catch(() => null) : null;
+        if (regChannel) {
+          await regChannel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, {
+            SendMessages: false,
+          }).catch(() => {});
+          await regChannel.send('🔒 **Registration is now closed (All available slots are filled).**').catch(() => {});
+        }
+      } catch {}
+
+      await updateManageDashboardMessage(interaction.client, registrationId).catch(() => {});
+      if (interaction.client) {
+        await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
+      }
+    }
+
+    // 9. Grant team leader access to the corresponding IDP channel
+    if (registration.idpChannelId && interaction.guild) {
+      try {
+        const idpChannel = await interaction.guild.channels.fetch(registration.idpChannelId).catch(() => null);
+        if (idpChannel && typeof idpChannel.permissionOverwrites?.edit === 'function') {
+          await idpChannel.permissionOverwrites.edit(interaction.user.id, {
+            ViewChannel: true,
+            ReadMessageHistory: true,
+            SendMessages: true,
+            CreatePublicThreads: false,
+            CreatePrivateThreads: false,
+            SendMessagesInThreads: false,
+            ManageThreads: false,
+            ManageChannels: false,
+            ManageRoles: false,
+          });
+        }
+      } catch (err) {
+        console.warn(`[ConfigurableRegistration] ⚠️ Failed to update IDP overwrite for leader ${interaction.user.id}:`, err.message);
+      }
+    }
+
+    // 10. Update existing slot chart, registration message & dashboard
+    if (interaction.client?.channels) {
+      await updateSlotChartMessage(interaction.client, registrationId).catch(() => {});
+      await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
+    }
+
+    // 11. Display ephemeral success confirmation
+    const successPayload = {
+      content:
+        `🎉 **Your squad has been successfully registered!**\n\n` +
+        `**Team:** **${team.teamName}**\n` +
+        `**Registration:** **${registration.displayName || registration.name}**\n` +
+        `**Slot Number:** \`#${slotNumber}\`\n` +
+        `**IDP Channel:** <#${registration.idpChannelId}>\n\n` +
+        `🔒 *You (<@${interaction.user.id}>) have been granted access to the private IDP channel above. Room ID and Password will be posted there prior to match start!*`,
+      embeds: [],
+      components: [],
+    };
+
+    return respondToConfirmationInteraction(interaction, successPayload);
   } catch (err) {
-    console.warn(`[ConfigurableRegistration] ⚠️ Failed to update IDP overwrite for leader ${interaction.user.id}:`, err.message);
+    console.error(`[ConfigurableRegistration] ❌ Error in handleConfirmRegistrationButtonClick:`, err);
+    return respondToConfirmationInteraction(interaction, {
+      content: `❌ An unexpected error occurred while confirming registration: ${err.message || err}`,
+      embeds: [],
+      components: [],
+    });
+  } finally {
+    inFlightConfirmations.delete(idempotencyKey);
+    await releaseLock(lockKey);
   }
-
-  // 7. Update Slot Chart & Registration Message
-  await updateSlotChartMessage(interaction.client, registrationId);
-  await updateRegistrationMessage(interaction.client, registrationId);
-
-  await interaction.reply({
-    content:
-      `🎉 **Registration Confirmed!**\n\n` +
-      `**Team:** **${team.teamName}**\n` +
-      `**Slot Number:** \`#${slotNumber}\`\n` +
-      `**IDP Channel:** <#${registration.idpChannelId}>\n\n` +
-      `🔒 *You (<@${interaction.user.id}>) have been granted access to the private IDP channel above. Room ID and Password will be posted there prior to match start!*`,
-    ephemeral: true,
-  });
 }
 
 /**
