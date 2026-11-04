@@ -14,10 +14,11 @@ import {
   cleanUpStaleConfigurableRegistrationsAndEntries,
 } from './configurableTournamentData.js';
 import { updateRegistrationMessage } from './configurableRegistrationService.js';
-import { updateSlotChartMessage } from './slotChartService.js';
+import { updateSlotChartMessage, syncRegistrationSlotList } from './slotChartService.js';
 import { refreshDashboard } from './configurableTournamentService.js';
 import { sendOrUpdateEnrollmentMessage } from './teamEnrollmentService.js';
 import { updateManageDashboardMessage } from './configurableRegistrationService.js';
+import { acquireLock, releaseLock } from './mongoService.js';
 
 let schedulerInterval = null;
 
@@ -35,79 +36,97 @@ let schedulerInterval = null;
  * @returns {Promise<boolean>}
  */
 export async function executeDailyCycleReset(client, registrationId, force = false) {
-  const reg = await getConfigurableRegistration(registrationId);
-  if (!reg) return false;
+  const lockKey = `lock:reg_confirm:${registrationId}`;
+  await acquireLock(lockKey, 10, 3000);
+  try {
+    const reg = await getConfigurableRegistration(registrationId);
+    if (!reg) return false;
 
-  const timezone = reg.timezone || 'Asia/Kolkata';
-  const now = new Date();
-  const cycleEval = evaluateDailyCycleStatus(reg.dailyStartTime, reg.dailyResetTime, timezone, now);
-  const cycleDateToArchive = reg.currentCycleDate || cycleEval.endedCycleDate || getCurrentTimeInTimezone(timezone, now).dateString;
+    const timezone = reg.timezone || 'Asia/Kolkata';
+    const now = new Date();
+    const cycleEval = evaluateDailyCycleStatus(reg.dailyStartTime, reg.dailyResetTime, timezone, now);
+    const cycleDateToArchive = force
+      ? (reg.currentCycleDate || cycleEval.endedCycleDate || getCurrentTimeInTimezone(timezone, now).dateString)
+      : (cycleEval.endedCycleDate || reg.currentCycleDate || getCurrentTimeInTimezone(timezone, now).dateString);
 
-  if (!force && reg.lastResetCycleDate && reg.lastResetCycleDate === cycleDateToArchive) {
-    return false;
-  }
+    if (!force) {
+      if (reg.lastResetCycleDate && reg.lastResetCycleDate === cycleDateToArchive) {
+        return false;
+      }
+      if (reg.currentCycleDate && cycleEval.endedCycleDate && reg.currentCycleDate > cycleEval.endedCycleDate) {
+        // The current active cycle has not ended yet; align lastResetCycleDate without resetting active entries
+        if (reg.lastResetCycleDate !== cycleEval.endedCycleDate) {
+          reg.lastResetCycleDate = cycleEval.endedCycleDate;
+          await saveConfigurableRegistration(reg);
+        }
+        return false;
+      }
+    }
 
-  console.log(`[RegistrationScheduler] 🔄 Executing daily cycle reset for "${reg.displayName}" (${reg.registrationId})...`);
+    console.log(`[RegistrationScheduler] 🔄 Executing daily cycle reset for "${reg.displayName}" (${reg.registrationId}) [archiving cycle: ${cycleDateToArchive}]...`);
 
-  // 1. Fetch active entries before archiving
-  const activeEntries = await getConfigurableEntriesForRegistration(registrationId);
+    // 1. Fetch active entries before archiving
+    const activeEntries = await getConfigurableEntriesForRegistration(registrationId);
 
-  // 2. Archive to discord_daily_registration_cycles and mark entries ARCHIVED
-  await archiveActiveRegistrationCycle(registrationId, {
-    cycleDate: cycleDateToArchive,
-    cycleId: reg.currentCycleId || `${registrationId}:cycle-${crypto.randomUUID()}`,
-    reason: 'SCHEDULED_DAILY_RESET',
-  });
+    // 2. Archive to discord_daily_registration_cycles and mark entries ARCHIVED
+    await archiveActiveRegistrationCycle(registrationId, {
+      cycleDate: cycleDateToArchive,
+      cycleId: reg.currentCycleId || `${registrationId}:${cycleDateToArchive}`,
+      reason: 'SCHEDULED_DAILY_RESET',
+    });
 
-  // 3. Clear leader IDP permissions for archived entries
-  if (reg.idpChannelId && client) {
-    try {
-      const guild = await client.guilds.fetch(reg.guildId).catch(() => null);
-      const idpChannel = guild ? await guild.channels.fetch(reg.idpChannelId).catch(() => null) : null;
-      if (idpChannel && typeof idpChannel.permissionOverwrites?.delete === 'function') {
-        for (const entry of activeEntries) {
-          if (entry.leaderDiscordId) {
-            await idpChannel.permissionOverwrites.delete(entry.leaderDiscordId).catch(() => {});
+    // 3. Clear leader IDP permissions for archived entries
+    if (reg.idpChannelId && client) {
+      try {
+        const guild = await client.guilds.fetch(reg.guildId).catch(() => null);
+        const idpChannel = guild ? await guild.channels.fetch(reg.idpChannelId).catch(() => null) : null;
+        if (idpChannel && typeof idpChannel.permissionOverwrites?.delete === 'function') {
+          for (const entry of activeEntries) {
+            if (entry.leaderDiscordId) {
+              await idpChannel.permissionOverwrites.delete(entry.leaderDiscordId).catch(() => {});
+            }
           }
         }
+      } catch (err) {
+        console.warn(`[RegistrationScheduler] ⚠️ Error resetting IDP overwrites:`, err.message);
       }
-    } catch (err) {
-      console.warn(`[RegistrationScheduler] ⚠️ Error resetting IDP overwrites:`, err.message);
     }
-  }
 
-  // 4. Determine status and next cycle
-  let nextCycleDate = cycleEval.activeCycleDate || cycleEval.cycleDate;
-  if (nextCycleDate === cycleDateToArchive) {
-    const { getNextCycleDateString } = await import('./configurableTournamentData.js');
-    nextCycleDate = getNextCycleDateString(timezone, now);
-  }
-
-  reg.lastResetAt = now;
-  reg.lastResetCycleDate = cycleDateToArchive;
-  reg.currentCycleDate = nextCycleDate;
-  reg.currentCycleId = `${registrationId}:${nextCycleDate}`;
-  reg.status = cycleEval.isOpen ? 'OPEN' : 'CLOSED';
-  reg.currentCycleStartedAt = cycleEval.isOpen ? now : null;
-  // Clear manual override when scheduled reset rolls over to next cycle
-  reg.manualOverride = null;
-  reg.manualOverrideCycleDate = null;
-  reg.manualOverrideAt = null;
-
-  await saveConfigurableRegistration(reg);
-
-  // 5. Update messages and dashboard
-  if (client) {
-    await updateRegistrationMessage(client, registrationId).catch(() => {});
-    await updateSlotChartMessage(client, registrationId).catch(() => {});
-    if (reg.tournamentId) {
-      await refreshDashboard(client, reg.tournamentId).catch(() => {});
+    // 4. Determine status and next cycle
+    let nextCycleDate = cycleEval.activeCycleDate || cycleEval.cycleDate;
+    if (force && nextCycleDate === cycleDateToArchive) {
+      const { getNextCycleDateString } = await import('./configurableTournamentData.js');
+      nextCycleDate = getNextCycleDateString(timezone, now);
     }
-    await updateManageDashboardMessage(client, registrationId).catch(() => {});
-  }
 
-  console.log(`[RegistrationScheduler] ✅ Reset completed for "${reg.displayName}". Status: ${reg.status}, Next Cycle: ${nextCycleDate}.`);
-  return true;
+    reg.lastResetAt = now;
+    reg.lastResetCycleDate = force ? cycleDateToArchive : (cycleEval.endedCycleDate || cycleDateToArchive);
+    reg.currentCycleDate = nextCycleDate;
+    reg.currentCycleId = `${registrationId}:${nextCycleDate}`;
+    reg.status = cycleEval.isOpen ? 'OPEN' : 'CLOSED';
+    reg.currentCycleStartedAt = cycleEval.isOpen ? now : null;
+    // Clear manual override when scheduled reset rolls over to next cycle
+    reg.manualOverride = null;
+    reg.manualOverrideCycleDate = null;
+    reg.manualOverrideAt = null;
+
+    await saveConfigurableRegistration(reg);
+
+    // 5. Update messages and dashboard
+    if (client) {
+      await updateRegistrationMessage(client, registrationId).catch(() => {});
+      await syncRegistrationSlotList(registrationId, reg.currentCycleId, client).catch(() => {});
+      if (reg.tournamentId) {
+        await refreshDashboard(client, reg.tournamentId).catch(() => {});
+      }
+      await updateManageDashboardMessage(client, registrationId).catch(() => {});
+    }
+
+    console.log(`[RegistrationScheduler] ✅ Reset completed for "${reg.displayName}". Status: ${reg.status}, Next Cycle: ${nextCycleDate}.`);
+    return true;
+  } finally {
+    await releaseLock(lockKey);
+  }
 }
 
 /**
@@ -127,12 +146,29 @@ export async function checkRegistrationLifecycles(client) {
       if (reg.dailyStartTime && reg.dailyResetTime) {
         const cycleEval = evaluateDailyCycleStatus(reg.dailyStartTime, reg.dailyResetTime, timezone, now);
 
-        // 1. Check if Reset is due
-        const resetDue = cycleEval.endedCycleDate && reg.lastResetCycleDate !== cycleEval.endedCycleDate;
+        // 1. Check if Reset is due:
+        // Only reset when the registration's currentCycleDate has actually ended (currentCycleDate <= endedCycleDate)
+        // and that ended cycle has not yet been reset.
+        const resetDue = Boolean(
+          cycleEval.endedCycleDate &&
+          reg.lastResetCycleDate !== cycleEval.endedCycleDate &&
+          (!reg.currentCycleDate || reg.currentCycleDate <= cycleEval.endedCycleDate)
+        );
 
         if (resetDue) {
           await executeDailyCycleReset(client, reg.registrationId);
           continue;
+        }
+
+        // If registration is already in the active cycle (> endedCycleDate) and lastResetCycleDate was unset/misaligned, align it
+        if (
+          cycleEval.endedCycleDate &&
+          reg.currentCycleDate &&
+          reg.currentCycleDate > cycleEval.endedCycleDate &&
+          reg.lastResetCycleDate !== cycleEval.endedCycleDate
+        ) {
+          reg.lastResetCycleDate = cycleEval.endedCycleDate;
+          await saveConfigurableRegistration(reg);
         }
 
         // 2. Check if Daily Start is due (transition CLOSED -> OPEN when in active window)
@@ -149,8 +185,10 @@ export async function checkRegistrationLifecycles(client) {
 
             if (entries.length < maxAvailable) {
               reg.status = 'OPEN';
-              reg.currentCycleDate = activeCycle;
-              reg.currentCycleId = `${reg.registrationId}:cycle-${crypto.randomUUID()}`;
+              if (reg.currentCycleDate !== activeCycle || !reg.currentCycleId) {
+                reg.currentCycleDate = activeCycle;
+                reg.currentCycleId = `${reg.registrationId}:${activeCycle}`;
+              }
               if (!reg.currentCycleStartedAt) reg.currentCycleStartedAt = now;
               stateChanged = true;
               console.log(`[RegistrationScheduler] 🟢 Daily cycle opened for "${reg.displayName}" (${reg.registrationId}).`);

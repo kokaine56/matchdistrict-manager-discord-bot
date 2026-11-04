@@ -136,6 +136,8 @@ import {
   buildSlotChartEmbed,
   updateSlotChartMessage,
   updateRegistrationSlotList,
+  syncRegistrationSlotList,
+  retrySlotListSync,
   buildSlotListText,
   buildSlotListTitle,
   getFilledSlotCounter,
@@ -1474,14 +1476,14 @@ test('Slot List Display Format - Exact title, sequential slots, status rules, an
 
   // Test counter states
   assert.equal(getFilledSlotCounter(0, 16), '⚪ 0/16 filled');
-  assert.equal(getFilledSlotCounter(10, 16), '🟡 10/16 filled');
+  assert.equal(getFilledSlotCounter(10, 16), '🟢 10/16 filled');
   assert.equal(getFilledSlotCounter(16, 16), '🟢 16/16 filled');
 
   // Available slot rendering when partially filled
   const partialEntries = [{ slotNumber: 3, teamName: 'Team guardians' }];
   const partialText = buildSlotListText(tournament, reg, partialEntries);
   assert.ok(partialText.includes('Slot 04 → AVAILABLE'));
-  assert.ok(partialText.includes('🟡 1/16 filled'));
+  assert.ok(partialText.includes('🟢 1/16 filled'));
 });
 
 test('Automatic Close - Automatically closes registration when all available slots are filled', async () => {
@@ -2046,7 +2048,7 @@ test('Persistent Message In-Place Editing - Updates existing message ID without 
   assert.equal(editedMessages.length, 1, 'Edited existing message in place');
   assert.equal(editedMessages[0].id, initialMsgId);
   assert.match(editedMessages[0].content, /Slot 02 → Team guardians/);
-  assert.match(editedMessages[0].content, /🟡 1\/9 filled/);
+  assert.match(editedMessages[0].content, /🟢 1\/9 filled/);
 
   // 4. Organiser changes team slot from 2 to 3
   const changeRes = await changeTeamSlot(regId, 'tm-guardians', 3, mockClient);
@@ -4221,7 +4223,7 @@ test('Real-Time Slot List & Confirmation - Complete Lifecycle & In-Place Message
   assert.match(updatedContent1, /Slot 02 → 🔒 LOCKED/);
   assert.match(updatedContent1, /Slot 03 → Team Alpha/);
   assert.match(updatedContent1, /Slot 04 → AVAILABLE/);
-  assert.match(updatedContent1, /🟡 1\/4 filled/);
+  assert.match(updatedContent1, /🟢 1\/4 filled/);
 
   // 3. Second squad registers: Team Bravo
   let interaction2Payload = null;
@@ -4253,7 +4255,7 @@ test('Real-Time Slot List & Confirmation - Complete Lifecycle & In-Place Message
   assert.match(updatedContent2, /Slot 03 → Team Alpha/);
   assert.match(updatedContent2, /Slot 04 → Team Bravo/);
   assert.match(updatedContent2, /Slot 05 → AVAILABLE/);
-  assert.match(updatedContent2, /🟡 2\/4 filled/);
+  assert.match(updatedContent2, /🟢 2\/4 filled/);
 
   // 4. Cancellation test
   let cancelPayload = null;
@@ -4360,6 +4362,349 @@ test('Real-Time Slot List - Multiple registrations remain strictly independent',
   assert.match(msg2, /Slot 01 → AVAILABLE/);
   assert.doesNotMatch(msg2, /Team Phoenix/);
 });
+
+test('Mandatory Verification Suite (Tests 1-6) - End-to-End Registration to IDP Slot List Synchronization', async () => {
+  const guildId = 'guild-mandatory-suite';
+  const tourId = 'tour-t3-scrims';
+  const reg12pmId = 'reg-12pm-mandatory';
+  const reg3pmId = 'reg-3pm-mandatory';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId,
+    name: 'T3 Scrims',
+    categoryId: 'cat-mandatory',
+    enrollTeamChannelId: 'chan-enroll-mandatory',
+    status: 'ACTIVE',
+  });
+
+  // Enroll 3 teams: Team Alpha, Team Bravo, Team Phoenix
+  const teamAlphaId = 'team-alpha-mand';
+  const teamBravoId = 'team-bravo-mand';
+  const teamPhoenixId = 'team-phoenix-mand';
+  const leaderAlpha = 'leader-alpha-mand';
+  const leaderBravo = 'leader-bravo-mand';
+  const leaderPhoenix = 'leader-phoenix-mand';
+
+  await saveConfigurableTeam({
+    teamId: teamAlphaId,
+    tournamentId: tourId,
+    teamName: 'Team Alpha',
+    leaderDiscordId: leaderAlpha,
+    players: [{ discordId: leaderAlpha, ign: 'AlphaLead', uid: '101' }],
+  });
+  await saveConfigurableTeam({
+    teamId: teamBravoId,
+    tournamentId: tourId,
+    teamName: 'Team Bravo',
+    leaderDiscordId: leaderBravo,
+    players: [{ discordId: leaderBravo, ign: 'BravoLead', uid: '102' }],
+  });
+  await saveConfigurableTeam({
+    teamId: teamPhoenixId,
+    tournamentId: tourId,
+    teamName: 'Team Phoenix',
+    leaderDiscordId: leaderPhoenix,
+    players: [{ discordId: leaderPhoenix, ign: 'PhoenixLead', uid: '103' }],
+  });
+
+  const cycle12pm = `${reg12pmId}:2026-11-04`;
+  const cycle3pm = `${reg3pmId}:2026-11-04`;
+
+  // Mock Discord channels and persistent messages
+  const channelStore = {
+    'cat-mandatory': { id: 'cat-mandatory', messages: new Map(), permissions: new Map() },
+    'chan-enroll-mandatory': { id: 'chan-enroll-mandatory', messages: new Map(), permissions: new Map() },
+    'chan-reg-12pm': { id: 'chan-reg-12pm', messages: new Map(), permissions: new Map() },
+    'chan-idp-12pm': { id: 'chan-idp-12pm', messages: new Map(), permissions: new Map() },
+    'chan-reg-3pm': { id: 'chan-reg-3pm', messages: new Map(), permissions: new Map() },
+    'chan-idp-3pm': { id: 'chan-idp-3pm', messages: new Map(), permissions: new Map() },
+  };
+
+  const makeChannelObj = (chanId) => {
+    const store = channelStore[chanId];
+    if (!store) return null;
+    return {
+      id: chanId,
+      isTextBased: () => true,
+      permissionOverwrites: {
+        edit: async (targetId, perms) => {
+          store.permissions.set(targetId, perms);
+        },
+        delete: async (targetId) => {
+          store.permissions.delete(targetId);
+        },
+      },
+      send: async (payload) => {
+        const msgId = `msg-${chanId}-${store.messages.size + 1}`;
+        const msgObj = {
+          id: msgId,
+          content: payload.content || '',
+          embeds: payload.embeds || [],
+          components: payload.components || [],
+          edit: async (editPayload) => {
+            if (editPayload.content !== undefined) msgObj.content = editPayload.content;
+            if (editPayload.embeds !== undefined) msgObj.embeds = editPayload.embeds;
+            if (editPayload.components !== undefined) msgObj.components = editPayload.components;
+            return msgObj;
+          },
+          delete: async () => {
+            store.messages.delete(msgId);
+          },
+        };
+        store.messages.set(msgId, msgObj);
+        return msgObj;
+      },
+      messages: {
+        fetch: async (msgId) => {
+          if (typeof msgId === 'string') {
+            const found = store.messages.get(msgId);
+            if (!found) {
+              const err = new Error('Unknown Message');
+              err.code = 10008;
+              throw err;
+            }
+            return found;
+          }
+          return store.messages;
+        },
+      },
+    };
+  };
+
+  const mockGuild = {
+    id: guildId,
+    roles: { everyone: { id: guildId } },
+    channels: {
+      cache: {
+        get: (id) => makeChannelObj(id),
+      },
+      fetch: async (id) => makeChannelObj(id),
+    },
+  };
+
+  const mockClient = {
+    guilds: {
+      cache: new Map([[guildId, mockGuild]]),
+      fetch: async (id) => (id === guildId ? mockGuild : null),
+    },
+    channels: {
+      cache: {
+        get: (id) => makeChannelObj(id),
+      },
+      fetch: async (id) => makeChannelObj(id),
+    },
+  };
+
+  // Seed initial persistent IDP messages
+  const initialIdp12pmMsg = await makeChannelObj('chan-idp-12pm').send({ content: 'Initial 12PM slotlist' });
+  const initialIdp3pmMsg = await makeChannelObj('chan-idp-3pm').send({ content: 'Initial 3PM slotlist' });
+  const initialReg12pmMsg = await makeChannelObj('chan-reg-12pm').send({ content: 'Initial 12PM reg' });
+  const initialReg3pmMsg = await makeChannelObj('chan-reg-3pm').send({ content: 'Initial 3PM reg' });
+
+  await saveConfigurableRegistration({
+    registrationId: reg12pmId,
+    tournamentId: tourId,
+    guildId,
+    displayName: '12PM',
+    totalSlots: 18,
+    reservedSlots: 2,
+    status: 'OPEN',
+    registrationChannelId: 'chan-reg-12pm',
+    registrationMessageId: initialReg12pmMsg.id,
+    idpChannelId: 'chan-idp-12pm',
+    slotChartMessageId: initialIdp12pmMsg.id,
+    idpRoleId: null,
+    scheduleMode: 'DAILY_RECURRING',
+    dailyStartTime: '00:01',
+    dailyEndTime: '23:55',
+    dailyResetTime: '23:59',
+    timezone: 'Asia/Kolkata',
+    currentCycleDate: '2026-11-04',
+    currentCycleId: cycle12pm,
+    lastResetCycleDate: '2026-11-03',
+  });
+
+  await saveConfigurableRegistration({
+    registrationId: reg3pmId,
+    tournamentId: tourId,
+    guildId,
+    displayName: '3PM',
+    totalSlots: 18,
+    reservedSlots: 2,
+    status: 'OPEN',
+    registrationChannelId: 'chan-reg-3pm',
+    registrationMessageId: initialReg3pmMsg.id,
+    idpChannelId: 'chan-idp-3pm',
+    slotChartMessageId: initialIdp3pmMsg.id,
+    idpRoleId: null,
+    scheduleMode: 'DAILY_RECURRING',
+    dailyStartTime: '00:01',
+    dailyEndTime: '23:55',
+    dailyResetTime: '23:59',
+    timezone: 'Asia/Kolkata',
+    currentCycleDate: '2026-11-04',
+    currentCycleId: cycle3pm,
+    lastResetCycleDate: '2026-11-03',
+  });
+
+  await syncRegistrationSlotList(reg12pmId, cycle12pm, mockClient);
+  await syncRegistrationSlotList(reg3pmId, cycle3pm, mockClient);
+  assert.match(initialIdp12pmMsg.content, /⚪ 0\/16 filled/);
+  assert.match(initialIdp3pmMsg.content, /⚪ 0\/16 filled/);
+
+  // =========================================================================
+  // TEST 1: Register Team Alpha in 12PM (totalSlots: 18, reservedSlots: 2)
+  // Expected: Slot 03 -> Team Alpha, Counter: 🟢 1/16 filled, buttons removed
+  // =========================================================================
+  let confirmAlphaReply = null;
+  const alphaConfirmInteraction = {
+    id: 'int-mand-alpha',
+    isButton: () => true,
+    guildId,
+    user: { id: leaderAlpha },
+    client: mockClient,
+    deferUpdate: async () => { alphaConfirmInteraction.deferred = true; },
+    editReply: async (p) => { confirmAlphaReply = p; },
+  };
+
+  await handleConfirmRegistrationButtonClick(alphaConfirmInteraction, reg12pmId, teamAlphaId);
+
+  assert.ok(confirmAlphaReply, 'TEST 1: Registration confirmation reply exists');
+  assert.match(confirmAlphaReply.content, /Registration Successful/);
+  assert.match(confirmAlphaReply.content, /Slot Number:.*`#3`/);
+  assert.deepEqual(confirmAlphaReply.components, [], 'TEST 1: Confirm & Cancel buttons removed');
+
+  // Verify duplicate confirmation is blocked
+  let duplicateReply = null;
+  const alphaDuplicateInteraction = {
+    id: 'int-mand-alpha-dup',
+    isButton: () => true,
+    guildId,
+    user: { id: leaderAlpha },
+    client: mockClient,
+    deferUpdate: async () => { alphaDuplicateInteraction.deferred = true; },
+    editReply: async (p) => { duplicateReply = p; },
+  };
+  await handleConfirmRegistrationButtonClick(alphaDuplicateInteraction, reg12pmId, teamAlphaId);
+  assert.match(duplicateReply.content, /already registered/);
+  assert.deepEqual(duplicateReply.components, []);
+
+  // Verify IDP 12PM slot list for TEST 1
+  assert.equal(channelStore['chan-idp-12pm'].messages.size, 1, 'TEST 1: Edited existing IDP message in-place');
+  assert.match(initialIdp12pmMsg.content, /T3 Scrims 12PM Slotlist/);
+  assert.match(initialIdp12pmMsg.content, /Slot 01 → 🔒 LOCKED/);
+  assert.match(initialIdp12pmMsg.content, /Slot 02 → 🔒 LOCKED/);
+  assert.match(initialIdp12pmMsg.content, /Slot 03 → Team Alpha/);
+  assert.match(initialIdp12pmMsg.content, /Slot 04 → AVAILABLE/);
+  assert.match(initialIdp12pmMsg.content, /Slot 18 → AVAILABLE/);
+  assert.match(initialIdp12pmMsg.content, /🟢 1\/16 filled/);
+
+  // =========================================================================
+  // TEST 2: Register Team Bravo in 12PM
+  // Expected: Slot 03 -> Team Alpha, Slot 04 -> Team Bravo, Counter: 🟢 2/16 filled
+  // =========================================================================
+  let confirmBravoReply = null;
+  const bravoConfirmInteraction = {
+    id: 'int-mand-bravo',
+    isButton: () => true,
+    guildId,
+    user: { id: leaderBravo },
+    client: mockClient,
+    deferUpdate: async () => { bravoConfirmInteraction.deferred = true; },
+    editReply: async (p) => { confirmBravoReply = p; },
+  };
+
+  await handleConfirmRegistrationButtonClick(bravoConfirmInteraction, reg12pmId, teamBravoId);
+  assert.match(confirmBravoReply.content, /Registration Successful/);
+  assert.match(confirmBravoReply.content, /Slot Number:.*`#4`/);
+  assert.deepEqual(confirmBravoReply.components, []);
+
+  assert.equal(channelStore['chan-idp-12pm'].messages.size, 1, 'TEST 2: Still 1 persistent message');
+  assert.match(initialIdp12pmMsg.content, /Slot 03 → Team Alpha/);
+  assert.match(initialIdp12pmMsg.content, /Slot 04 → Team Bravo/);
+  assert.match(initialIdp12pmMsg.content, /Slot 05 → AVAILABLE/);
+  assert.match(initialIdp12pmMsg.content, /🟢 2\/16 filled/);
+
+  // =========================================================================
+  // TEST 3: Register Team Phoenix in another registration instance (3PM)
+  // Expected: Only 3PM slot list changes; 12PM remains untouched
+  // =========================================================================
+  const snapshot12pmBeforeTest3 = initialIdp12pmMsg.content;
+  let confirmPhoenixReply = null;
+  const phoenixConfirmInteraction = {
+    id: 'int-mand-phoenix',
+    isButton: () => true,
+    guildId,
+    user: { id: leaderPhoenix },
+    client: mockClient,
+    deferUpdate: async () => { phoenixConfirmInteraction.deferred = true; },
+    editReply: async (p) => { confirmPhoenixReply = p; },
+  };
+
+  await handleConfirmRegistrationButtonClick(phoenixConfirmInteraction, reg3pmId, teamPhoenixId);
+  assert.match(confirmPhoenixReply.content, /Registration Successful/);
+  assert.match(confirmPhoenixReply.content, /Slot Number:.*`#3`/);
+
+  assert.equal(initialIdp12pmMsg.content, snapshot12pmBeforeTest3, 'TEST 3: 12PM slot list unaffected');
+  assert.match(initialIdp3pmMsg.content, /T3 Scrims 3PM Slotlist/);
+  assert.match(initialIdp3pmMsg.content, /Slot 03 → Team Phoenix/);
+  assert.match(initialIdp3pmMsg.content, /🟢 1\/16 filled/);
+  assert.doesNotMatch(initialIdp3pmMsg.content, /Team Alpha/);
+
+  // =========================================================================
+  // TEST 4: Restart the Discord bot (reconcileConfigurableTournaments + scheduler ticks)
+  // Expected: All slot lists retain their correct team names and counters
+  // =========================================================================
+  const fixedNowDuringOpenWindow = new Date('2026-11-04T06:30:00.000Z'); // 12:00 IST on 2026-11-04
+  await reconcileConfigurableTournaments(mockClient);
+  await checkRegistrationLifecycles(mockClient, fixedNowDuringOpenWindow);
+  await checkRegistrationLifecycles(mockClient, new Date(fixedNowDuringOpenWindow.getTime() + 30000));
+
+  assert.match(initialIdp12pmMsg.content, /Slot 03 → Team Alpha/, 'TEST 4: 12PM retained Team Alpha after restart & scheduler ticks');
+  assert.match(initialIdp12pmMsg.content, /Slot 04 → Team Bravo/, 'TEST 4: 12PM retained Team Bravo after restart & scheduler ticks');
+  assert.match(initialIdp12pmMsg.content, /🟢 2\/16 filled/, 'TEST 4: 12PM retained 2/16 counter');
+  assert.match(initialIdp3pmMsg.content, /Slot 03 → Team Phoenix/, 'TEST 4: 3PM retained Team Phoenix');
+  assert.match(initialIdp3pmMsg.content, /🟢 1\/16 filled/, 'TEST 4: 3PM retained 1/16 counter');
+
+  // =========================================================================
+  // TEST 5: Cancel or remove a registration through an authorised management action
+  // Expected: The corresponding slot list updates correctly
+  // =========================================================================
+  const removeRes = await removeTeamFromRegistration(reg12pmId, teamAlphaId, mockClient);
+  assert.equal(removeRes.success, true, 'TEST 5: Authorised removal succeeded');
+  assert.match(initialIdp12pmMsg.content, /Slot 03 → AVAILABLE/, 'TEST 5: Slot 03 freed');
+  assert.match(initialIdp12pmMsg.content, /Slot 04 → Team Bravo/, 'TEST 5: Slot 04 still Team Bravo');
+  assert.match(initialIdp12pmMsg.content, /🟢 1\/16 filled/, 'TEST 5: Counter updated to 1/16 filled');
+
+  // =========================================================================
+  // TEST 6: Register a team, then trigger Refresh
+  // Expected: The same accurate slot list remains. No data disappears or duplicates.
+  // =========================================================================
+  await handleConfirmRegistrationButtonClick(alphaConfirmInteraction, reg12pmId, teamAlphaId);
+  assert.match(initialIdp12pmMsg.content, /Slot 03 → Team Alpha/);
+  assert.match(initialIdp12pmMsg.content, /Slot 04 → Team Bravo/);
+  assert.match(initialIdp12pmMsg.content, /🟢 2\/16 filled/);
+
+  let refreshReply = null;
+  const refreshInteraction = {
+    id: 'int-mand-refresh',
+    isButton: () => true,
+    guildId,
+    user: { id: 'admin-mand' },
+    client: mockClient,
+    deferReply: async () => { refreshInteraction.deferred = true; },
+    editReply: async (p) => { refreshReply = p; },
+    update: async (p) => { refreshReply = p; },
+  };
+  await handleRefreshRegistration(refreshInteraction, reg12pmId);
+
+  assert.equal(channelStore['chan-idp-12pm'].messages.size, 1, 'TEST 6: Still 1 message after Refresh');
+  assert.match(initialIdp12pmMsg.content, /Slot 03 → Team Alpha/, 'TEST 6: Team Alpha preserved after Refresh');
+  assert.match(initialIdp12pmMsg.content, /Slot 04 → Team Bravo/, 'TEST 6: Team Bravo preserved after Refresh');
+  assert.match(initialIdp12pmMsg.content, /🟢 2\/16 filled/, 'TEST 6: Counter 2/16 preserved after Refresh');
+});
+
 
 
 

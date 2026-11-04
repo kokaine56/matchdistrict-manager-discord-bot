@@ -37,6 +37,8 @@ import { acquireLock, releaseLock } from './mongoService.js';
 import {
   updateSlotChartMessage,
   updateRegistrationSlotList,
+  syncRegistrationSlotList,
+  retrySlotListSync,
   buildSlotChartEmbed,
   buildSlotListText,
 } from './slotChartService.js';
@@ -328,7 +330,7 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
     });
 
     const registrationId = crypto.randomUUID();
-    const currentCycleId = `${registrationId}:cycle-${crypto.randomUUID()}`;
+    const currentCycleId = `${registrationId}:${currentCycleDate}`;
     const registrationDoc = {
       registrationId,
       tournamentId,
@@ -350,7 +352,7 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
       currentCycleDate,
       currentCycleStartedAt: cycleEval.isOpen ? now : null,
       lastResetAt: null,
-      lastResetCycleDate: null,
+      lastResetCycleDate: cycleEval.endedCycleDate || null,
       status,
       createdAt: now,
     };
@@ -361,7 +363,7 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
     await updateRegistrationMessage(interaction.client, registrationId);
 
     // 4. Post Persistent Slot Chart Message in IDP channel
-    await updateSlotChartMessage(interaction.client, registrationId);
+    await syncRegistrationSlotList(registrationId, currentCycleId, interaction.client);
 
     // 5. Refresh Setup Dashboard
     if (interaction.client) {
@@ -670,28 +672,6 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
     }
   }
 
-  // Step 3: Disable or mark the confirmation buttons as processing
-  if (interaction?.message && typeof interaction.message.edit === 'function') {
-    interaction.message.edit({
-      components: [
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`processing_confirm_${registrationId}`)
-            .setLabel('Confirming...')
-            .setEmoji('⏳')
-            .setStyle(ButtonStyle.Success)
-            .setDisabled(true),
-          new ButtonBuilder()
-            .setCustomId(`processing_cancel_${registrationId}`)
-            .setLabel('Cancel')
-            .setEmoji('✖️')
-            .setStyle(ButtonStyle.Secondary)
-            .setDisabled(true)
-        ),
-      ],
-    }).catch(() => {});
-  }
-
   // Idempotency: Prevent concurrent/repeated button clicks
   const idempotencyKey = `${registrationId}:${teamId}`;
   if (inFlightConfirmations.has(idempotencyKey)) {
@@ -708,7 +688,7 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
   await acquireLock(lockKey, 10, 3000);
 
   try {
-    // Step 5 & 7: Retrieve the team from MongoDB & verify enrollment
+    // Step 2: Validate the team and registration
     const team = await getConfigurableTeam(teamId);
     if (!team) {
       console.warn(`[ConfigurableRegistration] ❌ Team record not found [interactionId: ${interactionId}, teamId: ${teamId}]`);
@@ -721,7 +701,7 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
 
     console.log(`[ConfigurableRegistration] 🛡️ Team validation [interactionId: ${interactionId}, teamId: ${teamId}, teamName: ${team.teamName}, leader: ${team.leaderDiscordId}]`);
 
-    // Step 4 & 6: Verify interaction belongs to the correct user (user is the team leader)
+    // Verify interaction belongs to the correct user (user is the team leader)
     if (interaction?.user?.id && team.leaderDiscordId !== interaction.user.id) {
       console.warn(`[ConfigurableRegistration] ❌ Non-leader confirmation attempt [interactionId: ${interactionId}, user: ${interaction.user.id}, leader: ${team.leaderDiscordId}]`);
       return respondToConfirmationInteraction(interaction, {
@@ -731,7 +711,7 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       });
     }
 
-    // Step 5: Retrieve registration from MongoDB
+    // Retrieve registration from MongoDB
     const registration = await getConfigurableRegistration(registrationId);
     if (!registration || registration.status === 'DELETED' || registration.isDeleted) {
       console.warn(`[ConfigurableRegistration] ❌ Registration not found or deleted [interactionId: ${interactionId}, regId: ${registrationId}]`);
@@ -752,7 +732,7 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       });
     }
 
-    // Step 8: Verify registration is OPEN
+    // Verify registration is OPEN
     if (registration.status !== 'OPEN') {
       console.warn(`[ConfigurableRegistration] ❌ Registration closed [interactionId: ${interactionId}, regId: ${registrationId}, status: ${registration.status}]`);
       return respondToConfirmationInteraction(interaction, {
@@ -762,16 +742,17 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       });
     }
 
-    // Step 9: Verify the current daily cycle
+    // Verify the current daily cycle
     if (!registration.currentCycleId) {
-      registration.currentCycleId = `${registrationId}:cycle-${crypto.randomUUID()}`;
+      const fallbackDate = registration.currentCycleDate || getCurrentTimeInTimezone(registration.timezone || 'Asia/Kolkata', new Date()).dateString;
+      registration.currentCycleId = `${registrationId}:${fallbackDate}`;
       await saveConfigurableRegistration(registration);
     }
     const currentCycleId = registration.currentCycleId;
 
     console.log(`[ConfigurableRegistration] 📋 Registration validation [interactionId: ${interactionId}, regId: ${registrationId}, status: ${registration.status}, cycleId: ${currentCycleId}]`);
 
-    // Step 10: Check duplicate registration (only for this registration instance + currentCycleId + team)
+    // Check duplicate registration (only for this registration instance + currentCycleId + team)
     const activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
     const existingEntry = activeEntries.find((e) => e.teamId === team.teamId);
     if (existingEntry) {
@@ -797,7 +778,7 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
         await saveConfigurableRegistration(registration);
         if (interaction.client?.channels) {
           await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
-          await updateSlotChartMessage(interaction.client, registrationId).catch(() => {});
+          await syncRegistrationSlotList(registrationId, currentCycleId, interaction.client).catch(() => {});
           await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
         }
       }
@@ -808,9 +789,9 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       });
     }
 
-    // Step 11: Atomically allocate an available unlocked slot
-    const slotNumber = await getNextAvailableSlot(registrationId, registration.totalSlots, reservedCount, currentCycleId);
-    if (!slotNumber) {
+    // Step 3: Allocate an available unlocked slot atomically
+    const rawSlotNumber = await getNextAvailableSlot(registrationId, registration.totalSlots, reservedCount, currentCycleId);
+    if (!rawSlotNumber) {
       console.warn(`[ConfigurableRegistration] ❌ Slot allocation failed: none available [interactionId: ${interactionId}, regId: ${registrationId}]`);
       return respondToConfirmationInteraction(interaction, {
         content: '❌ Sorry, all available slots have been filled. No available slot number could be allocated.',
@@ -818,10 +799,11 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
         components: [],
       });
     }
+    const slotNumber = Number(rawSlotNumber);
 
-    console.log(`[ConfigurableRegistration] 🎯 Slot allocated [interactionId: ${interactionId}, regId: ${registrationId}, slot: ${slotNumber}]`);
+    console.log(`[ConfigurableRegistration] 🎯 Slot allocated [interactionId: ${interactionId}, regId: ${registrationId}, cycleId: ${currentCycleId}, teamId: ${team.teamId}, slot: ${slotNumber}]`);
 
-    // Step 12: Create registration entry in MongoDB
+    // Step 4 & 5: Save the RegistrationEntry in MongoDB and commit
     const now = new Date();
     const entryDoc = {
       entryId: crypto.randomUUID(),
@@ -835,11 +817,36 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       leaderDiscordId: interaction.user.id,
       slotNumber,
       status: 'CONFIRMED',
+      synchronized: false,
+      slotSyncStatus: 'PENDING',
       registeredAt: now,
     };
 
     await saveConfigurableEntry(entryDoc);
-    console.log(`[ConfigurableRegistration] 💾 Registration entry created [interactionId: ${interactionId}, entryId: ${entryDoc.entryId}, slot: ${slotNumber}]`);
+
+    // Step 6: Confirm the registration entry exists in MongoDB
+    let confirmedEntry = await getConfigurableEntry(registrationId, team.teamId, currentCycleId);
+    if (!confirmedEntry) {
+      console.warn(`[ConfigurableRegistration] ⚠️ Entry verification retry for regId=${registrationId}, teamId=${team.teamId}, cycleId=${currentCycleId}`);
+      await saveConfigurableEntry(entryDoc);
+      confirmedEntry = await getConfigurableEntry(registrationId, team.teamId, currentCycleId);
+    }
+    if (!confirmedEntry) {
+      throw new Error('Failed to confirm registration entry persistence in database.');
+    }
+
+    console.log(
+      `[ConfigurableRegistration] 💾 Confirmed RegistrationEntry in MongoDB ` +
+      JSON.stringify({
+        registrationId,
+        cycleId: currentCycleId,
+        teamId: team.teamId,
+        teamName: confirmedEntry.teamName,
+        slotNumber: confirmedEntry.slotNumber,
+        entryId: confirmedEntry.entryId,
+        status: confirmedEntry.status,
+      })
+    );
 
     // Auto-close if this was the last slot
     if (filledCount + 1 >= maxAvailable) {
@@ -862,7 +869,7 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       }
     }
 
-    // Step 13: Grant leader access to corresponding IDP channel
+    // Grant leader access to corresponding IDP channel
     let idpPermissionGranted = false;
     if (registration.idpChannelId && interaction.guild) {
       try {
@@ -892,12 +899,43 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       await saveConfigurableEntry(entryDoc).catch(() => {});
     }
 
-    // Step 14 & 15: Update existing slot chart, registration message & dashboard
+    // Step 7-11: Trigger slot-list synchronization using the exact registrationId and cycleId
+    const syncContext = {
+      teamId: team.teamId,
+      slotNumber,
+      entryId: confirmedEntry.entryId,
+      expectEntries: true,
+    };
+
+    let slotSyncSuccess = false;
     try {
-      await updateRegistrationSlotList(registrationId, currentCycleId, interaction.client);
-      console.log(`[ConfigurableRegistration] 📊 Slot list updated in real-time [interactionId: ${interactionId}, regId: ${registrationId}]`);
+      slotSyncSuccess = await syncRegistrationSlotList(
+        registrationId,
+        currentCycleId,
+        interaction.client,
+        syncContext
+      );
     } catch (err) {
-      console.warn(`[ConfigurableRegistration] ⚠️ Error updating slot list [interactionId: ${interactionId}]:`, err.message);
+      console.warn(`[ConfigurableRegistration] ⚠️ Error in syncRegistrationSlotList [interactionId: ${interactionId}]:`, err.message);
+      slotSyncSuccess = false;
+    }
+
+    if (slotSyncSuccess) {
+      entryDoc.synchronized = true;
+      entryDoc.slotSyncStatus = 'SYNCED';
+      entryDoc.slotSyncedAt = new Date();
+      await saveConfigurableEntry(entryDoc).catch(() => {});
+      console.log(`[ConfigurableRegistration] 📊 Slot list synchronized in real-time [interactionId: ${interactionId}, regId: ${registrationId}, cycleId: ${currentCycleId}, entryId: ${confirmedEntry.entryId}]`);
+    } else {
+      // Do not mark registration as fully synchronized until slot-list update succeeds.
+      // Preserve the successful registration and retry synchronization separately without allocating another slot.
+      entryDoc.synchronized = false;
+      entryDoc.slotSyncStatus = 'RETRY_PENDING';
+      await saveConfigurableEntry(entryDoc).catch(() => {});
+      if (interaction.client && registration.idpChannelId) {
+        console.warn(`[ConfigurableRegistration] ⚠️ Initial slot-list sync did not complete for regId=${registrationId}; scheduling separate retry synchronization...`);
+        retrySlotListSync(registrationId, currentCycleId, interaction.client, syncContext).catch(() => {});
+      }
     }
 
     if (interaction.client) {
@@ -906,7 +944,7 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
     }
 
-    // Step 16: Edit deferred ephemeral confirmation message to show Registration Successful with buttons REMOVED
+    // Display Registration Successful response and remove Confirm Registration and Cancel buttons
     const tournament = registration.tournamentId
       ? await getConfigurableTournament(registration.tournamentId)
       : null;
@@ -1131,7 +1169,7 @@ export async function handleRefreshRegistration(interaction, registrationId) {
 
   if (interaction.client) {
     await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
-    await updateSlotChartMessage(interaction.client, registrationId).catch(() => {});
+    await syncRegistrationSlotList(registrationId, currentCycleId, interaction.client).catch(() => {});
   }
 
   const payload = buildManageDashboardPayload(registration, filledCount);

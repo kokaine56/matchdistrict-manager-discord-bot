@@ -2,6 +2,7 @@ import { EmbedBuilder } from 'discord.js';
 import {
   getConfigurableRegistration,
   getConfigurableTournament,
+  getConfigurableTeam,
   getConfigurableEntry,
   getConfigurableEntriesForRegistration,
   saveConfigurableRegistration,
@@ -37,8 +38,7 @@ export function buildSlotListTitle(tournamentName, registrationName) {
 
 /**
  * Generates the status circle emoji counter for the bottom of the slot list:
- * - 🟢 when all available (unlocked) slots are occupied
- * - 🟡 when partially occupied (1 or more, but not full)
+ * - 🟢 when 1 or more available (unlocked) slots are occupied
  * - ⚪ when 0 teams are registered
  *
  * @param {number} occupiedCount
@@ -50,15 +50,7 @@ export function getFilledSlotCounter(occupiedCount, unlockedTotal) {
     return `⚪ 0/0 filled`;
   }
 
-  let emoji = '⚪';
-  if (occupiedCount >= unlockedTotal) {
-    emoji = '🟢';
-  } else if (occupiedCount > 0) {
-    emoji = '🟡';
-  } else {
-    emoji = '⚪';
-  }
-
+  const emoji = occupiedCount > 0 ? '🟢' : '⚪';
   return `${emoji} ${occupiedCount}/${unlockedTotal} filled`;
 }
 
@@ -71,7 +63,12 @@ export function getFilledSlotCounter(occupiedCount, unlockedTotal) {
  * Slot 03 → Team guardians
  * Slot 04 → AVAILABLE
  * ...
- * 🟢 16/16 filled
+ * 🟢 1/16 filled
+ *
+ * Rules enforced:
+ * - Do not count reserved slots as occupied.
+ * - Do not count the same team twice.
+ * - Coerce slotNumber to Number.
  *
  * @param {object} [tournament]
  * @param {object} registration
@@ -84,11 +81,26 @@ export function buildSlotListText(tournament, registration, entries = []) {
   const unlockedTotal = Math.max(0, totalSlots - reservedCount);
 
   const occupiedMap = new Map();
+  const seenTeams = new Set();
+
   for (const entry of entries) {
-    occupiedMap.set(entry.slotNumber, entry);
+    if (!entry) continue;
+    if (entry.status && !['CONFIRMED', 'REGISTERED'].includes(entry.status)) continue;
+    const slotNum = Number(entry.slotNumber);
+    if (!Number.isInteger(slotNum) || slotNum <= reservedCount || slotNum > totalSlots) {
+      continue;
+    }
+    const teamKey = entry.teamId || (entry.teamName || '').trim().toLowerCase();
+    if (teamKey && seenTeams.has(teamKey)) {
+      continue;
+    }
+    if (!occupiedMap.has(slotNum) && entry.teamName) {
+      occupiedMap.set(slotNum, entry);
+      if (teamKey) seenTeams.add(teamKey);
+    }
   }
 
-  const title = buildSlotListTitle(tournament?.name, registration.displayName);
+  const title = buildSlotListTitle(tournament?.name, registration.displayName || registration.name);
   const lines = [title];
 
   let occupiedUnlockedCount = 0;
@@ -193,45 +205,63 @@ export function getSlotChartClient() {
 }
 
 /**
- * Updates or creates the persistent slot list message in the registration's IDP channel.
- * Real-time synchronization service:
- * 1. Retrieves registration.
- * 2. Retrieves current cycle.
- * 3. Retrieves all active registration entries from MongoDB.
- * 4. Retrieves reserved slot configuration.
- * 5. Builds every slot sequentially from 01 through total capacity.
- * 6. Marks reserved slots 🔒 LOCKED.
- * 7. Marks occupied slots with their team names.
- * 8. Marks remaining slots AVAILABLE.
- * 9. Updates the existing Discord message in-place without duplicates.
+ * Single reusable synchronization service: syncRegistrationSlotList(registrationId, cycleId, [client], [context])
+ * 1. Reads current registration configuration.
+ * 2. Reads the current daily cycle.
+ * 3. Reads all active registration entries from MongoDB.
+ * 4. Detects & logs discrepancies if 0 entries are found after a successful registration.
+ * 5. Builds all slot states and exact counters.
+ * 6. Updates the correct existing Discord message in-place (never creates duplicates during normal sync).
+ * 7. Records synchronization status and errors, and outputs structured diagnostic logs.
  *
  * Supports flexible signatures:
- * - updateRegistrationSlotList(registrationId, [cycleId], [client])
- * - updateRegistrationSlotList(client, registrationId, [cycleId])
+ * - syncRegistrationSlotList(registrationId, [cycleId], [client], [context])
+ * - syncRegistrationSlotList(client, registrationId, [cycleId], [context])
  *
  * @param {string|import('discord.js').Client} firstArg
  * @param {string|import('discord.js').Client} [secondArg]
- * @param {string|import('discord.js').Client} [thirdArg]
+ * @param {string|import('discord.js').Client|object} [thirdArg]
+ * @param {object} [fourthArg]
  * @returns {Promise<boolean>}
  */
-export async function updateRegistrationSlotList(firstArg, secondArg = null, thirdArg = null) {
+export async function syncRegistrationSlotList(firstArg, secondArg = null, thirdArg = null, fourthArg = null) {
   let client = null;
   let registrationId = null;
   let cycleId = null;
+  let context = null;
 
   if (typeof firstArg === 'string') {
     registrationId = firstArg;
     if (secondArg && typeof secondArg === 'object' && (secondArg.channels || secondArg.guilds || secondArg.user)) {
       client = secondArg;
-      cycleId = typeof thirdArg === 'string' ? thirdArg : null;
+      if (typeof thirdArg === 'string') {
+        cycleId = thirdArg;
+        context = fourthArg && typeof fourthArg === 'object' ? fourthArg : null;
+      } else if (thirdArg && typeof thirdArg === 'object') {
+        context = thirdArg;
+      }
     } else {
       cycleId = typeof secondArg === 'string' ? secondArg : null;
-      client = thirdArg || activeDiscordClient;
+      if (thirdArg && typeof thirdArg === 'object' && (thirdArg.channels || thirdArg.guilds || thirdArg.user)) {
+        client = thirdArg;
+        context = fourthArg && typeof fourthArg === 'object' ? fourthArg : null;
+      } else if (thirdArg && typeof thirdArg === 'object') {
+        context = thirdArg;
+        client = activeDiscordClient;
+      } else {
+        client = activeDiscordClient;
+        context = fourthArg && typeof fourthArg === 'object' ? fourthArg : null;
+      }
     }
   } else {
     client = firstArg || activeDiscordClient;
     registrationId = secondArg;
-    cycleId = typeof thirdArg === 'string' ? thirdArg : null;
+    if (typeof thirdArg === 'string') {
+      cycleId = thirdArg;
+      context = fourthArg && typeof fourthArg === 'object' ? fourthArg : null;
+    } else if (thirdArg && typeof thirdArg === 'object') {
+      context = thirdArg;
+    }
   }
 
   if (!client) {
@@ -251,11 +281,82 @@ export async function updateRegistrationSlotList(firstArg, secondArg = null, thi
       : null;
 
     const currentCycleId = cycleId || registration.currentCycleId || null;
-    // Always fetch latest entries directly from MongoDB for this registration instance and cycle
-    const entries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
+
+    // Fetch latest active entries directly from MongoDB for this registration instance and cycle
+    let entries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
+
+    // Discrepancy check: If zero entries are found after a successful registration (or expected entry is missing),
+    // log the discrepancy and inspect all active entries for this registrationId instead of silently displaying 0/16.
+    if (
+      (entries.length === 0 && (context?.expectEntries || context?.entryId || context?.teamId)) ||
+      (context?.entryId && !entries.some((e) => e.entryId === context.entryId))
+    ) {
+      console.error(
+        `[SlotChart] 🚨 DISCREPANCY DETECTED: Expected active entry [entryId=${context?.entryId || 'N/A'}, teamId=${context?.teamId || 'N/A'}, slot=${context?.slotNumber ?? 'N/A'}] ` +
+        `not found in query for registrationId=${registrationId}, cycleId=${currentCycleId} (found=${entries.length}). Inspecting all active entries for registrationId...`
+      );
+      const allActiveForReg = await getConfigurableEntriesForRegistration(registrationId, null);
+      if (allActiveForReg.length > 0) {
+        console.warn(
+          `[SlotChart] ⚠️ Recovered ${allActiveForReg.length} active entry/entries for registrationId=${registrationId} with mismatched cycleId(s): ` +
+          `${allActiveForReg.map((e) => `${e.teamName}(#${e.slotNumber}, cycle=${e.cycleId})`).join(', ')}`
+        );
+        for (const recEntry of allActiveForReg) {
+          if (currentCycleId && recEntry.cycleId !== currentCycleId) {
+            recEntry.cycleId = currentCycleId;
+            await saveConfigurableEntry(recEntry);
+          }
+        }
+        entries = allActiveForReg;
+      }
+    }
+
+    // Ensure every entry has the actual teamName from MongoDB
+    for (const entry of entries) {
+      if (!entry.teamName && entry.teamId) {
+        const teamDoc = await getConfigurableTeam(entry.teamId);
+        if (teamDoc?.teamName) {
+          entry.teamName = teamDoc.teamName;
+        }
+      }
+    }
+
+    const totalSlots = registration.totalSlots || 20;
+    const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
+    const unlockedTotal = Math.max(0, totalSlots - reservedCount);
+
+    // Count valid occupied unlocked slots (excluding reserved slots and duplicate teams)
+    const occupiedSlotsSet = new Set();
+    const seenTeamsSet = new Set();
+    for (const entry of entries) {
+      const slotNum = Number(entry.slotNumber);
+      if (!Number.isInteger(slotNum) || slotNum <= reservedCount || slotNum > totalSlots) continue;
+      const teamKey = entry.teamId || (entry.teamName || '').trim().toLowerCase();
+      if (teamKey && seenTeamsSet.has(teamKey)) continue;
+      if (!occupiedSlotsSet.has(slotNum) && entry.teamName) {
+        occupiedSlotsSet.add(slotNum);
+        if (teamKey) seenTeamsSet.add(teamKey);
+      }
+    }
+    const occupiedCount = occupiedSlotsSet.size;
+    const availableCount = Math.max(0, unlockedTotal - occupiedCount);
 
     if (!client) {
-      console.warn(`[SlotChart] ⚠️ Discord client not available for updating slot list of ${registrationId}`);
+      console.warn(
+        `[SlotChart] ⚠️ Discord client not available for updating slot list ` +
+        JSON.stringify({
+          registrationId,
+          cycleId: currentCycleId,
+          teamId: context?.teamId || null,
+          allocatedSlotNumber: context?.slotNumber ?? null,
+          entryId: context?.entryId || null,
+          activeEntriesFound: entries.length,
+          occupiedSlotsCount: occupiedCount,
+          slotChartMessageId: registration.slotChartMessageId || null,
+          idpChannelId: registration.idpChannelId,
+          discordUpdateResult: 'SKIPPED_NO_CLIENT',
+        })
+      );
       return false;
     }
 
@@ -271,6 +372,21 @@ export async function updateRegistrationSlotList(firstArg, secondArg = null, thi
     }
 
     if (!channel) {
+      console.warn(
+        `[SlotChart] ⚠️ IDP channel not reachable ` +
+        JSON.stringify({
+          registrationId,
+          cycleId: currentCycleId,
+          teamId: context?.teamId || null,
+          allocatedSlotNumber: context?.slotNumber ?? null,
+          entryId: context?.entryId || null,
+          activeEntriesFound: entries.length,
+          occupiedSlotsCount: occupiedCount,
+          slotChartMessageId: registration.slotChartMessageId || null,
+          idpChannelId: registration.idpChannelId,
+          discordUpdateResult: 'FAILED_CHANNEL_NOT_FOUND',
+        })
+      );
       return false;
     }
     const isText = typeof channel.isTextBased === 'function' ? channel.isTextBased() : Boolean(channel.send);
@@ -281,28 +397,41 @@ export async function updateRegistrationSlotList(firstArg, secondArg = null, thi
     const title = buildSlotListTitle(tournament?.name, registration.displayName || registration.name);
     const chunks = buildSlotListChunks(tournament, registration, entries);
 
-    const storedMessageIds = Array.isArray(registration.slotChartMessageIds) && registration.slotChartMessageIds.length > 0
-      ? [...registration.slotChartMessageIds]
-      : registration.slotChartMessageId ? [registration.slotChartMessageId] : [];
+    const storedMessageIds = [];
+    if (registration.slotChartMessageId) {
+      storedMessageIds.push(registration.slotChartMessageId);
+    }
+    if (Array.isArray(registration.slotChartMessageIds)) {
+      for (const id of registration.slotChartMessageIds) {
+        if (id && !storedMessageIds.includes(id)) {
+          storedMessageIds.push(id);
+        }
+      }
+    }
 
     const updatedMessageIds = [];
+    let discordUpdateResult = 'UPDATED';
 
     for (let i = 0; i < chunks.length; i++) {
       const chunkText = chunks[i];
       let existingMsg = null;
+      let fetchErrorCode = null;
       const existingId = storedMessageIds[i];
 
-      if (existingId) {
+      if (existingId && channel.messages?.fetch) {
         try {
-          existingMsg = await channel.messages.fetch(existingId).catch(() => null);
-        } catch {}
+          existingMsg = await channel.messages.fetch(existingId);
+        } catch (fetchErr) {
+          fetchErrorCode = fetchErr?.code || null;
+          existingMsg = null;
+        }
       }
 
-      // If stored message was missing or not found, check recent channel messages before sending to prevent duplicates
+      // If stored message was not found by ID, check recent channel messages before sending to prevent duplicates
       if (!existingMsg && i === 0 && channel.messages?.fetch) {
         try {
           const recent = await channel.messages.fetch({ limit: 10 }).catch(() => null);
-          if (recent) {
+          if (recent && typeof recent.find === 'function') {
             existingMsg = recent.find((m) => m.content && (m.content.startsWith(title) || m.content.includes('Slot 01')));
           }
         } catch {}
@@ -312,15 +441,48 @@ export async function updateRegistrationSlotList(firstArg, secondArg = null, thi
         try {
           await existingMsg.edit({ content: chunkText, embeds: [] });
           updatedMessageIds.push(existingMsg.id);
+          discordUpdateResult = 'EDITED_EXISTING';
           continue;
-        } catch (err) {
-          console.warn(`[SlotChart] ⚠️ Could not edit existing message ${existingMsg.id}:`, err.message);
+        } catch (editErr) {
+          // If the message was genuinely deleted in Discord (10008 Unknown Message), recreate it once below.
+          // Otherwise, do NOT create a duplicate message; fail and allow separate retry synchronization!
+          if (editErr?.code !== 10008) {
+            console.error(
+              `[SlotChart] ❌ Failed to edit existing slot-list message ` +
+              JSON.stringify({
+                registrationId,
+                cycleId: currentCycleId,
+                teamId: context?.teamId || null,
+                allocatedSlotNumber: context?.slotNumber ?? null,
+                entryId: context?.entryId || null,
+                activeEntriesFound: entries.length,
+                occupiedSlotsCount: occupiedCount,
+                slotChartMessageId: existingMsg.id,
+                idpChannelId: registration.idpChannelId,
+                discordUpdateResult: `EDIT_FAILED: ${editErr.message}`,
+              })
+            );
+            const latestReg = (await getConfigurableRegistration(registrationId)) || registration;
+            latestReg.lastSlotSyncStatus = 'FAILED';
+            latestReg.lastSlotSyncError = editErr.message;
+            latestReg.lastSlotSyncAt = new Date();
+            await saveConfigurableRegistration(latestReg);
+            return false;
+          }
+          console.warn(`[SlotChart] ⚠️ Stored message ${existingMsg.id} no longer exists in Discord (10008); recreating once.`);
         }
+      } else if (existingId && fetchErrorCode && fetchErrorCode !== 10008) {
+        // Fetching existing message failed due to a transient error (not 10008 Unknown Message)
+        console.error(
+          `[SlotChart] ❌ Transient error fetching existing slot-list message ${existingId} (code: ${fetchErrorCode}); skipping duplicate send.`
+        );
+        return false;
       }
 
-      // Send new persistent message only if no existing message was found
+      // Send new persistent message only if no existing message exists
       const newMsg = await channel.send({ content: chunkText });
       updatedMessageIds.push(newMsg.id);
+      discordUpdateResult = existingId ? 'RECREATED_MISSING_MESSAGE' : 'CREATED_INITIAL_MESSAGE';
     }
 
     // Cleanup extra messages if chunks decreased
@@ -334,20 +496,88 @@ export async function updateRegistrationSlotList(firstArg, secondArg = null, thi
       }
     }
 
-    registration.slotChartMessageId = updatedMessageIds[0] || null;
-    registration.slotChartMessageIds = updatedMessageIds;
-    await saveConfigurableRegistration(registration);
+    const latestReg = (await getConfigurableRegistration(registrationId)) || registration;
+    latestReg.slotChartMessageId = updatedMessageIds[0] || null;
+    latestReg.slotChartMessageIds = updatedMessageIds;
+    latestReg.lastSlotSyncStatus = 'SYNCED';
+    latestReg.lastSlotSyncError = null;
+    latestReg.lastSlotSyncAt = new Date();
+    await saveConfigurableRegistration(latestReg);
+
+    const lastEntry = entries.length > 0 ? entries[entries.length - 1] : null;
+    console.log(
+      `[SlotChart] ✅ SlotListSyncDiag ` +
+      JSON.stringify({
+        registrationId,
+        cycleId: currentCycleId,
+        teamId: context?.teamId || lastEntry?.teamId || null,
+        allocatedSlotNumber: context?.slotNumber ?? lastEntry?.slotNumber ?? null,
+        entryId: context?.entryId || lastEntry?.entryId || null,
+        activeEntriesFound: entries.length,
+        occupiedSlotsCount: occupiedCount,
+        availableSlotsCount: availableCount,
+        slotChartMessageId: latestReg.slotChartMessageId,
+        idpChannelId: latestReg.idpChannelId,
+        discordUpdateResult,
+      })
+    );
+
     return true;
   } catch (err) {
-    console.error(`[SlotChart] ❌ Error updating slot chart for ${registrationId}:`, err);
+    console.error(
+      `[SlotChart] ❌ Error in syncRegistrationSlotList ` +
+      JSON.stringify({
+        registrationId,
+        cycleId,
+        teamId: context?.teamId || null,
+        allocatedSlotNumber: context?.slotNumber ?? null,
+        entryId: context?.entryId || null,
+        discordUpdateResult: `ERROR: ${err.message}`,
+      }),
+      err
+    );
     return false;
   }
 }
 
 /**
- * Alias for updateRegistrationSlotList to ensure 100% backward compatibility.
+ * Retries slot-list synchronization separately if the initial Discord message edit failed,
+ * without ever re-allocating a slot.
+ *
+ * @param {string} registrationId
+ * @param {string} cycleId
+ * @param {import('discord.js').Client} [client]
+ * @param {object} [context]
+ * @param {number} [maxRetries]
+ * @returns {Promise<boolean>}
  */
-export const updateSlotChartMessage = updateRegistrationSlotList;
+export async function retrySlotListSync(registrationId, cycleId, client = null, context = null, maxRetries = 2) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    await new Promise((r) => setTimeout(r, attempt * 150));
+    const ok = await syncRegistrationSlotList(registrationId, cycleId, client, context);
+    if (ok) {
+      if (context?.teamId) {
+        const entry = await getConfigurableEntry(registrationId, context.teamId, cycleId);
+        if (entry) {
+          entry.synchronized = true;
+          entry.slotSyncStatus = 'SYNCED';
+          entry.slotSyncedAt = new Date();
+          await saveConfigurableEntry(entry);
+        }
+      }
+      console.log(`[SlotChart] 🔄 Separate retry #${attempt} succeeded for registrationId=${registrationId}, cycleId=${cycleId}`);
+      return true;
+    }
+  }
+  console.warn(`[SlotChart] ⚠️ Separate retry exhausted for registrationId=${registrationId}, cycleId=${cycleId}`);
+  return false;
+}
+
+/**
+ * Aliases for syncRegistrationSlotList to ensure 100% backward compatibility without duplicate services.
+ */
+export const updateRegistrationSlotList = syncRegistrationSlotList;
+export const updateSlotChartMessage = syncRegistrationSlotList;
 
 /**
  * Organiser tool: changes an allocated team's slot number within the current cycle.
@@ -420,8 +650,16 @@ export async function removeTeamFromRegistration(registrationId, teamId, client 
   const resolvedClient = client || activeDiscordClient;
   if (resolvedClient && reg.idpChannelId && entry.leaderDiscordId) {
     try {
-      const guild = await resolvedClient.guilds.fetch(reg.guildId).catch(() => null);
-      const idpChannel = guild ? await guild.channels.fetch(reg.idpChannelId).catch(() => null) : null;
+      let idpChannel = null;
+      if (resolvedClient.channels?.fetch) {
+        idpChannel = await resolvedClient.channels.fetch(reg.idpChannelId).catch(() => null);
+      }
+      if (!idpChannel && reg.guildId && resolvedClient.guilds?.fetch) {
+        const guild = await resolvedClient.guilds.fetch(reg.guildId).catch(() => null);
+        if (guild?.channels?.fetch) {
+          idpChannel = await guild.channels.fetch(reg.idpChannelId).catch(() => null);
+        }
+      }
       if (idpChannel && typeof idpChannel.permissionOverwrites?.delete === 'function') {
         await idpChannel.permissionOverwrites.delete(entry.leaderDiscordId).catch(() => {});
       }
@@ -429,7 +667,7 @@ export async function removeTeamFromRegistration(registrationId, teamId, client 
   }
 
   if (resolvedClient) {
-    await updateRegistrationSlotList(registrationId, currentCycleId, resolvedClient);
+    await syncRegistrationSlotList(registrationId, currentCycleId, resolvedClient);
   }
 
   return { success: true };
