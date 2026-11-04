@@ -487,6 +487,37 @@ export async function findConfigurableRegistrationByChannelId(channelId, include
   return null;
 }
 
+export async function findConfigurableRegistrationByMessageId(messageId, includeDeleted = false) {
+  if (!messageId) return null;
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_configurable_registrations');
+      const query = {
+        $or: [{ registrationMessageId: messageId }, { slotChartMessageId: messageId }],
+      };
+      if (!includeDeleted) {
+        query.status = { $ne: 'DELETED' };
+        query.isDeleted = { $ne: true };
+      }
+      const doc = await col.findOne(query);
+      if (doc) {
+        localRegistrations.set(doc.registrationId, doc);
+        return doc;
+      }
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error finding registration by message ${messageId}:`, err.message);
+    }
+  }
+
+  for (const reg of localRegistrations.values()) {
+    if (reg.registrationMessageId === messageId || reg.slotChartMessageId === messageId) {
+      if (!includeDeleted && (reg.status === 'DELETED' || reg.isDeleted === true)) continue;
+      return reg;
+    }
+  }
+  return null;
+}
+
 export async function getAllActiveConfigurableRegistrations() {
   if (isMongoConnected()) {
     try {
@@ -803,6 +834,7 @@ export async function getConfigurableEntry(registrationId, teamId, cycleId = nul
         localEntries.set(`${registrationId}:${doc.cycleId || 'default'}:${teamId}`, doc);
         return doc;
       }
+      return null;
     } catch (err) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error reading entry:`, err.message);
     }
@@ -811,10 +843,16 @@ export async function getConfigurableEntry(registrationId, teamId, cycleId = nul
   if (cycleId) {
     const cycleEntry = localEntries.get(`${registrationId}:${cycleId}:${teamId}`);
     if (cycleEntry && ACTIVE_ENTRY_STATUSES.includes(cycleEntry.status)) return cycleEntry;
+    for (const entry of localEntries.values()) {
+      if (entry.registrationId === registrationId && entry.teamId === teamId && entry.cycleId === cycleId && ACTIVE_ENTRY_STATUSES.includes(entry.status)) {
+        return entry;
+      }
+    }
+    return null;
   }
   for (const entry of localEntries.values()) {
     if (entry.registrationId === registrationId && entry.teamId === teamId && ACTIVE_ENTRY_STATUSES.includes(entry.status)) {
-      if (!cycleId || entry.cycleId === cycleId) return entry;
+      return entry;
     }
   }
   return null;
@@ -1187,32 +1225,46 @@ export async function cleanUpStaleConfigurableRegistrationsAndEntries(client = n
       }
     }
 
-    // 2. Clean up any active entries belonging to DELETED or missing registrations
+    // 2. Clean up any active entries in MongoDB that:
+    // - Point to deleted/missing registrations
+    // - Do NOT appear in their registration's current slot chart (cycleId != currentCycleId)
     if (isMongoConnected()) {
       const regCol = getMongoDb().collection('discord_configurable_registrations');
       const entryCol = getMongoDb().collection('discord_configurable_entries');
 
-      // Get all active or non-deleted registration IDs
+      // Get all active (non-deleted) registrations and their current cycleId
       const activeRegDocs = await regCol.find({
         status: { $ne: 'DELETED' },
         isDeleted: { $ne: true },
-      }, { projection: { registrationId: 1 } }).toArray();
-      const validRegIds = new Set(activeRegDocs.map((r) => r.registrationId));
+      }, { projection: { registrationId: 1, currentCycleId: 1 } }).toArray();
 
-      // Find any confirmed entries whose registrationId is not in validRegIds
-      const orphanedEntries = await entryCol.find({
+      const validRegCycleMap = new Map();
+      for (const r of activeRegDocs) {
+        validRegCycleMap.set(r.registrationId, r.currentCycleId || null);
+      }
+
+      // Fetch all active entries (CONFIRMED / REGISTERED)
+      const allActiveEntries = await entryCol.find({
         status: { $in: ACTIVE_ENTRY_STATUSES },
-        registrationId: { $nin: Array.from(validRegIds) },
       }).toArray();
 
-      if (orphanedEntries.length > 0) {
-        console.log(`[ConfigurableTournament] 🧹 Found ${orphanedEntries.length} orphaned active entry/entries to archive.`);
-        const orphanedIds = orphanedEntries.map((e) => e._id);
+      const entriesToArchive = [];
+      for (const entry of allActiveEntries) {
+        const regCurrentCycleId = validRegCycleMap.get(entry.registrationId);
+        // If registration is deleted/missing OR entry's cycle does not match registration's currentCycleId
+        // (meaning it does NOT appear in its registration's current slot chart)
+        if (!validRegCycleMap.has(entry.registrationId) || !regCurrentCycleId || entry.cycleId !== regCurrentCycleId) {
+          entriesToArchive.push(entry._id);
+        }
+      }
+
+      if (entriesToArchive.length > 0) {
+        console.log(`[ConfigurableTournament] 🧹 Found ${entriesToArchive.length} stale/orphaned active entry/entries (not in current slot charts) to archive.`);
         await entryCol.updateMany(
-          { _id: { $in: orphanedIds } },
-          { $set: { status: 'ARCHIVED', archivedAt: now, archiveReason: 'STALE_REGISTRATION_CLEANUP' } }
+          { _id: { $in: entriesToArchive } },
+          { $set: { status: 'ARCHIVED', archivedAt: now, archiveReason: 'STALE_ENTRY_NOT_IN_CURRENT_CHART' } }
         );
-        cleanedEntries += orphanedEntries.length;
+        cleanedEntries += entriesToArchive.length;
       }
     }
 
@@ -1220,7 +1272,7 @@ export async function cleanUpStaleConfigurableRegistrationsAndEntries(client = n
     for (const [key, entry] of localEntries.entries()) {
       if (ACTIVE_ENTRY_STATUSES.includes(entry.status)) {
         const reg = localRegistrations.get(entry.registrationId);
-        if (!reg || reg.status === 'DELETED' || reg.isDeleted === true) {
+        if (!reg || reg.status === 'DELETED' || reg.isDeleted === true || (reg.currentCycleId && entry.cycleId !== reg.currentCycleId)) {
           entry.status = 'ARCHIVED';
           entry.archivedAt = now;
           localEntries.set(key, { ...entry });

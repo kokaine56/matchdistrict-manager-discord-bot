@@ -17,6 +17,7 @@ import {
   getEnrolledTeamsCount,
   getRegistrationEntriesCount,
   findConfigurableRegistrationByChannelId,
+  findConfigurableRegistrationByMessageId,
   deleteConfigurableRegistration,
   getPendingEnrollment,
   deletePendingEnrollment,
@@ -801,8 +802,27 @@ export async function handleConfigurableTournamentInteraction(interaction) {
 
   // 9. Register button in registration channel
   if (customId.startsWith('md_cfg_reg_btn_')) {
-    const registrationId = customId.replace('md_cfg_reg_btn_', '');
-    await handleRegisterSquadButtonClick(interaction, registrationId);
+    const rawRegistrationId = customId.replace('md_cfg_reg_btn_', '');
+    // Resolve the registration from the channel ID or message ID where the button was clicked
+    let registration = null;
+    if (interaction.channelId) {
+      registration = await findConfigurableRegistrationByChannelId(interaction.channelId);
+    }
+    if (!registration && interaction.message?.id) {
+      registration = await findConfigurableRegistrationByMessageId(interaction.message.id);
+    }
+    if (!registration && rawRegistrationId) {
+      registration = await getConfigurableRegistration(rawRegistrationId);
+    }
+
+    if (!registration || registration.status === 'DELETED' || registration.isDeleted) {
+      return interaction.reply({
+        content: '❌ Registration instance not found or has been deleted.',
+        ephemeral: true,
+      });
+    }
+
+    await handleRegisterSquadButtonClick(interaction, registration.registrationId);
     return true;
   }
 

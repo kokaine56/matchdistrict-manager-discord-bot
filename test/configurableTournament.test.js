@@ -15,6 +15,7 @@ import {
   getConfigurableRegistration,
   getConfigurableRegistrationsForTournament,
   findConfigurableRegistrationByChannelId,
+  findConfigurableRegistrationByMessageId,
   getAllActiveConfigurableRegistrations,
   deleteConfigurableRegistration,
   saveConfigurableTeam,
@@ -2496,6 +2497,106 @@ test('Startup Reconciliation Cleanup - Stale active entries belonging to deleted
   // Verify entry is now ARCHIVED and no longer active
   const entryAfter = await getConfigurableEntry(regIdStale, 'team-4crows-stale', `${regIdStale}:cycle-stale`);
   assert.equal(entryAfter, null, 'Orphaned entry must be archived and no longer returned as active confirmed');
+});
+
+test('One Source of Truth - Register button and slot chart never disagree', async () => {
+  const tourId = 'tour-one-source-truth';
+  const regId = 'reg-t2-10pm';
+  const regChanId = 'chan-t2-10pm-reg';
+  const idpChanId = 'chan-t2-10pm-idp';
+  const currentCycleId = `${regId}:cycle-live-10pm`;
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    requiredDiscordMembers: 1,
+  });
+
+  // Active registration instance with current cycle
+  await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    guildId: 'guild-cfg',
+    displayName: 'T2 10PM',
+    registrationNumber: 1,
+    totalSlots: 16,
+    reservedSlots: 0,
+    status: 'OPEN',
+    registrationChannelId: regChanId,
+    idpChannelId: idpChanId,
+    registrationMessageId: 'msg-reg-t2-10pm',
+    slotChartMessageId: 'msg-idp-t2-10pm',
+    currentCycleId: currentCycleId,
+  });
+
+  const leaderId = 'ldr-4crows-truth';
+  await saveConfigurableTeam({
+    teamId: 'team-4crows-truth',
+    tournamentId: tourId,
+    teamName: 'Team Name 4Crows',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'CrowLead', uid: '123456' }],
+  });
+
+  // Simulate an OLD active entry with a mismatched cycleId (e.g. from an old cycle that wasn't archived)
+  await saveConfigurableEntry({
+    registrationId: regId,
+    cycleId: `${regId}:cycle-obsolete-yesterday`,
+    tournamentId: tourId,
+    teamId: 'team-4crows-truth',
+    teamName: 'Team Name 4Crows',
+    slotNumber: 3,
+    status: 'CONFIRMED',
+  });
+
+  // 1. Slot chart reads active entries for currentCycleId
+  const slotChartEntries = await getConfigurableEntriesForRegistration(regId, currentCycleId);
+  assert.equal(slotChartEntries.length, 0, 'Slot chart shows 0/16 filled and all slots available');
+
+  // 2. Run cleanup so stale entry is archived
+  await cleanUpStaleConfigurableRegistrationsAndEntries(null);
+
+  const mockGuild = {
+    channels: {
+      fetch: async (id) => ({
+        id,
+        isTextBased: () => true,
+        delete: async () => {},
+        send: async () => ({ id: 'm' }),
+        messages: { fetch: async () => null },
+        permissionOverwrites: {
+          edit: async () => {},
+          delete: async () => {},
+        },
+      }),
+    },
+  };
+
+  // 3. User clicks Register button in #t2-10pm-reg
+  const buttonInteraction = {
+    channelId: regChanId, // clicked in #t2-10pm-reg
+    message: { id: 'msg-reg-t2-10pm' },
+    guild: mockGuild,
+    guildId: 'guild-cfg',
+    user: { id: leaderId },
+    client: { channels: mockGuild.channels },
+    reply: async (p) => { buttonInteraction.lastReply = p; },
+  };
+
+  // Register button clicked - resolves from channel ID / message ID and checks exact same source of truth
+  await handleRegisterSquadButtonClick(buttonInteraction, 'some-wrong-or-stale-id');
+  assert.match(
+    buttonInteraction.lastReply.content,
+    /Registration Confirmed!/,
+    'Register button must NOT claim already registered when slot chart was empty'
+  );
+  assert.match(buttonInteraction.lastReply.content, /Slot Number:.*`#1`/);
+
+  // Now slot chart has exactly 1 entry: Team 4Crows
+  const updatedSlotChartEntries = await getConfigurableEntriesForRegistration(regId, currentCycleId);
+  assert.equal(updatedSlotChartEntries.length, 1);
+  assert.equal(updatedSlotChartEntries[0].teamName, 'Team Name 4Crows');
+  assert.equal(updatedSlotChartEntries[0].slotNumber, 1);
 });
 
 

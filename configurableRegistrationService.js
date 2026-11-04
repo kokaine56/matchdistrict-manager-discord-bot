@@ -15,6 +15,8 @@ import {
   getConfigurableTournament,
   getConfigurableRegistration,
   getConfigurableRegistrationsForTournament,
+  findConfigurableRegistrationByChannelId,
+  findConfigurableRegistrationByMessageId,
   saveConfigurableRegistration,
   deleteConfigurableRegistration,
   getConfigurableTeamsForUser,
@@ -381,13 +383,26 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
  * @param {string} registrationId
  */
 export async function handleRegisterSquadButtonClick(interaction, registrationId) {
-  const registration = await getConfigurableRegistration(registrationId);
-  if (!registration) {
+  // Resolve the registration from the channel ID or message ID where the button was clicked
+  let registration = null;
+  if (interaction?.channelId) {
+    registration = await findConfigurableRegistrationByChannelId(interaction.channelId);
+  }
+  if (!registration && interaction?.message?.id) {
+    registration = await findConfigurableRegistrationByMessageId(interaction.message.id);
+  }
+  if (!registration && registrationId) {
+    registration = await getConfigurableRegistration(registrationId);
+  }
+
+  if (!registration || registration.status === 'DELETED' || registration.isDeleted) {
     return interaction.reply({
-      content: '❌ Registration instance not found.',
+      content: '❌ Registration instance not found or has been deleted.',
       ephemeral: true,
     });
   }
+
+  registrationId = registration.registrationId;
 
   if (registration.status !== 'OPEN') {
     return interaction.reply({
@@ -418,9 +433,11 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
   }
   const currentCycleId = registration.currentCycleId;
 
-  // 2. Check if team is ALREADY registered in THIS registration cycle
-  // Strictly matches: registrationId + currentCycleId + teamId with active status
-  const existingEntry = await getConfigurableEntry(registrationId, team.teamId, currentCycleId);
+  // 2. ONE SOURCE OF TRUTH: Fetch active entries of THIS registrationId and currentCycleId
+  // The duplicate check, the slot allocation, the filled counter, the registration message
+  // and the slot chart all read from this exact same data!
+  const activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
+  const existingEntry = activeEntries.find((e) => e.teamId === team.teamId);
   if (existingEntry && existingEntry.registrationId === registrationId) {
     return interaction.reply({
       content:
@@ -430,8 +447,7 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
     });
   }
 
-  // 3. Check capacity against non-reserved slots
-  const activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
+  // 3. Check capacity against non-reserved slots using activeEntries
   const filledCount = activeEntries.length;
   const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
   const maxAvailable = Math.max(0, registration.totalSlots - reservedCount);

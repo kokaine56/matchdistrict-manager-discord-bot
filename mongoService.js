@@ -235,6 +235,8 @@ async function ensureMongoIndexes() {
     await cfgRegCol.createIndex({ registrationId: 1 }, { unique: true });
     await cfgRegCol.createIndex({ registrationChannelId: 1 });
     await cfgRegCol.createIndex({ idpChannelId: 1 });
+    await cfgRegCol.createIndex({ registrationMessageId: 1 });
+    await cfgRegCol.createIndex({ slotChartMessageId: 1 });
     await cfgRegCol.createIndex({ status: 1 });
 
     const cfgTeamCol = mongoDb.collection('discord_configurable_teams');
