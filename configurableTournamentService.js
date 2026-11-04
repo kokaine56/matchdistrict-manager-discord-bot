@@ -1451,7 +1451,16 @@ async function resolveTournamentId(interaction, rawId) {
 
   // 9b. Cancel Registration button
   if (customId.startsWith('md_cfg_reg_cancel_')) {
-    await handleCancelRegistrationButtonClick(interaction);
+    const payload = customId.replace('md_cfg_reg_cancel_', '');
+    let registrationId, teamId;
+    if (payload.includes(':')) {
+      [registrationId, teamId] = payload.split(':');
+    } else if (payload.includes('_')) {
+      const parts = payload.split('_');
+      registrationId = parts[0];
+      teamId = parts.slice(1).join('_');
+    }
+    await handleCancelRegistrationButtonClick(interaction, registrationId, teamId);
     return true;
   }
 

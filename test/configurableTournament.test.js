@@ -3624,6 +3624,483 @@ test('Registration Router - Global interaction router dispatches confirm and can
   assert.match(cancelReply.content, /Registration cancelled/);
 });
 
+// ---------------------------------------------------------------------------
+// TIMEOUT BUG FIX & CONFIRMATION INTERACTION TEST SUITE
+// ---------------------------------------------------------------------------
+
+test('Confirmation Timeout Fix - Normal confirmation immediately defers reply and edits reply', async () => {
+  const tourId = 'tour-to-norm';
+  const regId = 'reg-to-norm';
+  const teamId = 'team-to-norm';
+  const leaderId = 'ldr-to-norm';
+
+  await saveConfigurableTournament({ tournamentId: tourId, name: 'Timeout Tour' });
+  await saveConfigurableRegistration({
+    tournamentId: tourId,
+    registrationId: regId,
+    displayName: 'Timeout Reg',
+    totalSlots: 10,
+    reservedSlots: 0,
+    status: 'OPEN',
+    registrationChannelId: 'chan-reg-norm',
+    idpChannelId: 'chan-idp-norm',
+    currentCycleId: `${regId}:cycle-norm`,
+  });
+  await saveConfigurableTeam({
+    teamId,
+    tournamentId: tourId,
+    teamName: 'Team Norm',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'LeaderN', uid: '111' }],
+  });
+
+  let deferred = false;
+  let deferredEphemeral = false;
+  let finalPayload = null;
+  const mockInteraction = {
+    id: 'int-norm-1',
+    isButton: () => true,
+    guildId: 'guild-norm',
+    user: { id: leaderId },
+    client: { channels: { fetch: async () => null } },
+    deferReply: async (opts) => {
+      deferred = true;
+      deferredEphemeral = opts?.ephemeral === true;
+      mockInteraction.deferred = true;
+    },
+    editReply: async (payload) => {
+      finalPayload = payload;
+    },
+  };
+
+  await handleConfirmRegistrationButtonClick(mockInteraction, regId, teamId);
+
+  // 1. Interaction was deferred immediately with ephemeral: true
+  assert.equal(deferred, true);
+  assert.equal(deferredEphemeral, true);
+  // 2. Final response was delivered via editReply
+  assert.ok(finalPayload);
+  assert.match(finalPayload.content, /Your squad has been successfully registered!/);
+  assert.match(finalPayload.content, /Slot Number:.*`#1`/);
+});
+
+test('Confirmation Timeout Fix - Cancellation acknowledges immediately and creates no entry', async () => {
+  const tourId = 'tour-to-cancel';
+  const regId = 'reg-to-cancel';
+  const teamId = 'team-to-cancel';
+  const leaderId = 'ldr-to-cancel';
+
+  await saveConfigurableTournament({ tournamentId: tourId, name: 'Cancel Tour' });
+  await saveConfigurableRegistration({
+    tournamentId: tourId,
+    registrationId: regId,
+    status: 'OPEN',
+    currentCycleId: `${regId}:cycle-cancel`,
+  });
+  await saveConfigurableTeam({
+    teamId,
+    tournamentId: tourId,
+    teamName: 'Team Cancel',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'LeaderC', uid: '222' }],
+  });
+
+  let updateDeferred = false;
+  let finalReply = null;
+  const mockInteraction = {
+    id: 'int-cancel-1',
+    isButton: () => true,
+    user: { id: leaderId },
+    deferUpdate: async () => {
+      updateDeferred = true;
+      mockInteraction.deferred = true;
+    },
+    editReply: async (p) => { finalReply = p; },
+    update: async (p) => { finalReply = p; },
+  };
+
+  await handleCancelRegistrationButtonClick(mockInteraction, regId, teamId);
+
+  assert.equal(updateDeferred, true);
+  assert.ok(finalReply);
+  assert.match(finalReply.content, /Registration cancelled/);
+
+  // Verify no entries were created
+  const entries = await getConfigurableEntriesForRegistration(regId, `${regId}:cycle-cancel`);
+  assert.equal(entries.length, 0);
+});
+
+test('Confirmation Timeout Fix - Slow MongoDB response does not block immediate deferReply', async () => {
+  const tourId = 'tour-to-slow-db';
+  const regId = 'reg-to-slow-db';
+  const teamId = 'team-to-slow-db';
+  const leaderId = 'ldr-to-slow-db';
+
+  await saveConfigurableTournament({ tournamentId: tourId, name: 'Slow DB Tour' });
+  await saveConfigurableRegistration({
+    tournamentId: tourId,
+    registrationId: regId,
+    displayName: 'Slow DB Reg',
+    totalSlots: 10,
+    reservedSlots: 0,
+    status: 'OPEN',
+    currentCycleId: `${regId}:cycle-slow-db`,
+  });
+  await saveConfigurableTeam({
+    teamId,
+    tournamentId: tourId,
+    teamName: 'Team Slow DB',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'LeaderSlow', uid: '333' }],
+  });
+
+  const timeline = [];
+  const mockInteraction = {
+    id: 'int-slow-db',
+    isButton: () => true,
+    guildId: 'guild-slow',
+    user: { id: leaderId },
+    client: { channels: { fetch: async () => null } },
+    deferReply: async () => {
+      timeline.push('deferReply');
+      mockInteraction.deferred = true;
+    },
+    editReply: async () => {
+      timeline.push('editReply');
+    },
+  };
+
+  await handleConfirmRegistrationButtonClick(mockInteraction, regId, teamId);
+
+  // deferReply must happen as the very first action
+  assert.equal(timeline[0], 'deferReply');
+  assert.equal(timeline[timeline.length - 1], 'editReply');
+});
+
+test('Confirmation Timeout Fix - Slow Discord permission update completes safely after deferReply', async () => {
+  const tourId = 'tour-to-slow-perm';
+  const regId = 'reg-to-slow-perm';
+  const teamId = 'team-to-slow-perm';
+  const leaderId = 'ldr-to-slow-perm';
+
+  await saveConfigurableTournament({ tournamentId: tourId, name: 'Slow Perm Tour' });
+  await saveConfigurableRegistration({
+    tournamentId: tourId,
+    registrationId: regId,
+    displayName: 'Slow Perm Reg',
+    totalSlots: 10,
+    reservedSlots: 0,
+    status: 'OPEN',
+    idpChannelId: 'chan-idp-slow',
+    currentCycleId: `${regId}:cycle-slow-perm`,
+  });
+  await saveConfigurableTeam({
+    teamId,
+    tournamentId: tourId,
+    teamName: 'Team Slow Perm',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'LeaderP', uid: '444' }],
+  });
+
+  let permissionEdited = false;
+  let replyDeferred = false;
+  const mockGuild = {
+    channels: {
+      fetch: async (chanId) => {
+        if (chanId === 'chan-idp-slow') {
+          return {
+            permissionOverwrites: {
+              edit: async () => {
+                // Simulating delayed network call to Discord API
+                await new Promise((r) => setTimeout(r, 50));
+                permissionEdited = true;
+              },
+            },
+          };
+        }
+        return null;
+      },
+    },
+  };
+
+  const mockInteraction = {
+    id: 'int-slow-perm',
+    isButton: () => true,
+    guild: mockGuild,
+    guildId: 'guild-slow-perm',
+    user: { id: leaderId },
+    client: { channels: mockGuild.channels },
+    deferReply: async () => {
+      replyDeferred = true;
+      mockInteraction.deferred = true;
+    },
+    editReply: async () => {},
+  };
+
+  await handleConfirmRegistrationButtonClick(mockInteraction, regId, teamId);
+
+  assert.equal(replyDeferred, true, 'Interaction deferred before permission update');
+  assert.equal(permissionEdited, true, 'Permission update succeeded');
+});
+
+test('Confirmation Timeout Fix - Simultaneous confirmation clicks handled via idempotency', async () => {
+  const tourId = 'tour-to-simul';
+  const regId = 'reg-to-simul';
+  const teamId = 'team-to-simul';
+  const leaderId = 'ldr-to-simul';
+
+  await saveConfigurableTournament({ tournamentId: tourId, name: 'Simul Tour' });
+  await saveConfigurableRegistration({
+    tournamentId: tourId,
+    registrationId: regId,
+    displayName: 'Simul Reg',
+    totalSlots: 16,
+    reservedSlots: 0,
+    status: 'OPEN',
+    currentCycleId: `${regId}:cycle-simul`,
+  });
+  await saveConfigurableTeam({
+    teamId,
+    tournamentId: tourId,
+    teamName: 'Team Simul',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'LeaderS', uid: '555' }],
+  });
+
+  const replies = [];
+  const makeInteraction = (id) => ({
+    id,
+    isButton: () => true,
+    guildId: 'guild-simul',
+    user: { id: leaderId },
+    client: { channels: { fetch: async () => null } },
+    deferReply: async () => {},
+    editReply: async (p) => { replies.push(p); },
+  });
+
+  // Launch two confirmations simultaneously for the same team and registration
+  const p1 = handleConfirmRegistrationButtonClick(makeInteraction('int-sim-1'), regId, teamId);
+  const p2 = handleConfirmRegistrationButtonClick(makeInteraction('int-sim-2'), regId, teamId);
+
+  await Promise.all([p1, p2]);
+
+  // Exactly one registration entry exists in MongoDB
+  const entries = await getConfigurableEntriesForRegistration(regId, `${regId}:cycle-simul`);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].teamId, teamId);
+});
+
+test('Confirmation Timeout Fix - Last available slot claimed by another team returns slots filled', async () => {
+  const tourId = 'tour-to-race-last';
+  const regId = 'reg-to-race-last';
+  const leaderId = 'ldr-to-race-last';
+
+  await saveConfigurableTournament({ tournamentId: tourId, name: 'Race Last Tour' });
+  await saveConfigurableRegistration({
+    tournamentId: tourId,
+    registrationId: regId,
+    displayName: 'Race Last Reg',
+    totalSlots: 1, // Only 1 total slot
+    reservedSlots: 0,
+    status: 'OPEN',
+    currentCycleId: `${regId}:cycle-race-last`,
+  });
+
+  // Another team already claimed the only slot
+  await saveConfigurableEntry({
+    entryId: 'entry-claimed-already',
+    registrationId: regId,
+    cycleId: `${regId}:cycle-race-last`,
+    teamId: 'other-team',
+    slotNumber: 1,
+    status: 'CONFIRMED',
+  });
+
+  await saveConfigurableTeam({
+    teamId: 'team-late',
+    tournamentId: tourId,
+    teamName: 'Team Late',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'LateLdr', uid: '666' }],
+  });
+
+  let replyPayload = null;
+  const mockInteraction = {
+    id: 'int-late',
+    isButton: () => true,
+    guildId: 'guild-late',
+    user: { id: leaderId },
+    client: { channels: { fetch: async () => null } },
+    deferReply: async () => { mockInteraction.deferred = true; },
+    editReply: async (p) => { replyPayload = p; },
+  };
+
+  await handleConfirmRegistrationButtonClick(mockInteraction, regId, 'team-late');
+
+  assert.ok(replyPayload);
+  assert.match(replyPayload.content, /all available slots have been filled/);
+});
+
+test('Confirmation Timeout Fix - Registration closing during confirmation returns currently closed', async () => {
+  const tourId = 'tour-to-closed';
+  const regId = 'reg-to-closed';
+  const teamId = 'team-to-closed';
+  const leaderId = 'ldr-to-closed';
+
+  await saveConfigurableTournament({ tournamentId: tourId, name: 'Closed Tour' });
+  await saveConfigurableRegistration({
+    tournamentId: tourId,
+    registrationId: regId,
+    displayName: 'Closed Reg',
+    totalSlots: 10,
+    reservedSlots: 0,
+    status: 'CLOSED', // Closed in background
+    currentCycleId: `${regId}:cycle-closed`,
+  });
+  await saveConfigurableTeam({
+    teamId,
+    tournamentId: tourId,
+    teamName: 'Team Closed',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'ClosedLdr', uid: '777' }],
+  });
+
+  let replyPayload = null;
+  const mockInteraction = {
+    id: 'int-closed',
+    isButton: () => true,
+    guildId: 'guild-closed',
+    user: { id: leaderId },
+    client: { channels: { fetch: async () => null } },
+    deferReply: async () => { mockInteraction.deferred = true; },
+    editReply: async (p) => { replyPayload = p; },
+  };
+
+  await handleConfirmRegistrationButtonClick(mockInteraction, regId, teamId);
+
+  assert.ok(replyPayload);
+  assert.match(replyPayload.content, /This registration is currently closed/);
+});
+
+test('Confirmation Timeout Fix - Failed IDP permission assignment preserves valid registration', async () => {
+  const tourId = 'tour-to-fail-idp';
+  const regId = 'reg-to-fail-idp';
+  const teamId = 'team-to-fail-idp';
+  const leaderId = 'ldr-to-fail-idp';
+
+  await saveConfigurableTournament({ tournamentId: tourId, name: 'Fail IDP Tour' });
+  await saveConfigurableRegistration({
+    tournamentId: tourId,
+    registrationId: regId,
+    displayName: 'Fail IDP Reg',
+    totalSlots: 10,
+    reservedSlots: 0,
+    status: 'OPEN',
+    idpChannelId: 'chan-idp-error',
+    currentCycleId: `${regId}:cycle-fail-idp`,
+  });
+  await saveConfigurableTeam({
+    teamId,
+    tournamentId: tourId,
+    teamName: 'Team Fail IDP',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'FailIdpLdr', uid: '888' }],
+  });
+
+  // Mock IDP channel that throws when editing permissions
+  const mockGuild = {
+    channels: {
+      fetch: async (chanId) => {
+        if (chanId === 'chan-idp-error') {
+          return {
+            permissionOverwrites: {
+              edit: async () => {
+                throw new Error('Discord API 50035: Invalid Form Body / Network timeout');
+              },
+            },
+          };
+        }
+        return null;
+      },
+    },
+  };
+
+  let replyPayload = null;
+  const mockInteraction = {
+    id: 'int-fail-idp',
+    isButton: () => true,
+    guild: mockGuild,
+    guildId: 'guild-fail-idp',
+    user: { id: leaderId },
+    client: { channels: mockGuild.channels },
+    deferReply: async () => { mockInteraction.deferred = true; },
+    editReply: async (p) => { replyPayload = p; },
+  };
+
+  await handleConfirmRegistrationButtonClick(mockInteraction, regId, teamId);
+
+  // 1. Success message is still shown to the user
+  assert.ok(replyPayload);
+  assert.match(replyPayload.content, /Your squad has been successfully registered!/);
+
+  // 2. Registration is preserved in MongoDB
+  const entries = await getConfigurableEntriesForRegistration(regId, `${regId}:cycle-fail-idp`);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].teamId, teamId);
+  assert.equal(entries[0].permissionPending, true, 'Permission queued for reconciliation');
+});
+
+test('Confirmation Timeout Fix - Repeated confirmation attempts after successful registration returns duplicate warning', async () => {
+  const tourId = 'tour-to-repeat';
+  const regId = 'reg-to-repeat';
+  const teamId = 'team-to-repeat';
+  const leaderId = 'ldr-to-repeat';
+
+  await saveConfigurableTournament({ tournamentId: tourId, name: 'Repeat Tour' });
+  await saveConfigurableRegistration({
+    tournamentId: tourId,
+    registrationId: regId,
+    displayName: 'Repeat Reg',
+    totalSlots: 10,
+    reservedSlots: 0,
+    status: 'OPEN',
+    idpChannelId: 'chan-idp-repeat',
+    currentCycleId: `${regId}:cycle-repeat`,
+  });
+  await saveConfigurableTeam({
+    teamId,
+    tournamentId: tourId,
+    teamName: 'Team Repeat',
+    leaderDiscordId: leaderId,
+    players: [{ discordId: leaderId, ign: 'RepeatLdr', uid: '999' }],
+  });
+
+  const makeInteraction = (id) => {
+    let payload = null;
+    return {
+      id,
+      isButton: () => true,
+      guildId: 'guild-repeat',
+      user: { id: leaderId },
+      client: { channels: { fetch: async () => null } },
+      deferReply: async function () { this.deferred = true; },
+      editReply: async (p) => { payload = p; },
+      getPayload: () => payload,
+    };
+  };
+
+  // First confirmation
+  const int1 = makeInteraction('int-rep-1');
+  await handleConfirmRegistrationButtonClick(int1, regId, teamId);
+  assert.match(int1.getPayload().content, /Your squad has been successfully registered!/);
+
+  // Repeated confirmation
+  const int2 = makeInteraction('int-rep-2');
+  await handleConfirmRegistrationButtonClick(int2, regId, teamId);
+  assert.match(int2.getPayload().content, /already registered in this daily cycle/);
+});
+
+
 
 
 

@@ -389,22 +389,33 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
  * @param {object} payload
  */
 async function respondToConfirmationInteraction(interaction, payload) {
-  if (interaction.deferred) {
+  try {
+    if (interaction.deferred) {
+      if (typeof interaction.editReply === 'function') {
+        return await interaction.editReply(payload);
+      }
+      if (typeof interaction.update === 'function') {
+        return await interaction.update(payload);
+      }
+      if (typeof interaction.reply === 'function') {
+        return await interaction.reply(payload);
+      }
+    }
+    if (typeof interaction.update === 'function' && interaction.isButton?.()) {
+      return await interaction.update(payload);
+    }
+    if (!interaction.replied && typeof interaction.reply === 'function') {
+      return await interaction.reply({ ...payload, ephemeral: true });
+    }
     if (typeof interaction.editReply === 'function') {
       return await interaction.editReply(payload);
     }
-  }
-  if (typeof interaction.update === 'function' && interaction.isButton?.()) {
-    return await interaction.update(payload);
-  }
-  if (!interaction.replied && typeof interaction.reply === 'function') {
-    return await interaction.reply({ ...payload, ephemeral: true });
-  }
-  if (typeof interaction.editReply === 'function') {
-    return await interaction.editReply(payload);
-  }
-  if (typeof interaction.followUp === 'function') {
-    return await interaction.followUp({ ...payload, ephemeral: true });
+    if (typeof interaction.followUp === 'function') {
+      return await interaction.followUp({ ...payload, ephemeral: true });
+    }
+  } catch (err) {
+    if (err?.code === 40060) return null;
+    console.error(`[ConfigurableRegistration] ❌ Error in respondToConfirmationInteraction:`, err.message);
   }
 }
 
@@ -541,34 +552,129 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
 
 /**
  * Handles the "Cancel" button on the registration confirmation message.
+ * Immediately acknowledges interaction and terminates pending confirmation.
  * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} [registrationId]
+ * @param {string} [teamId]
  */
-export async function handleCancelRegistrationButtonClick(interaction) {
+export async function handleCancelRegistrationButtonClick(interaction, registrationId = null, teamId = null) {
+  const interactionId = interaction?.id || 'unknown';
+  console.log(`[ConfigurableRegistration] 📥 Cancel button clicked [interactionId: ${interactionId}, regId: ${registrationId || 'N/A'}, teamId: ${teamId || 'N/A'}, user: ${interaction?.user?.id}]`);
+
+  // Immediately acknowledge the interaction
+  if (typeof interaction.deferUpdate === 'function' && !interaction.deferred && !interaction.replied) {
+    try {
+      await interaction.deferUpdate();
+      interaction.deferred = true;
+      console.log(`[ConfigurableRegistration] ⏱️ Cancel interaction acknowledged via deferUpdate [interactionId: ${interactionId}]`);
+    } catch (err) {
+      if (err?.code !== 40060) {
+        console.warn(`[ConfigurableRegistration] ⚠️ Failed to deferUpdate cancel [interactionId: ${interactionId}]:`, err.message);
+      }
+    }
+  }
+
   try {
+    // If teamId is supplied, verify only the original user/leader can cancel
+    if (teamId && interaction?.user?.id) {
+      const team = await getConfigurableTeam(teamId);
+      if (team && team.leaderDiscordId && team.leaderDiscordId !== interaction.user.id) {
+        console.warn(`[ConfigurableRegistration] ❌ Cancel rejected: non-leader [interactionId: ${interactionId}, user: ${interaction.user.id}, leader: ${team.leaderDiscordId}]`);
+        return respondToConfirmationInteraction(interaction, {
+          content: '❌ Only the original verified team leader can cancel this registration.',
+          embeds: [],
+          components: [],
+        });
+      }
+    }
+
     const payload = {
       content: '❌ Registration cancelled.',
       embeds: [],
       components: [],
     };
     await respondToConfirmationInteraction(interaction, payload);
+    console.log(`[ConfigurableRegistration] ⏱️ Cancel interaction completed successfully [interactionId: ${interactionId}]`);
     return true;
   } catch (err) {
-    console.error('[ConfigurableRegistration] ❌ Error in handleCancelRegistrationButtonClick:', err);
+    console.error(`[ConfigurableRegistration] ❌ Error in handleCancelRegistrationButtonClick [interactionId: ${interactionId}]:`, err);
+    return respondToConfirmationInteraction(interaction, {
+      content: '❌ An error occurred while cancelling registration.',
+      embeds: [],
+      components: [],
+    });
   }
 }
 
 /**
  * Handles the "Confirm Registration" button click.
- * Revalidates all preconditions, allocates slot atomically, creates MongoDB entry,
- * grants team leader IDP channel access, updates messages/dashboards, and displays success.
+ * Sequence:
+ * 1. User clicks Confirm Registration.
+ * 2. Immediately acknowledge interaction using deferReply (<3s deadline).
+ * 3. Disable/mark confirmation buttons as processing.
+ * 4. Verify interaction belongs to the correct user.
+ * 5. Retrieve team and registration from MongoDB.
+ * 6. Verify user is the team leader.
+ * 7. Verify team is enrolled.
+ * 8. Verify registration is OPEN.
+ * 9. Verify current daily cycle.
+ * 10. Check duplicate registration.
+ * 11. Atomically allocate an available unlocked slot.
+ * 12. Create registration entry.
+ * 13. Grant leader access to corresponding IDP channel.
+ * 14. Update existing slot chart.
+ * 15. Update registration message and dashboard.
+ * 16. Edit deferred ephemeral reply with result via editReply.
  *
  * @param {import('discord.js').ButtonInteraction} interaction
  * @param {string} registrationId
  * @param {string} teamId
  */
 export async function handleConfirmRegistrationButtonClick(interaction, registrationId, teamId) {
+  const interactionId = interaction?.id || 'unknown';
+  console.log(`[ConfigurableRegistration] 📥 Confirmation button clicked [interactionId: ${interactionId}, regId: ${registrationId}, teamId: ${teamId}, user: ${interaction?.user?.id}]`);
+
+  // Step 2: Immediately acknowledge the interaction using deferReply
+  if (typeof interaction.deferReply === 'function' && !interaction.deferred && !interaction.replied) {
+    try {
+      await interaction.deferReply({ ephemeral: true });
+      interaction.deferred = true;
+      console.log(`[ConfigurableRegistration] ⏱️ Interaction acknowledged via deferReply [interactionId: ${interactionId}, regId: ${registrationId}]`);
+    } catch (err) {
+      if (err?.code === 40060) {
+        console.warn(`[ConfigurableRegistration] ⚠️ Interaction already acknowledged [interactionId: ${interactionId}]:`, err.message);
+        return;
+      }
+      console.warn(`[ConfigurableRegistration] ⚠️ Failed to deferReply [interactionId: ${interactionId}]:`, err.message);
+    }
+  }
+
+  // Step 3: Disable or mark the confirmation buttons as processing
+  if (interaction?.message && typeof interaction.message.edit === 'function') {
+    interaction.message.edit({
+      components: [
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`processing_confirm_${registrationId}`)
+            .setLabel('Confirming...')
+            .setEmoji('⏳')
+            .setStyle(ButtonStyle.Success)
+            .setDisabled(true),
+          new ButtonBuilder()
+            .setCustomId(`processing_cancel_${registrationId}`)
+            .setLabel('Cancel')
+            .setEmoji('✖️')
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(true)
+        ),
+      ],
+    }).catch(() => {});
+  }
+
+  // Idempotency: Prevent concurrent/repeated button clicks
   const idempotencyKey = `${registrationId}:${teamId}`;
   if (inFlightConfirmations.has(idempotencyKey)) {
+    console.warn(`[ConfigurableRegistration] ⚠️ Registration already in flight [interactionId: ${interactionId}, key: ${idempotencyKey}]`);
     return respondToConfirmationInteraction(interaction, {
       content: '⏳ Registration is already being processed. Please wait...',
       embeds: [],
@@ -581,42 +687,22 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
   await acquireLock(lockKey, 10, 3000);
 
   try {
-    // 1. Fetch fresh registration record from DB
-    const registration = await getConfigurableRegistration(registrationId);
-    if (!registration || registration.status === 'DELETED' || registration.isDeleted) {
-      return respondToConfirmationInteraction(interaction, {
-        content: '❌ Registration instance not found or has been deleted.',
-        embeds: [],
-        components: [],
-      });
-    }
-
-    // 2. Verify registration is still OPEN
-    if (registration.status !== 'OPEN') {
-      return respondToConfirmationInteraction(interaction, {
-        content: `❌ Registration is no longer open (Current status: **${registration.status || 'CLOSED'}**).`,
-        embeds: [],
-        components: [],
-      });
-    }
-
-    // 3. Verify valid daily cycle
-    if (!registration.currentCycleId) {
-      registration.currentCycleId = `${registrationId}:cycle-${crypto.randomUUID()}`;
-      await saveConfigurableRegistration(registration);
-    }
-    const currentCycleId = registration.currentCycleId;
-
-    // 4. Verify team exists, is enrolled in this tournament, and user is still the leader
+    // Step 5 & 7: Retrieve the team from MongoDB & verify enrollment
     const team = await getConfigurableTeam(teamId);
-    if (!team || team.tournamentId !== registration.tournamentId) {
+    if (!team) {
+      console.warn(`[ConfigurableRegistration] ❌ Team record not found [interactionId: ${interactionId}, teamId: ${teamId}]`);
       return respondToConfirmationInteraction(interaction, {
-        content: '❌ Team record not found or no longer enrolled in this tournament.',
+        content: '❌ Team record not found. Squad is not enrolled.',
         embeds: [],
         components: [],
       });
     }
-    if (team.leaderDiscordId !== interaction.user.id) {
+
+    console.log(`[ConfigurableRegistration] 🛡️ Team validation [interactionId: ${interactionId}, teamId: ${teamId}, teamName: ${team.teamName}, leader: ${team.leaderDiscordId}]`);
+
+    // Step 4 & 6: Verify interaction belongs to the correct user (user is the team leader)
+    if (interaction?.user?.id && team.leaderDiscordId !== interaction.user.id) {
+      console.warn(`[ConfigurableRegistration] ❌ Non-leader confirmation attempt [interactionId: ${interactionId}, user: ${interaction.user.id}, leader: ${team.leaderDiscordId}]`);
       return respondToConfirmationInteraction(interaction, {
         content: '❌ Only the original verified team leader can confirm registration for this squad.',
         embeds: [],
@@ -624,10 +710,51 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       });
     }
 
-    // 5. Verify team has not already registered in this registration cycle
+    // Step 5: Retrieve registration from MongoDB
+    const registration = await getConfigurableRegistration(registrationId);
+    if (!registration || registration.status === 'DELETED' || registration.isDeleted) {
+      console.warn(`[ConfigurableRegistration] ❌ Registration not found or deleted [interactionId: ${interactionId}, regId: ${registrationId}]`);
+      return respondToConfirmationInteraction(interaction, {
+        content: '❌ Registration instance not found or has been deleted.',
+        embeds: [],
+        components: [],
+      });
+    }
+
+    // Verify team belongs to tournament of this registration
+    if (team.tournamentId !== registration.tournamentId) {
+      console.warn(`[ConfigurableRegistration] ❌ Team tournament mismatch [interactionId: ${interactionId}, teamTour: ${team.tournamentId}, regTour: ${registration.tournamentId}]`);
+      return respondToConfirmationInteraction(interaction, {
+        content: '❌ Team is not enrolled in this tournament.',
+        embeds: [],
+        components: [],
+      });
+    }
+
+    // Step 8: Verify registration is OPEN
+    if (registration.status !== 'OPEN') {
+      console.warn(`[ConfigurableRegistration] ❌ Registration closed [interactionId: ${interactionId}, regId: ${registrationId}, status: ${registration.status}]`);
+      return respondToConfirmationInteraction(interaction, {
+        content: `❌ This registration is currently closed. Registration is no longer open (Current status: **${registration.status || 'CLOSED'}**).`,
+        embeds: [],
+        components: [],
+      });
+    }
+
+    // Step 9: Verify the current daily cycle
+    if (!registration.currentCycleId) {
+      registration.currentCycleId = `${registrationId}:cycle-${crypto.randomUUID()}`;
+      await saveConfigurableRegistration(registration);
+    }
+    const currentCycleId = registration.currentCycleId;
+
+    console.log(`[ConfigurableRegistration] 📋 Registration validation [interactionId: ${interactionId}, regId: ${registrationId}, status: ${registration.status}, cycleId: ${currentCycleId}]`);
+
+    // Step 10: Check duplicate registration (only for this registration instance + currentCycleId + team)
     const activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
     const existingEntry = activeEntries.find((e) => e.teamId === team.teamId);
     if (existingEntry) {
+      console.warn(`[ConfigurableRegistration] ❌ Team already registered [interactionId: ${interactionId}, teamId: ${team.teamId}, slot: ${existingEntry.slotNumber}]`);
       return respondToConfirmationInteraction(interaction, {
         content:
           `❌ Your team **${team.teamName}** is already registered in this daily cycle!\n` +
@@ -637,12 +764,13 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       });
     }
 
-    // 6. Check that an available, unlocked slot exists
+    // Verify capacity against non-reserved slots
     const filledCount = activeEntries.length;
     const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
     const maxAvailable = Math.max(0, registration.totalSlots - reservedCount);
 
     if (filledCount >= maxAvailable) {
+      console.warn(`[ConfigurableRegistration] ❌ Capacity reached [interactionId: ${interactionId}, filled: ${filledCount}, max: ${maxAvailable}]`);
       if (registration.status === 'OPEN') {
         registration.status = 'CLOSED';
         await saveConfigurableRegistration(registration);
@@ -653,23 +781,26 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
         }
       }
       return respondToConfirmationInteraction(interaction, {
-        content: '❌ Sorry, all available slots for this registration instance have just been filled!',
+        content: '❌ Sorry, all available slots have been filled. (all available slots for this registration instance have just been filled!)',
         embeds: [],
         components: [],
       });
     }
 
-    // 7. Allocate slot atomically
+    // Step 11: Atomically allocate an available unlocked slot
     const slotNumber = await getNextAvailableSlot(registrationId, registration.totalSlots, reservedCount, currentCycleId);
     if (!slotNumber) {
+      console.warn(`[ConfigurableRegistration] ❌ Slot allocation failed: none available [interactionId: ${interactionId}, regId: ${registrationId}]`);
       return respondToConfirmationInteraction(interaction, {
-        content: '❌ No available slot number could be allocated.',
+        content: '❌ Sorry, all available slots have been filled. No available slot number could be allocated.',
         embeds: [],
         components: [],
       });
     }
 
-    // 8. Create the registration entry in MongoDB
+    console.log(`[ConfigurableRegistration] 🎯 Slot allocated [interactionId: ${interactionId}, regId: ${registrationId}, slot: ${slotNumber}]`);
+
+    // Step 12: Create registration entry in MongoDB
     const now = new Date();
     const entryDoc = {
       entryId: crypto.randomUUID(),
@@ -687,6 +818,7 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
     };
 
     await saveConfigurableEntry(entryDoc);
+    console.log(`[ConfigurableRegistration] 💾 Registration entry created [interactionId: ${interactionId}, entryId: ${entryDoc.entryId}, slot: ${slotNumber}]`);
 
     // Auto-close if this was the last slot
     if (filledCount + 1 >= maxAvailable) {
@@ -709,7 +841,8 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       }
     }
 
-    // 9. Grant team leader access to the corresponding IDP channel
+    // Step 13: Grant leader access to corresponding IDP channel
+    let idpPermissionGranted = false;
     if (registration.idpChannelId && interaction.guild) {
       try {
         const idpChannel = await interaction.guild.channels.fetch(registration.idpChannelId).catch(() => null);
@@ -725,19 +858,29 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
             ManageChannels: false,
             ManageRoles: false,
           });
+          idpPermissionGranted = true;
+          console.log(`[ConfigurableRegistration] 🔐 IDP permission update successful [interactionId: ${interactionId}, idpChannelId: ${registration.idpChannelId}, leader: ${interaction.user.id}]`);
         }
       } catch (err) {
-        console.warn(`[ConfigurableRegistration] ⚠️ Failed to update IDP overwrite for leader ${interaction.user.id}:`, err.message);
+        console.warn(`[ConfigurableRegistration] ⚠️ Failed to update IDP overwrite for leader ${interaction.user.id} [interactionId: ${interactionId}]: ${err.message}. Registration preserved; permission queued for reconciliation.`);
       }
     }
 
-    // 10. Update existing slot chart, registration message & dashboard
+    if (!idpPermissionGranted && registration.idpChannelId) {
+      entryDoc.permissionPending = true;
+      await saveConfigurableEntry(entryDoc).catch(() => {});
+    }
+
+    // Step 14 & 15: Update existing slot chart, registration message & dashboard
     if (interaction.client?.channels) {
-      await updateSlotChartMessage(interaction.client, registrationId).catch(() => {});
+      await updateSlotChartMessage(interaction.client, registrationId).catch((err) => {
+        console.warn(`[ConfigurableRegistration] ⚠️ Error updating slot chart [interactionId: ${interactionId}]:`, err.message);
+      });
+      console.log(`[ConfigurableRegistration] 📊 Slot chart updated [interactionId: ${interactionId}, regId: ${registrationId}]`);
       await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
     }
 
-    // 11. Display ephemeral success confirmation
+    // Step 16: Edit deferred ephemeral reply with result via editReply
     const successPayload = {
       content:
         `🎉 **Your squad has been successfully registered!**\n\n` +
@@ -750,11 +893,13 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       components: [],
     };
 
-    return respondToConfirmationInteraction(interaction, successPayload);
+    const res = await respondToConfirmationInteraction(interaction, successPayload);
+    console.log(`[ConfigurableRegistration] ✅ Final response sent via editReply [interactionId: ${interactionId}, regId: ${registrationId}, teamId: ${teamId}]`);
+    return res;
   } catch (err) {
-    console.error(`[ConfigurableRegistration] ❌ Error in handleConfirmRegistrationButtonClick:`, err);
+    console.error(`[ConfigurableRegistration] ❌ Error in handleConfirmRegistrationButtonClick [interactionId: ${interactionId}, regId: ${registrationId}, teamId: ${teamId}]:`, err);
     return respondToConfirmationInteraction(interaction, {
-      content: `❌ An unexpected error occurred while confirming registration: ${err.message || err}`,
+      content: `❌ Registration could not be completed. Please try again. (${err.message || 'Unknown error'})`,
       embeds: [],
       components: [],
     });
