@@ -15,6 +15,7 @@ import {
   getConfigurableTeamByName,
   getConfigurableTeamsForUser,
   saveConfigurableTeam,
+  saveConfigurableTeamWithExclusivity,
   deleteConfigurableTeam,
   saveConfigurableTournament,
   getConfigurableEntriesForTeam,
@@ -571,10 +572,31 @@ export async function handleStep3ModalSubmit(interaction, tournamentId) {
     const sub1Uid = interaction.fields.getTextInputValue('sub1_uid')?.trim();
     const sub2Ign = interaction.fields.getTextInputValue('sub2_ign')?.trim();
     const sub2Uid = interaction.fields.getTextInputValue('sub2_uid')?.trim();
+    let sub1DiscordId = null;
+    let sub2DiscordId = null;
+    try {
+      sub1DiscordId = interaction.fields.getTextInputValue('sub1_discord_id')?.trim() || null;
+    } catch {}
+    try {
+      sub2DiscordId = interaction.fields.getTextInputValue('sub2_discord_id')?.trim() || null;
+    } catch {}
 
+    const prevSubs = Array.isArray(session.substitutes) ? session.substitutes : [];
     const substitutes = [];
-    if (sub1Ign) substitutes.push({ ign: sub1Ign, uid: sub1Uid || 'N/A' });
-    if (sub2Ign) substitutes.push({ ign: sub2Ign, uid: sub2Uid || 'N/A' });
+    if (sub1Ign) {
+      substitutes.push({
+        ign: sub1Ign,
+        uid: sub1Uid || 'N/A',
+        discordId: sub1DiscordId || prevSubs[0]?.discordId || prevSubs[0]?.discordUserId || null,
+      });
+    }
+    if (sub2Ign) {
+      substitutes.push({
+        ign: sub2Ign,
+        uid: sub2Uid || 'N/A',
+        discordId: sub2DiscordId || prevSubs[1]?.discordId || prevSubs[1]?.discordUserId || null,
+      });
+    }
 
     session.substitutes = substitutes;
     session.step = 3;
@@ -687,12 +709,13 @@ export async function showStep5DiscordSelection(interaction, tournamentId) {
 
     const tournament = await getConfigurableTournament(tournamentId);
     const reqMembers = tournament?.requiredDiscordMembers ?? 4;
+    const subsCount = Array.isArray(session.substitutes) ? session.substitutes.length : 0;
 
     const select = new UserSelectMenuBuilder()
       .setCustomId(`md_cfg_step5_users_${tournamentId}`)
       .setPlaceholder(`Select ${reqMembers} Discord member${reqMembers > 1 ? 's' : ''}...`)
       .setMinValues(reqMembers)
-      .setMaxValues(reqMembers);
+      .setMaxValues(Math.min(25, reqMembers + subsCount));
 
     const row = new ActionRowBuilder().addComponents(select);
 
@@ -728,10 +751,20 @@ export async function handleStep5UserSelect(interaction, tournamentId) {
 
     const tournament = await getConfigurableTournament(tournamentId);
     const reqMembers = tournament?.requiredDiscordMembers ?? 4;
+    const subsCount = Array.isArray(session.substitutes) ? session.substitutes.length : 0;
     const selectedUsers = interaction.values; // Array of selected user IDs
+    const extraSubUsers = Array.isArray(interaction.substituteValues)
+      ? interaction.substituteValues
+      : Array.isArray(interaction.substituteUserIds)
+        ? interaction.substituteUserIds
+        : [];
 
-    // 1. Exact count validation
-    if (!selectedUsers || selectedUsers.length !== reqMembers) {
+    // 1. Count validation (allows exact reqMembers, or reqMembers + substitute Discord selections)
+    if (
+      !selectedUsers ||
+      selectedUsers.length < reqMembers ||
+      selectedUsers.length > reqMembers + subsCount
+    ) {
       return interaction.reply({
         content: `❌ You must select exactly ${reqMembers} Discord member${reqMembers > 1 ? 's' : ''}.`,
         ephemeral: true,
@@ -746,9 +779,31 @@ export async function handleStep5UserSelect(interaction, tournamentId) {
       });
     }
 
-    // 3. No duplicates
-    const uniqueUsers = new Set(selectedUsers);
-    if (uniqueUsers.size !== reqMembers) {
+    // 3. No duplicates across main selection or substitutes
+    const mainSelectedUsers = selectedUsers.slice(0, reqMembers);
+    if (!mainSelectedUsers.includes(interaction.user.id)) {
+      // Ensure leader is in mainSelectedUsers if extra sub users were selected in the same array
+      const idx = selectedUsers.indexOf(interaction.user.id);
+      if (idx >= reqMembers) {
+        const swapped = selectedUsers[reqMembers - 1];
+        mainSelectedUsers[reqMembers - 1] = interaction.user.id;
+        selectedUsers[idx] = swapped;
+      }
+    }
+    const inlineSubUsers = selectedUsers.slice(reqMembers);
+    const resolvedSubIds = (session.substitutes || []).map((s, idx) => {
+      return (
+        extraSubUsers[idx] ||
+        inlineSubUsers[idx] ||
+        s?.discordId ||
+        s?.discordUserId ||
+        null
+      );
+    });
+
+    const allCandidateIds = [...mainSelectedUsers, ...resolvedSubIds.filter(Boolean)];
+    const uniqueUsers = new Set(allCandidateIds);
+    if (uniqueUsers.size !== allCandidateIds.length || new Set(selectedUsers).size !== selectedUsers.length) {
       return interaction.reply({
         content: `❌ Duplicate member selections are not allowed. All selected accounts must be distinct.`,
         ephemeral: true,
@@ -757,7 +812,7 @@ export async function handleStep5UserSelect(interaction, tournamentId) {
 
     // 4. Server membership validation
     if (interaction.guild) {
-      for (const uid of selectedUsers) {
+      for (const uid of allCandidateIds) {
         let isMember = false;
         if (interaction.guild.members?.cache?.has?.(uid)) {
           isMember = true;
@@ -776,18 +831,8 @@ export async function handleStep5UserSelect(interaction, tournamentId) {
       }
     }
 
-    // 5. Re-check team name duplicate
-    const existingTeam = await getConfigurableTeamByName(tournamentId, session.teamName);
-    if (existingTeam && (!session.isEdit || existingTeam.teamId !== session.teamId)) {
-      await deletePendingEnrollment(tournamentId, interaction.user.id);
-      return interaction.reply({
-        content: `❌ A squad named **${session.teamName}** has already been registered.`,
-        ephemeral: true,
-      });
-    }
-
     // Submitting user is automatically identified and stored as team leader
-    const otherUsers = selectedUsers.filter((id) => id !== interaction.user.id);
+    const otherUsers = mainSelectedUsers.filter((id) => id !== interaction.user.id);
     const orderedUserIds = [interaction.user.id, ...otherUsers];
 
     const players = [
@@ -813,14 +858,15 @@ export async function handleStep5UserSelect(interaction, tournamentId) {
       },
     ];
 
-    const substitutes = (session.substitutes || []).map((s) => ({
+    const substitutes = (session.substitutes || []).map((s, idx) => ({
       ign: s.ign,
       uid: s.uid,
+      ...(resolvedSubIds[idx] ? { discordId: resolvedSubIds[idx] } : {}),
     }));
 
     if (session.isEdit) {
       // ----------------------------------------------------
-      // EDIT SQUAD
+      // EDIT SQUAD (with atomic player & substitute exclusivity check)
       // ----------------------------------------------------
       const existingTeamDoc = await getConfigurableTeam(session.teamId);
       if (!existingTeamDoc) {
@@ -836,7 +882,16 @@ export async function handleStep5UserSelect(interaction, tournamentId) {
         updatedAt: new Date(),
       };
 
-      await saveConfigurableTeam(updatedTeamDoc);
+      const commitResult = await saveConfigurableTeamWithExclusivity(updatedTeamDoc, { isEdit: true });
+      if (!commitResult.ok) {
+        if (commitResult.code === 'DUPLICATE_TEAM_NAME') {
+          await deletePendingEnrollment(tournamentId, interaction.user.id);
+        }
+        return interaction.reply({
+          content: commitResult.message || 'One or more selected members are already assigned to another squad in this tournament.',
+          ephemeral: true,
+        });
+      }
 
       // If team name changed, update existing registration entries and slot charts in place
       if (existingTeamDoc.teamName !== session.teamName) {
@@ -865,7 +920,7 @@ export async function handleStep5UserSelect(interaction, tournamentId) {
       });
     } else {
       // ----------------------------------------------------
-      // NEW ENROLLMENT
+      // NEW ENROLLMENT (with atomic player & substitute exclusivity check)
       // ----------------------------------------------------
       const teamDoc = {
         teamId: crypto.randomUUID(),
@@ -878,7 +933,17 @@ export async function handleStep5UserSelect(interaction, tournamentId) {
         enrolledAt: new Date(),
       };
 
-      await saveConfigurableTeam(teamDoc);
+      const commitResult = await saveConfigurableTeamWithExclusivity(teamDoc, { isEdit: false });
+      if (!commitResult.ok) {
+        if (commitResult.code === 'DUPLICATE_TEAM_NAME') {
+          await deletePendingEnrollment(tournamentId, interaction.user.id);
+        }
+        return interaction.reply({
+          content: commitResult.message || 'One or more selected members are already assigned to another squad in this tournament.',
+          ephemeral: true,
+        });
+      }
+
       await deletePendingEnrollment(tournamentId, interaction.user.id);
       await refreshDashboard(interaction.client, tournamentId);
 

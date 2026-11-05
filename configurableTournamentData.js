@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { getMongoDb, isMongoConnected } from './mongoService.js';
+import { getMongoDb, isMongoConnected, acquireLock, releaseLock } from './mongoService.js';
 
 // In-memory fallback stores (used when MongoDB is disconnected or in unit tests)
 const localTournaments = new Map(); // tournamentId -> doc
@@ -8,6 +8,10 @@ const localTeams = new Map(); // teamId -> doc
 const localEntries = new Map(); // `${registrationId}:${teamId}` or `${registrationId}:${cycleId}:${teamId}` -> doc
 const localPendingEnrollments = new Map(); // `${tournamentId}:${userId}` -> sessionDoc
 const localDailyCycles = new Map(); // cycleId -> doc
+const localSlots = new Map(); // `${registrationId}:${cycleId}:${slotNumber}` -> slotStateDoc
+const localPlayerMemberships = new Map(); // `${tournamentId}:${discordUserId}` -> membershipDoc
+const localAuditLogs = []; // Array of audit log docs
+const localMutexChains = new Map(); // lockKey -> Promise
 
 export function clearInMemoryData() {
   localTournaments.clear();
@@ -16,6 +20,40 @@ export function clearInMemoryData() {
   localEntries.clear();
   localPendingEnrollments.clear();
   localDailyCycles.clear();
+  localSlots.clear();
+  localPlayerMemberships.clear();
+  localAuditLogs.length = 0;
+  localMutexChains.clear();
+}
+
+/**
+ * Serializes concurrent operations for a given lockKey across both in-memory execution
+ * and distributed MongoDB locks.
+ *
+ * @template T
+ * @param {string} lockKey
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+export async function withAtomicMutex(lockKey, fn) {
+  const prev = localMutexChains.get(lockKey) || Promise.resolve();
+  let releaseLocal;
+  const current = new Promise((resolve) => {
+    releaseLocal = resolve;
+  });
+  localMutexChains.set(lockKey, prev.then(() => current));
+
+  await prev;
+  await acquireLock(lockKey);
+  try {
+    return await fn();
+  } finally {
+    await releaseLock(lockKey);
+    releaseLocal();
+    if (localMutexChains.get(lockKey) === current) {
+      localMutexChains.delete(lockKey);
+    }
+  }
 }
 
 function normalizeTournament(doc) {
@@ -30,19 +68,104 @@ function normalizeTournament(doc) {
 }
 
 /**
- * Normalizes reserved slots input into an integer count of locked slots starting from Slot 01.
- * @param {string|Array<number>|number} input
+ * Extracts and returns a sorted, deduplicated array of integer locked slot numbers (1..totalSlots).
+ * Supports:
+ * - A registration object (`reg.lockedSlots` or `reg.reservedSlots`)
+ * - An array of slot numbers (e.g. `[1, 2, 7, 17, 18]`)
+ * - A number count (e.g. `2` -> `[1, 2]`)
+ * - A string (e.g. `"2"` -> `[1, 2]` or `"1, 2, 7"` -> `[1, 2, 7]`)
+ *
+ * @param {object|Array<number>|number|string} registrationOrInput
+ * @param {number} [totalSlots]
+ * @returns {number[]}
+ */
+export function getLockedSlotNumbers(registrationOrInput, totalSlots = null) {
+  if (registrationOrInput === null || registrationOrInput === undefined || registrationOrInput === '') {
+    return [];
+  }
+
+  let effectiveTotal = typeof totalSlots === 'number' && totalSlots > 0 ? Math.floor(totalSlots) : null;
+  if (
+    registrationOrInput &&
+    typeof registrationOrInput === 'object' &&
+    !Array.isArray(registrationOrInput)
+  ) {
+    if (!effectiveTotal && typeof registrationOrInput.totalSlots === 'number' && registrationOrInput.totalSlots > 0) {
+      effectiveTotal = Math.floor(registrationOrInput.totalSlots);
+    }
+    if (Array.isArray(registrationOrInput.lockedSlots)) {
+      return getLockedSlotNumbers(registrationOrInput.lockedSlots, effectiveTotal);
+    }
+    if (registrationOrInput.reservedSlots !== undefined && registrationOrInput.reservedSlots !== null) {
+      return getLockedSlotNumbers(registrationOrInput.reservedSlots, effectiveTotal);
+    }
+    return [];
+  }
+
+  const clampFilter = (arr) => {
+    const set = new Set();
+    for (const raw of arr) {
+      const n = typeof raw === 'number' ? Math.floor(raw) : parseInt(String(raw).trim(), 10);
+      if (!Number.isInteger(n) || n < 1) continue;
+      if (effectiveTotal && n > effectiveTotal) continue;
+      set.add(n);
+    }
+    return Array.from(set).sort((a, b) => a - b);
+  };
+
+  if (Array.isArray(registrationOrInput)) {
+    return clampFilter(registrationOrInput);
+  }
+
+  if (typeof registrationOrInput === 'number') {
+    const count = isNaN(registrationOrInput) ? 0 : Math.max(0, Math.floor(registrationOrInput));
+    const maxCount = effectiveTotal ? Math.min(effectiveTotal, count) : count;
+    const result = [];
+    for (let s = 1; s <= maxCount; s++) {
+      result.push(s);
+    }
+    return result;
+  }
+
+  if (typeof registrationOrInput === 'string') {
+    const trimmed = registrationOrInput.trim();
+    if (!trimmed) return [];
+    if (/^\d+$/.test(trimmed)) {
+      const count = Math.max(0, parseInt(trimmed, 10));
+      const maxCount = effectiveTotal ? Math.min(effectiveTotal, count) : count;
+      const result = [];
+      for (let s = 1; s <= maxCount; s++) {
+        result.push(s);
+      }
+      return result;
+    }
+    const tokens = trimmed.split(/[\s,;]+/).filter(Boolean);
+    const parsedNums = tokens.map((t) => parseInt(t, 10)).filter((n) => Number.isInteger(n) && n >= 1);
+    if (parsedNums.length > 0) {
+      return clampFilter(parsedNums);
+    }
+  }
+
+  return [];
+}
+
+/**
+ * Normalizes reserved/locked slots input into an integer count of locked slots.
+ * @param {object|string|Array<number>|number} input
  * @param {number} [totalSlots]
  * @returns {number}
  */
 export function parseReservedSlots(input, totalSlots = null) {
   if (input === null || input === undefined || input === '') return 0;
+  if (typeof input === 'object' && !Array.isArray(input)) {
+    return getLockedSlotNumbers(input, totalSlots).length;
+  }
   let count = 0;
 
   if (typeof input === 'number') {
     count = isNaN(input) ? 0 : Math.max(0, Math.floor(input));
   } else if (Array.isArray(input)) {
-    count = input.length;
+    count = getLockedSlotNumbers(input, totalSlots).length;
   } else if (typeof input === 'string') {
     const trimmed = input.trim();
     const num = parseInt(trimmed, 10);
@@ -612,7 +735,33 @@ export async function saveConfigurableRegistration(doc) {
   const { _id, ...cleanDoc } = doc;
   const registrationId = cleanDoc.registrationId || crypto.randomUUID();
   const totalSlots = typeof cleanDoc.totalSlots === 'number' && cleanDoc.totalSlots > 0 ? cleanDoc.totalSlots : 20;
-  const reservedSlots = parseReservedSlots(cleanDoc.reservedSlots, totalSlots);
+  const existingLocal = localRegistrations.get(registrationId);
+
+  let lockedSlots = [];
+  if (cleanDoc.lockedSlots !== undefined && cleanDoc.lockedSlots !== null) {
+    lockedSlots = getLockedSlotNumbers(cleanDoc.lockedSlots, totalSlots);
+  } else if (Array.isArray(cleanDoc.reservedSlots)) {
+    lockedSlots = getLockedSlotNumbers(cleanDoc.reservedSlots, totalSlots);
+  } else if (typeof cleanDoc.reservedSlots === 'number' || typeof cleanDoc.reservedSlots === 'string') {
+    const requestedCount = parseReservedSlots(cleanDoc.reservedSlots, totalSlots);
+    const existingLocked = existingLocal ? getLockedSlotNumbers(existingLocal, totalSlots) : [];
+    if (existingLocked.length === requestedCount && existingLocked.length > 0) {
+      lockedSlots = existingLocked;
+    } else if (typeof cleanDoc.reservedSlots === 'string' && /[\s,;]/.test(cleanDoc.reservedSlots.trim())) {
+      lockedSlots = getLockedSlotNumbers(cleanDoc.reservedSlots, totalSlots);
+    } else {
+      lockedSlots = getLockedSlotNumbers(requestedCount, totalSlots);
+    }
+  } else if (existingLocal) {
+    lockedSlots = getLockedSlotNumbers(existingLocal, totalSlots);
+  }
+
+  const reservedSlots = lockedSlots.length;
+  const lockedSlotsMeta = {
+    ...(existingLocal?.lockedSlotsMeta || {}),
+    ...(cleanDoc.lockedSlotsMeta || {}),
+  };
+
   const parsedMatches = typeof cleanDoc.matches === 'number'
     ? cleanDoc.matches
     : parseInt(cleanDoc.matches, 10);
@@ -636,7 +785,6 @@ export async function saveConfigurableRegistration(doc) {
   }
   delete cleanDoc._scheduleBaseNow;
 
-  const existingLocal = localRegistrations.get(registrationId);
   let registrationNumber = cleanDoc.registrationNumber ?? existingLocal?.registrationNumber;
   if (
     (!Number.isFinite(Number(registrationNumber)) || Number(registrationNumber) <= 0) &&
@@ -660,8 +808,30 @@ export async function saveConfigurableRegistration(doc) {
       : {}),
     totalSlots,
     reservedSlots,
+    lockedSlots,
+    lockedSlotsMeta,
     matches,
     timezone,
+    scheduleImageUrl:
+      cleanDoc.scheduleImageUrl !== undefined
+        ? cleanDoc.scheduleImageUrl
+        : (existingLocal?.scheduleImageUrl ?? null),
+    scheduleMessageId:
+      cleanDoc.scheduleMessageId !== undefined
+        ? cleanDoc.scheduleMessageId
+        : (existingLocal?.scheduleMessageId ?? null),
+    scheduleChannelId:
+      cleanDoc.scheduleChannelId !== undefined
+        ? cleanDoc.scheduleChannelId
+        : (existingLocal?.scheduleChannelId ?? null),
+    uploadedBy:
+      cleanDoc.uploadedBy !== undefined
+        ? cleanDoc.uploadedBy
+        : (existingLocal?.uploadedBy ?? null),
+    uploadedAt:
+      cleanDoc.uploadedAt !== undefined
+        ? cleanDoc.uploadedAt
+        : (existingLocal?.uploadedAt ?? null),
     updatedAt: now,
     createdAt: cleanDoc.createdAt || existingLocal?.createdAt || now,
   };
@@ -680,6 +850,9 @@ export async function saveConfigurableRegistration(doc) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error saving registration ${registrationId}:`, err.message);
     }
   }
+
+  // Keep per-slot state documents synchronized for the registration's active cycle
+  await syncRegistrationSlotStates(registrationId, record.currentCycleId || 'default', record).catch(() => {});
 
   return record;
 }
@@ -878,6 +1051,11 @@ export async function deleteConfigurableRegistration(registrationId, client = nu
     reg.deletedAt = now;
     reg.registrationMessageId = null;
     reg.slotChartMessageId = null;
+    reg.scheduleImageUrl = null;
+    reg.scheduleMessageId = null;
+    reg.scheduleChannelId = null;
+    reg.uploadedBy = null;
+    reg.uploadedAt = null;
     reg.registrationChannelId = null;
     reg.idpChannelId = null;
     localRegistrations.set(registrationId, { ...reg });
@@ -897,6 +1075,11 @@ export async function deleteConfigurableRegistration(registrationId, client = nu
             deletedAt: now,
             registrationMessageId: null,
             slotChartMessageId: null,
+            scheduleImageUrl: null,
+            scheduleMessageId: null,
+            scheduleChannelId: null,
+            uploadedBy: null,
+            uploadedAt: null,
             registrationChannelId: null,
             idpChannelId: null,
           },
@@ -948,7 +1131,512 @@ export async function saveConfigurableTeam(doc) {
     }
   }
 
+  if (record.tournamentId) {
+    await syncTeamPlayerMemberships(record).catch(() => {});
+  }
+
   return record;
+}
+
+/**
+ * Extracts all Discord member assignments (main players + substitutes) from a team document.
+ *
+ * @param {object} teamDoc
+ * @returns {{
+ *   memberships: Array<{ tournamentId: string, discordUserId: string, teamId: string, role: string, status: string, assignedAt: Date, updatedAt: Date }>,
+ *   hasDuplicateWithinTeam: boolean,
+ *   duplicateUserId: string|null
+ * }}
+ */
+export function extractTeamDiscordMemberships(teamDoc) {
+  if (!teamDoc || !teamDoc.tournamentId || !teamDoc.teamId) {
+    return { memberships: [], hasDuplicateWithinTeam: false, duplicateUserId: null };
+  }
+  const now = new Date();
+  const seen = new Set();
+  const memberships = [];
+  let hasDuplicateWithinTeam = false;
+  let duplicateUserId = null;
+
+  const addMember = (rawId, role) => {
+    if (!rawId || typeof rawId !== 'string') return;
+    const uid = rawId.trim();
+    if (!uid) return;
+    if (seen.has(uid)) {
+      hasDuplicateWithinTeam = true;
+      duplicateUserId = uid;
+      return;
+    }
+    seen.add(uid);
+    memberships.push({
+      tournamentId: teamDoc.tournamentId,
+      discordUserId: uid,
+      teamId: teamDoc.teamId,
+      role,
+      status: 'ACTIVE',
+      assignedAt: now,
+      updatedAt: now,
+    });
+  };
+
+  if (Array.isArray(teamDoc.players)) {
+    for (let i = 0; i < teamDoc.players.length; i++) {
+      const p = teamDoc.players[i];
+      const uid = p?.discordId || p?.discordUserId;
+      if (uid) {
+        const role = uid === teamDoc.leaderDiscordId || i === 0 ? 'LEADER' : `MAIN_PLAYER_${i + 1}`;
+        addMember(uid, role);
+      }
+    }
+  }
+
+  if (teamDoc.leaderDiscordId && !seen.has(String(teamDoc.leaderDiscordId).trim())) {
+    addMember(String(teamDoc.leaderDiscordId).trim(), 'LEADER');
+  }
+
+  if (Array.isArray(teamDoc.substitutes)) {
+    for (let j = 0; j < teamDoc.substitutes.length; j++) {
+      const sub = teamDoc.substitutes[j];
+      const uid = sub?.discordId || sub?.discordUserId;
+      if (uid) {
+        addMember(uid, `SUBSTITUTE_${j + 1}`);
+      }
+    }
+  }
+
+  return { memberships, hasDuplicateWithinTeam, duplicateUserId };
+}
+
+/**
+ * Synchronizes player memberships in `discord_tournament_player_memberships` and `localPlayerMemberships`
+ * for a given team document, releasing any old memberships of that same team that are no longer assigned.
+ *
+ * @param {object} teamDoc
+ */
+export async function syncTeamPlayerMemberships(teamDoc) {
+  if (!teamDoc || !teamDoc.tournamentId || !teamDoc.teamId) return [];
+  const { memberships } = extractTeamDiscordMemberships(teamDoc);
+  const newUserIds = new Set(memberships.map((m) => m.discordUserId));
+
+  // Remove old memberships for this team that are no longer in the team's roster/substitutes
+  for (const [key, mem] of Array.from(localPlayerMemberships.entries())) {
+    if (mem.tournamentId === teamDoc.tournamentId && mem.teamId === teamDoc.teamId) {
+      if (!newUserIds.has(mem.discordUserId)) {
+        localPlayerMemberships.delete(key);
+      }
+    }
+  }
+
+  // Upsert current memberships
+  for (const m of memberships) {
+    const key = `${m.tournamentId}:${m.discordUserId}`;
+    const existing = localPlayerMemberships.get(key);
+    localPlayerMemberships.set(key, {
+      ...m,
+      assignedAt: existing?.teamId === m.teamId ? (existing.assignedAt || m.assignedAt) : m.assignedAt,
+      updatedAt: new Date(),
+    });
+  }
+
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_tournament_player_memberships');
+      await col.deleteMany({
+        tournamentId: teamDoc.tournamentId,
+        teamId: teamDoc.teamId,
+        discordUserId: { $nin: Array.from(newUserIds) },
+      });
+      for (const m of memberships) {
+        await col.updateOne(
+          { tournamentId: m.tournamentId, discordUserId: m.discordUserId },
+          {
+            $set: {
+              tournamentId: m.tournamentId,
+              discordUserId: m.discordUserId,
+              teamId: m.teamId,
+              role: m.role,
+              status: 'ACTIVE',
+              updatedAt: new Date(),
+            },
+            $setOnInsert: {
+              assignedAt: m.assignedAt,
+            },
+          },
+          { upsert: true }
+        );
+      }
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error syncing player memberships for team ${teamDoc.teamId}:`, err.message);
+    }
+  }
+
+  return memberships;
+}
+
+/**
+ * Releases all player memberships (main players and substitutes) for a deleted team.
+ *
+ * @param {string} tournamentId
+ * @param {string} teamId
+ */
+export async function releaseTeamPlayerMemberships(tournamentId, teamId) {
+  if (!teamId) return false;
+  for (const [key, mem] of Array.from(localPlayerMemberships.entries())) {
+    if (mem.teamId === teamId && (!tournamentId || mem.tournamentId === tournamentId)) {
+      localPlayerMemberships.delete(key);
+    }
+  }
+
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_tournament_player_memberships');
+      const query = tournamentId ? { tournamentId, teamId } : { teamId };
+      await col.deleteMany(query);
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error releasing player memberships for team ${teamId}:`, err.message);
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Queries all active player memberships for a tournament.
+ * Also reconciles from existing enrolled teams in that tournament so legacy/seeded teams are respected.
+ *
+ * @param {string} tournamentId
+ * @returns {Promise<Array<object>>}
+ */
+export async function getTournamentPlayerMemberships(tournamentId) {
+  if (!tournamentId) return [];
+
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_tournament_player_memberships');
+      const docs = await col.find({ tournamentId, status: 'ACTIVE' }).toArray();
+      for (const d of docs) {
+        localPlayerMemberships.set(`${d.tournamentId}:${d.discordUserId}`, d);
+      }
+      return docs;
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error reading player memberships for tournament ${tournamentId}:`, err.message);
+    }
+  }
+
+  // Ensure any in-memory teams for this tournament have their memberships populated
+  for (const team of localTeams.values()) {
+    if (team.tournamentId === tournamentId) {
+      const { memberships } = extractTeamDiscordMemberships(team);
+      for (const m of memberships) {
+        const key = `${m.tournamentId}:${m.discordUserId}`;
+        if (!localPlayerMemberships.has(key)) {
+          localPlayerMemberships.set(key, m);
+        }
+      }
+    }
+  }
+
+  return Array.from(localPlayerMemberships.values()).filter(
+    (m) => m.tournamentId === tournamentId && m.status === 'ACTIVE'
+  );
+}
+
+/**
+ * Checks whether any of the candidate Discord user IDs are already assigned to another squad in the same tournament.
+ *
+ * @param {string} tournamentId
+ * @param {string[]} discordUserIds
+ * @param {string|null} [excludeTeamId] Team ID allowed to retain its own members (during Edit Squad)
+ * @returns {Promise<{ ok: boolean, conflicts: Array<{ discordUserId: string, teamId: string, teamName?: string, role: string }>, message?: string }>}
+ */
+export async function checkTournamentPlayerExclusivity(tournamentId, discordUserIds = [], excludeTeamId = null) {
+  if (!tournamentId) {
+    return { ok: false, conflicts: [], message: '❌ Tournament ID is required.' };
+  }
+
+  const seen = new Set();
+  for (const rawId of discordUserIds) {
+    if (!rawId) continue;
+    const uid = String(rawId).trim();
+    if (!uid) continue;
+    if (seen.has(uid)) {
+      return {
+        ok: false,
+        code: 'DUPLICATE_SELECTION',
+        conflicts: [{ discordUserId: uid, teamId: excludeTeamId || null, role: 'DUPLICATE' }],
+        message: '❌ Duplicate member selections are not allowed. All selected accounts must be distinct.',
+      };
+    }
+    seen.add(uid);
+  }
+
+  const existingMemberships = await getTournamentPlayerMemberships(tournamentId);
+  const membershipByUser = new Map();
+  for (const m of existingMemberships) {
+    if (m.status === 'ACTIVE') {
+      membershipByUser.set(m.discordUserId, m);
+    }
+  }
+
+  // Also check enrolled teams in the tournament directly as a secondary safeguard
+  const teamsInTournament = await getConfigurableTeamsForTournament(tournamentId);
+  for (const team of teamsInTournament) {
+    const { memberships } = extractTeamDiscordMemberships(team);
+    for (const m of memberships) {
+      if (!membershipByUser.has(m.discordUserId)) {
+        membershipByUser.set(m.discordUserId, { ...m, teamName: team.teamName });
+      }
+    }
+  }
+
+  const conflicts = [];
+  for (const uid of seen) {
+    const existing = membershipByUser.get(uid);
+    if (existing && (!excludeTeamId || existing.teamId !== excludeTeamId)) {
+      const conflictingTeam = teamsInTournament.find((t) => t.teamId === existing.teamId);
+      conflicts.push({
+        discordUserId: uid,
+        teamId: existing.teamId,
+        teamName: conflictingTeam?.teamName || existing.teamName || null,
+        role: existing.role,
+      });
+    }
+  }
+
+  if (conflicts.length > 0) {
+    return {
+      ok: false,
+      code: 'PLAYER_ALREADY_ASSIGNED',
+      conflicts,
+      message: 'One or more selected members are already assigned to another squad in this tournament.',
+    };
+  }
+
+  return { ok: true, conflicts: [] };
+}
+
+/**
+ * Atomically validates player exclusivity (main players + substitutes) and saves the team and its memberships.
+ * Prevents concurrent enrollment conflicts using an atomic tournament lock, unique membership constraints,
+ * and MongoDB transactions where supported.
+ * During Edit Squad (`isEdit: true`), existing assignments are NEVER released before replacements are validated.
+ *
+ * @param {object} teamDoc
+ * @param {{ isEdit?: boolean }} [options]
+ * @returns {Promise<{ ok: boolean, code?: string, message?: string, team?: object, conflicts?: Array<object> }>}
+ */
+export async function saveConfigurableTeamWithExclusivity(teamDoc, options = {}) {
+  if (!teamDoc || !teamDoc.tournamentId) {
+    return { ok: false, code: 'INVALID_TEAM', message: '❌ Invalid team data.' };
+  }
+
+  const tournamentId = teamDoc.tournamentId;
+  const teamId = teamDoc.teamId || crypto.randomUUID();
+  const isEdit = Boolean(options.isEdit);
+  const candidateDoc = { ...teamDoc, teamId };
+
+  return await withAtomicMutex(`lock:tour_player_excl:${tournamentId}`, async () => {
+    // 1. Validate no duplicate player/substitute within the same submission
+    const { memberships, hasDuplicateWithinTeam } = extractTeamDiscordMemberships(candidateDoc);
+    if (hasDuplicateWithinTeam) {
+      return {
+        ok: false,
+        code: 'DUPLICATE_SELECTION',
+        message: '❌ Duplicate member selections are not allowed. All selected accounts must be distinct.',
+      };
+    }
+
+    // 2. Check team name uniqueness within the atomic lock
+    const existingByName = await getConfigurableTeamByName(tournamentId, candidateDoc.teamName);
+    if (existingByName && (!isEdit || existingByName.teamId !== teamId)) {
+      return {
+        ok: false,
+        code: 'DUPLICATE_TEAM_NAME',
+        message: `❌ A squad named **${candidateDoc.teamName}** has already been registered.`,
+      };
+    }
+
+    // 3. Check player & substitute exclusivity across the tournament (excluding this teamId when editing)
+    const allDiscordUserIds = memberships.map((m) => m.discordUserId);
+    const exclCheck = await checkTournamentPlayerExclusivity(
+      tournamentId,
+      allDiscordUserIds,
+      isEdit ? teamId : null
+    );
+    if (!exclCheck.ok) {
+      return exclCheck;
+    }
+
+    // 4. Commit atomically (using MongoDB transaction if connected and supported, plus in-memory state)
+    const now = new Date();
+    const record = {
+      ...candidateDoc,
+      teamId,
+      teamNameLower: (candidateDoc.teamName || '').trim().toLowerCase(),
+      updatedAt: now,
+      createdAt: candidateDoc.createdAt || now,
+    };
+
+    if (isMongoConnected()) {
+      const db = getMongoDb();
+      const teamCol = db.collection('discord_configurable_teams');
+      const memCol = db.collection('discord_tournament_player_memberships');
+      const newUserIds = memberships.map((m) => m.discordUserId);
+
+      try {
+        // Attempt transactional write if client supports sessions/transactions
+        let committedViaTx = false;
+        if (typeof db.client?.startSession === 'function') {
+          const session = db.client.startSession();
+          try {
+            await session.withTransaction(async () => {
+              // Verify no conflicting membership exists inside transaction
+              if (newUserIds.length > 0) {
+                const conflictInDb = await memCol.findOne(
+                  {
+                    tournamentId,
+                    discordUserId: { $in: newUserIds },
+                    ...(isEdit ? { teamId: { $ne: teamId } } : {}),
+                  },
+                  { session }
+                );
+                if (conflictInDb) {
+                  const conflictErr = new Error('One or more selected members are already assigned to another squad in this tournament.');
+                  conflictErr.code = 'PLAYER_ALREADY_ASSIGNED';
+                  throw conflictErr;
+                }
+              }
+
+              // Upsert new/kept player memberships first
+              for (const m of memberships) {
+                await memCol.updateOne(
+                  { tournamentId: m.tournamentId, discordUserId: m.discordUserId },
+                  {
+                    $set: {
+                      tournamentId: m.tournamentId,
+                      discordUserId: m.discordUserId,
+                      teamId: m.teamId,
+                      role: m.role,
+                      status: 'ACTIVE',
+                      updatedAt: now,
+                    },
+                    $setOnInsert: { assignedAt: now },
+                  },
+                  { upsert: true, session }
+                );
+              }
+
+              // Release any old memberships for this team that were replaced during Edit Squad
+              if (isEdit) {
+                await memCol.deleteMany(
+                  {
+                    tournamentId,
+                    teamId,
+                    discordUserId: { $nin: newUserIds },
+                  },
+                  { session }
+                );
+              }
+
+              // Save the team document
+              await teamCol.updateOne(
+                { teamId },
+                { $set: record },
+                { upsert: true, session }
+              );
+            });
+            committedViaTx = true;
+          } catch (txErr) {
+            if (txErr?.code === 'PLAYER_ALREADY_ASSIGNED' || txErr?.code === 11000) {
+              throw txErr;
+            }
+            // Fallback to non-transactional atomic operations if standalone Mongo doesn't support transactions
+          } finally {
+            await session.endSession().catch(() => {});
+          }
+        }
+
+        if (!committedViaTx) {
+          // Non-replica-set fallback using unique index enforcement on discord_tournament_player_memberships
+          const insertedThisAttempt = [];
+          try {
+            for (const m of memberships) {
+              const filter = isEdit
+                ? { tournamentId: m.tournamentId, discordUserId: m.discordUserId, teamId: { $in: [m.teamId] } }
+                : { tournamentId: m.tournamentId, discordUserId: m.discordUserId, teamId: m.teamId };
+              await memCol.updateOne(
+                filter,
+                {
+                  $set: {
+                    tournamentId: m.tournamentId,
+                    discordUserId: m.discordUserId,
+                    teamId: m.teamId,
+                    role: m.role,
+                    status: 'ACTIVE',
+                    updatedAt: now,
+                  },
+                  $setOnInsert: { assignedAt: now },
+                },
+                { upsert: true }
+              );
+              insertedThisAttempt.push(m.discordUserId);
+            }
+          } catch (writeErr) {
+            if (!isEdit && insertedThisAttempt.length > 0) {
+              await memCol.deleteMany({ tournamentId, teamId, discordUserId: { $in: insertedThisAttempt } }).catch(() => {});
+            }
+            throw writeErr;
+          }
+
+          if (isEdit) {
+            await memCol.deleteMany({
+              tournamentId,
+              teamId,
+              discordUserId: { $nin: newUserIds },
+            });
+          }
+
+          await teamCol.updateOne({ teamId }, { $set: record }, { upsert: true });
+        }
+      } catch (err) {
+        if (err?.code === 'PLAYER_ALREADY_ASSIGNED' || err?.code === 11000) {
+          return {
+            ok: false,
+            code: 'PLAYER_ALREADY_ASSIGNED',
+            message: 'One or more selected members are already assigned to another squad in this tournament.',
+          };
+        }
+        console.error(`[ConfigurableTournament] ❌ Database error committing team ${teamId}:`, err.message);
+        return {
+          ok: false,
+          code: 'DB_ERROR',
+          message: `❌ Database error while saving squad: ${err.message}`,
+        };
+      }
+    }
+
+    // Update in-memory stores atomically (releasing old replaced members only after validation succeeded)
+    const newUserIdSet = new Set(memberships.map((m) => m.discordUserId));
+    if (isEdit) {
+      for (const [key, mem] of Array.from(localPlayerMemberships.entries())) {
+        if (mem.tournamentId === tournamentId && mem.teamId === teamId && !newUserIdSet.has(mem.discordUserId)) {
+          localPlayerMemberships.delete(key);
+        }
+      }
+    }
+    for (const m of memberships) {
+      const key = `${m.tournamentId}:${m.discordUserId}`;
+      const prev = localPlayerMemberships.get(key);
+      localPlayerMemberships.set(key, {
+        ...m,
+        assignedAt: prev?.teamId === m.teamId ? (prev.assignedAt || now) : now,
+        updatedAt: now,
+      });
+    }
+    localTeams.set(teamId, { ...record });
+
+    return { ok: true, team: record, memberships };
+  });
 }
 
 export async function getConfigurableTeam(teamId) {
@@ -1004,6 +1692,8 @@ export async function getConfigurableTeamsForUser(tournamentId, discordId) {
           $or: [
             { leaderDiscordId: discordId },
             { 'players.discordId': discordId },
+            { 'substitutes.discordId': discordId },
+            { 'substitutes.discordUserId': discordId },
           ],
         })
         .toArray();
@@ -1020,7 +1710,8 @@ export async function getConfigurableTeamsForUser(tournamentId, discordId) {
     (t) =>
       t.tournamentId === tournamentId &&
       (t.leaderDiscordId === discordId ||
-        (t.players && t.players.some((p) => p.discordId === discordId)))
+        (t.players && t.players.some((p) => p.discordId === discordId || p.discordUserId === discordId)) ||
+        (t.substitutes && t.substitutes.some((s) => s.discordId === discordId || s.discordUserId === discordId)))
   );
 }
 
@@ -1057,10 +1748,14 @@ export async function getEnrolledTeamsCount(tournamentId) {
 
 export async function deleteConfigurableTeam(teamId) {
   if (!teamId) return false;
+  const existingTeam = localTeams.get(teamId) || (await getConfigurableTeam(teamId));
   localTeams.delete(teamId);
 
-  // Remove entries belonging to this team
-  for (const [key, entry] of localEntries.entries()) {
+  // Release all player & substitute memberships for this team
+  await releaseTeamPlayerMemberships(existingTeam?.tournamentId || null, teamId);
+
+  // Remove entries belonging to this team and release their slot states
+  for (const [key, entry] of Array.from(localEntries.entries())) {
     if (entry.teamId === teamId) {
       localEntries.delete(key);
     }
@@ -1078,7 +1773,175 @@ export async function deleteConfigurableTeam(teamId) {
       return false;
     }
   }
+
+  if (existingTeam) {
+    await recordConfigurableAuditLog({
+      action: 'SQUAD_DELETED',
+      tournamentId: existingTeam.tournamentId,
+      guildId: existingTeam.guildId,
+      teamId: existingTeam.teamId,
+      teamName: existingTeam.teamName,
+      actorId: existingTeam.leaderDiscordId,
+      timestamp: new Date(),
+    }).catch(() => {});
+  }
+
   return true;
+}
+
+/**
+ * Records an audit log entry in MongoDB (`discord_audit_logs`) and in-memory (`localAuditLogs`).
+ *
+ * @param {object} auditDoc
+ * @returns {Promise<object>}
+ */
+export async function recordConfigurableAuditLog(auditDoc) {
+  const record = {
+    auditId: crypto.randomUUID(),
+    timestamp: new Date(),
+    ...auditDoc,
+  };
+  localAuditLogs.push(record);
+
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_audit_logs');
+      await col.insertOne({ ...record });
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error writing audit log:`, err.message);
+    }
+  }
+  return record;
+}
+
+/**
+ * Retrieves recorded audit logs matching optional filter criteria.
+ *
+ * @param {{ tournamentId?: string, registrationId?: string, teamId?: string, action?: string }} [filter]
+ * @returns {Promise<Array<object>>}
+ */
+export async function getConfigurableAuditLogs(filter = {}) {
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_audit_logs');
+      const query = {};
+      if (filter.tournamentId) query.tournamentId = filter.tournamentId;
+      if (filter.registrationId) query.registrationId = filter.registrationId;
+      if (filter.teamId) query.teamId = filter.teamId;
+      if (filter.action) query.action = filter.action;
+      return await col.find(query).sort({ timestamp: -1 }).toArray();
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error reading audit logs:`, err.message);
+    }
+  }
+
+  return localAuditLogs.filter((log) => {
+    if (filter.tournamentId && log.tournamentId !== filter.tournamentId) return false;
+    if (filter.registrationId && log.registrationId !== filter.registrationId) return false;
+    if (filter.teamId && log.teamId !== filter.teamId) return false;
+    if (filter.action && log.action !== filter.action) return false;
+    return true;
+  });
+}
+
+/**
+ * Marks a team's registration entry as REMOVED for a specific registration and cycle,
+ * releasing its allocated slot without deleting the team's tournament enrollment or freeing player memberships.
+ *
+ * @param {string} registrationId
+ * @param {string} teamId
+ * @param {string|null} [cycleId]
+ * @param {string|null} [removedBy]
+ * @param {object} [extra]
+ * @returns {Promise<{ ok: boolean, entry?: object, releasedSlot?: number, message?: string }>}
+ */
+export async function markConfigurableEntryRemoved(
+  registrationId,
+  teamId,
+  cycleId = null,
+  removedBy = null,
+  extra = {}
+) {
+  if (!registrationId || !teamId) {
+    return { ok: false, message: 'Registration ID and Team ID are required.' };
+  }
+
+  const entry = await getConfigurableEntry(registrationId, teamId, cycleId);
+  if (!entry) {
+    return { ok: false, code: 'ENTRY_NOT_FOUND', message: 'Team is not currently registered in this registration cycle.' };
+  }
+
+  const now = new Date();
+  const resolvedCycleId = entry.cycleId || cycleId || 'default';
+  const releasedSlot = Number(entry.slotNumber);
+
+  const updatedEntry = {
+    ...entry,
+    status: 'REMOVED',
+    removedAt: now,
+    removedBy: removedBy || null,
+    updatedAt: now,
+    ...extra,
+  };
+
+  // Update in-memory entry to REMOVED (preserving history while making it inactive)
+  for (const [key, item] of Array.from(localEntries.entries())) {
+    if (
+      item.registrationId === registrationId &&
+      item.teamId === teamId &&
+      (!cycleId || item.cycleId === resolvedCycleId || item.cycleId === 'default') &&
+      ACTIVE_ENTRY_STATUSES.includes(item.status)
+    ) {
+      localEntries.set(key, { ...updatedEntry });
+    }
+  }
+  localEntries.set(`${registrationId}:${resolvedCycleId}:${teamId}`, { ...updatedEntry });
+
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_configurable_entries');
+      const query = {
+        registrationId,
+        teamId,
+        status: { $in: ACTIVE_ENTRY_STATUSES },
+      };
+      if (cycleId) {
+        query.cycleId = { $in: [cycleId, 'default'] };
+      }
+      await col.updateMany(query, {
+        $set: {
+          status: 'REMOVED',
+          removedAt: now,
+          removedBy: removedBy || null,
+          updatedAt: now,
+          ...extra,
+        },
+      });
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error marking entry removed:`, err.message);
+      return { ok: false, code: 'DB_ERROR', message: `Database error removing registration entry: ${err.message}` };
+    }
+  }
+
+  // Release the allocated slot state to AVAILABLE (unless locked)
+  const reg = localRegistrations.get(registrationId) || (await getConfigurableRegistration(registrationId));
+  const lockedSet = new Set(reg ? getLockedSlotNumbers(reg, reg.totalSlots) : []);
+  if (Number.isInteger(releasedSlot) && releasedSlot >= 1) {
+    const isLocked = lockedSet.has(releasedSlot);
+    const meta = reg?.lockedSlotsMeta?.[releasedSlot] || {};
+    await saveRegistrationSlotState({
+      registrationId,
+      cycleId: resolvedCycleId,
+      slotNumber: releasedSlot,
+      status: isLocked ? 'LOCKED' : 'AVAILABLE',
+      teamId: null,
+      teamName: null,
+      lockedBy: isLocked ? (meta.lockedBy || null) : null,
+      lockedAt: isLocked ? (meta.lockedAt || null) : null,
+    }).catch(() => {});
+  }
+
+  return { ok: true, entry: updatedEntry, releasedSlot };
 }
 
 // ----------------------------------------------------
@@ -1122,6 +1985,21 @@ export async function saveConfigurableEntry(doc) {
       );
     } catch (err) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error saving entry:`, err.message);
+    }
+  }
+
+  if (Number.isInteger(Number(slotNumber)) && Number(slotNumber) >= 1) {
+    if (['CONFIRMED', 'REGISTERED'].includes(record.status)) {
+      await saveRegistrationSlotState({
+        registrationId: record.registrationId,
+        cycleId: resolvedCycleId,
+        slotNumber: Number(slotNumber),
+        status: 'OCCUPIED',
+        teamId: record.teamId,
+        teamName: record.teamName || null,
+        lockedBy: null,
+        lockedAt: null,
+      }).catch(() => {});
     }
   }
 
@@ -1232,9 +2110,13 @@ export async function getConfigurableEntriesForTeam(teamId) {
 
 export async function deleteConfigurableEntry(registrationId, teamId, cycleId = null) {
   if (!registrationId || !teamId) return false;
+  const releasedSlots = [];
   for (const [key, entry] of Array.from(localEntries.entries())) {
     if (entry.registrationId === registrationId && entry.teamId === teamId) {
       if (!cycleId || entry.cycleId === cycleId || entry.cycleId === 'default') {
+        if (Number.isInteger(Number(entry.slotNumber))) {
+          releasedSlots.push({ slotNumber: Number(entry.slotNumber), cycleId: entry.cycleId || cycleId || 'default' });
+        }
         localEntries.delete(key);
       }
     }
@@ -1253,7 +2135,442 @@ export async function deleteConfigurableEntry(registrationId, teamId, cycleId = 
       return false;
     }
   }
+
+  const reg = localRegistrations.get(registrationId);
+  const lockedSet = new Set(reg ? getLockedSlotNumbers(reg, reg.totalSlots) : []);
+  for (const rel of releasedSlots) {
+    const isLocked = lockedSet.has(rel.slotNumber);
+    const meta = reg?.lockedSlotsMeta?.[rel.slotNumber] || {};
+    await saveRegistrationSlotState({
+      registrationId,
+      cycleId: rel.cycleId,
+      slotNumber: rel.slotNumber,
+      status: isLocked ? 'LOCKED' : 'AVAILABLE',
+      teamId: null,
+      teamName: null,
+      lockedBy: isLocked ? (meta.lockedBy || null) : null,
+      lockedAt: isLocked ? (meta.lockedAt || null) : null,
+    }).catch(() => {});
+  }
+
   return true;
+}
+
+// ----------------------------------------------------
+// INDIVIDUAL SLOT STATE CRUD & LOCK MANAGEMENT
+// ----------------------------------------------------
+
+/**
+ * Persists a single slot state document for a registration and daily cycle.
+ * Schema:
+ * {
+ *   registrationId,
+ *   cycleId,
+ *   slotNumber,
+ *   status: "LOCKED" | "AVAILABLE" | "OCCUPIED",
+ *   teamId: null | string,
+ *   lockedBy: null | string,
+ *   lockedAt: null | Date
+ * }
+ * @param {object} slotDoc
+ * @returns {Promise<object|null>}
+ */
+export async function saveRegistrationSlotState(slotDoc) {
+  if (!slotDoc || !slotDoc.registrationId || !Number.isInteger(Number(slotDoc.slotNumber))) {
+    return null;
+  }
+  const now = new Date();
+  const registrationId = slotDoc.registrationId;
+  const cycleId = slotDoc.cycleId || localRegistrations.get(registrationId)?.currentCycleId || 'default';
+  const slotNumber = Number(slotDoc.slotNumber);
+  const status = ['LOCKED', 'AVAILABLE', 'OCCUPIED'].includes(slotDoc.status) ? slotDoc.status : 'AVAILABLE';
+
+  const record = {
+    registrationId,
+    cycleId,
+    slotNumber,
+    status,
+    teamId: status === 'OCCUPIED' ? (slotDoc.teamId || null) : null,
+    teamName: status === 'OCCUPIED' ? (slotDoc.teamName || null) : null,
+    lockedBy: status === 'LOCKED' ? (slotDoc.lockedBy || null) : null,
+    lockedAt: status === 'LOCKED' ? (slotDoc.lockedAt || now) : null,
+    updatedAt: now,
+  };
+
+  const slotKey = `${registrationId}:${cycleId}:${slotNumber}`;
+  localSlots.set(slotKey, { ...record });
+
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_configurable_slots');
+      await col.updateOne(
+        { registrationId, cycleId, slotNumber },
+        { $set: record },
+        { upsert: true }
+      );
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error saving slot state ${slotKey}:`, err.message);
+    }
+  }
+
+  return record;
+}
+
+/**
+ * Synchronizes and persists all 1..totalSlots individual slot state documents for a registration and cycle.
+ * Preserves locked slots from the registration configuration and occupied team allocations from active entries.
+ *
+ * @param {string} registrationId
+ * @param {string} [cycleId]
+ * @param {object} [preloadedReg]
+ * @returns {Promise<Array<object>>}
+ */
+export async function syncRegistrationSlotStates(registrationId, cycleId = null, preloadedReg = null) {
+  if (!registrationId) return [];
+  const reg = preloadedReg || (await getConfigurableRegistration(registrationId));
+  if (!reg) return [];
+
+  const totalSlots = typeof reg.totalSlots === 'number' && reg.totalSlots > 0 ? reg.totalSlots : 20;
+  const resolvedCycleId = cycleId || reg.currentCycleId || 'default';
+  const lockedSet = new Set(getLockedSlotNumbers(reg, totalSlots));
+  const lockedMeta = reg.lockedSlotsMeta || {};
+
+  const entries = await getConfigurableEntriesForRegistration(registrationId, resolvedCycleId);
+  const occupiedBySlot = new Map();
+  for (const e of entries) {
+    const sNum = Number(e.slotNumber);
+    if (Number.isInteger(sNum) && sNum >= 1 && sNum <= totalSlots && !occupiedBySlot.has(sNum)) {
+      occupiedBySlot.set(sNum, e);
+    }
+  }
+
+  const now = new Date();
+  const slotStates = [];
+  const bulkOps = [];
+
+  for (let slot = 1; slot <= totalSlots; slot++) {
+    const slotKey = `${registrationId}:${resolvedCycleId}:${slot}`;
+    const existingSlotDoc = localSlots.get(slotKey);
+    const occupiedEntry = occupiedBySlot.get(slot);
+    const isLocked = lockedSet.has(slot);
+
+    let status = 'AVAILABLE';
+    let teamId = null;
+    let teamName = null;
+    let lockedBy = null;
+    let lockedAt = null;
+
+    if (occupiedEntry && !isLocked) {
+      status = 'OCCUPIED';
+      teamId = occupiedEntry.teamId || null;
+      teamName = occupiedEntry.teamName || null;
+    } else if (isLocked) {
+      status = 'LOCKED';
+      const meta = lockedMeta[slot] || {};
+      lockedBy = meta.lockedBy ?? existingSlotDoc?.lockedBy ?? null;
+      lockedAt = meta.lockedAt ?? existingSlotDoc?.lockedAt ?? now;
+    } else if (occupiedEntry) {
+      // Safeguard: never silently drop an existing occupied team allocation
+      status = 'OCCUPIED';
+      teamId = occupiedEntry.teamId || null;
+      teamName = occupiedEntry.teamName || null;
+    }
+
+    const record = {
+      registrationId,
+      cycleId: resolvedCycleId,
+      slotNumber: slot,
+      status,
+      teamId,
+      teamName,
+      lockedBy,
+      lockedAt,
+      updatedAt: now,
+    };
+
+    localSlots.set(slotKey, record);
+    slotStates.push(record);
+
+    if (isMongoConnected()) {
+      bulkOps.push({
+        updateOne: {
+          filter: { registrationId, cycleId: resolvedCycleId, slotNumber: slot },
+          update: { $set: record },
+          upsert: true,
+        },
+      });
+    }
+  }
+
+  // Clean up any slot documents beyond totalSlots if capacity was reduced
+  for (const [key, doc] of Array.from(localSlots.entries())) {
+    if (doc.registrationId === registrationId && doc.cycleId === resolvedCycleId && doc.slotNumber > totalSlots) {
+      localSlots.delete(key);
+    }
+  }
+
+  if (isMongoConnected() && bulkOps.length > 0) {
+    try {
+      const col = getMongoDb().collection('discord_configurable_slots');
+      await col.bulkWrite(bulkOps, { ordered: false });
+      await col.deleteMany({
+        registrationId,
+        cycleId: resolvedCycleId,
+        slotNumber: { $gt: totalSlots },
+      });
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error syncing slot states for ${registrationId}:`, err.message);
+    }
+  }
+
+  return slotStates;
+}
+
+/**
+ * Retrieves the ordered array of individual slot states (1..totalSlots) for a registration and cycle.
+ * @param {string} registrationId
+ * @param {string} [cycleId]
+ * @returns {Promise<Array<object>>}
+ */
+export async function getRegistrationSlotStates(registrationId, cycleId = null) {
+  if (!registrationId) return [];
+  const reg = await getConfigurableRegistration(registrationId);
+  if (!reg) return [];
+
+  const resolvedCycleId = cycleId || reg.currentCycleId || 'default';
+  if (isMongoConnected()) {
+    try {
+      const col = getMongoDb().collection('discord_configurable_slots');
+      const docs = await col
+        .find({ registrationId, cycleId: resolvedCycleId })
+        .sort({ slotNumber: 1 })
+        .toArray();
+      for (const d of docs) {
+        d.slotNumber = Number(d.slotNumber);
+        localSlots.set(`${registrationId}:${resolvedCycleId}:${d.slotNumber}`, d);
+      }
+    } catch (err) {
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error reading slot states for ${registrationId}:`, err.message);
+    }
+  }
+
+  return syncRegistrationSlotStates(registrationId, resolvedCycleId, reg);
+}
+
+/**
+ * Atomically locks one or more individual slots for a specific registration.
+ * Enforces Occupied Slot Protection: refuses to lock any slot currently assigned to a team
+ * unless the team is removed or reassigned first.
+ *
+ * @param {string} registrationId
+ * @param {number|Array<number|string>} slotNumbersInput
+ * @param {string} [lockedBy]
+ * @param {string} [cycleId]
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   code?: string,
+ *   message?: string,
+ *   conflicts?: Array<{ slotNumber: number, teamId: string, teamName: string }>,
+ *   lockedSlots?: number[],
+ *   newlyLocked?: number[],
+ *   slotStates?: Array<object>,
+ *   registration?: object
+ * }>}
+ */
+export async function lockRegistrationSlots(registrationId, slotNumbersInput, lockedBy = null, cycleId = null) {
+  if (!registrationId) {
+    return { ok: false, code: 'INVALID_REGISTRATION', message: '❌ Registration not found.' };
+  }
+
+  const lockKey = `lock:reg_confirm:${registrationId}`;
+  await acquireLock(lockKey, 10, 3000);
+  try {
+    const reg = await getConfigurableRegistration(registrationId);
+    if (!reg) {
+      return { ok: false, code: 'INVALID_REGISTRATION', message: '❌ Registration instance not found.' };
+    }
+
+    const totalSlots = typeof reg.totalSlots === 'number' && reg.totalSlots > 0 ? reg.totalSlots : 20;
+    const rawList = Array.isArray(slotNumbersInput) ? slotNumbersInput : [slotNumbersInput];
+    const requestedSlots = [];
+    for (const item of rawList) {
+      const num = typeof item === 'number' ? Math.floor(item) : parseInt(String(item).trim(), 10);
+      if (!Number.isInteger(num) || num < 1 || num > totalSlots) {
+        return {
+          ok: false,
+          code: 'INVALID_SLOT_NUMBER',
+          message: `❌ Invalid slot number "${item}". Slot numbers must be between 1 and ${totalSlots}.`,
+        };
+      }
+      if (!requestedSlots.includes(num)) {
+        requestedSlots.push(num);
+      }
+    }
+
+    if (requestedSlots.length === 0) {
+      return { ok: false, code: 'NO_SLOTS_SELECTED', message: '❌ Please select at least one slot to lock.' };
+    }
+
+    const resolvedCycleId = cycleId || reg.currentCycleId || 'default';
+    const activeEntries = await getConfigurableEntriesForRegistration(registrationId, resolvedCycleId);
+    const occupiedBySlot = new Map();
+    for (const entry of activeEntries) {
+      const sNum = Number(entry.slotNumber);
+      if (Number.isInteger(sNum) && !occupiedBySlot.has(sNum)) {
+        occupiedBySlot.set(sNum, entry);
+      }
+    }
+
+    // Occupied Slot Protection: never lock a slot currently assigned to a team without handling the team first
+    const conflicts = [];
+    for (const slotNum of requestedSlots) {
+      const occ = occupiedBySlot.get(slotNum);
+      if (occ) {
+        conflicts.push({
+          slotNumber: slotNum,
+          teamId: occ.teamId,
+          teamName: occ.teamName || 'Assigned Team',
+        });
+      }
+    }
+
+    if (conflicts.length > 0) {
+      const primaryConflict = conflicts[0];
+      const msg =
+        `This slot is currently assigned to ${primaryConflict.teamName}. Remove or reassign the team before locking this slot.`;
+      return {
+        ok: false,
+        code: 'SLOT_OCCUPIED',
+        message: msg,
+        conflicts,
+      };
+    }
+
+    const now = new Date();
+    const existingLocked = new Set(getLockedSlotNumbers(reg, totalSlots));
+    const newlyLocked = [];
+    const lockedMeta = { ...(reg.lockedSlotsMeta || {}) };
+
+    for (const slotNum of requestedSlots) {
+      if (!existingLocked.has(slotNum)) {
+        newlyLocked.push(slotNum);
+      }
+      existingLocked.add(slotNum);
+      lockedMeta[slotNum] = {
+        lockedBy: lockedBy || lockedMeta[slotNum]?.lockedBy || null,
+        lockedAt: lockedMeta[slotNum]?.lockedAt || now,
+      };
+    }
+
+    const updatedLockedSlots = Array.from(existingLocked).sort((a, b) => a - b);
+    reg.lockedSlots = updatedLockedSlots;
+    reg.reservedSlots = updatedLockedSlots.length;
+    reg.lockedSlotsMeta = lockedMeta;
+
+    // Check if locking slots caused all usable slots to be filled
+    const unlockedCapacity = Math.max(0, totalSlots - updatedLockedSlots.length);
+    if (reg.status === 'OPEN' && activeEntries.length >= unlockedCapacity && unlockedCapacity >= 0) {
+      reg.status = 'CLOSED';
+    }
+
+    const savedReg = await saveConfigurableRegistration(reg);
+    const slotStates = await syncRegistrationSlotStates(registrationId, resolvedCycleId, savedReg);
+
+    return {
+      ok: true,
+      lockedSlots: updatedLockedSlots,
+      newlyLocked,
+      slotStates,
+      registration: savedReg,
+    };
+  } finally {
+    await releaseLock(lockKey);
+  }
+}
+
+/**
+ * Atomically unlocks one or more individual slots for a specific registration,
+ * immediately restoring them to AVAILABLE for future registration.
+ *
+ * @param {string} registrationId
+ * @param {number|Array<number|string>} slotNumbersInput
+ * @param {string} [unlockedBy]
+ * @param {string} [cycleId]
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   code?: string,
+ *   message?: string,
+ *   lockedSlots?: number[],
+ *   newlyUnlocked?: number[],
+ *   slotStates?: Array<object>,
+ *   registration?: object
+ * }>}
+ */
+export async function unlockRegistrationSlots(registrationId, slotNumbersInput, unlockedBy = null, cycleId = null) {
+  if (!registrationId) {
+    return { ok: false, code: 'INVALID_REGISTRATION', message: '❌ Registration not found.' };
+  }
+
+  const lockKey = `lock:reg_confirm:${registrationId}`;
+  await acquireLock(lockKey, 10, 3000);
+  try {
+    const reg = await getConfigurableRegistration(registrationId);
+    if (!reg) {
+      return { ok: false, code: 'INVALID_REGISTRATION', message: '❌ Registration instance not found.' };
+    }
+
+    const totalSlots = typeof reg.totalSlots === 'number' && reg.totalSlots > 0 ? reg.totalSlots : 20;
+    const rawList = Array.isArray(slotNumbersInput) ? slotNumbersInput : [slotNumbersInput];
+    const requestedSlots = [];
+    for (const item of rawList) {
+      const num = typeof item === 'number' ? Math.floor(item) : parseInt(String(item).trim(), 10);
+      if (!Number.isInteger(num) || num < 1 || num > totalSlots) {
+        return {
+          ok: false,
+          code: 'INVALID_SLOT_NUMBER',
+          message: `❌ Invalid slot number "${item}". Slot numbers must be between 1 and ${totalSlots}.`,
+        };
+      }
+      if (!requestedSlots.includes(num)) {
+        requestedSlots.push(num);
+      }
+    }
+
+    if (requestedSlots.length === 0) {
+      return { ok: false, code: 'NO_SLOTS_SELECTED', message: '❌ Please select at least one locked slot to unlock.' };
+    }
+
+    const resolvedCycleId = cycleId || reg.currentCycleId || 'default';
+    const existingLocked = new Set(getLockedSlotNumbers(reg, totalSlots));
+    const newlyUnlocked = [];
+    const lockedMeta = { ...(reg.lockedSlotsMeta || {}) };
+
+    for (const slotNum of requestedSlots) {
+      if (existingLocked.has(slotNum)) {
+        existingLocked.delete(slotNum);
+        newlyUnlocked.push(slotNum);
+      }
+      delete lockedMeta[slotNum];
+    }
+
+    const updatedLockedSlots = Array.from(existingLocked).sort((a, b) => a - b);
+    reg.lockedSlots = updatedLockedSlots;
+    reg.reservedSlots = updatedLockedSlots.length;
+    reg.lockedSlotsMeta = lockedMeta;
+
+    const savedReg = await saveConfigurableRegistration(reg);
+    const slotStates = await syncRegistrationSlotStates(registrationId, resolvedCycleId, savedReg);
+
+    return {
+      ok: true,
+      lockedSlots: updatedLockedSlots,
+      newlyUnlocked,
+      slotStates,
+      registration: savedReg,
+    };
+  } finally {
+    await releaseLock(lockKey);
+  }
 }
 
 export async function getRegistrationEntriesCount(registrationId, cycleId = null) {
@@ -1275,23 +2592,57 @@ export async function getRegistrationEntriesCount(registrationId, cycleId = null
 }
 
 /**
- * Finds the lowest unassigned slot number between 1 and totalSlots.
- * Reserved slots always occupy the beginning (Slot 01 to Slot reservedSlots).
- * Formula: firstAvailableSlot = reservedSlots + 1
+ * Dynamically identifies all locked and occupied slots for the registration and cycle,
+ * and returns the lowest available unlocked slot number between 1 and totalSlots.
+ * Never allocates a locked slot or an occupied slot.
  *
  * @param {string} registrationId
- * @param {number} totalSlots
- * @param {number} [reservedSlotsCount]
+ * @param {number} [totalSlots]
+ * @param {number|Array<number>|object} [reservedSlotsInput]
  * @param {string} [cycleId]
  * @returns {Promise<number|null>} Returns null if full.
  */
-export async function getNextAvailableSlot(registrationId, totalSlots, reservedSlotsCount = 0, cycleId = null) {
-  const entries = await getConfigurableEntriesForRegistration(registrationId, cycleId);
-  const occupiedSlots = new Set(entries.map((e) => Number(e.slotNumber)));
-  const rCount = parseReservedSlots(reservedSlotsCount, totalSlots);
+export async function getNextAvailableSlot(registrationId, totalSlots = null, reservedSlotsInput = 0, cycleId = null) {
+  const reg = registrationId ? await getConfigurableRegistration(registrationId) : null;
+  const effectiveTotal =
+    (typeof totalSlots === 'number' && totalSlots > 0 ? Math.floor(totalSlots) : null) ||
+    (typeof reg?.totalSlots === 'number' && reg.totalSlots > 0 ? Math.floor(reg.totalSlots) : 20);
+  const resolvedCycleId = cycleId || reg?.currentCycleId || null;
 
-  for (let slot = rCount + 1; slot <= totalSlots; slot++) {
-    if (!occupiedSlots.has(slot)) {
+  const entries = await getConfigurableEntriesForRegistration(registrationId, resolvedCycleId);
+  const occupiedSlots = new Set(entries.map((e) => Number(e.slotNumber)).filter((n) => Number.isInteger(n)));
+
+  // Build locked slots set from registration configuration, direct input, and cycle slot state documents
+  const lockedSlotsSet = new Set();
+  if (reg) {
+    for (const s of getLockedSlotNumbers(reg, effectiveTotal)) {
+      lockedSlotsSet.add(s);
+    }
+  }
+
+  if (Array.isArray(reservedSlotsInput) || (reservedSlotsInput && typeof reservedSlotsInput === 'object')) {
+    for (const s of getLockedSlotNumbers(reservedSlotsInput, effectiveTotal)) {
+      lockedSlotsSet.add(s);
+    }
+  } else if (lockedSlotsSet.size === 0 && reservedSlotsInput) {
+    for (const s of getLockedSlotNumbers(reservedSlotsInput, effectiveTotal)) {
+      lockedSlotsSet.add(s);
+    }
+  }
+
+  const slotLookupCycle = resolvedCycleId || 'default';
+  for (let slot = 1; slot <= effectiveTotal; slot++) {
+    const slotDoc = localSlots.get(`${registrationId}:${slotLookupCycle}:${slot}`);
+    if (slotDoc?.status === 'LOCKED' && lockedSlotsSet.has(slot)) {
+      lockedSlotsSet.add(slot);
+    }
+    if (slotDoc?.status === 'OCCUPIED' && slotDoc.teamId) {
+      occupiedSlots.add(slot);
+    }
+  }
+
+  for (let slot = 1; slot <= effectiveTotal; slot++) {
+    if (!lockedSlotsSet.has(slot) && !occupiedSlots.has(slot)) {
       return slot;
     }
   }
@@ -1391,6 +2742,7 @@ export async function archiveActiveRegistrationCycle(registrationId, extraData =
   const cycleDate = restExtra.cycleDate || reg.currentCycleDate || getCurrentTimeInTimezone(reg.timezone || 'Asia/Kolkata', now).dateString;
   const cycleId = restExtra.cycleId || reg.currentCycleId || `${registrationId}:${cycleDate}`;
 
+  const lockedSlots = getLockedSlotNumbers(reg, reg.totalSlots);
   const cycleRecord = {
     cycleId,
     registrationId: reg.registrationId,
@@ -1407,7 +2759,8 @@ export async function archiveActiveRegistrationCycle(registrationId, extraData =
       registeredAt: e.registeredAt,
     })),
     totalSlots: reg.totalSlots,
-    reservedSlots: parseReservedSlots(reg.reservedSlots, reg.totalSlots),
+    reservedSlots: lockedSlots.length,
+    lockedSlots,
     status: 'COMPLETED',
     startedAt: reg.currentCycleStartedAt || null,
     endedAt: now,
@@ -1440,6 +2793,9 @@ export async function archiveActiveRegistrationCycle(registrationId, extraData =
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error archiving entries for ${registrationId}:`, err.message);
     }
   }
+
+  // Restore new/current cycle slot states: preserve LOCKED slots, restore all unlocked slots to AVAILABLE
+  await syncRegistrationSlotStates(registrationId, reg.currentCycleId || 'default', reg).catch(() => {});
 
   return cycleRecord;
 }

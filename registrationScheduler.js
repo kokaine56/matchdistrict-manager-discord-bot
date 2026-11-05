@@ -10,9 +10,15 @@ import {
   getCurrentTimeInTimezone,
   computeNextScheduleTimestamps,
   parseReservedSlots,
+  getLockedSlotNumbers,
+  syncRegistrationSlotStates,
   cleanUpStaleConfigurableRegistrationsAndEntries,
 } from './configurableTournamentData.js';
-import { updateRegistrationMessage, updateManageDashboardMessage } from './configurableRegistrationService.js';
+import {
+  updateRegistrationMessage,
+  updateManageDashboardMessage,
+  reconcileRegistrationScheduleMessage,
+} from './configurableRegistrationService.js';
 import { updateSlotChartMessage, syncRegistrationSlotList } from './slotChartService.js';
 import { refreshDashboard, reorderTournamentCategoryChannels } from './configurableTournamentService.js';
 import { sendOrUpdateEnrollmentMessage } from './teamEnrollmentService.js';
@@ -359,6 +365,8 @@ export async function executeDailyCycleReset(client, registrationId, force = fal
       reason: 'SCHEDULED_DAILY_RESET',
     });
 
+    await syncRegistrationSlotStates(registrationId, savedReg.currentCycleId, savedReg).catch(() => {});
+
     if (client) {
       await syncRegistrationSlotList(registrationId, savedReg.currentCycleId, client).catch(() => {});
 
@@ -448,7 +456,7 @@ export async function executeExactDueTransition(client, regOrId, customNow = nul
         // Respect manual close action
       } else {
         const entries = await getConfigurableEntriesForRegistration(reg.registrationId, reg.currentCycleId);
-        const reservedCount = parseReservedSlots(reg.reservedSlots, reg.totalSlots);
+        const reservedCount = getLockedSlotNumbers(reg, reg.totalSlots).length;
         const maxAvailable = reg.totalSlots - reservedCount;
 
         if (entries.length < maxAvailable) {
@@ -591,8 +599,10 @@ export async function reconcileConfigurableTournaments(client) {
       // 3. Reconcile registration instances, timers, and IDP permissions
       const registrations = await getConfigurableRegistrationsForTournament(tour.tournamentId);
       for (const reg of registrations) {
+        await syncRegistrationSlotStates(reg.registrationId, reg.currentCycleId, reg).catch(() => {});
         await armRegistrationTimer(client, reg).catch(() => {});
         await updateRegistrationMessage(client, reg.registrationId).catch(() => {});
+        await reconcileRegistrationScheduleMessage(client, reg).catch(() => {});
         await updateSlotChartMessage(client, reg.registrationId).catch(() => {});
 
         // Reconcile IDP channel permission overwrites for leaders
@@ -613,6 +623,7 @@ export async function reconcileConfigurableTournaments(client) {
                 }).catch(() => {});
               }
               const entries = await getConfigurableEntriesForRegistration(reg.registrationId);
+              const activeLeaderIds = new Set(entries.map((e) => e.leaderDiscordId).filter(Boolean));
               for (const entry of entries) {
                 if (entry.leaderDiscordId) {
                   await idpChannel.permissionOverwrites
@@ -629,6 +640,20 @@ export async function reconcileConfigurableTournaments(client) {
                     })
                     .catch(() => {});
                 }
+              }
+
+              if (Array.isArray(reg.pendingIdpRevocations) && reg.pendingIdpRevocations.length > 0 && typeof idpChannel.permissionOverwrites?.delete === 'function') {
+                const stillPending = [];
+                for (const revokedLeaderId of reg.pendingIdpRevocations) {
+                  if (activeLeaderIds.has(revokedLeaderId)) continue;
+                  try {
+                    await idpChannel.permissionOverwrites.delete(revokedLeaderId);
+                  } catch {
+                    stillPending.push(revokedLeaderId);
+                  }
+                }
+                reg.pendingIdpRevocations = stillPending;
+                await saveConfigurableRegistration(reg).catch(() => {});
               }
             }
           } catch (err) {

@@ -178,6 +178,7 @@ import {
   handleConfigurableChannelUpdate,
   handleConfigurableChannelDelete,
 } from './configurableTournamentService.js';
+import { handleScheduleImageUploadMessage } from './configurableRegistrationService.js';
 import {
   startRegistrationScheduler,
   reconcileConfigurableTournaments,
@@ -2471,6 +2472,10 @@ client.on(Events.MessageCreate, async (message) => {
     // Check if message is a submission screenshot upload in temporary upload channel/thread
     const handledScreenshot = await handleSubmissionScreenshotUpload(message);
     if (handledScreenshot) return;
+
+    // Check if message is a registration schedule image upload from an organiser
+    const handledScheduleUpload = await handleScheduleImageUploadMessage(message);
+    if (handledScheduleUpload) return;
 
     const content = message.content?.trim();
 

@@ -15,6 +15,7 @@ import {
   getConfigurableTournament,
   getConfigurableRegistration,
   getConfigurableRegistrationsForTournament,
+  getAllActiveConfigurableRegistrations,
   findConfigurableRegistrationByChannelId,
   findConfigurableRegistrationByMessageId,
   saveConfigurableRegistration,
@@ -28,6 +29,11 @@ import {
   saveConfigurableEntry,
   deleteConfigurableEntry,
   parseReservedSlots,
+  getLockedSlotNumbers,
+  getRegistrationSlotStates,
+  syncRegistrationSlotStates,
+  lockRegistrationSlots,
+  unlockRegistrationSlots,
   parseTimeString,
   getCurrentTimeInTimezone,
   evaluateDailyCycleStatus,
@@ -42,6 +48,9 @@ import {
   buildSlotChartEmbed,
   buildSlotListText,
   formatSlotListCodeBlock,
+  getFilledSlotCounter,
+  changeTeamSlot,
+  removeTeamFromRegistration,
 } from './slotChartService.js';
 import {
   TOURNAMENT_DENIED_PERMISSIONS,
@@ -100,7 +109,7 @@ export function formatRegistrationStartTime(registration) {
 export function resolveRegistrationStatus(registration, filledCount = 0) {
   if (!registration) return 'CLOSED';
   const totalSlots = Number(registration.totalSlots) > 0 ? Number(registration.totalSlots) : 20;
-  const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
+  const reservedCount = getLockedSlotNumbers(registration, totalSlots).length;
   const maxAvailable = Math.max(0, totalSlots - reservedCount);
 
   if (registration.status === 'FULL' || (maxAvailable > 0 && filledCount >= maxAvailable)) {
@@ -222,7 +231,7 @@ export function evaluateEffectiveRegistrationOpenState(registration, filledCount
   }
 
   const totalSlots = Number(registration.totalSlots) > 0 ? Number(registration.totalSlots) : 20;
-  const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
+  const reservedCount = getLockedSlotNumbers(registration, totalSlots).length;
   const maxAvailable = Math.max(0, totalSlots - reservedCount);
 
   if (maxAvailable > 0 && filledCount >= maxAvailable) {
@@ -395,7 +404,7 @@ export function buildRegistrationDescriptionText(registration, filledCount = 0) 
   const timeStr = formatRegistrationStartTime(registration);
   const statusStr = resolveRegistrationStatus(registration, filledCount);
   const totalSlots = Number(registration?.totalSlots) > 0 ? Number(registration.totalSlots) : 20;
-  const reservedCount = parseReservedSlots(registration?.reservedSlots, totalSlots);
+  const reservedCount = getLockedSlotNumbers(registration, totalSlots).length;
   const unlockedSlots = Math.max(0, totalSlots - reservedCount);
   const parsedMatches = parseInt(registration?.matches, 10);
   const matches = !isNaN(parsedMatches) && parsedMatches > 0 ? parsedMatches : 1;
@@ -520,11 +529,12 @@ export async function updateRegistrationMessage(client, registrationId, options 
         if (recent && typeof recent.find === 'function') {
           existing = recent.find(
             (m) =>
-              m.components?.some((r) =>
+              m.id !== registration.scheduleMessageId &&
+              (m.components?.some((r) =>
                 r.components?.some((b) => (b.customId || b.data?.custom_id) === `md_cfg_reg_btn_${registrationId}`)
               ) ||
-              m.embeds?.some((e) => (e.title || e.data?.title) === headerTitle) ||
-              (typeof m.content === 'string' && registration.displayName && m.content.startsWith(registration.displayName))
+                m.embeds?.some((e) => (e.title || e.data?.title) === headerTitle) ||
+                (typeof m.content === 'string' && registration.displayName && m.content.startsWith(registration.displayName)))
           );
         }
       } catch {}
@@ -1092,7 +1102,7 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
   let currentCycleId = registration.currentCycleId;
   let activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
   let filledCount = activeEntries.length;
-  const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
+  const reservedCount = getLockedSlotNumbers(registration, registration.totalSlots).length;
   const maxAvailable = Math.max(0, registration.totalSlots - reservedCount);
 
   if (filledCount >= maxAvailable || registration.status === 'FULL') {
@@ -1263,7 +1273,7 @@ export async function handleSelectRegistrationTeam(interaction, registrationId, 
     });
   }
 
-  const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
+  const reservedCount = getLockedSlotNumbers(registration, registration.totalSlots).length;
   const maxAvailable = Math.max(0, registration.totalSlots - reservedCount);
   const freeSlots = Math.max(0, maxAvailable - filledCount);
 
@@ -1514,9 +1524,10 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       });
     }
 
-    // Verify capacity against non-reserved slots
+    // Verify capacity against non-reserved/unlocked slots
     const filledCount = activeEntries.length;
-    const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
+    const lockedSlotNumbers = getLockedSlotNumbers(registration, registration.totalSlots);
+    const reservedCount = lockedSlotNumbers.length;
     const maxAvailable = Math.max(0, registration.totalSlots - reservedCount);
 
     if (filledCount >= maxAvailable) {
@@ -1537,8 +1548,13 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       });
     }
 
-    // Step 3: Allocate an available unlocked slot atomically
-    const rawSlotNumber = await getNextAvailableSlot(registrationId, registration.totalSlots, reservedCount, currentCycleId);
+    // Step 3: Allocate an available unlocked slot atomically (skips all locked & occupied slots)
+    const rawSlotNumber = await getNextAvailableSlot(
+      registrationId,
+      registration.totalSlots,
+      lockedSlotNumbers,
+      currentCycleId
+    );
     if (!rawSlotNumber) {
       console.warn(`[ConfigurableRegistration] ❌ Slot allocation failed: none available [interactionId: ${interactionId}, regId: ${registrationId}]`);
       return respondToConfirmationInteraction(interaction, {
@@ -1764,7 +1780,7 @@ export async function handleManageRegistrationsButton(interaction, tournamentId)
  */
 export function buildManageDashboardPayload(registration, filledCount = 0) {
   const totalSlots = registration.totalSlots || 20;
-  const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
+  const reservedCount = getLockedSlotNumbers(registration, totalSlots).length;
   const maxAvailable = Math.max(0, totalSlots - reservedCount);
   const availableSlots = Math.max(0, maxAvailable - filledCount);
   const isOpen = registration.status === 'OPEN';
@@ -1799,6 +1815,12 @@ export function buildManageDashboardPayload(registration, filledCount = 0) {
     .setEmoji('🗑️')
     .setStyle(ButtonStyle.Danger);
 
+  const scheduleBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_schedule_${registration.registrationId}`)
+    .setLabel('Schedule')
+    .setEmoji('📅')
+    .setStyle(ButtonStyle.Primary);
+
   const row = new ActionRowBuilder().addComponents(
     editSettingsBtn,
     toggleStatusBtn,
@@ -1807,6 +1829,9 @@ export function buildManageDashboardPayload(registration, filledCount = 0) {
     deleteBtn
   );
 
+  const row2 = new ActionRowBuilder().addComponents(scheduleBtn);
+
+  const hasSchedule = Boolean(registration.scheduleImageUrl && registration.scheduleMessageId);
   const content =
     `🛠️ **Managing: ${registration.displayName}**\n\n` +
     `• **Name:** ${registration.displayName}\n` +
@@ -1818,10 +1843,11 @@ export function buildManageDashboardPayload(registration, filledCount = 0) {
     `• **Available Slots:** \`${availableSlots}\`\n` +
     `• **Daily Start Time:** \`${registration.dailyStartTime || 'N/A'}\` (${registration.timezone || 'IST'})\n` +
     `• **Daily Reset Time:** \`${registration.dailyResetTime || 'N/A'}\` (${registration.timezone || 'IST'})\n` +
+    `• **Schedule:** ${hasSchedule ? 'Uploaded ✅' : 'Not uploaded'}\n` +
     `• **Registration Channel:** <#${registration.registrationChannelId}>\n` +
     `• **IDP Channel:** <#${registration.idpChannelId}>\n`;
 
-  return { content, components: [row] };
+  return { content, components: [row, row2] };
 }
 
 /**
@@ -1940,7 +1966,7 @@ export async function handleToggleStatus(interaction, registrationId) {
   const currentCycleId = registration.currentCycleId || null;
   const filledCount = await getRegistrationEntriesCount(registrationId, currentCycleId);
   const totalSlots = registration.totalSlots || 20;
-  const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
+  const reservedCount = getLockedSlotNumbers(registration, totalSlots).length;
   const maxAvailable = Math.max(0, totalSlots - reservedCount);
 
   const isOpening = registration.status !== 'OPEN';
@@ -2155,7 +2181,19 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
     newMatches = parsedMatches;
   }
 
-  const newReservedCount = parseReservedSlots(rawReserved, rawSlots);
+  const existingLocked = getLockedSlotNumbers(registration, rawSlots);
+  let newLockedSlots = [];
+  if (typeof rawReserved === 'string' && /[\s,;]/.test(rawReserved.trim())) {
+    newLockedSlots = getLockedSlotNumbers(rawReserved, rawSlots);
+  } else {
+    const requestedCount = parseReservedSlots(rawReserved, rawSlots);
+    if (existingLocked.length === requestedCount && existingLocked.length > 0) {
+      newLockedSlots = existingLocked;
+    } else {
+      newLockedSlots = getLockedSlotNumbers(requestedCount, rawSlots);
+    }
+  }
+  const newReservedCount = newLockedSlots.length;
   if (newReservedCount >= rawSlots) {
     return interaction.editReply({
       content: '❌ Reserved slots count cannot equal or exceed total capacity.',
@@ -2172,9 +2210,9 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
     });
   }
 
-  // Safeguard: newly reserved slots occupy 1..newReservedCount.
-  // Check if any existing team is assigned to slotNumber <= newReservedCount
-  const conflictingEntries = entries.filter((e) => e.slotNumber <= newReservedCount);
+  // Safeguard: check if any existing team is assigned to any of the newly locked slots
+  const newLockedSet = new Set(newLockedSlots);
+  const conflictingEntries = entries.filter((e) => newLockedSet.has(Number(e.slotNumber)));
   if (conflictingEntries.length > 0) {
     return interaction.editReply({
       content: `❌ Slot(s) ${conflictingEntries.map((e) => `#${e.slotNumber}`).join(', ')} cannot be reserved because they are already occupied by registered teams (${conflictingEntries.map((e) => e.teamName).join(', ')}).`,
@@ -2243,6 +2281,7 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
   }
 
   registration.totalSlots = rawSlots;
+  registration.lockedSlots = newLockedSlots;
   registration.reservedSlots = newReservedCount;
   registration.matches = newMatches;
   registration.dailyStartTime = parsedStart.formatted;
@@ -2276,7 +2315,85 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
 }
 
 /**
- * Shows the current slot chart code block to the organiser.
+ * Builds the View Current Slot Chart payload combining the slot list code block and organiser controls:
+ * - 🔒 Manage Reserved Slots
+ * - 🔄 Refresh Slot Chart
+ * - ⬅️ Back
+ *
+ * @param {object} [tournament]
+ * @param {object} registration
+ * @param {Array<object>} [entries]
+ * @returns {{ content: string, components: ActionRowBuilder[] }}
+ */
+export function buildSlotChartViewPayload(tournament, registration, entries = []) {
+  const text = formatSlotListCodeBlock(buildSlotListText(tournament, registration, entries));
+
+  const manageSlotsBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_manage_slots_${registration.registrationId}`)
+    .setLabel('Manage Reserved Slots')
+    .setEmoji('🔒')
+    .setStyle(ButtonStyle.Primary);
+
+  const refreshChartBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_refresh_slotchart_${registration.registrationId}`)
+    .setLabel('Refresh Slot Chart')
+    .setEmoji('🔄')
+    .setStyle(ButtonStyle.Secondary);
+
+  const backBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_back_to_manage_${registration.registrationId}`)
+    .setLabel('Back')
+    .setEmoji('⬅️')
+    .setStyle(ButtonStyle.Secondary);
+
+  const row = new ActionRowBuilder().addComponents(manageSlotsBtn, refreshChartBtn, backBtn);
+  const components = [row];
+
+  const sortedEntries = [...(entries || [])]
+    .filter((e) => e && e.teamId && Number.isInteger(Number(e.slotNumber)))
+    .sort((a, b) => Number(a.slotNumber) - Number(b.slotNumber));
+
+  if (sortedEntries.length > 0) {
+    const teamOptions = sortedEntries.slice(0, 25).map((e) => {
+      const paddedSlot = String(Number(e.slotNumber)).padStart(2, '0');
+      const teamLabel = `${e.teamName || 'Team'} — Slot ${paddedSlot}`.slice(0, 100);
+      return {
+        label: teamLabel,
+        value: e.teamId,
+        description: `Remove ${String(e.teamName || 'Team').slice(0, 65)} from this registration`,
+      };
+    });
+
+    const removeTeamSelect = new StringSelectMenuBuilder()
+      .setCustomId(`md_cfg_remove_team_select_${registration.registrationId}`)
+      .setPlaceholder('🗑️ Select an occupied team to remove from this registration...')
+      .setMinValues(1)
+      .setMaxValues(1)
+      .addOptions(teamOptions);
+
+    components.push(new ActionRowBuilder().addComponents(removeTeamSelect));
+  }
+
+  const removeTeamBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_remove_team_btn_${registration.registrationId}`)
+    .setLabel('Remove Team')
+    .setEmoji('🗑️')
+    .setStyle(ButtonStyle.Danger);
+
+  components.push(new ActionRowBuilder().addComponents(removeTeamBtn));
+
+  return {
+    content: text,
+    components,
+  };
+}
+
+/**
+ * Shows the current slot chart code block to the organiser along with slot management controls:
+ * - 🔒 Manage Reserved Slots
+ * - 🔄 Refresh Slot Chart
+ * - ⬅️ Back
+ *
  * @param {import('discord.js').ButtonInteraction} interaction
  * @param {string} registrationId
  */
@@ -2287,10 +2404,906 @@ export async function handleViewCurrentSlotChart(interaction, registrationId) {
   }
 
   const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
-  const entries = await getConfigurableEntriesForRegistration(registrationId, registration.currentCycleId);
-  const text = formatSlotListCodeBlock(buildSlotListText(tournament, registration, entries));
+  if (interaction?.user || interaction?.member || interaction?.isOrganiser === false) {
+    const authorised = await isAuthorisedScheduleOrganiser(interaction, tournament);
+    if (!authorised) {
+      return interaction.reply({
+        content: '❌ Permission denied: only authorised tournament organisers can use slot management controls.',
+        ephemeral: true,
+      });
+    }
+  }
 
-  await interaction.reply({ content: text, ephemeral: true });
+  await syncRegistrationSlotStates(registrationId, registration.currentCycleId, registration).catch(() => {});
+  const entries = await getConfigurableEntriesForRegistration(registrationId, registration.currentCycleId);
+  const payload = buildSlotChartViewPayload(tournament, registration, entries);
+
+  if (typeof interaction.update === 'function' && interaction.preferUpdate === true) {
+    return interaction.update(payload);
+  }
+  return interaction.reply({ ...payload, ephemeral: true });
+}
+
+/**
+ * Refreshes the current slot chart in the IDP channel and re-renders the View Current Slot Chart interface.
+ * Preserves occupied team allocations and locked slots.
+ *
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ */
+export async function handleRefreshSlotChartView(interaction, registrationId) {
+  const registration = await getConfigurableRegistration(registrationId);
+  if (!registration) {
+    return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
+  }
+
+  const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
+  if (interaction?.user || interaction?.member || interaction?.isOrganiser === false) {
+    const authorised = await isAuthorisedScheduleOrganiser(interaction, tournament);
+    if (!authorised) {
+      return interaction.reply({
+        content: '❌ Permission denied: only authorised tournament organisers can use slot management controls.',
+        ephemeral: true,
+      });
+    }
+  }
+
+  const currentCycleId = registration.currentCycleId || null;
+  await syncRegistrationSlotStates(registrationId, currentCycleId, registration).catch(() => {});
+  if (interaction.client) {
+    await syncRegistrationSlotList(registrationId, currentCycleId, interaction.client).catch(() => {});
+    await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
+  }
+
+  const latestReg = (await getConfigurableRegistration(registrationId)) || registration;
+  const entries = await getConfigurableEntriesForRegistration(registrationId, latestReg.currentCycleId);
+  const payload = buildSlotChartViewPayload(tournament, latestReg, entries);
+
+  if (typeof interaction.update === 'function') {
+    return interaction.update(payload);
+  }
+  return interaction.reply({ ...payload, ephemeral: true });
+}
+
+/**
+ * Navigates back from View Current Slot Chart to the registration's Manage Dashboard.
+ *
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ */
+export async function handleBackToManageRegistration(interaction, registrationId) {
+  const registration = await getConfigurableRegistration(registrationId);
+  if (!registration) {
+    return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
+  }
+
+  const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
+  if (interaction?.user || interaction?.member || interaction?.isOrganiser === false) {
+    const authorised = await isAuthorisedScheduleOrganiser(interaction, tournament);
+    if (!authorised) {
+      return interaction.reply({
+        content: '❌ Permission denied: only authorised tournament organisers can use slot management controls.',
+        ephemeral: true,
+      });
+    }
+  }
+
+  const currentCycleId = registration.currentCycleId || null;
+  const filledCount = await getRegistrationEntriesCount(registrationId, currentCycleId);
+  const payload = buildManageDashboardPayload(registration, filledCount);
+
+  if (typeof interaction.update === 'function') {
+    return interaction.update(payload);
+  }
+  return interaction.reply({ ...payload, ephemeral: true });
+}
+
+/**
+ * Builds the interactive Manage Reserved Slots payload allowing the organiser to lock or unlock ANY individual slot.
+ * Provides:
+ * - Multi-select menu for Lock Slot (up to 25 slots per page)
+ * - Multi-select menu for Unlock Slot (up to 25 slots per page)
+ * - Action buttons: Lock Slot, Unlock Slot, Refresh Slot Chart, Back
+ *
+ * @param {object} [tournament]
+ * @param {object} registration
+ * @param {Array<object>} [entries]
+ * @param {number} [page]
+ * @param {string} [statusNotice]
+ * @returns {{ content: string, components: ActionRowBuilder[] }}
+ */
+export function buildManageReservedSlotsPayload(
+  tournament,
+  registration,
+  entries = [],
+  page = 0,
+  statusNotice = null
+) {
+  const totalSlots = registration.totalSlots || 20;
+  const lockedSlots = getLockedSlotNumbers(registration, totalSlots);
+  const lockedSet = new Set(lockedSlots);
+
+  const occupiedBySlot = new Map();
+  for (const e of entries) {
+    const sNum = Number(e.slotNumber);
+    if (Number.isInteger(sNum) && sNum >= 1 && sNum <= totalSlots && !occupiedBySlot.has(sNum)) {
+      occupiedBySlot.set(sNum, e);
+    }
+  }
+
+  let occupiedCount = 0;
+  for (const [slotNum] of occupiedBySlot.entries()) {
+    if (!lockedSet.has(slotNum)) {
+      occupiedCount++;
+    }
+  }
+
+  const usableSlots = Math.max(0, totalSlots - lockedSet.size);
+  const availableSlots = Math.max(0, usableSlots - occupiedCount);
+  const counterStr = getFilledSlotCounter(occupiedCount, usableSlots);
+  const slotChartCodeBlock = formatSlotListCodeBlock(buildSlotListText(tournament, registration, entries));
+
+  const pageSize = 25;
+  const totalPages = Math.max(1, Math.ceil(totalSlots / pageSize));
+  const safePage = Math.max(0, Math.min(totalPages - 1, Number(page) || 0));
+  const startSlot = safePage * pageSize + 1;
+  const endSlot = Math.min(totalSlots, (safePage + 1) * pageSize);
+
+  const lockableOptions = [];
+  const unlockableOptions = [];
+
+  for (let slot = startSlot; slot <= endSlot; slot++) {
+    const padded = String(slot).padStart(2, '0');
+    if (lockedSet.has(slot)) {
+      unlockableOptions.push({
+        label: `Slot ${padded}`,
+        value: String(slot),
+        description: `Currently 🔒 LOCKED — Select to unlock Slot ${padded}`,
+      });
+    } else {
+      const occ = occupiedBySlot.get(slot);
+      lockableOptions.push({
+        label: `Slot ${padded}`,
+        value: String(slot),
+        description: occ
+          ? `Currently OCCUPIED by ${String(occ.teamName).slice(0, 60)}`
+          : `Currently AVAILABLE — Select to lock Slot ${padded}`,
+      });
+    }
+  }
+
+  const components = [];
+
+  // Select Menu 1: Lock Slot
+  const lockSelect = new StringSelectMenuBuilder()
+    .setCustomId(`md_cfg_lock_slots_select_${registration.registrationId}:${safePage}`)
+    .setPlaceholder(
+      lockableOptions.length > 0
+        ? '🔒 Lock Slot — Select one or more slots to lock...'
+        : '🔒 Lock Slot — All slots in this range are already locked'
+    );
+
+  if (lockableOptions.length > 0) {
+    lockSelect
+      .setMinValues(1)
+      .setMaxValues(lockableOptions.length)
+      .addOptions(lockableOptions);
+  } else {
+    lockSelect
+      .setDisabled(true)
+      .addOptions([{ label: 'All slots locked', value: 'none', description: 'No unlocked slots in this range' }]);
+  }
+  components.push(new ActionRowBuilder().addComponents(lockSelect));
+
+  // Select Menu 2: Unlock Slot
+  const unlockSelect = new StringSelectMenuBuilder()
+    .setCustomId(`md_cfg_unlock_slots_select_${registration.registrationId}:${safePage}`)
+    .setPlaceholder(
+      unlockableOptions.length > 0
+        ? '🔓 Unlock Slot — Select one or more locked slots to unlock...'
+        : '🔓 Unlock Slot — No locked slots in this range'
+    );
+
+  if (unlockableOptions.length > 0) {
+    unlockSelect
+      .setMinValues(1)
+      .setMaxValues(unlockableOptions.length)
+      .addOptions(unlockableOptions);
+  } else {
+    unlockSelect
+      .setDisabled(true)
+      .addOptions([{ label: 'No locked slots', value: 'none', description: 'All slots in this range are unlocked' }]);
+  }
+  components.push(new ActionRowBuilder().addComponents(unlockSelect));
+
+  // Row 3: Action Buttons (Lock Slot, Unlock Slot, Refresh Slot Chart, Back)
+  const lockBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_lock_slot_btn_${registration.registrationId}:${safePage}`)
+    .setLabel('Lock Slot')
+    .setEmoji('🔒')
+    .setStyle(ButtonStyle.Primary)
+    .setDisabled(lockableOptions.length === 0);
+
+  const unlockBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_unlock_slot_btn_${registration.registrationId}:${safePage}`)
+    .setLabel('Unlock Slot')
+    .setEmoji('🔓')
+    .setStyle(ButtonStyle.Success)
+    .setDisabled(unlockableOptions.length === 0);
+
+  const refreshBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_refresh_slotchart_${registration.registrationId}`)
+    .setLabel('Refresh Slot Chart')
+    .setEmoji('🔄')
+    .setStyle(ButtonStyle.Secondary);
+
+  const backBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_view_slotchart_${registration.registrationId}`)
+    .setLabel('Back')
+    .setEmoji('⬅️')
+    .setStyle(ButtonStyle.Secondary);
+
+  components.push(new ActionRowBuilder().addComponents(lockBtn, unlockBtn, refreshBtn, backBtn));
+
+  if (totalPages > 1) {
+    const prevPageBtn = new ButtonBuilder()
+      .setCustomId(`md_cfg_manage_slots_${registration.registrationId}:${Math.max(0, safePage - 1)}`)
+      .setLabel('Prev Slots')
+      .setEmoji('◀️')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(safePage === 0);
+
+    const nextPageBtn = new ButtonBuilder()
+      .setCustomId(`md_cfg_manage_slots_${registration.registrationId}:${Math.min(totalPages - 1, safePage + 1)}`)
+      .setLabel('Next Slots')
+      .setEmoji('▶️')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(safePage >= totalPages - 1);
+
+    components.push(new ActionRowBuilder().addComponents(prevPageBtn, nextPageBtn));
+  }
+
+  const lockedListText =
+    lockedSlots.length > 0
+      ? lockedSlots.map((s) => `Slot ${String(s).padStart(2, '0')}`).join(', ')
+      : 'None';
+
+  const headerLines = [
+    ...(statusNotice ? [statusNotice, ''] : []),
+    `🔒 **Manage Reserved Slots — ${registration.displayName}**`,
+    `• **Total Slots:** \`${totalSlots}\` | **Locked Slots:** \`${lockedSlots.length}\` (${lockedListText})`,
+    `• **Occupied Slots:** \`${occupiedCount}\` | **Available Slots:** \`${availableSlots}\` | **Counter:** ${counterStr}`,
+    '',
+    slotChartCodeBlock,
+  ];
+
+  return {
+    content: headerLines.join('\n'),
+    components,
+  };
+}
+
+/**
+ * Opens the Manage Reserved Slots interface for a registration.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ * @param {number} [page]
+ */
+export async function handleManageReservedSlotsButton(interaction, registrationId, page = 0) {
+  const registration = await getConfigurableRegistration(registrationId);
+  if (!registration) {
+    return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
+  }
+
+  const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
+  if (interaction?.user || interaction?.member || interaction?.isOrganiser === false) {
+    const authorised = await isAuthorisedScheduleOrganiser(interaction, tournament);
+    if (!authorised) {
+      return interaction.reply({
+        content: '❌ Permission denied: only authorised tournament organisers can manage reserved slots.',
+        ephemeral: true,
+      });
+    }
+  }
+
+  await syncRegistrationSlotStates(registrationId, registration.currentCycleId, registration).catch(() => {});
+  const entries = await getConfigurableEntriesForRegistration(registrationId, registration.currentCycleId);
+  const payload = buildManageReservedSlotsPayload(tournament, registration, entries, page);
+
+  if (typeof interaction.update === 'function') {
+    return interaction.update(payload);
+  }
+  return interaction.reply({ ...payload, ephemeral: true });
+}
+
+/**
+ * Handles locking one or more individual slots selected by the organiser.
+ * Enforces Occupied Slot Protection: if a selected slot is occupied by a team,
+ * refuses to lock it directly and prompts the organiser to confirm removing or reassigning the team first.
+ *
+ * @param {import('discord.js').StringSelectMenuInteraction|import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ * @param {Array<number|string>} [slotNumbersOverride]
+ * @param {number} [page]
+ */
+export async function handleLockSlotsSelect(
+  interaction,
+  registrationId,
+  slotNumbersOverride = null,
+  page = 0
+) {
+  const registration = await getConfigurableRegistration(registrationId);
+  if (!registration) {
+    return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
+  }
+
+  const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
+  if (interaction?.user || interaction?.member || interaction?.isOrganiser === false) {
+    const authorised = await isAuthorisedScheduleOrganiser(interaction, tournament);
+    if (!authorised) {
+      return interaction.reply({
+        content: '❌ Permission denied: only authorised tournament organisers can lock or unlock slots.',
+        ephemeral: true,
+      });
+    }
+  }
+
+  const selectedValues = Array.isArray(slotNumbersOverride)
+    ? slotNumbersOverride
+    : Array.isArray(interaction?.values)
+      ? interaction.values
+      : [];
+
+  const result = await lockRegistrationSlots(
+    registrationId,
+    selectedValues,
+    interaction?.user?.id || null,
+    registration.currentCycleId
+  );
+
+  if (!result.ok) {
+    if (result.code === 'SLOT_OCCUPIED' && Array.isArray(result.conflicts) && result.conflicts.length > 0) {
+      const conflict = result.conflicts[0];
+      const paddedSlot = String(conflict.slotNumber).padStart(2, '0');
+      const reassignBtn = new ButtonBuilder()
+        .setCustomId(`md_cfg_slot_occ_reassign_${registrationId}_${conflict.slotNumber}_${conflict.teamId}`)
+        .setLabel(`Reassign ${conflict.teamName} & Lock Slot ${paddedSlot}`.slice(0, 80))
+        .setEmoji('🔄')
+        .setStyle(ButtonStyle.Primary);
+
+      const removeBtn = new ButtonBuilder()
+        .setCustomId(`md_cfg_slot_occ_remove_${registrationId}_${conflict.slotNumber}_${conflict.teamId}`)
+        .setLabel(`Remove ${conflict.teamName} & Lock Slot ${paddedSlot}`.slice(0, 80))
+        .setEmoji('🗑️')
+        .setStyle(ButtonStyle.Danger);
+
+      const cancelBtn = new ButtonBuilder()
+        .setCustomId(`md_cfg_manage_slots_${registrationId}:${page}`)
+        .setLabel('Cancel')
+        .setEmoji('⬅️')
+        .setStyle(ButtonStyle.Secondary);
+
+      const actionRow = new ActionRowBuilder().addComponents(reassignBtn, removeBtn, cancelBtn);
+      const conflictPayload = {
+        content: result.message,
+        components: [actionRow],
+      };
+
+      if (typeof interaction.update === 'function' && interaction.preferUpdate === true) {
+        return interaction.update(conflictPayload);
+      }
+      return interaction.reply({ ...conflictPayload, ephemeral: true });
+    }
+
+    return interaction.reply({ content: result.message || '❌ Failed to lock slot(s).', ephemeral: true });
+  }
+
+  const updatedReg = result.registration || (await getConfigurableRegistration(registrationId));
+  if (interaction?.client) {
+    await syncRegistrationSlotList(registrationId, updatedReg.currentCycleId, interaction.client).catch(() => {});
+    await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
+    await updateManageDashboardMessage(interaction.client, registrationId).catch(() => {});
+    await refreshDashboard(interaction.client, updatedReg.tournamentId).catch(() => {});
+  }
+
+  const entries = await getConfigurableEntriesForRegistration(registrationId, updatedReg.currentCycleId);
+  const lockedLabels = selectedValues
+    .map((v) => `Slot ${String(parseInt(v, 10)).padStart(2, '0')}`)
+    .join(', ');
+  const notice = `✅ Locked ${lockedLabels}.`;
+  const payload = buildManageReservedSlotsPayload(tournament, updatedReg, entries, page, notice);
+
+  if (typeof interaction.update === 'function') {
+    return interaction.update(payload);
+  }
+  return interaction.reply({ ...payload, ephemeral: true });
+}
+
+/**
+ * Handles unlocking one or more individual locked slots selected by the organiser.
+ * Immediately restores unlocked slots to AVAILABLE for future registration and updates the IDP slot chart.
+ *
+ * @param {import('discord.js').StringSelectMenuInteraction|import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ * @param {Array<number|string>} [slotNumbersOverride]
+ * @param {number} [page]
+ */
+export async function handleUnlockSlotsSelect(
+  interaction,
+  registrationId,
+  slotNumbersOverride = null,
+  page = 0
+) {
+  const registration = await getConfigurableRegistration(registrationId);
+  if (!registration) {
+    return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
+  }
+
+  const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
+  if (interaction?.user || interaction?.member || interaction?.isOrganiser === false) {
+    const authorised = await isAuthorisedScheduleOrganiser(interaction, tournament);
+    if (!authorised) {
+      return interaction.reply({
+        content: '❌ Permission denied: only authorised tournament organisers can lock or unlock slots.',
+        ephemeral: true,
+      });
+    }
+  }
+
+  const selectedValues = Array.isArray(slotNumbersOverride)
+    ? slotNumbersOverride
+    : Array.isArray(interaction?.values)
+      ? interaction.values
+      : [];
+
+  const result = await unlockRegistrationSlots(
+    registrationId,
+    selectedValues,
+    interaction?.user?.id || null,
+    registration.currentCycleId
+  );
+
+  if (!result.ok) {
+    return interaction.reply({ content: result.message || '❌ Failed to unlock slot(s).', ephemeral: true });
+  }
+
+  const updatedReg = result.registration || (await getConfigurableRegistration(registrationId));
+  if (interaction?.client) {
+    await syncRegistrationSlotList(registrationId, updatedReg.currentCycleId, interaction.client).catch(() => {});
+    await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
+    await updateManageDashboardMessage(interaction.client, registrationId).catch(() => {});
+    await refreshDashboard(interaction.client, updatedReg.tournamentId).catch(() => {});
+  }
+
+  const entries = await getConfigurableEntriesForRegistration(registrationId, updatedReg.currentCycleId);
+  const unlockedLabels = selectedValues
+    .map((v) => `Slot ${String(parseInt(v, 10)).padStart(2, '0')}`)
+    .join(', ');
+  const notice = `✅ Unlocked ${unlockedLabels} (now AVAILABLE for registration).`;
+  const payload = buildManageReservedSlotsPayload(tournament, updatedReg, entries, page, notice);
+
+  if (typeof interaction.update === 'function') {
+    return interaction.update(payload);
+  }
+  return interaction.reply({ ...payload, ephemeral: true });
+}
+
+/**
+ * Handles explicit organiser confirmation to reassign an occupying team to the next available unlocked slot
+ * and then lock the target slot.
+ *
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ * @param {number|string} slotNumberInput
+ * @param {string} teamId
+ */
+export async function handleOccupiedSlotReassignAndLock(
+  interaction,
+  registrationId,
+  slotNumberInput,
+  teamId
+) {
+  const registration = await getConfigurableRegistration(registrationId);
+  if (!registration) {
+    return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
+  }
+
+  const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
+  if (interaction?.user || interaction?.member || interaction?.isOrganiser === false) {
+    const authorised = await isAuthorisedScheduleOrganiser(interaction, tournament);
+    if (!authorised) {
+      return interaction.reply({
+        content: '❌ Permission denied: only authorised tournament organisers can reassign teams and lock slots.',
+        ephemeral: true,
+      });
+    }
+  }
+
+  const targetSlot = Number(slotNumberInput);
+  const currentCycleId = registration.currentCycleId || null;
+  const entries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
+  const existingTeamEntry = entries.find((e) => e.teamId === teamId && Number(e.slotNumber) === targetSlot);
+  if (!existingTeamEntry) {
+    return interaction.reply({
+      content: '❌ The team is no longer assigned to that slot.',
+      ephemeral: true,
+    });
+  }
+
+  // Find next available unlocked slot excluding targetSlot
+  const lockedWithTarget = Array.from(new Set([...getLockedSlotNumbers(registration, registration.totalSlots), targetSlot]));
+  const newSlot = await getNextAvailableSlot(registrationId, registration.totalSlots, lockedWithTarget, currentCycleId);
+  if (!newSlot) {
+    return interaction.reply({
+      content: `❌ Cannot reassign **${existingTeamEntry.teamName}**: no other unlocked available slots remain.`,
+      ephemeral: true,
+    });
+  }
+
+  const moveRes = await changeTeamSlot(registrationId, teamId, newSlot, interaction?.client || null);
+  if (!moveRes.success) {
+    return interaction.reply({ content: `❌ ${moveRes.message}`, ephemeral: true });
+  }
+
+  const lockRes = await lockRegistrationSlots(
+    registrationId,
+    [targetSlot],
+    interaction?.user?.id || null,
+    currentCycleId
+  );
+  if (!lockRes.ok) {
+    return interaction.reply({ content: lockRes.message || '❌ Failed to lock slot after reassignment.', ephemeral: true });
+  }
+
+  const updatedReg = lockRes.registration || (await getConfigurableRegistration(registrationId));
+  if (interaction?.client) {
+    await syncRegistrationSlotList(registrationId, updatedReg.currentCycleId, interaction.client).catch(() => {});
+    await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
+    await updateManageDashboardMessage(interaction.client, registrationId).catch(() => {});
+    await refreshDashboard(interaction.client, updatedReg.tournamentId).catch(() => {});
+  }
+
+  const updatedEntries = await getConfigurableEntriesForRegistration(registrationId, updatedReg.currentCycleId);
+  const paddedOld = String(targetSlot).padStart(2, '0');
+  const paddedNew = String(newSlot).padStart(2, '0');
+  const notice = `✅ Reassigned **${existingTeamEntry.teamName}** from Slot ${paddedOld} to **Slot ${paddedNew}** and locked **Slot ${paddedOld}**.`;
+  const payload = buildManageReservedSlotsPayload(tournament, updatedReg, updatedEntries, 0, notice);
+
+  if (typeof interaction.update === 'function') {
+    return interaction.update(payload);
+  }
+  return interaction.reply({ ...payload, ephemeral: true });
+}
+
+/**
+ * Handles explicit organiser confirmation to remove an occupying team from the current cycle
+ * and then lock the target slot.
+ *
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ * @param {number|string} slotNumberInput
+ * @param {string} teamId
+ */
+export async function handleOccupiedSlotRemoveAndLock(
+  interaction,
+  registrationId,
+  slotNumberInput,
+  teamId
+) {
+  const registration = await getConfigurableRegistration(registrationId);
+  if (!registration) {
+    return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
+  }
+
+  const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
+  if (interaction?.user || interaction?.member || interaction?.isOrganiser === false) {
+    const authorised = await isAuthorisedScheduleOrganiser(interaction, tournament);
+    if (!authorised) {
+      return interaction.reply({
+        content: '❌ Permission denied: only authorised tournament organisers can remove teams and lock slots.',
+        ephemeral: true,
+      });
+    }
+  }
+
+  const targetSlot = Number(slotNumberInput);
+  const currentCycleId = registration.currentCycleId || null;
+  const entries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
+  const existingTeamEntry = entries.find((e) => e.teamId === teamId && Number(e.slotNumber) === targetSlot);
+  const teamName = existingTeamEntry?.teamName || 'Team';
+
+  const remRes = await removeTeamFromRegistration(registrationId, teamId, interaction?.client || null);
+  if (!remRes.success) {
+    return interaction.reply({ content: `❌ ${remRes.message}`, ephemeral: true });
+  }
+
+  const lockRes = await lockRegistrationSlots(
+    registrationId,
+    [targetSlot],
+    interaction?.user?.id || null,
+    currentCycleId
+  );
+  if (!lockRes.ok) {
+    return interaction.reply({ content: lockRes.message || '❌ Failed to lock slot after team removal.', ephemeral: true });
+  }
+
+  const updatedReg = lockRes.registration || (await getConfigurableRegistration(registrationId));
+  if (interaction?.client) {
+    await syncRegistrationSlotList(registrationId, updatedReg.currentCycleId, interaction.client).catch(() => {});
+    await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
+    await updateManageDashboardMessage(interaction.client, registrationId).catch(() => {});
+    await refreshDashboard(interaction.client, updatedReg.tournamentId).catch(() => {});
+  }
+
+  const updatedEntries = await getConfigurableEntriesForRegistration(registrationId, updatedReg.currentCycleId);
+  const paddedSlot = String(targetSlot).padStart(2, '0');
+  const notice = `✅ Removed **${teamName}** and locked **Slot ${paddedSlot}**.`;
+  const payload = buildManageReservedSlotsPayload(tournament, updatedReg, updatedEntries, 0, notice);
+
+  if (typeof interaction.update === 'function') {
+    return interaction.update(payload);
+  }
+  return interaction.reply({ ...payload, ephemeral: true });
+}
+
+// ---------------------------------------------------------------------------
+// REMOVE REGISTERED TEAM FROM A REGISTRATION (ORGANISER CONTROLS)
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds the team selection payload for removing a registered team from a specific registration instance.
+ *
+ * @param {object} [tournament]
+ * @param {object} registration
+ * @param {Array<object>} [entries]
+ * @returns {{ content: string, components: ActionRowBuilder[] }}
+ */
+export function buildRemoveTeamMenuPayload(tournament, registration, entries = []) {
+  const tourTitle = tournament?.name ? `${tournament.name} — ` : '';
+  const regTitle = `${tourTitle}${registration.displayName} Registration`;
+  const sortedEntries = [...(entries || [])]
+    .filter((e) => e && e.teamId && Number.isInteger(Number(e.slotNumber)))
+    .sort((a, b) => Number(a.slotNumber) - Number(b.slotNumber));
+
+  const backBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_view_slotchart_${registration.registrationId}`)
+    .setLabel('Back')
+    .setEmoji('⬅️')
+    .setStyle(ButtonStyle.Secondary);
+
+  if (sortedEntries.length === 0) {
+    return {
+      content: `**${regTitle}**\n\nℹ️ No teams are currently registered in this registration cycle.`,
+      components: [new ActionRowBuilder().addComponents(backBtn)],
+    };
+  }
+
+  const lines = sortedEntries.map((e) => {
+    const padded = String(Number(e.slotNumber)).padStart(2, '0');
+    return `${e.teamName || 'Team'} — Slot ${padded}`;
+  });
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`md_cfg_remove_team_select_${registration.registrationId}`)
+    .setPlaceholder('Select a registered team to remove...')
+    .setMinValues(1)
+    .setMaxValues(1)
+    .addOptions(
+      sortedEntries.slice(0, 25).map((e) => {
+        const padded = String(Number(e.slotNumber)).padStart(2, '0');
+        return {
+          label: `${e.teamName || 'Team'} — Slot ${padded}`.slice(0, 100),
+          value: e.teamId,
+          description: `Slot ${padded} | Select to remove from ${registration.displayName}`.slice(0, 100),
+        };
+      })
+    );
+
+  return {
+    content: `**${regTitle}**\n\n${lines.join('\n')}`,
+    components: [
+      new ActionRowBuilder().addComponents(select),
+      new ActionRowBuilder().addComponents(backBtn),
+    ],
+  };
+}
+
+/**
+ * Opens the Remove Team selection interface for a registration.
+ *
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ */
+export async function handleRemoveTeamMenuButton(interaction, registrationId) {
+  const registration = await getConfigurableRegistration(registrationId);
+  if (!registration) {
+    return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
+  }
+
+  const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
+  if (interaction?.user || interaction?.member || interaction?.isOrganiser === false) {
+    const authorised = await isAuthorisedScheduleOrganiser(interaction, tournament);
+    if (!authorised) {
+      return interaction.reply({
+        content: '❌ Permission denied: only authorised tournament organisers can remove teams from a registration.',
+        ephemeral: true,
+      });
+    }
+  }
+
+  const entries = await getConfigurableEntriesForRegistration(registrationId, registration.currentCycleId);
+  const payload = buildRemoveTeamMenuPayload(tournament, registration, entries);
+
+  if (typeof interaction.update === 'function' && interaction.preferUpdate === true) {
+    return interaction.update(payload);
+  }
+  return interaction.reply({ ...payload, ephemeral: true });
+}
+
+/**
+ * Builds the confirmation prompt before removing a registered team from a registration.
+ *
+ * @param {object} registration
+ * @param {object} entry
+ * @returns {{ content: string, components: ActionRowBuilder[] }}
+ */
+export function buildRemoveTeamConfirmPayload(registration, entry) {
+  const teamName = entry?.teamName || 'Team';
+  const paddedSlot = String(Number(entry?.slotNumber || 0)).padStart(2, '0');
+
+  const confirmBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_remove_team_confirm_${registration.registrationId}_${entry.teamId}`)
+    .setLabel('Confirm Removal')
+    .setEmoji('🗑️')
+    .setStyle(ButtonStyle.Danger);
+
+  const cancelBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_remove_team_cancel_${registration.registrationId}`)
+    .setLabel('Cancel')
+    .setEmoji('✖️')
+    .setStyle(ButtonStyle.Secondary);
+
+  return {
+    content:
+      `**Remove Team from Registration?**\n` +
+      `Are you sure you want to remove ${teamName} from this registration? The team will lose access to this registration's private IDP channel.\n` +
+      `*(Slot ${paddedSlot} — ${registration.displayName})*`,
+    components: [new ActionRowBuilder().addComponents(confirmBtn, cancelBtn)],
+  };
+}
+
+/**
+ * Handles selecting a registered team to remove and displays the confirmation prompt.
+ *
+ * @param {import('discord.js').StringSelectMenuInteraction|import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ * @param {string|null} [teamIdOverride]
+ */
+export async function handleRemoveTeamSelect(interaction, registrationId, teamIdOverride = null) {
+  const registration = await getConfigurableRegistration(registrationId);
+  if (!registration) {
+    return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
+  }
+
+  const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
+  if (interaction?.user || interaction?.member || interaction?.isOrganiser === false) {
+    const authorised = await isAuthorisedScheduleOrganiser(interaction, tournament);
+    if (!authorised) {
+      return interaction.reply({
+        content: '❌ Permission denied: only authorised tournament organisers can remove teams from a registration.',
+        ephemeral: true,
+      });
+    }
+  }
+
+  const selectedTeamId = teamIdOverride || interaction?.values?.[0] || null;
+  if (!selectedTeamId) {
+    return interaction.reply({ content: '❌ Please select a team to remove.', ephemeral: true });
+  }
+
+  const entry = await getConfigurableEntry(registrationId, selectedTeamId, registration.currentCycleId);
+  if (!entry) {
+    return interaction.reply({
+      content: '❌ Selected team is no longer registered in the current cycle.',
+      ephemeral: true,
+    });
+  }
+
+  const payload = buildRemoveTeamConfirmPayload(registration, entry);
+  if (typeof interaction.update === 'function') {
+    return interaction.update(payload);
+  }
+  return interaction.reply({ ...payload, ephemeral: true });
+}
+
+/**
+ * Handles the Confirm Removal button to remove the team from the registration instance,
+ * release its slot, update the slot chart & dashboards, revoke its IDP channel access, and log to audit.
+ *
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ * @param {string} teamId
+ */
+export async function handleConfirmRemoveTeamFromRegistration(interaction, registrationId, teamId) {
+  const registration = await getConfigurableRegistration(registrationId);
+  if (!registration) {
+    return interaction.reply({ content: '❌ Registration instance not found.', ephemeral: true });
+  }
+
+  const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
+  if (interaction?.user || interaction?.member || interaction?.isOrganiser === false) {
+    const authorised = await isAuthorisedScheduleOrganiser(interaction, tournament);
+    if (!authorised) {
+      return interaction.reply({
+        content: '❌ Permission denied: only authorised tournament organisers can remove teams from a registration.',
+        ephemeral: true,
+      });
+    }
+  }
+
+  const res = await removeTeamFromRegistration(
+    registrationId,
+    teamId,
+    interaction?.client || null,
+    interaction?.user?.id || null
+  );
+
+  if (!res.success) {
+    const errPayload = {
+      content: `❌ ${res.message || 'Could not remove team from registration.'}`,
+      components: [],
+    };
+    if (typeof interaction.update === 'function') {
+      return interaction.update(errPayload);
+    }
+    return interaction.reply({ ...errPayload, ephemeral: true });
+  }
+
+  const paddedSlot = String(Number(res.releasedSlot || 0)).padStart(2, '0');
+  let resultMessage;
+  if (res.idpAccessRevoked === false) {
+    resultMessage =
+      `⚠️ Removed **${res.teamName}** from **${registration.displayName}** and released **Slot ${paddedSlot}** (now **AVAILABLE**), ` +
+      `but revoking Discord access to <#${registration.idpChannelId}> failed (${res.idpRevocationError || 'permission overwrite error'}). ` +
+      `Permission reconciliation has been queued.`;
+  } else {
+    resultMessage =
+      `✅ Removed **${res.teamName}** from **${registration.displayName}**. ` +
+      `**Slot ${paddedSlot}** is now **AVAILABLE** and leader access to <#${registration.idpChannelId}> has been revoked.`;
+  }
+
+  const backBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_view_slotchart_${registrationId}`)
+    .setLabel('Back to Slot Chart')
+    .setEmoji('📋')
+    .setStyle(ButtonStyle.Secondary);
+
+  const donePayload = {
+    content: resultMessage,
+    components: [new ActionRowBuilder().addComponents(backBtn)],
+  };
+
+  if (typeof interaction.update === 'function') {
+    return interaction.update(donePayload);
+  }
+  return interaction.reply({ ...donePayload, ephemeral: true });
+}
+
+/**
+ * Handles cancelling the Remove Team confirmation prompt.
+ *
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ */
+export async function handleCancelRemoveTeamFromRegistration(interaction, registrationId) {
+  const payload = {
+    content: 'ℹ️ Team removal cancelled. The team remains registered in its assigned slot.',
+    components: [],
+  };
+  if (typeof interaction.update === 'function') {
+    return interaction.update(payload);
+  }
+  return interaction.reply({ ...payload, ephemeral: true });
 }
 
 /**
@@ -2356,3 +3369,963 @@ export async function handleDeleteRegistration(interaction, registrationId) {
     ephemeral: true,
   });
 }
+
+// ============================================================================
+// REGISTRATION-SPECIFIC SCHEDULE IMAGE MANAGEMENT
+// ============================================================================
+
+const SCHEDULE_UPLOAD_TTL_MS = 10 * 60 * 1000;
+const MAX_SCHEDULE_IMAGE_BYTES = 15 * 1024 * 1024;
+const ALLOWED_SCHEDULE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp'];
+const ALLOWED_SCHEDULE_MIME_PREFIXES = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'];
+
+// Keyed by `${guildId}:${userId}` -> { registrationId, tournamentId, guildId, channelId, userId, createdAt }
+const pendingScheduleUploads = new Map();
+
+/**
+ * Clears all in-memory pending schedule upload sessions (useful for test cleanup).
+ */
+export function clearPendingScheduleUploads() {
+  pendingScheduleUploads.clear();
+}
+
+/**
+ * Checks whether an interaction/message actor is an authorised tournament organiser.
+ * Prevents ordinary participants from managing official schedules.
+ * @param {object} actorCtx - Interaction or Message
+ * @param {object} tournament
+ * @returns {Promise<boolean>}
+ */
+export async function isAuthorisedScheduleOrganiser(actorCtx, tournament) {
+  if (!actorCtx) return false;
+  if (actorCtx.isOrganiser === false) return false;
+  if (actorCtx.isOrganiser === true) return true;
+
+  const userId = actorCtx.user?.id || actorCtx.author?.id || null;
+  const guild = actorCtx.guild || null;
+  const member = actorCtx.member || null;
+
+  if (typeof member?.permissions?.has === 'function') {
+    const hasAdminOrManage =
+      Boolean(member.permissions.has(PermissionFlagsBits.Administrator)) ||
+      Boolean(member.permissions.has(PermissionFlagsBits.ManageGuild));
+    if (hasAdminOrManage) return true;
+    if (userId && (userId === tournament?.createdBy || (guild?.ownerId && userId === guild.ownerId))) {
+      return true;
+    }
+    return false;
+  }
+
+  if (userId && (userId === tournament?.createdBy || (guild?.ownerId && userId === guild.ownerId))) {
+    return true;
+  }
+
+  // If member permissions are not attached on a synthetic test object, reject if the user is an enrolled squad participant
+  if (userId && tournament?.tournamentId) {
+    const enrolledTeams = await getConfigurableTeamsForUser(tournament.tournamentId, userId);
+    if (enrolledTeams.length > 0) {
+      return false;
+    }
+  }
+
+  return Boolean(userId);
+}
+
+/**
+ * Validates guild, tournament, registration, registration channel, and organiser permissions
+ * for any schedule management action.
+ * @param {object} actorCtx - Interaction or Message
+ * @param {string} registrationId
+ * @returns {Promise<{ ok: boolean, error?: string, registration?: object, tournament?: object }>}
+ */
+export async function validateScheduleManagementContext(actorCtx, registrationId) {
+  if (!registrationId) {
+    return { ok: false, error: '❌ Invalid registration ID.' };
+  }
+
+  const registration = await getConfigurableRegistration(registrationId);
+  if (!registration || registration.status === 'DELETED' || registration.isDeleted) {
+    return { ok: false, error: '❌ Registration instance not found or has been deleted.' };
+  }
+
+  const tournament = registration.tournamentId
+    ? await getConfigurableTournament(registration.tournamentId)
+    : null;
+  if (!tournament || tournament.status === 'DELETED' || tournament.isDeleted) {
+    return { ok: false, error: '❌ Tournament configuration not found or has been deleted.' };
+  }
+
+  const contextGuildId = actorCtx?.guild?.id || actorCtx?.guildId || null;
+  const expectedGuildId = registration.guildId || tournament.guildId || null;
+  if (contextGuildId && expectedGuildId && contextGuildId !== expectedGuildId) {
+    return { ok: false, error: '❌ Guild mismatch: this registration belongs to a different server.' };
+  }
+
+  if (registration.tournamentId !== tournament.tournamentId) {
+    return { ok: false, error: '❌ Registration does not belong to this tournament.' };
+  }
+
+  if (!registration.registrationChannelId) {
+    return { ok: false, error: '❌ Registration channel ID is missing for this registration.' };
+  }
+
+  if (registration.idpChannelId && registration.registrationChannelId === registration.idpChannelId) {
+    return { ok: false, error: '❌ Invalid channel configuration: schedule cannot be posted in an IDP channel.' };
+  }
+
+  const authorised = await isAuthorisedScheduleOrganiser(actorCtx, tournament);
+  if (!authorised) {
+    return {
+      ok: false,
+      error: '❌ Permission denied: only authorised tournament organisers can manage official registration schedules.',
+    };
+  }
+
+  return { ok: true, registration, tournament };
+}
+
+/**
+ * Validates that an uploaded attachment is a valid image (PNG, JPG, JPEG, WEBP).
+ * @param {object} attachment
+ * @returns {{ valid: boolean, error?: string, fileName?: string, imageUrl?: string, attachmentSource?: any }}
+ */
+export function validateScheduleImageAttachment(attachment) {
+  if (!attachment || typeof attachment !== 'object') {
+    return {
+      valid: false,
+      error: '❌ No image attachment found. Please upload a valid **PNG**, **JPG**, or **JPEG** schedule image.',
+    };
+  }
+
+  const rawUrl = attachment.url || attachment.proxyURL || (typeof attachment.attachment === 'string' ? attachment.attachment : '') || '';
+  const hasBufferOrStream = Buffer.isBuffer(attachment.attachment) || Buffer.isBuffer(attachment.buffer);
+  if (!rawUrl && !hasBufferOrStream) {
+    return {
+      valid: false,
+      error: '❌ Invalid attachment: missing image URL or file data.',
+    };
+  }
+
+  if (typeof attachment.size === 'number') {
+    if (attachment.size <= 0) {
+      return { valid: false, error: '❌ Invalid image attachment: file is empty.' };
+    }
+    if (attachment.size > MAX_SCHEDULE_IMAGE_BYTES) {
+      return { valid: false, error: '❌ Schedule image exceeds the 15 MB size limit.' };
+    }
+  }
+
+  const contentType = String(attachment.contentType || '').toLowerCase().trim();
+  const rawName = String(attachment.name || rawUrl.split('?')[0].split('/').pop() || '').trim();
+  const lowerName = rawName.toLowerCase();
+
+  const hasValidMime = contentType
+    ? ALLOWED_SCHEDULE_MIME_PREFIXES.some((prefix) => contentType.startsWith(prefix))
+    : false;
+  const hasInvalidMime = Boolean(contentType && !contentType.startsWith('image/'));
+
+  if (hasInvalidMime) {
+    return {
+      valid: false,
+      error: '❌ Invalid file type. Only **PNG**, **JPG**, and **JPEG** image attachments are allowed.',
+    };
+  }
+
+  const matchedExt = ALLOWED_SCHEDULE_EXTENSIONS.find((ext) => lowerName.endsWith(ext));
+  if (!hasValidMime && !matchedExt) {
+    return {
+      valid: false,
+      error: '❌ Invalid image format. Please attach a **PNG**, **JPG**, or **JPEG** image file.',
+    };
+  }
+
+  const ext = matchedExt || (contentType.includes('png') ? '.png' : '.jpg');
+  const safeBaseName = rawName
+    ? rawName.replace(/[^a-zA-Z0-9._-]/g, '_')
+    : `schedule${ext}`;
+  const fileName = ALLOWED_SCHEDULE_EXTENSIONS.some((e) => safeBaseName.toLowerCase().endsWith(e))
+    ? safeBaseName
+    : `${safeBaseName}${ext}`;
+
+  return {
+    valid: true,
+    fileName,
+    imageUrl: rawUrl || `attachment://${fileName}`,
+    attachmentSource: attachment.attachment || attachment.buffer || rawUrl,
+  };
+}
+
+/**
+ * Builds the ephemeral Schedule Management menu payload for a specific registration.
+ * @param {object} registration
+ * @returns {{ content: string, embeds: EmbedBuilder[], components: ActionRowBuilder[] }}
+ */
+export function buildScheduleManagementPayload(registration) {
+  const hasSchedule = Boolean(registration.scheduleImageUrl && registration.scheduleMessageId);
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('Schedule Management')
+    .setDescription(
+      `Upload the match schedule image for this registration. The bot will publish it in the corresponding registration channel.\n\n` +
+      `• **Registration:** ${registration.displayName}\n` +
+      `• **Target Channel:** <#${registration.registrationChannelId}>\n` +
+      `• **Current Schedule:** ${hasSchedule ? `Published (Message ID: \`${registration.scheduleMessageId}\`)` : 'None'}`
+    );
+
+  const uploadBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_sched_upload_${registration.registrationId}`)
+    .setLabel('Upload Schedule')
+    .setEmoji('📤')
+    .setStyle(ButtonStyle.Success);
+
+  const viewBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_sched_view_${registration.registrationId}`)
+    .setLabel('View Current Schedule')
+    .setEmoji('🖼️')
+    .setStyle(ButtonStyle.Secondary);
+
+  const removeBtn = new ButtonBuilder()
+    .setCustomId(`md_cfg_sched_remove_${registration.registrationId}`)
+    .setLabel('Remove Schedule')
+    .setEmoji('🗑️')
+    .setStyle(ButtonStyle.Danger);
+
+  const row = new ActionRowBuilder().addComponents(uploadBtn, viewBtn, removeBtn);
+
+  return {
+    content:
+      `**Schedule Management**\n` +
+      `Upload the match schedule image for this registration. The bot will publish it in the corresponding registration channel.`,
+    embeds: [embed],
+    components: [row],
+  };
+}
+
+/**
+ * Handles clicking the "📅 Schedule" button for a specific registration in Manage Registrations.
+ * Displays the ephemeral Schedule Management screen with Upload, View, and Remove buttons.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ */
+export async function handleScheduleButton(interaction, registrationId) {
+  const validation = await validateScheduleManagementContext(interaction, registrationId);
+  if (!validation.ok) {
+    return interaction.reply({ content: validation.error, ephemeral: true });
+  }
+
+  const payload = buildScheduleManagementPayload(validation.registration);
+  return interaction.reply({ ...payload, ephemeral: true });
+}
+
+/**
+ * Handles clicking "Upload Schedule" for a specific registration.
+ * Starts a pending upload session for the organiser (or immediately publishes if an attachment is provided on the interaction).
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ */
+export async function handleUploadScheduleButton(interaction, registrationId) {
+  const validation = await validateScheduleManagementContext(interaction, registrationId);
+  if (!validation.ok) {
+    return interaction.reply({ content: validation.error, ephemeral: true });
+  }
+
+  const { registration, tournament } = validation;
+  const userId = interaction.user?.id;
+  const guildId = interaction.guild?.id || interaction.guildId || registration.guildId || tournament.guildId;
+  const channelId = interaction.channelId || interaction.channel?.id || null;
+
+  // If the interaction already carries an attachment directly, validate and publish immediately
+  const directAttachment =
+    interaction.attachment ||
+    (interaction.attachments instanceof Map
+      ? Array.from(interaction.attachments.values())[0]
+      : interaction.attachments?.first?.() ||
+        (Array.isArray(interaction.attachments) ? interaction.attachments[0] : null));
+
+  if (directAttachment) {
+    const pubResult = await publishRegistrationScheduleImage(
+      interaction.guild || interaction.client,
+      registration.registrationId,
+      directAttachment,
+      userId,
+      interaction
+    );
+    if (!pubResult.ok) {
+      return interaction.reply({ content: pubResult.error, ephemeral: true });
+    }
+    return interaction.reply({
+      content: `✅ Schedule image for **${registration.displayName}** has been published in <#${registration.registrationChannelId}>!`,
+      ephemeral: true,
+    });
+  }
+
+  const now = new Date();
+  const sessionKey = `${guildId}:${userId}`;
+  pendingScheduleUploads.set(sessionKey, {
+    registrationId: registration.registrationId,
+    tournamentId: tournament.tournamentId,
+    guildId,
+    channelId,
+    userId,
+    createdAt: now.getTime(),
+  });
+
+  registration.pendingScheduleUploadBy = userId;
+  registration.pendingScheduleUploadChannelId = channelId;
+  registration.pendingScheduleUploadAt = now;
+  await saveConfigurableRegistration(registration);
+
+  const cancelRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`md_cfg_sched_upload_cancel_${registration.registrationId}`)
+      .setLabel('Cancel Upload')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  return interaction.reply({
+    content:
+      `📤 **Upload Schedule for ${registration.displayName}**\n` +
+      `Please upload or attach your schedule image (**PNG**, **JPG**, or **JPEG**) in a message now.\n` +
+      `The bot will publish it directly in <#${registration.registrationChannelId}>.`,
+    components: [cancelRow],
+    ephemeral: true,
+  });
+}
+
+/**
+ * Cancels an active pending schedule upload session.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ */
+export async function handleCancelUploadScheduleButton(interaction, registrationId) {
+  const validation = await validateScheduleManagementContext(interaction, registrationId);
+  if (!validation.ok) {
+    return interaction.reply({ content: validation.error, ephemeral: true });
+  }
+
+  const { registration, tournament } = validation;
+  const userId = interaction.user?.id;
+  const guildId = interaction.guild?.id || interaction.guildId || registration.guildId || tournament.guildId;
+  pendingScheduleUploads.delete(`${guildId}:${userId}`);
+
+  registration.pendingScheduleUploadBy = null;
+  registration.pendingScheduleUploadChannelId = null;
+  registration.pendingScheduleUploadAt = null;
+  await saveConfigurableRegistration(registration);
+
+  if (typeof interaction.update === 'function') {
+    return interaction.update({
+      content: `❌ Schedule upload for **${registration.displayName}** has been cancelled.`,
+      components: [],
+    });
+  }
+  return interaction.reply({
+    content: `❌ Schedule upload for **${registration.displayName}** has been cancelled.`,
+    ephemeral: true,
+  });
+}
+
+/**
+ * Resolves a channel by ID from a guild or client.
+ * @param {object} guildOrClient
+ * @param {string} guildId
+ * @param {string} channelId
+ */
+async function resolveDiscordChannelById(guildOrClient, guildId, channelId) {
+  if (!guildOrClient || !channelId) return null;
+  let guild = null;
+  let client = null;
+  if (guildOrClient.guilds) {
+    client = guildOrClient;
+    if (guildId) {
+      guild =
+        client.guilds.cache?.get?.(guildId) ||
+        (typeof client.guilds.fetch === 'function' ? await client.guilds.fetch(guildId).catch(() => null) : null);
+    }
+  } else if (guildOrClient.channels) {
+    guild = guildOrClient;
+    client = guildOrClient.client || null;
+  }
+
+  const fromGuildCache = guild?.channels?.cache?.get?.(channelId);
+  if (fromGuildCache) return fromGuildCache;
+  const fromClientCache = client?.channels?.cache?.get?.(channelId);
+  if (fromClientCache) return fromClientCache;
+  if (typeof guild?.channels?.fetch === 'function') {
+    const fetched = await guild.channels.fetch(channelId).catch(() => null);
+    if (fetched) return fetched;
+  }
+  if (typeof client?.channels?.fetch === 'function') {
+    const fetched = await client.channels.fetch(channelId).catch(() => null);
+    if (fetched) return fetched;
+  }
+  if (typeof guildOrClient?.channels?.fetch === 'function' && guildOrClient !== guild && guildOrClient !== client) {
+    const fetched = await guildOrClient.channels.fetch(channelId).catch(() => null);
+    if (fetched) return fetched;
+  }
+  return null;
+}
+
+/**
+ * Extracts the published attachment URL from a sent/edited Discord message, falling back to the input URL.
+ * @param {object} msg
+ * @param {string} fallbackUrl
+ * @returns {string}
+ */
+function extractPublishedAttachmentUrl(msg, fallbackUrl) {
+  if (!msg) return fallbackUrl;
+  if (msg.attachments instanceof Map && msg.attachments.size > 0) {
+    const first = Array.from(msg.attachments.values())[0];
+    if (first?.url || first?.proxyURL) return first.url || first.proxyURL;
+  }
+  if (typeof msg.attachments?.first === 'function') {
+    const first = msg.attachments.first();
+    if (first?.url || first?.proxyURL) return first.url || first.proxyURL;
+  }
+  if (Array.isArray(msg.attachments) && msg.attachments[0]) {
+    const first = msg.attachments[0];
+    if (first?.url || first?.proxyURL) return first.url || first.proxyURL;
+  }
+  if (Array.isArray(msg.files) && msg.files[0]) {
+    const f = msg.files[0];
+    if (typeof f === 'string') return f;
+    if (typeof f?.attachment === 'string') return f.attachment;
+  }
+  return fallbackUrl;
+}
+
+/**
+ * Publishes or updates the schedule image for a specific registration in its corresponding registration channel.
+ * - Never posts to an IDP channel or another registration's channel.
+ * - Sends the actual image as a Discord file attachment (`files: [...]`), not an embed-only link or text replacement.
+ * - Replaces/edits the previously managed schedule message if one exists; never creates duplicates or deletes unrelated messages.
+ * - Persists schedule metadata (`registrationId`, `scheduleImageUrl`, `scheduleMessageId`, `scheduleChannelId`, `uploadedBy`, `uploadedAt`, `updatedAt`) in MongoDB.
+ *
+ * @param {import('discord.js').Guild|import('discord.js').Client} guildOrClient
+ * @param {string} registrationId
+ * @param {object} attachment
+ * @param {string} uploadedByUserId
+ * @param {object} [actorCtx]
+ * @returns {Promise<{ ok: boolean, error?: string, registration?: object, message?: object, replacedExisting?: boolean }>}
+ */
+export async function publishRegistrationScheduleImage(
+  guildOrClient,
+  registrationId,
+  attachment,
+  uploadedByUserId,
+  actorCtx = null
+) {
+  const contextToValidate = actorCtx || {
+    user: { id: uploadedByUserId },
+    isOrganiser: Boolean(uploadedByUserId),
+  };
+
+  const validation = await validateScheduleManagementContext(contextToValidate, registrationId);
+  if (!validation.ok) {
+    return { ok: false, error: validation.error };
+  }
+
+  const imgValidation = validateScheduleImageAttachment(attachment);
+  if (!imgValidation.valid) {
+    return { ok: false, error: imgValidation.error };
+  }
+
+  const { registration, tournament } = validation;
+  const targetChannelId = registration.registrationChannelId;
+
+  // Ensure targetChannelId does not belong to any other registration or any IDP channel
+  const allTournamentRegs = await getConfigurableRegistrationsForTournament(tournament.tournamentId, false);
+  const conflictingReg = allTournamentRegs.find(
+    (r) =>
+      r.registrationId !== registration.registrationId &&
+      (r.registrationChannelId === targetChannelId || r.idpChannelId === targetChannelId)
+  );
+  if (conflictingReg || targetChannelId === registration.idpChannelId) {
+    return {
+      ok: false,
+      error: '❌ Channel safety check failed: target channel conflicts with another registration or IDP channel.',
+    };
+  }
+
+  const regChannel = await resolveDiscordChannelById(
+    guildOrClient,
+    registration.guildId || tournament.guildId,
+    targetChannelId
+  );
+  if (!regChannel || (typeof regChannel.isTextBased === 'function' && !regChannel.isTextBased())) {
+    return {
+      ok: false,
+      error: '❌ Target registration channel could not be found or is not a text channel.',
+    };
+  }
+
+  if (regChannel.id !== targetChannelId || regChannel.id === registration.idpChannelId) {
+    return {
+      ok: false,
+      error: '❌ Channel verification failed: resolved channel does not match the registration channel ID.',
+    };
+  }
+
+  const filePayload = {
+    attachment: imgValidation.attachmentSource,
+    name: imgValidation.fileName,
+  };
+
+  let publishedMessage = null;
+  let replacedExisting = false;
+
+  // Check if a previously managed schedule message exists in this registration channel
+  if (
+    registration.scheduleMessageId &&
+    registration.scheduleMessageId !== registration.registrationMessageId &&
+    registration.scheduleMessageId !== registration.slotChartMessageId &&
+    typeof regChannel.messages?.fetch === 'function'
+  ) {
+    const existingScheduleMsg = await regChannel.messages.fetch(registration.scheduleMessageId).catch(() => null);
+    if (
+      existingScheduleMsg &&
+      existingScheduleMsg.id !== registration.registrationMessageId &&
+      existingScheduleMsg.id !== registration.slotChartMessageId
+    ) {
+      if (typeof existingScheduleMsg.edit === 'function') {
+        publishedMessage = await existingScheduleMsg
+          .edit({
+            content: '',
+            embeds: [],
+            files: [filePayload],
+            attachments: [],
+          })
+          .catch(() => null);
+        if (publishedMessage) {
+          publishedMessage.files = [filePayload];
+          publishedMessage.attachments = new Map([
+            [
+              'att-sched-1',
+              {
+                id: 'att-sched-1',
+                name: imgValidation.fileName,
+                url: imgValidation.imageUrl,
+                proxyURL: imgValidation.imageUrl,
+                contentType: attachment.contentType || 'image/png',
+              },
+            ],
+          ]);
+          replacedExisting = true;
+        }
+      }
+      if (!publishedMessage && typeof existingScheduleMsg.delete === 'function') {
+        await existingScheduleMsg.delete().catch(() => null);
+        replacedExisting = true;
+      }
+    }
+  }
+
+  if (!publishedMessage) {
+    publishedMessage = await regChannel.send({
+      files: [filePayload],
+    });
+    if (publishedMessage && !publishedMessage.files) {
+      publishedMessage.files = [filePayload];
+    }
+    if (publishedMessage && !publishedMessage.attachments) {
+      publishedMessage.attachments = new Map([
+        [
+          'att-sched-1',
+          {
+            id: 'att-sched-1',
+            name: imgValidation.fileName,
+            url: imgValidation.imageUrl,
+            proxyURL: imgValidation.imageUrl,
+            contentType: attachment.contentType || 'image/png',
+          },
+        ],
+      ]);
+    }
+  }
+
+  const now = new Date();
+  const finalImageUrl = extractPublishedAttachmentUrl(publishedMessage, imgValidation.imageUrl);
+
+  registration.scheduleImageUrl = finalImageUrl;
+  registration.scheduleMessageId = publishedMessage.id;
+  registration.scheduleChannelId = regChannel.id;
+  registration.uploadedBy = uploadedByUserId || registration.uploadedBy || null;
+  registration.uploadedAt = now;
+  registration.updatedAt = now;
+  registration.pendingScheduleUploadBy = null;
+  registration.pendingScheduleUploadChannelId = null;
+  registration.pendingScheduleUploadAt = null;
+
+  const savedRegistration = await saveConfigurableRegistration(registration);
+
+  const guildId = registration.guildId || tournament.guildId;
+  if (guildId && uploadedByUserId) {
+    pendingScheduleUploads.delete(`${guildId}:${uploadedByUserId}`);
+  }
+
+  const client = guildOrClient?.guilds ? guildOrClient : guildOrClient?.client || actorCtx?.client || null;
+  if (client) {
+    await updateManageDashboardMessage(client, registration.registrationId).catch(() => {});
+  }
+
+  return {
+    ok: true,
+    registration: savedRegistration,
+    message: publishedMessage,
+    replacedExisting,
+  };
+}
+
+/**
+ * Handles an incoming Discord message to check if it is a schedule image upload from an organiser.
+ * Can also be invoked with an explicit registrationId.
+ * @param {import('discord.js').Message} message
+ * @param {string} [explicitRegistrationId]
+ * @returns {Promise<boolean>} true if handled
+ */
+export async function handleScheduleImageUploadMessage(message, explicitRegistrationId = null) {
+  if (!message || message.author?.bot) return false;
+
+  const userId = message.author?.id || message.user?.id;
+  const guildId = message.guild?.id || message.guildId || null;
+  const channelId = message.channel?.id || message.channelId || null;
+  if (!userId) return false;
+
+  let targetRegistrationId = explicitRegistrationId || null;
+
+  if (!targetRegistrationId && guildId) {
+    const sessionKey = `${guildId}:${userId}`;
+    const pendingSession = pendingScheduleUploads.get(sessionKey);
+    if (pendingSession) {
+      if (Date.now() - pendingSession.createdAt > SCHEDULE_UPLOAD_TTL_MS) {
+        pendingScheduleUploads.delete(sessionKey);
+      } else if (!pendingSession.channelId || !channelId || pendingSession.channelId === channelId) {
+        targetRegistrationId = pendingSession.registrationId;
+      }
+    }
+  }
+
+  // Fallback: check MongoDB / in-memory registrations for pendingScheduleUploadBy (survives bot restart)
+  if (!targetRegistrationId) {
+    const allActive = await getAllActiveConfigurableRegistrations();
+    const matchedReg = allActive.find((r) => {
+      if (r.pendingScheduleUploadBy !== userId) return false;
+      if (guildId && r.guildId && r.guildId !== guildId) return false;
+      if (r.pendingScheduleUploadChannelId && channelId && r.pendingScheduleUploadChannelId !== channelId) {
+        return false;
+      }
+      const startedAt = r.pendingScheduleUploadAt ? new Date(r.pendingScheduleUploadAt).getTime() : 0;
+      return !startedAt || Date.now() - startedAt <= SCHEDULE_UPLOAD_TTL_MS;
+    });
+    if (matchedReg) {
+      targetRegistrationId = matchedReg.registrationId;
+    }
+  }
+
+  if (!targetRegistrationId) {
+    return false;
+  }
+
+  const validation = await validateScheduleManagementContext(message, targetRegistrationId);
+  if (!validation.ok) {
+    if (typeof message.reply === 'function') {
+      await message.reply(validation.error).catch(() => {});
+    }
+    return true;
+  }
+
+  const firstAttachment =
+    message.attachment ||
+    (message.attachments instanceof Map
+      ? Array.from(message.attachments.values())[0]
+      : message.attachments?.first?.() ||
+        (Array.isArray(message.attachments) ? message.attachments[0] : null));
+
+  const imgCheck = validateScheduleImageAttachment(firstAttachment);
+  if (!imgCheck.valid) {
+    if (typeof message.reply === 'function') {
+      await message.reply(imgCheck.error).catch(() => {});
+    }
+    return true;
+  }
+
+  const pubResult = await publishRegistrationScheduleImage(
+    message.guild || message.client,
+    targetRegistrationId,
+    firstAttachment,
+    userId,
+    message
+  );
+
+  if (!pubResult.ok) {
+    if (typeof message.reply === 'function') {
+      await message.reply(pubResult.error).catch(() => {});
+    }
+    return true;
+  }
+
+  if (typeof message.reply === 'function') {
+    const actionWord = pubResult.replacedExisting ? 'updated' : 'published';
+    await message
+      .reply(
+        `✅ Schedule image for **${pubResult.registration.displayName}** has been ${actionWord} in <#${pubResult.registration.registrationChannelId}>!`
+      )
+      .catch(() => {});
+  }
+
+  return true;
+}
+
+/**
+ * Handles clicking "View Current Schedule" for a registration.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ */
+export async function handleViewScheduleButton(interaction, registrationId) {
+  const validation = await validateScheduleManagementContext(interaction, registrationId);
+  if (!validation.ok) {
+    return interaction.reply({ content: validation.error, ephemeral: true });
+  }
+
+  const { registration, tournament } = validation;
+  if (!registration.scheduleImageUrl && !registration.scheduleMessageId) {
+    return interaction.reply({
+      content: `ℹ️ No schedule image is currently uploaded for **${registration.displayName}**.`,
+      ephemeral: true,
+    });
+  }
+
+  const targetChannelId = registration.scheduleChannelId || registration.registrationChannelId;
+  let scheduleMessageExists = true;
+  let currentUrl = registration.scheduleImageUrl;
+
+  if (registration.scheduleMessageId && (interaction.guild || interaction.client)) {
+    const regChannel = await resolveDiscordChannelById(
+      interaction.guild || interaction.client,
+      registration.guildId || tournament.guildId,
+      targetChannelId
+    );
+    if (regChannel && typeof regChannel.messages?.fetch === 'function') {
+      const msg = await regChannel.messages.fetch(registration.scheduleMessageId).catch(() => null);
+      if (!msg) {
+        scheduleMessageExists = false;
+      } else {
+        currentUrl = extractPublishedAttachmentUrl(msg, currentUrl);
+      }
+    }
+  }
+
+  const uploadedAtStr = registration.uploadedAt
+    ? new Date(registration.uploadedAt).toISOString()
+    : 'Unknown';
+
+  const statusNote = scheduleMessageExists
+    ? `• **Message ID:** \`${registration.scheduleMessageId}\``
+    : `• **Message Status:** ⚠️ Previous message (\`${registration.scheduleMessageId}\`) was deleted from channel; stored image reference is shown below.`;
+
+  return interaction.reply({
+    content:
+      `📅 **Current Schedule — ${registration.displayName}**\n` +
+      `• **Registration Channel:** <#${targetChannelId}>\n` +
+      `${statusNote}\n` +
+      `• **Uploaded By:** ${registration.uploadedBy ? `<@${registration.uploadedBy}>` : 'Organiser'}\n` +
+      `• **Uploaded At:** \`${uploadedAtStr}\`\n` +
+      `• **Schedule Image:** ${currentUrl || 'N/A'}`,
+    ...(currentUrl ? { files: [{ attachment: currentUrl, name: 'schedule.png' }] } : {}),
+    ephemeral: true,
+  });
+}
+
+/**
+ * Handles clicking "Remove Schedule" — requires confirmation before deleting the bot-managed schedule message.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ */
+export async function handleRemoveSchedulePromptButton(interaction, registrationId) {
+  const validation = await validateScheduleManagementContext(interaction, registrationId);
+  if (!validation.ok) {
+    return interaction.reply({ content: validation.error, ephemeral: true });
+  }
+
+  const { registration } = validation;
+  if (!registration.scheduleImageUrl && !registration.scheduleMessageId) {
+    return interaction.reply({
+      content: `ℹ️ No schedule image is currently uploaded for **${registration.displayName}**.`,
+      ephemeral: true,
+    });
+  }
+
+  const confirmRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`md_cfg_sched_remove_confirm_${registration.registrationId}`)
+      .setLabel('Confirm Remove')
+      .setEmoji('🗑️')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`md_cfg_sched_remove_cancel_${registration.registrationId}`)
+      .setLabel('Cancel')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const promptPayload = {
+    content:
+      `⚠️ **Confirm Schedule Removal**\n` +
+      `Are you sure you want to remove the schedule image for **${registration.displayName}** from <#${registration.scheduleChannelId || registration.registrationChannelId}>?\n` +
+      `Only the bot-managed schedule message will be deleted.`,
+    embeds: [],
+    components: [confirmRow],
+  };
+
+  if (typeof interaction.update === 'function' && interaction.isButton?.()) {
+    return interaction.update(promptPayload);
+  }
+  return interaction.reply({ ...promptPayload, ephemeral: true });
+}
+
+/**
+ * Handles confirming removal of a registration's schedule.
+ * Deletes ONLY the bot-managed schedule message and clears the schedule fields in MongoDB.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ */
+export async function handleConfirmRemoveScheduleButton(interaction, registrationId) {
+  const validation = await validateScheduleManagementContext(interaction, registrationId);
+  if (!validation.ok) {
+    return interaction.reply({ content: validation.error, ephemeral: true });
+  }
+
+  const { registration, tournament } = validation;
+  const targetChannelId = registration.scheduleChannelId || registration.registrationChannelId;
+  const scheduleMsgId = registration.scheduleMessageId;
+
+  // Delete ONLY the bot-managed schedule message, never the registration message or other messages
+  if (
+    scheduleMsgId &&
+    scheduleMsgId !== registration.registrationMessageId &&
+    scheduleMsgId !== registration.slotChartMessageId &&
+    (interaction.guild || interaction.client)
+  ) {
+    const regChannel = await resolveDiscordChannelById(
+      interaction.guild || interaction.client,
+      registration.guildId || tournament.guildId,
+      targetChannelId
+    );
+    if (regChannel && typeof regChannel.messages?.fetch === 'function') {
+      const scheduleMsg = await regChannel.messages.fetch(scheduleMsgId).catch(() => null);
+      if (
+        scheduleMsg &&
+        scheduleMsg.id === scheduleMsgId &&
+        scheduleMsg.id !== registration.registrationMessageId &&
+        scheduleMsg.id !== registration.slotChartMessageId &&
+        typeof scheduleMsg.delete === 'function'
+      ) {
+        await scheduleMsg.delete().catch(() => null);
+      }
+    }
+  }
+
+  registration.scheduleImageUrl = null;
+  registration.scheduleMessageId = null;
+  registration.scheduleChannelId = null;
+  registration.uploadedBy = null;
+  registration.uploadedAt = null;
+  registration.updatedAt = new Date();
+  await saveConfigurableRegistration(registration);
+
+  if (interaction.client) {
+    await updateManageDashboardMessage(interaction.client, registration.registrationId).catch(() => {});
+  }
+
+  const donePayload = {
+    content: `✅ Schedule image for **${registration.displayName}** has been removed.`,
+    embeds: [],
+    components: [],
+  };
+
+  if (typeof interaction.update === 'function' && interaction.isButton?.()) {
+    return interaction.update(donePayload);
+  }
+  return interaction.reply({ ...donePayload, ephemeral: true });
+}
+
+/**
+ * Handles cancelling schedule removal and restores the Schedule Management panel.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ */
+export async function handleCancelRemoveScheduleButton(interaction, registrationId) {
+  const validation = await validateScheduleManagementContext(interaction, registrationId);
+  if (!validation.ok) {
+    return interaction.reply({ content: validation.error, ephemeral: true });
+  }
+
+  const payload = buildScheduleManagementPayload(validation.registration);
+  if (typeof interaction.update === 'function' && interaction.isButton?.()) {
+    return interaction.update(payload);
+  }
+  return interaction.reply({ ...payload, ephemeral: true });
+}
+
+/**
+ * Reconciles a registration's schedule message on bot restart.
+ * Ensures the schedule message in the registration channel remains intact, or republishes it
+ * from the stored `scheduleImageUrl` if the message was deleted while offline.
+ * @param {import('discord.js').Client} client
+ * @param {object|string} regOrId
+ * @returns {Promise<boolean>}
+ */
+export async function reconcileRegistrationScheduleMessage(client, regOrId) {
+  try {
+    if (!client) return false;
+    const registration =
+      typeof regOrId === 'string' ? await getConfigurableRegistration(regOrId) : regOrId;
+    if (!registration || registration.status === 'DELETED' || registration.isDeleted) return false;
+    if (!registration.scheduleImageUrl || !registration.registrationChannelId) return false;
+    if (registration.registrationChannelId === registration.idpChannelId) return false;
+
+    const targetChannelId = registration.registrationChannelId;
+    const regChannel = await resolveDiscordChannelById(client, registration.guildId, targetChannelId);
+    if (!regChannel || (typeof regChannel.isTextBased === 'function' && !regChannel.isTextBased())) {
+      return false;
+    }
+
+    if (registration.scheduleMessageId && typeof regChannel.messages?.fetch === 'function') {
+      const existing = await regChannel.messages.fetch(registration.scheduleMessageId).catch(() => null);
+      if (existing) {
+        const refreshedUrl = extractPublishedAttachmentUrl(existing, registration.scheduleImageUrl);
+        if (
+          refreshedUrl !== registration.scheduleImageUrl ||
+          registration.scheduleChannelId !== regChannel.id
+        ) {
+          registration.scheduleImageUrl = refreshedUrl;
+          registration.scheduleChannelId = regChannel.id;
+          await saveConfigurableRegistration(registration);
+        }
+        return true;
+      }
+    }
+
+    // Schedule message was missing; republish the schedule image directly into the registration channel
+    const filePayload = {
+      attachment: registration.scheduleImageUrl,
+      name: 'schedule.png',
+    };
+    const republished = await regChannel.send({ files: [filePayload] }).catch(() => null);
+    if (republished?.id) {
+      registration.scheduleMessageId = republished.id;
+      registration.scheduleChannelId = regChannel.id;
+      registration.scheduleImageUrl = extractPublishedAttachmentUrl(
+        republished,
+        registration.scheduleImageUrl
+      );
+      await saveConfigurableRegistration(registration);
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.warn(`[ConfigurableRegistration] ⚠️ Schedule reconciliation warning:`, err.message);
+    return false;
+  }
+}
+

@@ -248,6 +248,14 @@ async function ensureMongoIndexes() {
     await cfgTeamCol.createIndex({ tournamentId: 1, teamNameLower: 1 }, { unique: true });
     await cfgTeamCol.createIndex({ tournamentId: 1, leaderDiscordId: 1 });
     await cfgTeamCol.createIndex({ tournamentId: 1, 'players.discordId': 1 });
+    await cfgTeamCol.createIndex({ tournamentId: 1, 'substitutes.discordId': 1 });
+
+    const playerMemCol = mongoDb.collection('discord_tournament_player_memberships');
+    await playerMemCol.createIndex({ tournamentId: 1, discordUserId: 1 }, { unique: true });
+    await playerMemCol.createIndex({ tournamentId: 1, teamId: 1 });
+
+    const cfgSlotCol = mongoDb.collection('discord_configurable_slots');
+    await cfgSlotCol.createIndex({ registrationId: 1, cycleId: 1, slotNumber: 1 }, { unique: true });
 
     const cfgEntryCol = mongoDb.collection('discord_configurable_entries');
     try {

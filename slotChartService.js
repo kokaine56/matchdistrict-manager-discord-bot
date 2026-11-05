@@ -9,6 +9,11 @@ import {
   saveConfigurableEntry,
   deleteConfigurableEntry,
   parseReservedSlots,
+  getLockedSlotNumbers,
+  syncRegistrationSlotStates,
+  markConfigurableEntryRemoved,
+  recordConfigurableAuditLog,
+  withAtomicMutex,
 } from './configurableTournamentData.js';
 
 /**
@@ -137,7 +142,9 @@ export function formatSlotListCodeBlock(text) {
  */
 export function buildSlotListText(tournament, registration, entries = []) {
   const totalSlots = registration.totalSlots || 20;
-  const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
+  const lockedSlotNumbers = getLockedSlotNumbers(registration, totalSlots);
+  const lockedSlotsSet = new Set(lockedSlotNumbers);
+  const reservedCount = lockedSlotsSet.size;
   const unlockedTotal = Math.max(0, totalSlots - reservedCount);
 
   const occupiedMap = new Map();
@@ -147,7 +154,7 @@ export function buildSlotListText(tournament, registration, entries = []) {
     if (!entry) continue;
     if (entry.status && !['CONFIRMED', 'REGISTERED'].includes(entry.status)) continue;
     const slotNum = Number(entry.slotNumber);
-    if (!Number.isInteger(slotNum) || slotNum <= reservedCount || slotNum > totalSlots) {
+    if (!Number.isInteger(slotNum) || slotNum < 1 || slotNum > totalSlots || lockedSlotsSet.has(slotNum)) {
       continue;
     }
     const teamKey = entry.teamId || (entry.teamName || '').trim().toLowerCase();
@@ -167,7 +174,7 @@ export function buildSlotListText(tournament, registration, entries = []) {
 
   for (let slot = 1; slot <= totalSlots; slot++) {
     const padded = String(slot).padStart(2, '0');
-    if (slot <= reservedCount) {
+    if (lockedSlotsSet.has(slot)) {
       lines.push(`Slot ${padded} → 🔒 LOCKED`);
     } else {
       const entry = occupiedMap.get(slot);
@@ -382,15 +389,18 @@ export async function syncRegistrationSlotList(firstArg, secondArg = null, third
     }
 
     const totalSlots = registration.totalSlots || 20;
-    const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
+    const lockedSlotsSet = new Set(getLockedSlotNumbers(registration, totalSlots));
+    const reservedCount = lockedSlotsSet.size;
     const unlockedTotal = Math.max(0, totalSlots - reservedCount);
 
-    // Count valid occupied unlocked slots (excluding reserved slots and duplicate teams)
+    await syncRegistrationSlotStates(registrationId, currentCycleId, registration).catch(() => {});
+
+    // Count valid occupied unlocked slots (excluding locked slots and duplicate teams)
     const occupiedSlotsSet = new Set();
     const seenTeamsSet = new Set();
     for (const entry of entries) {
       const slotNum = Number(entry.slotNumber);
-      if (!Number.isInteger(slotNum) || slotNum <= reservedCount || slotNum > totalSlots) continue;
+      if (!Number.isInteger(slotNum) || slotNum < 1 || slotNum > totalSlots || lockedSlotsSet.has(slotNum)) continue;
       const teamKey = entry.teamId || (entry.teamName || '').trim().toLowerCase();
       if (teamKey && seenTeamsSet.has(teamKey)) continue;
       if (!occupiedSlotsSet.has(slotNum) && entry.teamName) {
@@ -653,20 +663,21 @@ export async function changeTeamSlot(registrationId, teamId, newSlotNumber, clie
   const reg = await getConfigurableRegistration(registrationId);
   if (!reg) return { success: false, message: 'Registration not found' };
 
-  if (newSlotNumber < 1 || newSlotNumber > reg.totalSlots) {
+  const targetSlot = Number(newSlotNumber);
+  if (!Number.isInteger(targetSlot) || targetSlot < 1 || targetSlot > reg.totalSlots) {
     return { success: false, message: `Slot number must be between 1 and ${reg.totalSlots}` };
   }
 
-  const reservedCount = parseReservedSlots(reg.reservedSlots, reg.totalSlots);
-  if (newSlotNumber <= reservedCount) {
-    return { success: false, message: `Slot ${newSlotNumber} is LOCKED / Reserved.` };
+  const lockedSlotsSet = new Set(getLockedSlotNumbers(reg, reg.totalSlots));
+  if (lockedSlotsSet.has(targetSlot)) {
+    return { success: false, message: `Slot ${targetSlot} is LOCKED / Reserved.` };
   }
 
   const currentCycleId = reg.currentCycleId || null;
   const entries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
-  const targetOccupied = entries.find((e) => e.slotNumber === newSlotNumber);
+  const targetOccupied = entries.find((e) => Number(e.slotNumber) === targetSlot);
   if (targetOccupied && targetOccupied.teamId !== teamId) {
-    return { success: false, message: `Slot ${newSlotNumber} is already occupied by ${targetOccupied.teamName}.` };
+    return { success: false, message: `Slot ${targetSlot} is already occupied by ${targetOccupied.teamName}.` };
   }
 
   const teamEntry = entries.find((e) => e.teamId === teamId);
@@ -674,8 +685,9 @@ export async function changeTeamSlot(registrationId, teamId, newSlotNumber, clie
     return { success: false, message: 'Team is not registered in this cycle.' };
   }
 
-  teamEntry.slotNumber = newSlotNumber;
+  teamEntry.slotNumber = targetSlot;
   await saveConfigurableEntry(teamEntry);
+  await syncRegistrationSlotStates(registrationId, currentCycleId, reg).catch(() => {});
 
   const resolvedClient = client || activeDiscordClient;
   if (resolvedClient) {
@@ -694,21 +706,25 @@ export async function changeTeamSlot(registrationId, teamId, newSlotNumber, clie
  * @param {import('discord.js').Client} [client]
  * @returns {Promise<{ success: boolean, message?: string }>}
  */
-export async function removeTeamFromRegistration(registrationId, teamId, client = null) {
-  const reg = await getConfigurableRegistration(registrationId);
-  if (!reg) return { success: false, message: 'Registration not found' };
-
-  const currentCycleId = reg.currentCycleId || null;
-  const entry = await getConfigurableEntry(registrationId, teamId, currentCycleId);
-  if (!entry) {
-    return { success: false, message: 'Team registration entry not found in current cycle.' };
-  }
-
-  await deleteConfigurableEntry(registrationId, teamId, currentCycleId);
-
-  // Revoke IDP access
+/**
+ * Retries revoking a removed team leader's IDP channel permission overwrite.
+ *
+ * @param {string} registrationId
+ * @param {string} leaderDiscordId
+ * @param {import('discord.js').Client} [client]
+ * @param {number} [maxRetries]
+ * @returns {Promise<boolean>}
+ */
+export async function retryRevokeIdpChannelAccess(registrationId, leaderDiscordId, client = null, maxRetries = 2) {
+  if (!registrationId || !leaderDiscordId) return false;
   const resolvedClient = client || activeDiscordClient;
-  if (resolvedClient && reg.idpChannelId && entry.leaderDiscordId) {
+  if (!resolvedClient) return false;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    await new Promise((r) => setTimeout(r, attempt * 100));
+    const reg = await getConfigurableRegistration(registrationId);
+    if (!reg || !reg.idpChannelId) return false;
+
     try {
       let idpChannel = null;
       if (resolvedClient.channels?.fetch) {
@@ -721,16 +737,169 @@ export async function removeTeamFromRegistration(registrationId, teamId, client 
         }
       }
       if (idpChannel && typeof idpChannel.permissionOverwrites?.delete === 'function') {
-        await idpChannel.permissionOverwrites.delete(entry.leaderDiscordId).catch(() => {});
+        await idpChannel.permissionOverwrites.delete(leaderDiscordId);
+        if (Array.isArray(reg.pendingIdpRevocations)) {
+          reg.pendingIdpRevocations = reg.pendingIdpRevocations.filter((id) => id !== leaderDiscordId);
+          await saveConfigurableRegistration(reg);
+        }
+        return true;
       }
     } catch {}
   }
+  return false;
+}
 
-  if (resolvedClient) {
-    await syncRegistrationSlotList(registrationId, currentCycleId, resolvedClient);
-    const { updateRegistrationMessage } = await import('./configurableRegistrationService.js');
-    await updateRegistrationMessage(resolvedClient, registrationId).catch(() => {});
-  }
+/**
+ * Organiser tool: removes a team from a registration cycle (registration-level removal).
+ * Marks the registration entry as REMOVED, releases the allocated slot without shifting other teams,
+ * updates the persistent slot list, revokes ONLY that registration's IDP channel access for the team leader,
+ * updates the registration message & management dashboard, and records an audit log entry.
+ * Preserves the team's tournament enrollment and player memberships.
+ *
+ * @param {string} registrationId
+ * @param {string} teamId
+ * @param {import('discord.js').Client} [client]
+ * @param {string|null} [actorId]
+ * @returns {Promise<{
+ *   success: boolean,
+ *   code?: string,
+ *   message?: string,
+ *   entry?: object,
+ *   releasedSlot?: number,
+ *   idpAccessRevoked?: boolean,
+ *   idpRevocationError?: string|null
+ * }>}
+ */
+export async function removeTeamFromRegistration(registrationId, teamId, client = null, actorId = null) {
+  return await withAtomicMutex(`lock:reg_confirm:${registrationId}`, async () => {
+    const reg = await getConfigurableRegistration(registrationId);
+    if (!reg) {
+      return { success: false, code: 'REGISTRATION_NOT_FOUND', message: 'Registration not found' };
+    }
 
-  return { success: true };
+    const currentCycleId = reg.currentCycleId || null;
+    const entry = await getConfigurableEntry(registrationId, teamId, currentCycleId);
+    if (!entry) {
+      return {
+        success: false,
+        code: 'ENTRY_NOT_FOUND',
+        message: 'Team registration entry not found or already removed in the current cycle.',
+      };
+    }
+
+    const teamDoc = await getConfigurableTeam(teamId);
+    const leaderDiscordId = entry.leaderDiscordId || teamDoc?.leaderDiscordId || null;
+    const teamName = entry.teamName || teamDoc?.teamName || 'Unknown Team';
+
+    const removalRes = await markConfigurableEntryRemoved(
+      registrationId,
+      teamId,
+      currentCycleId,
+      actorId,
+      { idpAccessRevoked: false }
+    );
+    if (!removalRes.ok) {
+      return {
+        success: false,
+        code: removalRes.code || 'DB_ERROR',
+        message: removalRes.message || 'Failed to mark registration entry as removed.',
+      };
+    }
+
+    // Check if registration was FULL and now has an available slot again
+    const remainingEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
+    const totalSlots = reg.totalSlots || 20;
+    const lockedCount = getLockedSlotNumbers(reg, totalSlots).length;
+    const usableSlots = Math.max(0, totalSlots - lockedCount);
+    if (reg.status === 'FULL' && remainingEntries.length < usableSlots && reg.manualOverride !== 'CLOSED') {
+      reg.status = 'OPEN';
+      await saveConfigurableRegistration(reg);
+    }
+
+    // Revoke IDP access ONLY for this registration's IDP channel
+    const resolvedClient = client || activeDiscordClient;
+    let idpAccessRevoked = false;
+    let idpRevocationError = null;
+
+    if (reg.idpChannelId && leaderDiscordId) {
+      if (!resolvedClient) {
+        idpAccessRevoked = false;
+        idpRevocationError = 'Discord client unavailable for IDP permission revocation.';
+      } else {
+        try {
+          let idpChannel = null;
+          if (resolvedClient.channels?.fetch) {
+            idpChannel = await resolvedClient.channels.fetch(reg.idpChannelId).catch(() => null);
+          }
+          if (!idpChannel && reg.guildId && resolvedClient.guilds?.fetch) {
+            const guild = await resolvedClient.guilds.fetch(reg.guildId).catch(() => null);
+            if (guild?.channels?.fetch) {
+              idpChannel = await guild.channels.fetch(reg.idpChannelId).catch(() => null);
+            }
+          }
+          if (!idpChannel || typeof idpChannel.permissionOverwrites?.delete !== 'function') {
+            idpAccessRevoked = false;
+            idpRevocationError = 'IDP channel not reachable to revoke permission overwrite.';
+          } else {
+            await idpChannel.permissionOverwrites.delete(leaderDiscordId);
+            idpAccessRevoked = true;
+          }
+        } catch (permErr) {
+          idpAccessRevoked = false;
+          idpRevocationError = permErr?.message || 'Failed to delete IDP permission overwrite.';
+        }
+      }
+
+      if (!idpAccessRevoked) {
+        const pendingSet = new Set(Array.isArray(reg.pendingIdpRevocations) ? reg.pendingIdpRevocations : []);
+        pendingSet.add(leaderDiscordId);
+        reg.pendingIdpRevocations = Array.from(pendingSet);
+        await saveConfigurableRegistration(reg);
+        if (resolvedClient) {
+          retryRevokeIdpChannelAccess(registrationId, leaderDiscordId, resolvedClient).catch(() => {});
+        }
+      }
+    } else {
+      idpAccessRevoked = true;
+    }
+
+    await recordConfigurableAuditLog({
+      action: 'REGISTRATION_TEAM_REMOVED',
+      tournamentId: reg.tournamentId,
+      guildId: reg.guildId,
+      registrationId,
+      cycleId: currentCycleId,
+      teamId,
+      teamName,
+      releasedSlot: removalRes.releasedSlot,
+      leaderDiscordId,
+      idpChannelId: reg.idpChannelId || null,
+      idpAccessRevoked,
+      idpRevocationError,
+      actorId: actorId || null,
+    }).catch(() => {});
+
+    if (resolvedClient) {
+      await syncRegistrationSlotList(registrationId, currentCycleId, resolvedClient);
+      const {
+        updateRegistrationMessage,
+        updateManageDashboardMessage,
+      } = await import('./configurableRegistrationService.js');
+      const { refreshDashboard } = await import('./configurableTournamentService.js');
+      await updateRegistrationMessage(resolvedClient, registrationId).catch(() => {});
+      await updateManageDashboardMessage(resolvedClient, registrationId).catch(() => {});
+      if (reg.tournamentId) {
+        await refreshDashboard(resolvedClient, reg.tournamentId).catch(() => {});
+      }
+    }
+
+    return {
+      success: true,
+      entry: removalRes.entry,
+      teamName,
+      releasedSlot: removalRes.releasedSlot,
+      idpAccessRevoked,
+      idpRevocationError,
+    };
+  });
 }

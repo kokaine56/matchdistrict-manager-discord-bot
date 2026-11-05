@@ -71,7 +71,25 @@ import {
   handleEditRegistrationButton,
   handleEditRegistrationModalSubmit,
   handleViewCurrentSlotChart,
+  handleRefreshSlotChartView,
+  handleBackToManageRegistration,
+  handleManageReservedSlotsButton,
+  handleLockSlotsSelect,
+  handleUnlockSlotsSelect,
+  handleOccupiedSlotReassignAndLock,
+  handleOccupiedSlotRemoveAndLock,
+  handleRemoveTeamMenuButton,
+  handleRemoveTeamSelect,
+  handleConfirmRemoveTeamFromRegistration,
+  handleCancelRemoveTeamFromRegistration,
   handleRefreshRegistration,
+  handleScheduleButton,
+  handleUploadScheduleButton,
+  handleCancelUploadScheduleButton,
+  handleViewScheduleButton,
+  handleRemoveSchedulePromptButton,
+  handleConfirmRemoveScheduleButton,
+  handleCancelRemoveScheduleButton,
 } from './configurableRegistrationService.js';
 import { updateSlotChartMessage } from './slotChartService.js';
 
@@ -1900,10 +1918,87 @@ export async function handleConfigurableTournamentInteraction(interaction) {
     return true;
   }
 
-  // 12b. View Current Slot Chart
+  // 12b. View Current Slot Chart & Slot Management controls
   if (customId.startsWith('md_cfg_view_slotchart_')) {
     const registrationId = customId.replace('md_cfg_view_slotchart_', '');
     await handleViewCurrentSlotChart(interaction, registrationId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_back_to_manage_')) {
+    const registrationId = customId.replace('md_cfg_back_to_manage_', '');
+    await handleBackToManageRegistration(interaction, registrationId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_manage_slots_')) {
+    const raw = customId.replace('md_cfg_manage_slots_', '');
+    const [registrationId, pageStr] = raw.split(':');
+    await handleManageReservedSlotsButton(interaction, registrationId, pageStr ? Number(pageStr) : 0);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_lock_slots_select_')) {
+    const raw = customId.replace('md_cfg_lock_slots_select_', '');
+    const [registrationId, pageStr] = raw.split(':');
+    await handleLockSlotsSelect(interaction, registrationId, null, pageStr ? Number(pageStr) : 0);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_unlock_slots_select_')) {
+    const raw = customId.replace('md_cfg_unlock_slots_select_', '');
+    const [registrationId, pageStr] = raw.split(':');
+    await handleUnlockSlotsSelect(interaction, registrationId, null, pageStr ? Number(pageStr) : 0);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_lock_slot_btn_') || customId.startsWith('md_cfg_unlock_slot_btn_')) {
+    const prefix = customId.startsWith('md_cfg_lock_slot_btn_') ? 'md_cfg_lock_slot_btn_' : 'md_cfg_unlock_slot_btn_';
+    const raw = customId.replace(prefix, '');
+    const [registrationId, pageStr] = raw.split(':');
+    await handleManageReservedSlotsButton(interaction, registrationId, pageStr ? Number(pageStr) : 0);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_slot_occ_reassign_')) {
+    const raw = customId.replace('md_cfg_slot_occ_reassign_', '');
+    const parts = raw.split('_');
+    const teamId = parts.pop();
+    const slotNumber = Number(parts.pop());
+    const registrationId = parts.join('_');
+    await handleOccupiedSlotReassignAndLock(interaction, registrationId, slotNumber, teamId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_slot_occ_remove_')) {
+    const raw = customId.replace('md_cfg_slot_occ_remove_', '');
+    const parts = raw.split('_');
+    const teamId = parts.pop();
+    const slotNumber = Number(parts.pop());
+    const registrationId = parts.join('_');
+    await handleOccupiedSlotRemoveAndLock(interaction, registrationId, slotNumber, teamId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_remove_team_btn_')) {
+    const registrationId = customId.replace('md_cfg_remove_team_btn_', '');
+    await handleRemoveTeamMenuButton(interaction, registrationId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_remove_team_select_')) {
+    const registrationId = customId.replace('md_cfg_remove_team_select_', '');
+    await handleRemoveTeamSelect(interaction, registrationId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_remove_team_confirm_')) {
+    const raw = customId.replace('md_cfg_remove_team_confirm_', '');
+    let registrationId;
+    let teamId;
+    if (raw.includes(':')) {
+      [registrationId, teamId] = raw.split(':');
+    } else {
+      const lastIdx = raw.lastIndexOf('_');
+      registrationId = raw.slice(0, lastIdx);
+      teamId = raw.slice(lastIdx + 1);
+    }
+    await handleConfirmRemoveTeamFromRegistration(interaction, registrationId, teamId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_remove_team_cancel_')) {
+    const registrationId = customId.replace('md_cfg_remove_team_cancel_', '');
+    await handleCancelRemoveTeamFromRegistration(interaction, registrationId);
     return true;
   }
 
@@ -1915,7 +2010,7 @@ export async function handleConfigurableTournamentInteraction(interaction) {
   }
   if (customId.startsWith('md_cfg_refresh_slotchart_')) {
     const registrationId = customId.replace('md_cfg_refresh_slotchart_', '');
-    await handleRefreshRegistration(interaction, registrationId);
+    await handleRefreshSlotChartView(interaction, registrationId);
     return true;
   }
 
@@ -1923,6 +2018,43 @@ export async function handleConfigurableTournamentInteraction(interaction) {
   if (customId.startsWith('md_cfg_delete_reg_')) {
     const registrationId = customId.replace('md_cfg_delete_reg_', '');
     await handleDeleteRegistration(interaction, registrationId);
+    return true;
+  }
+
+  // 14a. Registration Schedule Management buttons
+  if (customId.startsWith('md_cfg_schedule_')) {
+    const registrationId = customId.replace('md_cfg_schedule_', '');
+    await handleScheduleButton(interaction, registrationId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_sched_upload_cancel_')) {
+    const registrationId = customId.replace('md_cfg_sched_upload_cancel_', '');
+    await handleCancelUploadScheduleButton(interaction, registrationId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_sched_upload_')) {
+    const registrationId = customId.replace('md_cfg_sched_upload_', '');
+    await handleUploadScheduleButton(interaction, registrationId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_sched_view_')) {
+    const registrationId = customId.replace('md_cfg_sched_view_', '');
+    await handleViewScheduleButton(interaction, registrationId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_sched_remove_confirm_')) {
+    const registrationId = customId.replace('md_cfg_sched_remove_confirm_', '');
+    await handleConfirmRemoveScheduleButton(interaction, registrationId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_sched_remove_cancel_')) {
+    const registrationId = customId.replace('md_cfg_sched_remove_cancel_', '');
+    await handleCancelRemoveScheduleButton(interaction, registrationId);
+    return true;
+  }
+  if (customId.startsWith('md_cfg_sched_remove_')) {
+    const registrationId = customId.replace('md_cfg_sched_remove_', '');
+    await handleRemoveSchedulePromptButton(interaction, registrationId);
     return true;
   }
 

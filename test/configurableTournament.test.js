@@ -35,6 +35,19 @@ import {
   getPendingEnrollment,
   deletePendingEnrollment,
   parseReservedSlots,
+  getLockedSlotNumbers,
+  saveRegistrationSlotState,
+  syncRegistrationSlotStates,
+  getRegistrationSlotStates,
+  lockRegistrationSlots,
+  unlockRegistrationSlots,
+  getTournamentPlayerMemberships,
+  checkTournamentPlayerExclusivity,
+  saveConfigurableTeamWithExclusivity,
+  releaseTeamPlayerMemberships,
+  recordConfigurableAuditLog,
+  getConfigurableAuditLogs,
+  markConfigurableEntryRemoved,
   parseTimeString,
   evaluateDailyCycleStatus,
   getCurrentTimeInTimezone,
@@ -121,7 +134,34 @@ import {
   handleEditRegistrationButton,
   handleEditRegistrationModalSubmit,
   handleViewCurrentSlotChart,
+  handleRefreshSlotChartView,
+  handleBackToManageRegistration,
+  buildManageReservedSlotsPayload,
+  handleManageReservedSlotsButton,
+  handleLockSlotsSelect,
+  handleUnlockSlotsSelect,
+  handleOccupiedSlotReassignAndLock,
+  handleOccupiedSlotRemoveAndLock,
+  buildRemoveTeamMenuPayload,
+  handleRemoveTeamMenuButton,
+  buildRemoveTeamConfirmPayload,
+  handleRemoveTeamSelect,
+  handleConfirmRemoveTeamFromRegistration,
+  handleCancelRemoveTeamFromRegistration,
   handleDeleteRegistration,
+  clearPendingScheduleUploads,
+  buildScheduleManagementPayload,
+  validateScheduleImageAttachment,
+  handleScheduleButton,
+  handleUploadScheduleButton,
+  handleCancelUploadScheduleButton,
+  handleScheduleImageUploadMessage,
+  publishRegistrationScheduleImage,
+  handleViewScheduleButton,
+  handleRemoveSchedulePromptButton,
+  handleConfirmRemoveScheduleButton,
+  handleCancelRemoveScheduleButton,
+  reconcileRegistrationScheduleMessage,
 } from '../configurableRegistrationService.js';
 
 /**
@@ -173,6 +213,7 @@ import {
 
 test.beforeEach(() => {
   clearAllRegistrationTimers();
+  clearPendingScheduleUploads();
   clearInMemoryData();
 });
 
@@ -2128,12 +2169,17 @@ test('Registration Dashboard - Exactly 1 Row of 5 Buttons and required status fi
 
   const payload = buildManageDashboardPayload(reg, 4);
 
-  // Exactly 1 ActionRow
-  assert.equal(payload.components.length, 1);
+  // Row 1 (5 primary buttons) + Row 2 (📅 Schedule button)
+  assert.equal(payload.components.length, 2);
   const row = payload.components[0];
+  const scheduleRow = payload.components[1];
 
-  // Exactly 5 Buttons
+  // Exactly 5 Buttons in Row 1
   assert.equal(row.components.length, 5);
+  assert.equal(scheduleRow.components.length, 1);
+  assert.equal(scheduleRow.components[0].data.custom_id, 'md_cfg_schedule_reg-dash-5btn');
+  assert.equal(scheduleRow.components[0].data.label, 'Schedule');
+  assert.equal(scheduleRow.components[0].data.emoji.name, '📅');
 
   const customIds = row.components.map((c) => c.data.custom_id);
   assert.deepEqual(customIds, [
@@ -5425,6 +5471,8 @@ test('Exact Timing & Schedule Evaluation - Next due time persisted in MongoDB, e
   clearAllRegistrationTimers();
 });
 
+
+
 test('Tournament Discord Channel Order - Enforces SETUP -> INFO -> UPDATES -> VERIFY -> ALL REGS -> ALL IDPS across creation, 5 registrations, rename, deletion, restart, and rate limits', async () => {
   const guildId = 'guild-order-suite';
   const otherCategoryId = 'cat-unrelated-999';
@@ -5803,6 +5851,1528 @@ test('Tournament Discord Channel Order - Enforces SETUP -> INFO -> UPDATES -> VE
 
   clearAllRegistrationTimers();
 });
+
+// -----------------------------------------------------------------------------------------
+// FEATURE — REGISTRATION-SPECIFIC SCHEDULE IMAGE MANAGEMENT
+// -----------------------------------------------------------------------------------------
+
+test('Registration Schedule Management - Separate per-registration schedule upload, replacement, view, remove, permissions & restart persistence', async () => {
+  const guildId = 'guild-sched-test';
+  const tourId = 'tour-sched-1';
+  const organizerId = 'org-user-1';
+  const normalUserId = 'participant-user-1';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId,
+    name: 'T3 Scrims',
+    prefix: 'T3',
+    createdBy: organizerId,
+    setupChannelId: 'chan-setup-sched',
+    verifyChannelId: 'chan-verify-sched',
+  });
+
+  const reg1 = await saveConfigurableRegistration({
+    registrationId: 'reg-sched-1',
+    tournamentId: tourId,
+    guildId,
+    displayName: 'T3 Registration 1',
+    registrationChannelId: 'chan-reg-1',
+    idpChannelId: 'chan-idp-1',
+    registrationMessageId: 'msg-reg-1',
+    status: 'OPEN',
+  });
+
+  const reg2 = await saveConfigurableRegistration({
+    registrationId: 'reg-sched-2',
+    tournamentId: tourId,
+    guildId,
+    displayName: 'T3 Registration 2',
+    registrationChannelId: 'chan-reg-2',
+    idpChannelId: 'chan-idp-2',
+    registrationMessageId: 'msg-reg-2',
+    status: 'OPEN',
+  });
+
+  // Set up mock Discord channels and message stores
+  const channelMessages = new Map([
+    ['chan-reg-1', new Map([
+      ['msg-reg-1', { id: 'msg-reg-1', author: { id: 'bot-1' }, content: 'Persistent Reg 1 Msg', deleted: false, edit: async () => {} }],
+      ['msg-unrelated-1', { id: 'msg-unrelated-1', author: { id: 'user-99' }, content: 'Unrelated Chat Msg', deleted: false, edit: async () => {} }],
+    ])],
+    ['chan-idp-1', new Map()],
+    ['chan-reg-2', new Map([
+      ['msg-reg-2', { id: 'msg-reg-2', author: { id: 'bot-1' }, content: 'Persistent Reg 2 Msg', deleted: false, edit: async () => {} }],
+    ])],
+    ['chan-idp-2', new Map()],
+  ]);
+
+  let msgCounter = 100;
+  const makeChannelMock = (channelId) => {
+    const store = channelMessages.get(channelId);
+    return {
+      id: channelId,
+      guildId,
+      isTextBased: () => true,
+      send: async (payload) => {
+        const id = `sched-msg-${++msgCounter}`;
+        const msgObj = {
+          id,
+          channelId,
+          author: { id: 'bot-1' },
+          content: payload.content || '',
+          files: payload.files || [],
+          attachments: new Map(
+            (payload.files || []).map((f, idx) => [
+              `att-${id}-${idx}`,
+              {
+                id: `att-${id}-${idx}`,
+                url: `https://cdn.discordapp.com/attachments/${channelId}/${id}/${f.name || 'schedule.png'}`,
+                name: f.name || 'schedule.png',
+                contentType: 'image/png',
+              },
+            ])
+          ),
+          deleted: false,
+          edit: async (editPayload) => {
+            if (editPayload.files) {
+              msgObj.files = editPayload.files;
+              msgObj.attachments = new Map(
+                editPayload.files.map((f, idx) => [
+                  `att-${id}-edit-${idx}`,
+                  {
+                    id: `att-${id}-edit-${idx}`,
+                    url: `https://cdn.discordapp.com/attachments/${channelId}/${id}/${f.name || 'schedule-updated.png'}`,
+                    name: f.name || 'schedule-updated.png',
+                    contentType: 'image/png',
+                  },
+                ])
+              );
+            }
+            return msgObj;
+          },
+          delete: async () => {
+            msgObj.deleted = true;
+            store.delete(id);
+          },
+        };
+        store.set(id, msgObj);
+        return msgObj;
+      },
+      messages: {
+        fetch: async (target) => {
+          if (typeof target === 'string') {
+            const found = store.get(target);
+            if (!found || found.deleted) {
+              const err = new Error('Unknown Message');
+              err.code = 10008;
+              throw err;
+            }
+            return found;
+          }
+          return store;
+        },
+      },
+    };
+  };
+
+  const channelsMap = new Map([
+    ['chan-reg-1', makeChannelMock('chan-reg-1')],
+    ['chan-idp-1', makeChannelMock('chan-idp-1')],
+    ['chan-reg-2', makeChannelMock('chan-reg-2')],
+    ['chan-idp-2', makeChannelMock('chan-idp-2')],
+  ]);
+
+  const mockGuild = {
+    id: guildId,
+    channels: {
+      cache: channelsMap,
+      fetch: async (id) => channelsMap.get(id) || null,
+    },
+  };
+
+  const mockClient = {
+    user: { id: 'bot-1' },
+    channels: {
+      fetch: async (id) => channelsMap.get(id) || null,
+    },
+  };
+
+  // 1. Permission Check: Reject ordinary participant from opening Schedule Management
+  let participantReply = null;
+  await handleScheduleButton(
+    {
+      guildId,
+      guild: mockGuild,
+      user: { id: normalUserId },
+      member: { permissions: { has: () => false } },
+      reply: async (p) => { participantReply = p; },
+    },
+    reg1.registrationId
+  );
+  assert.ok(participantReply);
+  assert.equal(participantReply.ephemeral, true);
+  assert.match(participantReply.content, /only authorised tournament organisers/i);
+
+  // 2. Organiser opens Schedule Management for Registration 1
+  let schedMenuReply = null;
+  await handleScheduleButton(
+    {
+      guildId,
+      guild: mockGuild,
+      user: { id: organizerId },
+      member: { permissions: { has: () => true } },
+      reply: async (p) => { schedMenuReply = p; },
+    },
+    reg1.registrationId
+  );
+  assert.ok(schedMenuReply);
+  assert.equal(schedMenuReply.ephemeral, true);
+  assert.match(schedMenuReply.content, /Schedule Management/);
+  assert.match(
+    schedMenuReply.content,
+    /Upload the match schedule image for this registration\. The bot will publish it in the corresponding registration channel\./
+  );
+  const schedMenuBtnIds = schedMenuReply.components[0].components.map((b) => b.data.custom_id);
+  assert.deepEqual(schedMenuBtnIds, [
+    'md_cfg_sched_upload_reg-sched-1',
+    'md_cfg_sched_view_reg-sched-1',
+    'md_cfg_sched_remove_reg-sched-1',
+  ]);
+  const schedMenuBtnLabels = schedMenuReply.components[0].components.map((b) => b.data.label);
+  assert.deepEqual(schedMenuBtnLabels, [
+    'Upload Schedule',
+    'View Current Schedule',
+    'Remove Schedule',
+  ]);
+
+  // 3. Organiser clicks Upload Schedule for Registration 1
+  let uploadPromptReply = null;
+  await handleUploadScheduleButton(
+    {
+      guildId,
+      guild: mockGuild,
+      channelId: 'chan-setup-sched',
+      user: { id: organizerId },
+      member: { permissions: { has: () => true } },
+      reply: async (p) => { uploadPromptReply = p; },
+    },
+    reg1.registrationId
+  );
+  assert.ok(uploadPromptReply);
+  assert.match(uploadPromptReply.content, /upload or attach/i);
+
+  // 4. Reject invalid (non-image) attachment while upload session is active
+  let invalidUploadReply = null;
+  const handledInvalid = await handleScheduleImageUploadMessage({
+    author: { id: organizerId, bot: false },
+    guildId,
+    guild: mockGuild,
+    channelId: 'chan-setup-sched',
+    client: mockClient,
+    attachments: new Map([
+      ['att-bad', { name: 'document.pdf', contentType: 'application/pdf', size: 1024, url: 'https://example.com/document.pdf' }],
+    ]),
+    reply: async (p) => { invalidUploadReply = typeof p === 'string' ? { content: p } : p; },
+  });
+  assert.equal(handledInvalid, true);
+  assert.ok(invalidUploadReply);
+  assert.match(invalidUploadReply.content, /Invalid file type/i);
+
+  // 5. Ordinary user posting an image does NOT trigger or hijack the organiser's schedule upload
+  const handledNormalUser = await handleScheduleImageUploadMessage({
+    author: { id: normalUserId, bot: false },
+    guildId,
+    guild: mockGuild,
+    channelId: 'chan-setup-sched',
+    client: mockClient,
+    attachments: new Map([
+      ['att-usr', { name: 'hack.png', contentType: 'image/png', size: 2048, url: 'https://example.com/hack.png' }],
+    ]),
+    reply: async () => {},
+  });
+  assert.equal(handledNormalUser, false);
+
+  // 6. Organiser uploads valid PNG image for Registration 1
+  let reg1UploadSuccessReply = null;
+  const handledReg1Upload = await handleScheduleImageUploadMessage({
+    author: { id: organizerId, bot: false },
+    guildId,
+    guild: mockGuild,
+    channelId: 'chan-setup-sched',
+    client: mockClient,
+    attachments: new Map([
+      [
+        'att-reg1-png',
+        {
+          name: 't3_reg1_schedule.png',
+          contentType: 'image/png',
+          size: 4096,
+          url: 'https://cdn.discordapp.com/ephemeral/t3_reg1_schedule.png',
+        },
+      ],
+    ]),
+    reply: async (p) => { reg1UploadSuccessReply = typeof p === 'string' ? { content: p } : p; },
+    delete: async () => {},
+  });
+  assert.equal(handledReg1Upload, true);
+  assert.ok(reg1UploadSuccessReply);
+  assert.match(reg1UploadSuccessReply.content, /published in <#chan-reg-1>/);
+
+  const updatedReg1 = await getConfigurableRegistration('reg-sched-1');
+  assert.ok(updatedReg1.scheduleMessageId, 'scheduleMessageId saved in DB for Reg 1');
+  assert.equal(updatedReg1.scheduleChannelId, 'chan-reg-1', 'scheduleChannelId matches Reg 1 channel');
+  assert.equal(updatedReg1.uploadedBy, organizerId, 'uploadedBy saved');
+  assert.ok(updatedReg1.uploadedAt, 'uploadedAt timestamp saved');
+  assert.ok(updatedReg1.updatedAt, 'updatedAt timestamp saved');
+  assert.match(updatedReg1.scheduleImageUrl, /t3_reg1_schedule\.png/);
+
+  const reg1FirstScheduleMsgId = updatedReg1.scheduleMessageId;
+  // Verify published in Registration 1 channel, NOT in IDP 1 and NOT in Registration 2
+  assert.equal(channelMessages.get('chan-reg-1').has(reg1FirstScheduleMsgId), true);
+  assert.equal(channelMessages.get('chan-idp-1').size, 0, 'IDP 1 channel must receive 0 schedule messages');
+  assert.equal(channelMessages.get('chan-reg-2').size, 1, 'Reg 2 channel still only has its persistent registration message');
+
+  // 7. Upload a DIFFERENT schedule to Registration 2 -> verify published only in Reg 2 channel
+  await handleUploadScheduleButton(
+    {
+      guildId,
+      guild: mockGuild,
+      channelId: 'chan-setup-sched',
+      user: { id: organizerId },
+      member: { permissions: { has: () => true } },
+      reply: async () => {},
+    },
+    reg2.registrationId
+  );
+
+  let reg2UploadSuccessReply = null;
+  await handleScheduleImageUploadMessage({
+    author: { id: organizerId, bot: false },
+    guildId,
+    guild: mockGuild,
+    channelId: 'chan-setup-sched',
+    client: mockClient,
+    attachments: new Map([
+      [
+        'att-reg2-jpg',
+        {
+          name: 't3_reg2_schedule.jpg',
+          contentType: 'image/jpeg',
+          size: 5120,
+          url: 'https://cdn.discordapp.com/ephemeral/t3_reg2_schedule.jpg',
+        },
+      ],
+    ]),
+    reply: async (p) => { reg2UploadSuccessReply = typeof p === 'string' ? { content: p } : p; },
+    delete: async () => {},
+  });
+  assert.ok(reg2UploadSuccessReply);
+  assert.match(reg2UploadSuccessReply.content, /published in <#chan-reg-2>/);
+
+  const updatedReg2 = await getConfigurableRegistration('reg-sched-2');
+  assert.ok(updatedReg2.scheduleMessageId);
+  assert.notEqual(updatedReg2.scheduleMessageId, updatedReg1.scheduleMessageId);
+  assert.equal(updatedReg2.scheduleChannelId, 'chan-reg-2');
+  assert.match(updatedReg2.scheduleImageUrl, /t3_reg2_schedule\.jpg/);
+  assert.equal(channelMessages.get('chan-reg-2').has(updatedReg2.scheduleMessageId), true);
+  assert.equal(channelMessages.get('chan-idp-2').size, 0, 'IDP 2 channel untouched');
+
+  // 8. Replace Registration 1's schedule -> must update without duplicate schedule announcements or deleting unrelated messages
+  const reg1MsgCountBeforeReplace = channelMessages.get('chan-reg-1').size;
+  await handleUploadScheduleButton(
+    {
+      guildId,
+      guild: mockGuild,
+      channelId: 'chan-setup-sched',
+      user: { id: organizerId },
+      member: { permissions: { has: () => true } },
+      reply: async () => {},
+    },
+    reg1.registrationId
+  );
+
+  let reg1ReplaceReply = null;
+  await handleScheduleImageUploadMessage({
+    author: { id: organizerId, bot: false },
+    guildId,
+    guild: mockGuild,
+    channelId: 'chan-setup-sched',
+    client: mockClient,
+    attachments: new Map([
+      [
+        'att-reg1-replace',
+        {
+          name: 't3_reg1_schedule_v2.jpeg',
+          contentType: 'image/jpeg',
+          size: 6144,
+          url: 'https://cdn.discordapp.com/ephemeral/t3_reg1_schedule_v2.jpeg',
+        },
+      ],
+    ]),
+    reply: async (p) => { reg1ReplaceReply = typeof p === 'string' ? { content: p } : p; },
+    delete: async () => {},
+  });
+  assert.ok(reg1ReplaceReply);
+  assert.match(reg1ReplaceReply.content, /updated/);
+
+  const replacedReg1 = await getConfigurableRegistration('reg-sched-1');
+  assert.equal(replacedReg1.scheduleMessageId, reg1FirstScheduleMsgId, 'Edited existing schedule message in place');
+  assert.match(replacedReg1.scheduleImageUrl, /t3_reg1_schedule_v2\.jpeg/);
+  assert.equal(channelMessages.get('chan-reg-1').size, reg1MsgCountBeforeReplace, 'No duplicate schedule messages created');
+  assert.equal(channelMessages.get('chan-reg-1').has('msg-reg-1'), true, 'Persistent registration message preserved');
+  assert.equal(channelMessages.get('chan-reg-1').has('msg-unrelated-1'), true, 'Unrelated message preserved');
+
+  // 9. View Current Schedule for Registration 1
+  let viewScheduleReply = null;
+  await handleViewScheduleButton(
+    {
+      guildId,
+      guild: mockGuild,
+      client: mockClient,
+      user: { id: organizerId },
+      member: { permissions: { has: () => true } },
+      reply: async (p) => { viewScheduleReply = p; },
+    },
+    reg1.registrationId
+  );
+  assert.ok(viewScheduleReply);
+  assert.equal(viewScheduleReply.ephemeral, true);
+  assert.match(viewScheduleReply.content, /Current Schedule — T3 Registration 1/);
+  assert.match(viewScheduleReply.content, /t3_reg1_schedule_v2\.jpeg/);
+  assert.equal(viewScheduleReply.files.length, 1);
+
+  // 10. Bot restart reconciliation preserves and recovers schedule state (including if message was externally deleted)
+  channelMessages.get('chan-reg-2').delete(updatedReg2.scheduleMessageId);
+  await reconcileConfigurableTournaments(mockClient);
+  const reg1AfterRestart = await getConfigurableRegistration('reg-sched-1');
+  assert.equal(reg1AfterRestart.scheduleMessageId, reg1FirstScheduleMsgId);
+  assert.match(reg1AfterRestart.scheduleImageUrl, /t3_reg1_schedule_v2\.jpeg/);
+  const reg2AfterRestart = await getConfigurableRegistration('reg-sched-2');
+  assert.ok(reg2AfterRestart.scheduleMessageId, 'Reconciled and re-published missing schedule message on restart');
+  assert.notEqual(reg2AfterRestart.scheduleMessageId, updatedReg2.scheduleMessageId, 'New message ID stored after recovery');
+  assert.equal(channelMessages.get('chan-reg-2').has(reg2AfterRestart.scheduleMessageId), true);
+
+  // 11. Remove Schedule with confirmation for Registration 1
+  let removePromptReply = null;
+  await handleRemoveSchedulePromptButton(
+    {
+      guildId,
+      guild: mockGuild,
+      user: { id: organizerId },
+      member: { permissions: { has: () => true } },
+      reply: async (p) => { removePromptReply = p; },
+    },
+    reg1.registrationId
+  );
+  assert.ok(removePromptReply);
+  assert.match(removePromptReply.content, /Are you sure you want to remove the schedule image/);
+  const removeConfirmBtnIds = removePromptReply.components[0].components.map((b) => b.data.custom_id);
+  assert.deepEqual(removeConfirmBtnIds, [
+    'md_cfg_sched_remove_confirm_reg-sched-1',
+    'md_cfg_sched_remove_cancel_reg-sched-1',
+  ]);
+
+  let confirmRemoveReply = null;
+  await handleConfirmRemoveScheduleButton(
+    {
+      guildId,
+      guild: mockGuild,
+      client: mockClient,
+      user: { id: organizerId },
+      member: { permissions: { has: () => true } },
+      reply: async (p) => { confirmRemoveReply = p; },
+    },
+    reg1.registrationId
+  );
+  assert.ok(confirmRemoveReply);
+  assert.match(confirmRemoveReply.content, /Schedule image for \*\*T3 Registration 1\*\* has been removed/);
+
+  const clearedReg1 = await getConfigurableRegistration('reg-sched-1');
+  assert.equal(clearedReg1.scheduleMessageId, null);
+  assert.equal(clearedReg1.scheduleImageUrl, null);
+  assert.equal(clearedReg1.scheduleChannelId, null);
+  assert.equal(channelMessages.get('chan-reg-1').has(reg1FirstScheduleMsgId), false, 'Bot-managed schedule message deleted from Discord');
+  assert.equal(channelMessages.get('chan-reg-1').has('msg-reg-1'), true, 'Registration embed message untouched');
+  assert.equal(channelMessages.get('chan-reg-1').has('msg-unrelated-1'), true, 'Unrelated messages untouched');
+
+  // Verify Registration 2's schedule is still intact after Registration 1's schedule was removed
+  const reg2StillIntact = await getConfigurableRegistration('reg-sched-2');
+  assert.ok(reg2StillIntact.scheduleMessageId);
+  assert.equal(channelMessages.get('chan-reg-2').has(reg2StillIntact.scheduleMessageId), true);
+
+  clearAllRegistrationTimers();
+});
+
+test('FEATURE: Individual Slot Reservation & Lock Management — non-contiguous locking, allocation, occupied protection, persistence & daily reset', async () => {
+  clearInMemoryData();
+  clearAllRegistrationTimers();
+
+  const guildId = 'guild-slot-lock';
+  const tourId = 'tour-slot-lock';
+  const organizerId = 'org-slot-lock-1';
+  const randomUserId = 'user-unauth-999';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId,
+    name: 'T3 Scrims',
+    categoryId: 'cat-slot-lock',
+    setupChannelId: 'chan-setup-lock',
+    standardChannels: {
+      infoChannelId: 'chan-info-lock',
+      updatesChannelId: 'chan-updates-lock',
+      verifyChannelId: 'chan-verify-lock',
+    },
+    createdBy: organizerId,
+    requiredDiscordMembers: 4,
+  });
+
+  const channelMessages = new Map();
+  const ensureChannelMap = (chanId) => {
+    if (!channelMessages.has(chanId)) channelMessages.set(chanId, new Map());
+    return channelMessages.get(chanId);
+  };
+
+  let msgSeq = 1;
+  const buildMockChannel = (chanId) => ({
+    id: chanId,
+    isTextBased: () => true,
+    permissionOverwrites: {
+      edit: async () => {},
+      delete: async () => {},
+    },
+    messages: {
+      fetch: async (msgId) => {
+        const map = ensureChannelMap(chanId);
+        if (!map.has(msgId)) throw new Error('Unknown Message');
+        return map.get(msgId);
+      },
+    },
+    send: async (payload) => {
+      const id = `msg-lock-${chanId}-${msgSeq++}`;
+      const record = {
+        id,
+        channelId: chanId,
+        content: payload.content || '',
+        embeds: payload.embeds || [],
+        components: payload.components || [],
+        edit: async (nextPayload) => {
+          if (nextPayload.content !== undefined) record.content = nextPayload.content;
+          if (nextPayload.embeds !== undefined) record.embeds = nextPayload.embeds;
+          if (nextPayload.components !== undefined) record.components = nextPayload.components;
+          return record;
+        },
+        delete: async () => {
+          ensureChannelMap(chanId).delete(id);
+        },
+      };
+      ensureChannelMap(chanId).set(id, record);
+      return record;
+    },
+  });
+
+  const mockGuild = {
+    id: guildId,
+    roles: { everyone: { id: guildId } },
+    channels: {
+      fetch: async (id) => buildMockChannel(id),
+    },
+  };
+
+  const mockClient = {
+    user: { id: 'bot-slot-lock' },
+    guilds: {
+      fetch: async (id) => (id === guildId ? mockGuild : null),
+    },
+    channels: {
+      fetch: async (id) => buildMockChannel(id),
+    },
+  };
+
+  // Seed initial persistent registration and slot chart messages
+  const reg1Msg = await buildMockChannel('chan-reg-lock-1').send({ content: 'Initial reg 1' });
+  const idp1Msg = await buildMockChannel('chan-idp-lock-1').send({ content: 'Initial slotchart 1' });
+  const reg2Msg = await buildMockChannel('chan-reg-lock-2').send({ content: 'Initial reg 2' });
+  const idp2Msg = await buildMockChannel('chan-idp-lock-2').send({ content: 'Initial slotchart 2' });
+
+  const reg1 = await saveConfigurableRegistration({
+    registrationId: 'reg-lock-1',
+    tournamentId: tourId,
+    guildId,
+    displayName: '12PM',
+    totalSlots: 18,
+    reservedSlots: 0,
+    lockedSlots: [],
+    matches: 2,
+    status: 'OPEN',
+    manualOverride: 'OPEN',
+    dailyStartTime: '11:00',
+    dailyResetTime: '23:00',
+    currentCycleDate: '2026-11-05',
+    currentCycleId: 'reg-lock-1:2026-11-05',
+    registrationChannelId: 'chan-reg-lock-1',
+    registrationMessageId: reg1Msg.id,
+    idpChannelId: 'chan-idp-lock-1',
+    slotChartMessageId: idp1Msg.id,
+  });
+
+  const reg2 = await saveConfigurableRegistration({
+    registrationId: 'reg-lock-2',
+    tournamentId: tourId,
+    guildId,
+    displayName: '3PM',
+    totalSlots: 18,
+    reservedSlots: 0,
+    lockedSlots: [],
+    matches: 2,
+    status: 'OPEN',
+    manualOverride: 'OPEN',
+    dailyStartTime: '14:00',
+    dailyResetTime: '23:00',
+    currentCycleDate: '2026-11-05',
+    currentCycleId: 'reg-lock-2:2026-11-05',
+    registrationChannelId: 'chan-reg-lock-2',
+    registrationMessageId: reg2Msg.id,
+    idpChannelId: 'chan-idp-lock-2',
+    slotChartMessageId: idp2Msg.id,
+  });
+
+  // 1. Accessing Slot Management via View Current Slot Chart
+  // Verify main registration dashboard does not have a duplicate Manage Reserved Slots button
+  const mainDashPayload = buildManageDashboardPayload(reg1, 0);
+  const mainDashButtonIds = mainDashPayload.components.flatMap((row) =>
+    row.components.map((c) => c.data.custom_id)
+  );
+  assert.equal(
+    mainDashButtonIds.some((id) => id.startsWith('md_cfg_manage_slots_')),
+    false,
+    'Main registration dashboard must not have a separate Manage Reserved Slots button'
+  );
+  assert.equal(
+    mainDashButtonIds.includes(`md_cfg_view_slotchart_${reg1.registrationId}`),
+    true,
+    'Main registration dashboard has View Current Slot Chart button'
+  );
+
+  // Unauthorised user cannot open View Current Slot Chart or Manage Reserved Slots
+  let unauthReply = null;
+  await handleViewCurrentSlotChart(
+    {
+      guildId,
+      guild: mockGuild,
+      client: mockClient,
+      user: { id: randomUserId },
+      member: { permissions: { has: () => false } },
+      reply: async (p) => { unauthReply = p; },
+    },
+    reg1.registrationId
+  );
+  assert.ok(unauthReply);
+  assert.match(unauthReply.content, /only authorised tournament organisers/i);
+
+  // Authorised organiser clicks View Current Slot Chart
+  let slotChartViewReply = null;
+  await handleViewCurrentSlotChart(
+    {
+      guildId,
+      guild: mockGuild,
+      client: mockClient,
+      user: { id: organizerId },
+      member: { permissions: { has: () => true } },
+      reply: async (p) => { slotChartViewReply = p; },
+    },
+    reg1.registrationId
+  );
+  assert.ok(slotChartViewReply);
+  assert.match(slotChartViewReply.content, /Slot 01 → AVAILABLE/);
+  assert.match(slotChartViewReply.content, /⚪ 0\/18 filled/);
+  const viewControlsIds = slotChartViewReply.components[0].components.map((b) => b.data.custom_id);
+  assert.deepEqual(viewControlsIds, [
+    `md_cfg_manage_slots_${reg1.registrationId}`,
+    `md_cfg_refresh_slotchart_${reg1.registrationId}`,
+    `md_cfg_back_to_manage_${reg1.registrationId}`,
+  ]);
+  const viewControlsLabels = slotChartViewReply.components[0].components.map((b) => b.data.label);
+  assert.deepEqual(viewControlsLabels, [
+    'Manage Reserved Slots',
+    'Refresh Slot Chart',
+    'Back',
+  ]);
+
+  // 2. Click Manage Reserved Slots -> verify Lock Slot and Unlock Slot menus
+  let manageSlotsUpdate = null;
+  await handleConfigurableTournamentInteraction({
+    customId: `md_cfg_manage_slots_${reg1.registrationId}`,
+    isButton: () => true,
+    isStringSelectMenu: () => false,
+    isModalSubmit: () => false,
+    guildId,
+    guild: mockGuild,
+    client: mockClient,
+    user: { id: organizerId },
+    member: { permissions: { has: () => true } },
+    update: async (p) => { manageSlotsUpdate = p; },
+    reply: async (p) => { manageSlotsUpdate = p; },
+  });
+  assert.ok(manageSlotsUpdate);
+  const selectMenuIds = manageSlotsUpdate.components
+    .map((r) => r.components[0]?.data?.custom_id)
+    .filter(Boolean);
+  assert.equal(selectMenuIds.includes(`md_cfg_lock_slots_select_${reg1.registrationId}:0`), true);
+
+  // 3. Test 1 & Test 2: Lock Slots 01 & 02 AND Lock Slots 17 & 18 (non-contiguous ends)
+  let lockEndsUpdate = null;
+  await handleConfigurableTournamentInteraction({
+    customId: `md_cfg_lock_slots_select_${reg1.registrationId}:0`,
+    isButton: () => false,
+    isStringSelectMenu: () => true,
+    isModalSubmit: () => false,
+    values: ['1', '2', '17', '18'],
+    guildId,
+    guild: mockGuild,
+    client: mockClient,
+    user: { id: organizerId },
+    member: { permissions: { has: () => true } },
+    update: async (p) => { lockEndsUpdate = p; },
+    reply: async (p) => { lockEndsUpdate = p; },
+  });
+  assert.ok(lockEndsUpdate);
+
+  // Verify IDP channel slot chart updated in place without duplicate message
+  assert.equal(ensureChannelMap('chan-idp-lock-1').size, 1, 'Existing IDP slot chart edited in place');
+  assert.match(idp1Msg.content, /Slot 01 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 02 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 03 → AVAILABLE/);
+  assert.match(idp1Msg.content, /Slot 16 → AVAILABLE/);
+  assert.match(idp1Msg.content, /Slot 17 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 18 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /⚪ 0\/14 filled/);
+
+  // Enroll 6 verified teams
+  const teamNames = ['Team Alpha', 'Team Bravo', 'Team Charlie', 'Team Delta', 'Team Echo', 'Team Foxtrot'];
+  for (let i = 0; i < teamNames.length; i++) {
+    await saveConfigurableTeam({
+      teamId: `team-lock-${i + 1}`,
+      tournamentId: tourId,
+      guildId,
+      teamName: teamNames[i],
+      leaderDiscordId: `leader-lock-${i + 1}`,
+      leaderInGameName: `Leader${i + 1}`,
+      leaderInGameUid: `50000${i + 1}`,
+      VerificationStatus: 'VERIFIED',
+      players: [
+        { discordId: `leader-lock-${i + 1}`, ign: `P1_${i}`, uid: `1001_${i}` },
+        { discordId: `p2-lock-${i + 1}`, ign: `P2_${i}`, uid: `1002_${i}` },
+        { discordId: `p3-lock-${i + 1}`, ign: `P3_${i}`, uid: `1003_${i}` },
+        { discordId: `p4-lock-${i + 1}`, ign: `P4_${i}`, uid: `1004_${i}` },
+      ],
+    });
+  }
+
+  // Register first 4 teams -> should get Slots 03, 04, 05, 06 (skipping 01 & 02)
+  const expectedFirstFourSlots = [3, 4, 5, 6];
+  for (let i = 0; i < 4; i++) {
+    const leaderId = `leader-lock-${i + 1}`;
+    const interaction = {
+      guildId,
+      guild: mockGuild,
+      client: mockClient,
+      user: { id: leaderId },
+      reply: async () => {},
+    };
+    await registerSquadFull(interaction, reg1.registrationId);
+    const finalReply = interaction.lastReply;
+    assert.ok(finalReply);
+    assert.match(finalReply.content, new RegExp(`Slot #${expectedFirstFourSlots[i]}`));
+  }
+
+  // 4. Test 3: Lock a middle slot (Slot 07) and verify subsequent registrations skip Slot 07
+  let lockMiddleUpdate = null;
+  await handleLockSlotsSelect(
+    {
+      guildId,
+      guild: mockGuild,
+      client: mockClient,
+      user: { id: organizerId },
+      member: { permissions: { has: () => true } },
+      values: ['7'],
+      update: async (p) => { lockMiddleUpdate = p; },
+      reply: async (p) => { lockMiddleUpdate = p; },
+    },
+    reg1.registrationId,
+    ['7']
+  );
+  assert.ok(lockMiddleUpdate);
+  assert.match(idp1Msg.content, /Slot 07 → 🔒 LOCKED/);
+  // 4 occupied out of (18 - 5 locked = 13 usable)
+  assert.match(idp1Msg.content, /🟡 4\/13 filled/);
+
+  // Register Team Echo (5th team) and Team Foxtrot (6th team) -> must skip Slot 07 and allocate Slots 08 & 09
+  const expectedNextTwoSlots = [8, 9];
+  for (let i = 4; i < 6; i++) {
+    const leaderId = `leader-lock-${i + 1}`;
+    const interaction = {
+      guildId,
+      guild: mockGuild,
+      client: mockClient,
+      user: { id: leaderId },
+      reply: async () => {},
+    };
+    await registerSquadFull(interaction, reg1.registrationId);
+    const finalReply = interaction.lastReply;
+    assert.ok(finalReply);
+    assert.match(finalReply.content, new RegExp(`Slot #${expectedNextTwoSlots[i - 4]}`));
+  }
+
+  // Verify IDP Slot Chart matches exact expected layout and counter (6/13 filled)
+  assert.match(idp1Msg.content, /Slot 01 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 02 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 03 → Team Alpha/);
+  assert.match(idp1Msg.content, /Slot 04 → Team Bravo/);
+  assert.match(idp1Msg.content, /Slot 05 → Team Charlie/);
+  assert.match(idp1Msg.content, /Slot 06 → Team Delta/);
+  assert.match(idp1Msg.content, /Slot 07 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 08 → Team Echo/);
+  assert.match(idp1Msg.content, /Slot 09 → Team Foxtrot/);
+  assert.match(idp1Msg.content, /Slot 10 → AVAILABLE/);
+  assert.match(idp1Msg.content, /Slot 17 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 18 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /🟡 6\/13 filled/);
+
+  // 5. Test 4: Unlock Slot 07 and verify it immediately becomes AVAILABLE and is allocated to next team
+  let unlockMiddleUpdate = null;
+  await handleUnlockSlotsSelect(
+    {
+      guildId,
+      guild: mockGuild,
+      client: mockClient,
+      user: { id: organizerId },
+      member: { permissions: { has: () => true } },
+      values: ['7'],
+      update: async (p) => { unlockMiddleUpdate = p; },
+      reply: async (p) => { unlockMiddleUpdate = p; },
+    },
+    reg1.registrationId,
+    ['7']
+  );
+  assert.ok(unlockMiddleUpdate);
+  assert.match(idp1Msg.content, /Slot 07 → AVAILABLE/);
+  assert.match(idp1Msg.content, /🟡 6\/14 filled/);
+
+  // Enroll and register a 7th team (Team Golf) -> must receive newly unlocked Slot 07 (lowest available unlocked slot)
+  await saveConfigurableTeam({
+    teamId: 'team-lock-7',
+    tournamentId: tourId,
+    guildId,
+    teamName: 'Team Golf',
+    leaderDiscordId: 'leader-lock-7',
+    leaderInGameName: 'Leader7',
+    leaderInGameUid: '500007',
+    VerificationStatus: 'VERIFIED',
+    players: [
+      { discordId: 'leader-lock-7', ign: 'P1_7', uid: '1001_7' },
+      { discordId: 'p2-lock-7', ign: 'P2_7', uid: '1002_7' },
+      { discordId: 'p3-lock-7', ign: 'P3_7', uid: '1003_7' },
+      { discordId: 'p4-lock-7', ign: 'P4_7', uid: '1004_7' },
+    ],
+  });
+  const golfInteraction = {
+    guildId,
+    guild: mockGuild,
+    client: mockClient,
+    user: { id: 'leader-lock-7' },
+    reply: async () => {},
+  };
+  await registerSquadFull(golfInteraction, reg1.registrationId);
+  const golfReply = golfInteraction.lastReply;
+  assert.match(golfReply.content, /Slot #7/);
+  assert.match(idp1Msg.content, /Slot 07 → Team Golf/);
+  assert.match(idp1Msg.content, /🟡 7\/14 filled/);
+
+  // 6. Test 5: Occupied Slot Protection — Attempt to lock occupied Slot 03 (assigned to Team Alpha)
+  let occupiedLockPrompt = null;
+  await handleLockSlotsSelect(
+    {
+      guildId,
+      guild: mockGuild,
+      client: mockClient,
+      user: { id: organizerId },
+      member: { permissions: { has: () => true } },
+      values: ['3'],
+      update: async (p) => { occupiedLockPrompt = p; },
+      reply: async (p) => { occupiedLockPrompt = p; },
+    },
+    reg1.registrationId,
+    ['3']
+  );
+  assert.ok(occupiedLockPrompt);
+  assert.match(
+    occupiedLockPrompt.content,
+    /This slot is currently assigned to Team Alpha\. Remove or reassign the team before locking this slot\./
+  );
+
+  // Verify Slot 03 is STILL occupied by Team Alpha (not silently deleted or moved)
+  const entriesBeforeConfirm = await getConfigurableEntriesForRegistration(reg1.registrationId, reg1.currentCycleId);
+  const alphaBefore = entriesBeforeConfirm.find((e) => e.teamId === 'team-lock-1');
+  assert.equal(alphaBefore.slotNumber, 3);
+
+  // Organiser explicitly confirms Reassign Team Alpha to next available slot (Slot 10) and Lock Slot 03
+  let reassignConfirmReply = null;
+  await handleConfigurableTournamentInteraction({
+    customId: `md_cfg_slot_occ_reassign_${reg1.registrationId}_3_team-lock-1`,
+    isButton: () => true,
+    isStringSelectMenu: () => false,
+    isModalSubmit: () => false,
+    guildId,
+    guild: mockGuild,
+    client: mockClient,
+    user: { id: organizerId },
+    member: { permissions: { has: () => true } },
+    update: async (p) => { reassignConfirmReply = p; },
+    reply: async (p) => { reassignConfirmReply = p; },
+  });
+  assert.ok(reassignConfirmReply);
+  assert.match(idp1Msg.content, /Slot 03 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 10 → Team Alpha/);
+  assert.match(idp1Msg.content, /🟡 7\/13 filled/);
+
+  // 7. Test 6: Persistence in MongoDB / slot state records & Bot Restart reconciliation
+  const slotStates = await getRegistrationSlotStates(reg1.registrationId, reg1.currentCycleId);
+  assert.equal(slotStates.length, 18);
+  const slotStateByNum = new Map(slotStates.map((s) => [s.slotNumber, s]));
+  assert.equal(slotStateByNum.get(1).status, 'LOCKED');
+  assert.equal(slotStateByNum.get(2).status, 'LOCKED');
+  assert.equal(slotStateByNum.get(3).status, 'LOCKED');
+  assert.equal(slotStateByNum.get(4).status, 'OCCUPIED');
+  assert.equal(slotStateByNum.get(4).teamId, 'team-lock-2');
+  assert.equal(slotStateByNum.get(10).status, 'OCCUPIED');
+  assert.equal(slotStateByNum.get(10).teamId, 'team-lock-1');
+  assert.equal(slotStateByNum.get(11).status, 'AVAILABLE');
+  assert.equal(slotStateByNum.get(17).status, 'LOCKED');
+  assert.equal(slotStateByNum.get(18).status, 'LOCKED');
+
+  await reconcileConfigurableTournaments(mockClient);
+  const reg1AfterRestart = await getConfigurableRegistration(reg1.registrationId);
+  assert.deepEqual(getLockedSlotNumbers(reg1AfterRestart, 18), [1, 2, 3, 17, 18]);
+
+  // 8. Test 8: Verify other registration instances (reg2) remain completely unaffected
+  const reg2State = await getConfigurableRegistration(reg2.registrationId);
+  assert.deepEqual(getLockedSlotNumbers(reg2State, 18), []);
+
+  // 9. Test 7: Start a new daily cycle and verify locked slots remain LOCKED while occupied slots reset to AVAILABLE
+  await executeDailyCycleReset(mockClient, reg1.registrationId, true, new Date('2026-11-05T23:05:00+05:30'));
+  const reg1NextCycle = await getConfigurableRegistration(reg1.registrationId);
+  assert.deepEqual(getLockedSlotNumbers(reg1NextCycle, 18), [1, 2, 3, 17, 18]);
+
+  const nextCycleSlotStates = await getRegistrationSlotStates(reg1.registrationId, reg1NextCycle.currentCycleId);
+  const nextStateByNum = new Map(nextCycleSlotStates.map((s) => [s.slotNumber, s]));
+  assert.equal(nextStateByNum.get(1).status, 'LOCKED');
+  assert.equal(nextStateByNum.get(2).status, 'LOCKED');
+  assert.equal(nextStateByNum.get(3).status, 'LOCKED');
+  assert.equal(nextStateByNum.get(4).status, 'AVAILABLE');
+  assert.equal(nextStateByNum.get(10).status, 'AVAILABLE');
+  assert.equal(nextStateByNum.get(17).status, 'LOCKED');
+  assert.equal(nextStateByNum.get(18).status, 'LOCKED');
+
+  assert.match(idp1Msg.content, /Slot 01 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 02 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 03 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 04 → AVAILABLE/);
+  assert.match(idp1Msg.content, /Slot 17 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 18 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /⚪ 0\/13 filled/);
+
+  clearAllRegistrationTimers();
+});
+
+test('FEATURE: Registration-Level Team Removal — slot release without shifting, IDP access revocation, audit log & enrollment preservation', async () => {
+  clearInMemoryData();
+  clearAllRegistrationTimers();
+
+  const guildId = 'guild-rem-team';
+  const tourId = 'tour-rem-team';
+  const organizerId = 'org-rem-1';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId,
+    name: 'T3 Scrims',
+    categoryId: 'cat-rem-team',
+    setupChannelId: 'chan-setup-rem',
+    standardChannels: {
+      infoChannelId: 'chan-info-rem',
+      updatesChannelId: 'chan-updates-rem',
+      verifyChannelId: 'chan-verify-rem',
+    },
+    createdBy: organizerId,
+    requiredDiscordMembers: 4,
+  });
+
+  const channelMessages = new Map();
+  const idpPermissionOverwrites = new Map(); // chanId -> Set of userIds with access
+  const failRevokeForChannels = new Set();
+
+  const ensureChannelMap = (chanId) => {
+    if (!channelMessages.has(chanId)) channelMessages.set(chanId, new Map());
+    return channelMessages.get(chanId);
+  };
+  const ensureOverwriteSet = (chanId) => {
+    if (!idpPermissionOverwrites.has(chanId)) idpPermissionOverwrites.set(chanId, new Set());
+    return idpPermissionOverwrites.get(chanId);
+  };
+
+  let msgSeq = 1;
+  const buildMockChannel = (chanId) => ({
+    id: chanId,
+    isTextBased: () => true,
+    permissionOverwrites: {
+      edit: async (targetId, perms) => {
+        if (perms?.ViewChannel === true) {
+          ensureOverwriteSet(chanId).add(targetId);
+        }
+      },
+      delete: async (targetId) => {
+        if (failRevokeForChannels.has(chanId)) {
+          throw new Error('Discord API 500: Permission overwrite delete failed');
+        }
+        ensureOverwriteSet(chanId).delete(targetId);
+      },
+    },
+    messages: {
+      fetch: async (msgId) => {
+        const map = ensureChannelMap(chanId);
+        if (!map.has(msgId)) throw new Error('Unknown Message');
+        return map.get(msgId);
+      },
+    },
+    send: async (payload) => {
+      const id = `msg-rem-${chanId}-${msgSeq++}`;
+      const record = {
+        id,
+        channelId: chanId,
+        content: payload.content || '',
+        embeds: payload.embeds || [],
+        components: payload.components || [],
+        edit: async (nextPayload) => {
+          if (nextPayload.content !== undefined) record.content = nextPayload.content;
+          if (nextPayload.embeds !== undefined) record.embeds = nextPayload.embeds;
+          if (nextPayload.components !== undefined) record.components = nextPayload.components;
+          return record;
+        },
+        delete: async () => {
+          ensureChannelMap(chanId).delete(id);
+        },
+      };
+      ensureChannelMap(chanId).set(id, record);
+      return record;
+    },
+  });
+
+  const mockGuild = {
+    id: guildId,
+    roles: { everyone: { id: guildId } },
+    channels: {
+      fetch: async (id) => buildMockChannel(id),
+    },
+  };
+
+  const mockClient = {
+    user: { id: 'bot-rem' },
+    guilds: {
+      fetch: async (id) => (id === guildId ? mockGuild : null),
+    },
+    channels: {
+      fetch: async (id) => buildMockChannel(id),
+    },
+  };
+
+  const reg1Msg = await buildMockChannel('chan-reg-rem-1').send({ content: 'Initial reg 1' });
+  const idp1Msg = await buildMockChannel('chan-idp-rem-1').send({ content: 'Initial slotchart 1' });
+  const reg2Msg = await buildMockChannel('chan-reg-rem-2').send({ content: 'Initial reg 2' });
+  const idp2Msg = await buildMockChannel('chan-idp-rem-2').send({ content: 'Initial slotchart 2' });
+
+  const reg1 = await saveConfigurableRegistration({
+    registrationId: 'reg-rem-1',
+    tournamentId: tourId,
+    guildId,
+    displayName: '10PM',
+    totalSlots: 6,
+    reservedSlots: 2,
+    lockedSlots: [1, 2],
+    matches: 2,
+    status: 'OPEN',
+    manualOverride: 'OPEN',
+    dailyStartTime: '09:00',
+    dailyResetTime: '23:00',
+    currentCycleDate: '2026-11-05',
+    currentCycleId: 'reg-rem-1:2026-11-05',
+    registrationChannelId: 'chan-reg-rem-1',
+    registrationMessageId: reg1Msg.id,
+    idpChannelId: 'chan-idp-rem-1',
+    slotChartMessageId: idp1Msg.id,
+  });
+
+  const reg2 = await saveConfigurableRegistration({
+    registrationId: 'reg-rem-2',
+    tournamentId: tourId,
+    guildId,
+    displayName: '11PM',
+    totalSlots: 6,
+    reservedSlots: 2,
+    lockedSlots: [1, 2],
+    matches: 2,
+    status: 'OPEN',
+    manualOverride: 'OPEN',
+    dailyStartTime: '10:00',
+    dailyResetTime: '23:00',
+    currentCycleDate: '2026-11-05',
+    currentCycleId: 'reg-rem-2:2026-11-05',
+    registrationChannelId: 'chan-reg-rem-2',
+    registrationMessageId: reg2Msg.id,
+    idpChannelId: 'chan-idp-rem-2',
+    slotChartMessageId: idp2Msg.id,
+  });
+
+  // Enroll 4 teams in the tournament
+  const teamsData = [
+    { id: 'team-rem-alpha', name: 'Team Alpha', leader: 'leader-rem-alpha', members: ['leader-rem-alpha', 'p2-alpha', 'p3-alpha', 'p4-alpha'] },
+    { id: 'team-rem-bravo', name: 'Team Bravo', leader: 'leader-rem-bravo', members: ['leader-rem-bravo', 'p2-bravo', 'p3-bravo', 'p4-bravo'] },
+    { id: 'team-rem-phoenix', name: 'Team Phoenix', leader: 'leader-rem-phoenix', members: ['leader-rem-phoenix', 'p2-phoenix', 'p3-phoenix', 'p4-phoenix'] },
+    { id: 'team-rem-delta', name: 'Team Delta', leader: 'leader-rem-delta', members: ['leader-rem-delta', 'p2-delta', 'p3-delta', 'p4-delta'] },
+  ];
+
+  for (const t of teamsData) {
+    await saveConfigurableTeam({
+      teamId: t.id,
+      tournamentId: tourId,
+      guildId,
+      teamName: t.name,
+      leaderDiscordId: t.leader,
+      VerificationStatus: 'VERIFIED',
+      players: t.members.map((m, idx) => ({ discordId: m, ign: `${t.name}_P${idx + 1}`, uid: `800${idx}` })),
+    });
+  }
+
+  // Register Team Alpha, Team Bravo, Team Phoenix in Registration 1 -> Slots 03, 04, 05
+  for (const t of teamsData.slice(0, 3)) {
+    const interaction = {
+      guildId,
+      guild: mockGuild,
+      client: mockClient,
+      user: { id: t.leader },
+      reply: async () => {},
+    };
+    await registerSquadFull(interaction, reg1.registrationId);
+  }
+
+  // Also register Team Alpha in Registration 2 -> Slot 03
+  const alphaReg2Int = {
+    guildId,
+    guild: mockGuild,
+    client: mockClient,
+    user: { id: 'leader-rem-alpha' },
+    reply: async () => {},
+  };
+  await registerSquadFull(alphaReg2Int, reg2.registrationId);
+
+  // Verify initial state before removal
+  assert.equal(ensureOverwriteSet('chan-idp-rem-1').has('leader-rem-alpha'), true);
+  assert.equal(ensureOverwriteSet('chan-idp-rem-2').has('leader-rem-alpha'), true);
+  assert.match(idp1Msg.content, /Slot 01 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 02 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 03 → Team Alpha/);
+  assert.match(idp1Msg.content, /Slot 04 → Team Bravo/);
+  assert.match(idp1Msg.content, /Slot 05 → Team Phoenix/);
+  assert.match(idp1Msg.content, /Slot 06 → AVAILABLE/);
+
+  // 1. Organiser opens Remove Team menu
+  let removeMenuReply = null;
+  await handleConfigurableTournamentInteraction({
+    customId: `md_cfg_remove_team_btn_${reg1.registrationId}`,
+    isButton: () => true,
+    isStringSelectMenu: () => false,
+    isModalSubmit: () => false,
+    guildId,
+    guild: mockGuild,
+    client: mockClient,
+    user: { id: organizerId },
+    member: { permissions: { has: () => true } },
+    reply: async (p) => { removeMenuReply = p; },
+  });
+  assert.ok(removeMenuReply);
+  assert.match(removeMenuReply.content, /T3 Scrims — 10PM Registration/);
+  assert.match(removeMenuReply.content, /Team Alpha — Slot 03/);
+  assert.match(removeMenuReply.content, /Team Bravo — Slot 04/);
+  assert.match(removeMenuReply.content, /Team Phoenix — Slot 05/);
+
+  // 2. Organiser selects Team Alpha -> Confirmation prompt shown
+  let confirmPromptReply = null;
+  await handleConfigurableTournamentInteraction({
+    customId: `md_cfg_remove_team_select_${reg1.registrationId}`,
+    isButton: () => false,
+    isStringSelectMenu: () => true,
+    isModalSubmit: () => false,
+    values: ['team-rem-alpha'],
+    guildId,
+    guild: mockGuild,
+    client: mockClient,
+    user: { id: organizerId },
+    member: { permissions: { has: () => true } },
+    update: async (p) => { confirmPromptReply = p; },
+    reply: async (p) => { confirmPromptReply = p; },
+  });
+  assert.ok(confirmPromptReply);
+  assert.match(confirmPromptReply.content, /Remove Team from Registration\?/);
+  assert.match(
+    confirmPromptReply.content,
+    /Are you sure you want to remove Team Alpha from this registration\? The team will lose access to this registration's private IDP channel\./
+  );
+  const confirmRowBtns = confirmPromptReply.components[0].components.map((b) => b.data.label);
+  assert.deepEqual(confirmRowBtns, ['Confirm Removal', 'Cancel']);
+
+  // 3. Organiser clicks Confirm Removal for Team Alpha in Registration 1
+  let removalResultReply = null;
+  await handleConfigurableTournamentInteraction({
+    customId: `md_cfg_remove_team_confirm_${reg1.registrationId}_team-rem-alpha`,
+    isButton: () => true,
+    isStringSelectMenu: () => false,
+    isModalSubmit: () => false,
+    guildId,
+    guild: mockGuild,
+    client: mockClient,
+    user: { id: organizerId },
+    member: { permissions: { has: () => true } },
+    update: async (p) => { removalResultReply = p; },
+    reply: async (p) => { removalResultReply = p; },
+  });
+  assert.ok(removalResultReply);
+  assert.match(removalResultReply.content, /Removed \*\*Team Alpha\*\*/);
+  assert.match(removalResultReply.content, /Slot 03/);
+
+  // Verify slot chart updated immediately WITHOUT shifting Team Bravo (Slot 04) or Team Phoenix (Slot 05)
+  assert.match(idp1Msg.content, /Slot 01 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 02 → 🔒 LOCKED/);
+  assert.match(idp1Msg.content, /Slot 03 → AVAILABLE/);
+  assert.match(idp1Msg.content, /Slot 04 → Team Bravo/);
+  assert.match(idp1Msg.content, /Slot 05 → Team Phoenix/);
+  assert.match(idp1Msg.content, /Slot 06 → AVAILABLE/);
+  assert.match(idp1Msg.content, /🟡 2\/4 filled/);
+
+  // Verify leader lost access to IDP 1, but kept access to IDP 2
+  assert.equal(ensureOverwriteSet('chan-idp-rem-1').has('leader-rem-alpha'), false, 'Leader lost access to Registration 1 IDP');
+  assert.equal(ensureOverwriteSet('chan-idp-rem-2').has('leader-rem-alpha'), true, 'Leader kept access to Registration 2 IDP');
+
+  // Verify Team Alpha remains enrolled in tournament and its player memberships are NOT released
+  const alphaTeamStillEnrolled = await getConfigurableTeam('team-rem-alpha');
+  assert.ok(alphaTeamStillEnrolled, 'Team Alpha remains enrolled in the tournament');
+  const tourMemberships = await getTournamentPlayerMemberships(tourId);
+  const alphaMemberships = tourMemberships.filter((m) => m.teamId === 'team-rem-alpha');
+  assert.equal(alphaMemberships.length, 4, 'Removing from a registration must not free player memberships');
+
+  // Verify audit log recorded the removal
+  const auditLogs = await getConfigurableAuditLogs({
+    tournamentId: tourId,
+    registrationId: reg1.registrationId,
+    teamId: 'team-rem-alpha',
+    action: 'REGISTRATION_TEAM_REMOVED',
+  });
+  assert.equal(auditLogs.length, 1);
+  assert.equal(auditLogs[0].releasedSlot, 3);
+  assert.equal(auditLogs[0].idpAccessRevoked, true);
+
+  // Verify duplicate removal request is handled gracefully
+  let duplicateRemovalReply = null;
+  await handleConfirmRemoveTeamFromRegistration(
+    {
+      guildId,
+      guild: mockGuild,
+      client: mockClient,
+      user: { id: organizerId },
+      member: { permissions: { has: () => true } },
+      update: async (p) => { duplicateRemovalReply = p; },
+      reply: async (p) => { duplicateRemovalReply = p; },
+    },
+    reg1.registrationId,
+    'team-rem-alpha'
+  );
+  assert.ok(duplicateRemovalReply);
+  assert.match(duplicateRemovalReply.content, /not found or already removed/i);
+
+  // 4. Register another team (Team Delta) into Registration 1 -> must receive newly released Slot #3
+  const deltaInt = {
+    guildId,
+    guild: mockGuild,
+    client: mockClient,
+    user: { id: 'leader-rem-delta' },
+    reply: async () => {},
+  };
+  await registerSquadFull(deltaInt, reg1.registrationId);
+  assert.match(deltaInt.lastReply.content, /Slot #3/);
+  assert.match(idp1Msg.content, /Slot 03 → Team Delta/);
+
+  // 5. Test Discord permission revocation failure handling (never silently report access revoked; retry on reconciliation)
+  failRevokeForChannels.add('chan-idp-rem-1');
+  let failedPermReply = null;
+  await handleConfirmRemoveTeamFromRegistration(
+    {
+      guildId,
+      guild: mockGuild,
+      client: mockClient,
+      user: { id: organizerId },
+      member: { permissions: { has: () => true } },
+      update: async (p) => { failedPermReply = p; },
+      reply: async (p) => { failedPermReply = p; },
+    },
+    reg1.registrationId,
+    'team-rem-bravo'
+  );
+  assert.ok(failedPermReply);
+  assert.match(failedPermReply.content, /revoking Discord access.*failed/i);
+  assert.match(failedPermReply.content, /reconciliation has been queued/i);
+  assert.match(idp1Msg.content, /Slot 04 → AVAILABLE/);
+
+  // Now restore Discord API and run reconciliation -> Bravo's leader access to IDP 1 is revoked
+  failRevokeForChannels.delete('chan-idp-rem-1');
+  await reconcileConfigurableTournaments(mockClient);
+  assert.equal(ensureOverwriteSet('chan-idp-rem-1').has('leader-rem-bravo'), false, 'Reconciliation revoked pending IDP access');
+
+  clearAllRegistrationTimers();
+});
+
+test('FEATURE: Player Exclusivity During Team Verification — main players, substitutes, cross-tournament, edit squad, delete squad & concurrency', async () => {
+  clearInMemoryData();
+  clearAllRegistrationTimers();
+
+  const guildId = 'guild-player-excl';
+  const tour1Id = 'tour-excl-1';
+  const tour2Id = 'tour-excl-2';
+
+  await saveConfigurableTournament({
+    tournamentId: tour1Id,
+    guildId,
+    name: 'T1 Pro League',
+    requiredDiscordMembers: 4,
+  });
+
+  await saveConfigurableTournament({
+    tournamentId: tour2Id,
+    guildId,
+    name: 'T2 Challenger Cup',
+    requiredDiscordMembers: 4,
+  });
+
+  const allTestMembers = [
+    'player-a', 'player-b', 'player-c', 'player-d',
+    'player-e', 'player-f', 'player-g', 'player-h',
+    'player-i', 'player-j', 'player-k', 'player-l',
+    'sub-a', 'sub-b',
+  ];
+
+  const makeStep5Interaction = (tournamentId, leaderId, values, substituteValues = []) => {
+    let output = null;
+    return {
+      guildId,
+      guild: {
+        id: guildId,
+        members: {
+          cache: new Map(allTestMembers.map((id) => [id, { id }])),
+          fetch: async (id) => (allTestMembers.includes(id) ? { id } : null),
+        },
+      },
+      client: { channels: { fetch: async () => null } },
+      user: { id: leaderId },
+      values,
+      substituteValues,
+      reply: async (p) => { output = p; return p; },
+      update: async (p) => { output = p; return p; },
+      getReply: () => output,
+    };
+  };
+
+  // 1. Enroll Team Alpha in Tournament 1 with 4 main players (player-a..d) and 1 substitute (sub-a)
+  await handleStep1ModalSubmit(createMockStep1Interaction(tour1Id, 'player-a', 'Team Alpha', 'Alpha1', '101', 'Alpha2', '102'), tour1Id);
+  await handleStep2ModalSubmit(createMockStep2Interaction(tour1Id, 'player-a', 'Alpha3', '103', 'Alpha4', '104'), tour1Id);
+  await handleStep3ModalSubmit(
+    createMockStep3Interaction(tour1Id, 'player-a', [{ ign: 'AlphaSub1', uid: '105' }]),
+    tour1Id
+  );
+
+  const alphaStep5 = makeStep5Interaction(
+    tour1Id,
+    'player-a',
+    ['player-a', 'player-b', 'player-c', 'player-d'],
+    ['sub-a']
+  );
+  await handleStep5UserSelect(alphaStep5, tour1Id);
+  assert.match(alphaStep5.getReply().content, /Your squad has been successfully enrolled/);
+
+  const teamAlpha = await getConfigurableTeamByName(tour1Id, 'Team Alpha');
+  assert.ok(teamAlpha);
+
+  // 2. Attempt to enroll Team Bravo in Tournament 1 using one of Team Alpha's main players ('player-b')
+  await handleStep1ModalSubmit(createMockStep1Interaction(tour1Id, 'player-e', 'Team Bravo', 'Bravo1', '201', 'Bravo2', '202'), tour1Id);
+  await handleStep2ModalSubmit(createMockStep2Interaction(tour1Id, 'player-e', 'Bravo3', '203', 'Bravo4', '204'), tour1Id);
+  await handleSkipSubstitutes(createMockButtonInteraction(tour1Id, 'player-e'), tour1Id);
+
+  const bravoConflictMain = makeStep5Interaction(
+    tour1Id,
+    'player-e',
+    ['player-e', 'player-b', 'player-f', 'player-g']
+  );
+  await handleStep5UserSelect(bravoConflictMain, tour1Id);
+  assert.match(
+    bravoConflictMain.getReply().content,
+    /One or more selected members are already assigned to another squad in this tournament\./
+  );
+  const bravoNotCreatedYet = await getConfigurableTeamByName(tour1Id, 'Team Bravo');
+  assert.equal(bravoNotCreatedYet, null, 'Team Bravo must not be created when conflicting player is selected');
+
+  // 3. Attempt to enroll Team Bravo in Tournament 1 using Team Alpha's substitute ('sub-a') as a main player
+  const bravoConflictSubAsMain = makeStep5Interaction(
+    tour1Id,
+    'player-e',
+    ['player-e', 'sub-a', 'player-f', 'player-g']
+  );
+  await handleStep5UserSelect(bravoConflictSubAsMain, tour1Id);
+  assert.match(
+    bravoConflictSubAsMain.getReply().content,
+    /One or more selected members are already assigned to another squad in this tournament\./
+  );
+
+  // 4. Attempt to enroll Team Bravo in Tournament 1 using Team Alpha's main player ('player-c') as a substitute
+  await handleStep3ModalSubmit(
+    createMockStep3Interaction(tour1Id, 'player-e', [{ ign: 'BravoSub', uid: '299' }]),
+    tour1Id
+  );
+  const bravoConflictMainAsSub = makeStep5Interaction(
+    tour1Id,
+    'player-e',
+    ['player-e', 'player-f', 'player-g', 'player-h'],
+    ['player-c']
+  );
+  await handleStep5UserSelect(bravoConflictMainAsSub, tour1Id);
+  assert.match(
+    bravoConflictMainAsSub.getReply().content,
+    /One or more selected members are already assigned to another squad in this tournament\./
+  );
+
+  // 5. Try using Team Alpha's players ('player-b', 'sub-a') in ANOTHER tournament (Tournament 2) -> ALLOWED!
+  await handleStep1ModalSubmit(createMockStep1Interaction(tour2Id, 'player-b', 'Other Tour Squad', 'OT1', '301', 'OT2', '302'), tour2Id);
+  await handleStep2ModalSubmit(createMockStep2Interaction(tour2Id, 'player-b', 'OT3', '303', 'OT4', '304'), tour2Id);
+  await handleSkipSubstitutes(createMockButtonInteraction(tour2Id, 'player-b'), tour2Id);
+
+  const tour2Step5 = makeStep5Interaction(
+    tour2Id,
+    'player-b',
+    ['player-b', 'sub-a', 'player-c', 'player-d']
+  );
+  await handleStep5UserSelect(tour2Step5, tour2Id);
+  assert.match(tour2Step5.getReply().content, /Your squad has been successfully enrolled/);
+
+  // 6. Edit Team Alpha in Tournament 1 and replace 'player-d' with 'player-i' (and remove substitute 'sub-a')
+  await handleEditSquadButtonClick(
+    {
+      user: { id: 'player-a' },
+      showModal: async () => {},
+      reply: async () => {},
+    },
+    teamAlpha.teamId
+  );
+  await handleStep1ModalSubmit(createMockStep1Interaction(tour1Id, 'player-a', 'Team Alpha', 'Alpha1', '101', 'Alpha2', '102'), tour1Id);
+  await handleStep2ModalSubmit(createMockStep2Interaction(tour1Id, 'player-a', 'Alpha3', '103', 'Alpha4New', '109'), tour1Id);
+  await handleSkipSubstitutes(createMockButtonInteraction(tour1Id, 'player-a'), tour1Id);
+
+  const editAlphaStep5 = makeStep5Interaction(
+    tour1Id,
+    'player-a',
+    ['player-a', 'player-b', 'player-c', 'player-i']
+  );
+  await handleStep5UserSelect(editAlphaStep5, tour1Id);
+  assert.match(editAlphaStep5.getReply().content, /Your squad has been successfully updated/);
+
+  // Verify 'player-d' and 'sub-a' were released after successful edit, and 'player-i' is now assigned to Team Alpha
+  const membershipsAfterEdit = await getTournamentPlayerMemberships(tour1Id);
+  const memberIdsAfterEdit = new Set(membershipsAfterEdit.map((m) => m.discordUserId));
+  assert.equal(memberIdsAfterEdit.has('player-i'), true, 'New player assigned to Team Alpha');
+  assert.equal(memberIdsAfterEdit.has('player-d'), false, 'Old replaced main player released');
+  assert.equal(memberIdsAfterEdit.has('sub-a'), false, 'Old removed substitute released');
+
+  // Now Team Bravo CAN enroll using the released 'player-d' and 'sub-a'!
+  await handleStep1ModalSubmit(createMockStep1Interaction(tour1Id, 'player-e', 'Team Bravo', 'Bravo1', '201', 'Bravo2', '202'), tour1Id);
+  await handleStep2ModalSubmit(createMockStep2Interaction(tour1Id, 'player-e', 'Bravo3', '203', 'Bravo4', '204'), tour1Id);
+  await handleStep3ModalSubmit(
+    createMockStep3Interaction(tour1Id, 'player-e', [{ ign: 'BravoSub', uid: '299' }]),
+    tour1Id
+  );
+  const bravoSuccessStep5 = makeStep5Interaction(
+    tour1Id,
+    'player-e',
+    ['player-e', 'player-d', 'player-f', 'player-g'],
+    ['sub-a']
+  );
+  await handleStep5UserSelect(bravoSuccessStep5, tour1Id);
+  assert.match(bravoSuccessStep5.getReply().content, /Your squad has been successfully enrolled/);
+
+  // 7. Delete Team Bravo -> verify its players ('player-e', 'player-d', 'player-f', 'player-g', 'sub-a') are released
+  const teamBravo = await getConfigurableTeamByName(tour1Id, 'Team Bravo');
+  assert.ok(teamBravo);
+  let deleteBravoOut = null;
+  await handleDeleteSquadConfirm(
+    {
+      guildId,
+      user: { id: 'player-e' },
+      client: { channels: { fetch: async () => null } },
+      update: async (p) => { deleteBravoOut = p; },
+      reply: async (p) => { deleteBravoOut = p; },
+    },
+    teamBravo.teamId
+  );
+  assert.match(deleteBravoOut.content, /Squad Deleted/);
+  const membershipsAfterDelete = await getTournamentPlayerMemberships(tour1Id);
+  const memberIdsAfterDelete = new Set(membershipsAfterDelete.map((m) => m.discordUserId));
+  assert.equal(memberIdsAfterDelete.has('player-e'), false);
+  assert.equal(memberIdsAfterDelete.has('player-d'), false);
+  assert.equal(memberIdsAfterDelete.has('sub-a'), false);
+
+  // 8. Concurrency test: Two simultaneous enrollment sessions selecting the same Discord player ('player-h')
+  await handleStep1ModalSubmit(createMockStep1Interaction(tour1Id, 'player-e', 'Concurrent One', 'C1', '401', 'C2', '402'), tour1Id);
+  await handleStep2ModalSubmit(createMockStep2Interaction(tour1Id, 'player-e', 'C3', '403', 'C4', '404'), tour1Id);
+  await handleSkipSubstitutes(createMockButtonInteraction(tour1Id, 'player-e'), tour1Id);
+
+  await handleStep1ModalSubmit(createMockStep1Interaction(tour1Id, 'player-j', 'Concurrent Two', 'D1', '501', 'D2', '502'), tour1Id);
+  await handleStep2ModalSubmit(createMockStep2Interaction(tour1Id, 'player-j', 'D3', '503', 'D4', '504'), tour1Id);
+  await handleSkipSubstitutes(createMockButtonInteraction(tour1Id, 'player-j'), tour1Id);
+
+  // Both select 'player-h' and submit simultaneously
+  const concurrentInt1 = makeStep5Interaction(tour1Id, 'player-e', ['player-e', 'player-f', 'player-g', 'player-h']);
+  const concurrentInt2 = makeStep5Interaction(tour1Id, 'player-j', ['player-j', 'player-k', 'player-l', 'player-h']);
+
+  await Promise.all([
+    handleStep5UserSelect(concurrentInt1, tour1Id),
+    handleStep5UserSelect(concurrentInt2, tour1Id),
+  ]);
+
+  const reply1 = concurrentInt1.getReply()?.content || '';
+  const reply2 = concurrentInt2.getReply()?.content || '';
+  const successes = [reply1, reply2].filter((r) => r.includes('successfully enrolled'));
+  const rejections = [reply1, reply2].filter((r) =>
+    r.includes('One or more selected members are already assigned to another squad in this tournament.')
+  );
+
+  assert.equal(successes.length, 1, 'Exactly one concurrent enrollment must succeed');
+  assert.equal(rejections.length, 1, 'The conflicting concurrent enrollment must be rejected');
+
+  const finalTour1Memberships = await getTournamentPlayerMemberships(tour1Id);
+  const playerHRecords = finalTour1Memberships.filter((m) => m.discordUserId === 'player-h');
+  assert.equal(playerHRecords.length, 1, 'No duplicate membership records exist for the contested player');
+
+  clearAllRegistrationTimers();
+});
+
+
+
+
 
 
 
