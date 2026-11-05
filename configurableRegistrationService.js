@@ -41,6 +41,7 @@ import {
   retrySlotListSync,
   buildSlotChartEmbed,
   buildSlotListText,
+  formatSlotListCodeBlock,
 } from './slotChartService.js';
 import {
   TOURNAMENT_DENIED_PERMISSIONS,
@@ -66,12 +67,12 @@ function getSafeFieldValue(interaction, fieldId) {
 }
 
 /**
- * Formats a registration's daily start time into 12-hour AM/PM clock format (e.g. "11:00 AM").
+ * Formats a registration's daily start time into 12-hour AM/PM clock format (e.g. "9:08 AM").
  * @param {object} registration
  * @returns {string}
  */
 export function formatRegistrationStartTime(registration) {
-  const raw = registration?.rawDailyStartTime || registration?.dailyStartTime;
+  const raw = registration?.dailyStartTime || registration?.rawDailyStartTime;
   if (!raw || typeof raw !== 'string') return 'N/A';
   const parsed = parseTimeString(raw);
   if (!parsed) return raw.trim();
@@ -82,15 +83,14 @@ export function formatRegistrationStartTime(registration) {
 }
 
 /**
- * Resolves the display status of a registration instance:
- * - NOT OPENED YET — Before daily start time.
+ * Resolves the display status of a registration instance for the persistent registration message:
  * - OPEN — Registration is accepting teams.
- * - CLOSED — Organiser has manually closed registration or the daily cycle has ended.
+ * - CLOSED — Registration is not open or has been closed.
  * - FULL — All available slots are occupied.
  *
  * @param {object} registration
  * @param {number} [filledCount]
- * @returns {'NOT OPENED YET' | 'OPEN' | 'CLOSED' | 'FULL'}
+ * @returns {'OPEN' | 'CLOSED' | 'FULL'}
  */
 export function resolveRegistrationStatus(registration, filledCount = 0) {
   if (!registration) return 'CLOSED';
@@ -101,20 +101,54 @@ export function resolveRegistrationStatus(registration, filledCount = 0) {
   if (registration.status === 'FULL' || (maxAvailable > 0 && filledCount >= maxAvailable)) {
     return 'FULL';
   }
-  if (
-    registration.status === 'NOT OPENED YET' ||
-    registration.status === 'UPCOMING' ||
-    (registration.status === 'CLOSED' && registration.beforeStart === true && registration.manualOverride !== 'CLOSED')
-  ) {
-    return 'NOT OPENED YET';
-  }
   if (registration.status === 'OPEN') {
     return 'OPEN';
   }
-  if (registration.status === 'CLOSED') {
-    return 'CLOSED';
+  return 'CLOSED';
+}
+
+/**
+ * Formats the first line of the persistent registration channel message:
+ * "<bold prefix> <registration name>" (for example "𝐓𝟑 10PM").
+ * @param {object} registration
+ * @param {object} [tournament]
+ * @returns {string}
+ */
+export function formatRegistrationHeaderLine(registration, tournament = null) {
+  const regName = (registration?.displayName || registration?.name || 'Registration').trim();
+  const rawPrefix = (
+    registration?.prefix ||
+    tournament?.prefix ||
+    (tournament?.name ? buildTournamentPrefix(tournament.name) : '')
+  ).trim();
+  const boldPrefix = (
+    registration?.boldPrefix ||
+    tournament?.boldPrefix ||
+    (rawPrefix ? toMathematicalBold(rawPrefix) : '')
+  ).trim();
+
+  if (!boldPrefix) {
+    const words = regName.split(/\s+/);
+    if (words.length > 1 && words[0].length <= 4 && /\d/.test(words[0])) {
+      return `${toMathematicalBold(words[0])} ${words.slice(1).join(' ')}`;
+    }
+    return regName;
   }
-  return 'OPEN';
+
+  if (regName.startsWith(boldPrefix)) {
+    return regName;
+  }
+
+  if (rawPrefix) {
+    const escapedRaw = rawPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const prefixRegex = new RegExp(`^${escapedRaw}(?:\\s+|$)`, 'i');
+    if (prefixRegex.test(regName)) {
+      const rest = regName.replace(prefixRegex, '').trim();
+      return rest ? `${boldPrefix} ${rest}` : boldPrefix;
+    }
+  }
+
+  return `${boldPrefix} ${regName}`;
 }
 
 /**
@@ -162,29 +196,32 @@ export function isTeamVerifiedForTournament(team, tournamentId) {
 
 /**
  * Builds the clean, compact registration message text for a registration channel:
- * <Registration Name>
- * Time: <Daily Start Time>
- * Status: <NOT OPENED YET | OPEN | CLOSED | FULL>
- * Slots: <Total Slot Capacity>
- * Matches: <Number of Matches>
+ * <bold prefix> <registration name>
+ * Time: <daily start time, e.g. 9:13 AM>
+ * Status: <OPEN, CLOSED or FULL>
+ * Slots: <total slots minus reserved slots>
+ * Matches: <matches number>
  *
  * @param {object} registration
  * @param {number} [filledCount]
+ * @param {object} [tournament]
  * @returns {string}
  */
-export function buildRegistrationMessageText(registration, filledCount = 0) {
-  const regName = registration?.displayName || registration?.name || 'Registration';
+export function buildRegistrationMessageText(registration, filledCount = 0, tournament = null) {
+  const headerLine = formatRegistrationHeaderLine(registration, tournament);
   const timeStr = formatRegistrationStartTime(registration);
   const statusStr = resolveRegistrationStatus(registration, filledCount);
   const totalSlots = Number(registration?.totalSlots) > 0 ? Number(registration.totalSlots) : 20;
+  const reservedCount = parseReservedSlots(registration?.reservedSlots, totalSlots);
+  const unlockedSlots = Math.max(0, totalSlots - reservedCount);
   const parsedMatches = parseInt(registration?.matches, 10);
   const matches = !isNaN(parsedMatches) && parsedMatches > 0 ? parsedMatches : 1;
 
   return [
-    regName,
+    headerLine,
     `Time: ${timeStr}`,
     `Status: ${statusStr}`,
-    `Slots: ${totalSlots}`,
+    `Slots: ${unlockedSlots}`,
     `Matches: ${matches}`,
   ].join('\n');
 }
@@ -193,21 +230,23 @@ export function buildRegistrationMessageText(registration, filledCount = 0) {
  * Builds the Embed for a public Registration Channel.
  * @param {object} registration
  * @param {number} filledCount
+ * @param {object} [tournament]
  * @returns {EmbedBuilder}
  */
-export function buildRegistrationEmbed(registration, filledCount = 0) {
+export function buildRegistrationEmbed(registration, filledCount = 0, tournament = null) {
   const statusStr = resolveRegistrationStatus(registration, filledCount);
   const isOpen = statusStr === 'OPEN';
-  const text = buildRegistrationMessageText(registration, filledCount);
+  const text = buildRegistrationMessageText(registration, filledCount, tournament);
 
   return new EmbedBuilder()
-    .setColor(isOpen ? 0x22c55e : statusStr === 'NOT OPENED YET' ? 0x3b82f6 : 0xef4444)
-    .setTitle(registration?.displayName || registration?.name || 'Registration')
+    .setColor(isOpen ? 0x22c55e : 0xef4444)
+    .setTitle(formatRegistrationHeaderLine(registration, tournament))
     .setDescription(text);
 }
 
 /**
  * Builds the register button component row.
+ * Disabled when not open, closed, or full.
  * @param {object} registration
  * @param {number} [filledCount]
  * @returns {ActionRowBuilder}
@@ -219,7 +258,7 @@ export function buildRegistrationComponents(registration, filledCount = 0) {
     .setCustomId(`md_cfg_reg_btn_${registration.registrationId}`)
     .setLabel('Register Squad')
     .setStyle(isOpen ? ButtonStyle.Success : ButtonStyle.Secondary)
-    .setDisabled(false);
+    .setDisabled(!isOpen);
 
   return new ActionRowBuilder().addComponents(button);
 }
@@ -249,9 +288,12 @@ export async function updateRegistrationMessage(client, registrationId) {
     }
     if (!channel || !channel.isTextBased()) return false;
 
+    const tournament = registration.tournamentId
+      ? await getConfigurableTournament(registration.tournamentId)
+      : null;
     const currentCycleId = registration.currentCycleId || null;
     const filledCount = await getRegistrationEntriesCount(registrationId, currentCycleId);
-    const content = buildRegistrationMessageText(registration, filledCount);
+    const content = buildRegistrationMessageText(registration, filledCount, tournament);
     const row = buildRegistrationComponents(registration, filledCount);
 
     let existing = null;
@@ -511,6 +553,8 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
       guildId: guild.id,
       registrationNumber: regNumber,
       displayName,
+      prefix: rawPrefix,
+      boldPrefix,
       registrationChannelId: regChannel.id,
       registrationMessageId: null,
       idpChannelId: idpChannel.id,
@@ -606,9 +650,153 @@ async function respondToConfirmationInteraction(interaction, payload) {
 const inFlightConfirmations = new Set();
 
 /**
+ * Builds a fixed custom ID carrying registrationId, cycleId, and teamId (within Discord's 100-char limit)
+ * so confirmation/cancel interactions work seamlessly even after a bot restart.
+ * @param {'confirm' | 'cancel'} action
+ * @param {string} registrationId
+ * @param {string} [cycleId]
+ * @param {string} teamId
+ * @returns {string}
+ */
+export function buildConfirmationCustomId(action, registrationId, cycleId, teamId) {
+  const prefix = action === 'cancel' ? 'md_cfg_reg_cancel_' : 'md_cfg_reg_confirm_';
+  const rawCycle = cycleId ? String(cycleId) : '';
+  const cycleToken = rawCycle.startsWith(`${registrationId}:`)
+    ? rawCycle.slice(registrationId.length + 1)
+    : rawCycle;
+
+  if (!cycleToken) {
+    return `${prefix}${registrationId}:${teamId}`;
+  }
+
+  const full = `${prefix}${registrationId}:${cycleToken}:${teamId}`;
+  if (full.length <= 100) {
+    return full;
+  }
+
+  const maxCycleLen = Math.max(1, 100 - (prefix.length + registrationId.length + teamId.length + 2));
+  return `${prefix}${registrationId}:${cycleToken.slice(-maxCycleLen)}:${teamId}`;
+}
+
+/**
+ * Parses a confirmation or cancel custom ID into { registrationId, cycleId, teamId }.
+ * Supports both 3-part (`regId:cycleId:teamId`) and legacy 2-part (`regId:teamId`) IDs.
+ * @param {string} customId
+ * @returns {{ registrationId: string|null, cycleId: string|null, teamId: string|null }}
+ */
+export function parseConfirmationCustomId(customId) {
+  const payload = String(customId || '')
+    .replace(/^md_cfg_reg_confirm_/, '')
+    .replace(/^md_cfg_reg_cancel_/, '')
+    .replace(/^md_cfg_reg_select_team_/, '');
+  if (payload.includes(':')) {
+    const parts = payload.split(':');
+    const registrationId = parts[0];
+    const teamId = parts[parts.length - 1];
+    const rawCycle = parts.length > 2 ? parts.slice(1, -1).join(':') : null;
+    const cycleId = rawCycle
+      ? (rawCycle.startsWith(`${registrationId}:`) ? rawCycle : `${registrationId}:${rawCycle}`)
+      : null;
+    return { registrationId, cycleId, teamId };
+  }
+  const parts = payload.split('_');
+  return {
+    registrationId: parts[0] || null,
+    cycleId: null,
+    teamId: parts.slice(1).join('_') || null,
+  };
+}
+
+/**
+ * Builds the Confirm and Cancel button ActionRow for a registration confirmation prompt.
+ * @param {string} registrationId
+ * @param {string} cycleId
+ * @param {string} teamId
+ * @param {boolean} [disabled]
+ * @returns {ActionRowBuilder}
+ */
+export function buildConfirmationComponents(registrationId, cycleId, teamId, disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(buildConfirmationCustomId('confirm', registrationId, cycleId, teamId))
+      .setLabel('Confirm')
+      .setEmoji('✅')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(disabled),
+    new ButtonBuilder()
+      .setCustomId(buildConfirmationCustomId('cancel', registrationId, cycleId, teamId))
+      .setLabel('Cancel')
+      .setEmoji('✖️')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(disabled)
+  );
+}
+
+/**
+ * Disables both Confirm and Cancel buttons immediately when either button is clicked.
+ * @param {import('discord.js').ButtonInteraction} interaction
+ * @param {string} registrationId
+ * @param {string} cycleId
+ * @param {string} teamId
+ */
+function disableConfirmationButtonsImmediately(interaction, registrationId, cycleId, teamId) {
+  try {
+    const disabledRow = buildConfirmationComponents(registrationId, cycleId, teamId, true);
+    if (interaction?.message?.components) {
+      for (const row of interaction.message.components) {
+        for (const comp of row.components || []) {
+          comp.disabled = true;
+          if (comp.data) comp.data.disabled = true;
+        }
+      }
+    }
+    if (typeof interaction?.message?.edit === 'function') {
+      interaction.message.edit({ components: [disabledRow] }).catch(() => {});
+    }
+  } catch {}
+}
+
+/**
+ * Builds the confirmation message payload for a specific team and registration.
+ * @param {object} tournament
+ * @param {object} registration
+ * @param {object} team
+ * @param {number} freeSlots
+ * @param {number} maxAvailable
+ * @param {string} currentCycleId
+ * @returns {object}
+ */
+function buildConfirmationPromptPayload(tournament, registration, team, freeSlots, maxAvailable, currentCycleId) {
+  const regName = registration.displayName || registration.name || 'Registration';
+  const content = `Register ${team.teamName} in ${regName}?\nFree slots: ${freeSlots}`;
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('Confirm Squad Registration')
+    .setDescription(
+      `Register **${team.teamName}** in **${regName}**?\n\n` +
+      `🏆 **Tournament:** **${tournament?.name || 'Tournament'}**\n` +
+      `📝 **Registration:** **${regName}**\n` +
+      `🛡️ **Team:** **${team.teamName}**\n` +
+      `📊 **Free Slots:** **${freeSlots}** (Total Available Slots: **${maxAvailable}**)\n` +
+      `🟢 **Status:** **${registration.status}**`
+    );
+
+  const row = buildConfirmationComponents(registration.registrationId, currentCycleId, team.teamId, false);
+  return {
+    content,
+    embeds: [embed],
+    components: [row],
+  };
+}
+
+/**
  * Handles the "Register Squad" button click in a registration channel.
- * Opens an ephemeral confirmation message with squad details, available slots,
- * and Confirm / Cancel buttons. Does NOT immediately register the team.
+ * Flow:
+ * 1. Identify registration from the channel.
+ * 2. Check if registration is open / full.
+ * 3. Check user's enrolled team(s) (if >1 eligible team, ask which one with a select menu).
+ * 4. Show private confirmation: "Register <Team Name> in <registration name>?" with free slots and Confirm/Cancel buttons.
  *
  * @param {import('discord.js').ButtonInteraction} interaction
  * @param {string} registrationId
@@ -636,47 +824,13 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
   registrationId = registration.registrationId;
   const tournament = await getConfigurableTournament(registration.tournamentId);
 
-  // 1. Verification Check FIRST: Check whether user's team is enrolled and verified in this tournament
-  const userTeams = await getConfigurableTeamsForUser(registration.tournamentId, interaction.user.id);
-  const verifiedTeams = userTeams.filter((t) => isTeamVerifiedForTournament(t, registration.tournamentId));
-
-  if (verifiedTeams.length === 0) {
-    return interaction.reply({
-      content: `First verify your squad here ${getTournamentVerifyChannelMention(tournament)} channel`,
-      ephemeral: true,
-    });
-  }
-
-  // 2. Verify that the user is the team leader
-  const leaderTeams = verifiedTeams.filter((t) => t.leaderDiscordId === interaction.user.id);
-  if (leaderTeams.length === 0) {
-    const enrolledTeam = verifiedTeams[0];
-    return interaction.reply({
-      content: `❌ Only the verified **Team Leader** (<@${enrolledTeam.leaderDiscordId}>) can register **${enrolledTeam.teamName}**.`,
-      ephemeral: true,
-    });
-  }
-
-  const team = leaderTeams[0]; // Leader's enrolled & verified team
   if (!registration.currentCycleId) {
     registration.currentCycleId = `${registrationId}:cycle-${crypto.randomUUID()}`;
     await saveConfigurableRegistration(registration);
   }
   const currentCycleId = registration.currentCycleId;
 
-  // 3. Fetch active entries of THIS registrationId and currentCycleId to check duplicate and capacity
   const activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
-  const existingEntry = activeEntries.find((e) => e.teamId === team.teamId);
-  if (existingEntry && existingEntry.registrationId === registrationId) {
-    return interaction.reply({
-      content:
-        `❌ Your team **${team.teamName}** is already registered in this daily cycle!\n` +
-        `Assigned to **Slot #${existingEntry.slotNumber}** in <#${registration.idpChannelId}>.`,
-      ephemeral: true,
-    });
-  }
-
-  // 4. Check capacity and registration status
   const filledCount = activeEntries.length;
   const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
   const maxAvailable = Math.max(0, registration.totalSlots - reservedCount);
@@ -698,59 +852,178 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
   }
 
   if (registration.status !== 'OPEN') {
-    const displayStatus = resolveRegistrationStatus(registration, filledCount);
     return interaction.reply({
       content:
-        `❌ Registration is currently **${displayStatus}**.\n` +
-        `Daily Schedule: Opens at \`${formatRegistrationStartTime(registration)}\` | Resets at \`${registration.dailyResetTime || 'N/A'}\`.`,
+        `Registration is currently NOT OPENED YET.\n` +
+        `Daily Schedule: Opens at ${formatRegistrationStartTime(registration)}`,
       ephemeral: true,
     });
   }
 
-  // 5. Build compact, mobile-friendly Confirmation Message
-  const embed = new EmbedBuilder()
-    .setColor(0x5865f2)
-    .setTitle('Confirm Squad Registration')
-    .setDescription(
-      `You are about to register your enrolled squad for this registration.\n` +
-      `Please confirm that you want to proceed.\n\n` +
-      `🏆 **Tournament:** **${tournament?.name || 'Tournament'}**\n` +
-      `📝 **Registration:** **${registration.displayName || registration.name}**\n` +
-      `🛡️ **Team:** **${team.teamName}**\n` +
-      `📊 **Total Available Slots:** **${maxAvailable}**\n` +
-      `🟢 **Status:** **${registration.status}**`
-    );
+  // Check whether user's team is enrolled and verified in this tournament
+  const userTeams = await getConfigurableTeamsForUser(registration.tournamentId, interaction.user.id);
+  const verifiedTeams = userTeams.filter((t) => isTeamVerifiedForTournament(t, registration.tournamentId));
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`md_cfg_reg_confirm_${registrationId}:${team.teamId}`)
-      .setLabel('Confirm Registration')
-      .setEmoji('✅')
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(`md_cfg_reg_cancel_${registrationId}:${team.teamId}`)
-      .setLabel('Cancel')
-      .setEmoji('✖️')
-      .setStyle(ButtonStyle.Secondary)
+  if (verifiedTeams.length === 0) {
+    return interaction.reply({
+      content: `First verify your squad here ${getTournamentVerifyChannelMention(tournament)} channel`,
+      ephemeral: true,
+    });
+  }
+
+  // Verify that the user is the team leader
+  const leaderTeams = verifiedTeams.filter((t) => t.leaderDiscordId === interaction.user.id);
+  if (leaderTeams.length === 0) {
+    const enrolledTeam = verifiedTeams[0];
+    return interaction.reply({
+      content: `❌ Only the verified **Team Leader** (<@${enrolledTeam.leaderDiscordId}>) can register **${enrolledTeam.teamName}**.`,
+      ephemeral: true,
+    });
+  }
+
+  // If the user has more than one eligible team, ask which one with a select menu
+  if (leaderTeams.length > 1) {
+    const rawCycle = String(currentCycleId);
+    const cycleToken = rawCycle.startsWith(`${registrationId}:`)
+      ? rawCycle.slice(registrationId.length + 1)
+      : rawCycle;
+    const selectCustomId = `md_cfg_reg_select_team_${registrationId}:${cycleToken}`.slice(0, 100);
+    const selectMenu = new StringSelectMenuBuilder()
+      .setCustomId(selectCustomId)
+      .setPlaceholder('Select a squad to register...')
+      .addOptions(
+        leaderTeams.slice(0, 25).map((t) => ({
+          label: String(t.teamName || 'Squad').slice(0, 100),
+          value: String(t.teamId),
+          description: `Register ${t.teamName} in ${registration.displayName || registration.name}`.slice(0, 100),
+        }))
+      );
+    const selectRow = new ActionRowBuilder().addComponents(selectMenu);
+    return interaction.reply({
+      content: 'Select which squad you want to register:',
+      components: [selectRow],
+      ephemeral: true,
+    });
+  }
+
+  const team = leaderTeams[0]; // Leader's enrolled & verified team
+
+  // Check duplicate in this registration and current cycle
+  const existingEntry = activeEntries.find((e) => e.teamId === team.teamId);
+  if (existingEntry && existingEntry.registrationId === registrationId) {
+    return interaction.reply({
+      content:
+        `Your team **${team.teamName}** is already registered in this daily cycle! ` +
+        `Assigned to **Slot #${existingEntry.slotNumber}** and get IDP in <#${registration.idpChannelId}>.`,
+      ephemeral: true,
+    });
+  }
+
+  const freeSlots = Math.max(0, maxAvailable - filledCount);
+  const promptPayload = buildConfirmationPromptPayload(
+    tournament,
+    registration,
+    team,
+    freeSlots,
+    maxAvailable,
+    currentCycleId
   );
 
   return interaction.reply({
-    embeds: [embed],
-    components: [row],
+    ...promptPayload,
     ephemeral: true,
   });
 }
 
 /**
+ * Handles selecting a team when a user has multiple eligible squads to register.
+ * Displays the private confirmation prompt for the selected squad.
+ * @param {import('discord.js').StringSelectMenuInteraction} interaction
+ * @param {string} registrationId
+ * @param {string} [cycleId]
+ */
+export async function handleSelectRegistrationTeam(interaction, registrationId, cycleId = null) {
+  const selectedTeamId = interaction.values?.[0];
+  const registration = await getConfigurableRegistration(registrationId);
+  if (!registration || registration.status === 'DELETED' || registration.isDeleted) {
+    return respondToConfirmationInteraction(interaction, {
+      content: '❌ Registration instance not found or has been deleted.',
+      embeds: [],
+      components: [],
+    });
+  }
+
+  if (registration.status !== 'OPEN') {
+    return respondToConfirmationInteraction(interaction, {
+      content:
+        `Registration is currently NOT OPENED YET.\n` +
+        `Daily Schedule: Opens at ${formatRegistrationStartTime(registration)}`,
+      embeds: [],
+      components: [],
+    });
+  }
+
+  const tournament = await getConfigurableTournament(registration.tournamentId);
+  const team = await getConfigurableTeam(selectedTeamId);
+  if (!team || !isTeamVerifiedForTournament(team, registration.tournamentId) || team.leaderDiscordId !== interaction.user.id) {
+    return respondToConfirmationInteraction(interaction, {
+      content: `❌ Selected squad is not eligible or you are not its verified Team Leader.`,
+      embeds: [],
+      components: [],
+    });
+  }
+
+  const currentCycleId = registration.currentCycleId || cycleId;
+  const activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
+  const existingEntry = activeEntries.find((e) => e.teamId === team.teamId);
+  if (existingEntry && existingEntry.registrationId === registrationId) {
+    return respondToConfirmationInteraction(interaction, {
+      content:
+        `Your team **${team.teamName}** is already registered in this daily cycle! ` +
+        `Assigned to **Slot #${existingEntry.slotNumber}** and get IDP in <#${registration.idpChannelId}>.`,
+      embeds: [],
+      components: [],
+    });
+  }
+
+  const filledCount = activeEntries.length;
+  const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
+  const maxAvailable = Math.max(0, registration.totalSlots - reservedCount);
+  const freeSlots = Math.max(0, maxAvailable - filledCount);
+
+  if (freeSlots <= 0) {
+    return respondToConfirmationInteraction(interaction, {
+      content: '❌ Registration is currently **FULL**. All available slots for this registration instance are occupied!',
+      embeds: [],
+      components: [],
+    });
+  }
+
+  const promptPayload = buildConfirmationPromptPayload(
+    tournament,
+    registration,
+    team,
+    freeSlots,
+    maxAvailable,
+    currentCycleId
+  );
+
+  return respondToConfirmationInteraction(interaction, promptPayload);
+}
+
+/**
  * Handles the "Cancel" button on the registration confirmation message.
- * Immediately acknowledges interaction and terminates pending confirmation.
+ * Immediately disables both buttons, acknowledges interaction, and terminates pending confirmation.
  * @param {import('discord.js').ButtonInteraction} interaction
  * @param {string} [registrationId]
  * @param {string} [teamId]
+ * @param {string} [cycleId]
  */
-export async function handleCancelRegistrationButtonClick(interaction, registrationId = null, teamId = null) {
+export async function handleCancelRegistrationButtonClick(interaction, registrationId = null, teamId = null, cycleId = null) {
   const interactionId = interaction?.id || 'unknown';
   console.log(`[ConfigurableRegistration] 📥 Cancel button clicked [interactionId: ${interactionId}, regId: ${registrationId || 'N/A'}, teamId: ${teamId || 'N/A'}, user: ${interaction?.user?.id}]`);
+
+  disableConfirmationButtonsImmediately(interaction, registrationId, cycleId, teamId);
 
   // Immediately acknowledge the interaction
   if (typeof interaction.deferUpdate === 'function' && !interaction.deferred && !interaction.replied) {
@@ -821,9 +1094,12 @@ export async function handleCancelRegistrationButtonClick(interaction, registrat
  * @param {string} registrationId
  * @param {string} teamId
  */
-export async function handleConfirmRegistrationButtonClick(interaction, registrationId, teamId) {
+export async function handleConfirmRegistrationButtonClick(interaction, registrationId, teamId, cycleId = null) {
   const interactionId = interaction?.id || 'unknown';
-  console.log(`[ConfigurableRegistration] 📥 Confirmation button clicked [interactionId: ${interactionId}, regId: ${registrationId}, teamId: ${teamId}, user: ${interaction?.user?.id}]`);
+  console.log(`[ConfigurableRegistration] 📥 Confirmation button clicked [interactionId: ${interactionId}, regId: ${registrationId}, teamId: ${teamId}, cycleId: ${cycleId || 'N/A'}, user: ${interaction?.user?.id}]`);
+
+  // Immediately disable both buttons on the confirmation message so a double click can't register twice
+  disableConfirmationButtonsImmediately(interaction, registrationId, cycleId, teamId);
 
   // Step 2: Immediately acknowledge the interaction using deferUpdate (<3s deadline)
   // deferUpdate keeps the interaction tied to the existing ephemeral confirmation message,
@@ -945,8 +1221,8 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       console.warn(`[ConfigurableRegistration] ❌ Team already registered [interactionId: ${interactionId}, teamId: ${team.teamId}, slot: ${existingEntry.slotNumber}]`);
       return respondToConfirmationInteraction(interaction, {
         content:
-          `❌ Your team **${team.teamName}** is already registered in this daily cycle!\n` +
-          `Assigned to **Slot #${existingEntry.slotNumber}** in <#${registration.idpChannelId}>.`,
+          `Your team **${team.teamName}** is already registered in this daily cycle! ` +
+          `Assigned to **Slot #${existingEntry.slotNumber}** and get IDP in <#${registration.idpChannelId}>.`,
         embeds: [],
         components: [],
       });
@@ -1129,18 +1405,9 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});
     }
 
-    // Display Registration Successful response and remove Confirm Registration and Cancel buttons
-    const tournamentName = tournament?.name || 'Tournament';
-    const regName = registration.displayName || registration.name;
+    // Display Registration Successful response and remove Confirm and Cancel buttons
     const successPayload = {
-      content:
-        `🎉 **Registration Successful**\n` +
-        `Your squad has been successfully registered!\n\n` +
-        `🏆 **Tournament:** **${tournamentName}**\n` +
-        `📝 **Registration:** **${regName}**\n` +
-        `🛡️ **Team:** **${team.teamName}**\n` +
-        `🎯 **Allocated Slot Number:** \`#${slotNumber}\`\n` +
-        (registration.idpChannelId ? `🔒 **IDP Channel:** <#${registration.idpChannelId}>\n\n*(You have been granted access to the private IDP channel above. Room ID and Password will be posted there!)*` : ''),
+      content: `Registered! Slot #${slotNumber}, your IDP channel is <#${registration.idpChannelId}>.`,
       embeds: [],
       components: [],
     };
@@ -1712,7 +1979,7 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
 }
 
 /**
- * Shows the current slot chart embed to the organiser.
+ * Shows the current slot chart code block to the organiser.
  * @param {import('discord.js').ButtonInteraction} interaction
  * @param {string} registrationId
  */
@@ -1724,7 +1991,7 @@ export async function handleViewCurrentSlotChart(interaction, registrationId) {
 
   const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
   const entries = await getConfigurableEntriesForRegistration(registrationId, registration.currentCycleId);
-  const text = buildSlotListText(tournament, registration, entries);
+  const text = formatSlotListCodeBlock(buildSlotListText(tournament, registration, entries));
 
   await interaction.reply({ content: text, ephemeral: true });
 }

@@ -60,8 +60,10 @@ import {
   handleAddRegistrationButton,
   handleAddRegistrationModalSubmit,
   handleRegisterSquadButtonClick,
+  handleSelectRegistrationTeam,
   handleConfirmRegistrationButtonClick,
   handleCancelRegistrationButtonClick,
+  parseConfirmationCustomId,
   handleManageRegistrationsButton,
   handleManageSelectMenu,
   handleToggleStatus,
@@ -582,7 +584,7 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
         ManageThreads: false,
         ManageChannels: false,
         ManageRoles: false,
-      }).catch(() => {});
+      }).catch(() => { });
     }
 
     // 1. Verify channel (Shared squad enrollment)
@@ -652,7 +654,7 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
       .setTitle(`📢 Announcements — ${tournament.name}`)
       .setDescription('Official announcements and schedules will be posted here.')
       .setTimestamp();
-    await updatesChannel.send({ embeds: [updateEmbed] }).catch(() => {});
+    await updatesChannel.send({ embeds: [updateEmbed] }).catch(() => { });
 
     const infoEmbed = new EmbedBuilder()
       .setColor(0x5865f2)
@@ -664,7 +666,7 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
         `• Fair play and sportsmanship are strictly enforced.`
       )
       .setTimestamp();
-    await infoChannel.send({ embeds: [infoEmbed] }).catch(() => {});
+    await infoChannel.send({ embeds: [infoEmbed] }).catch(() => { });
 
     // Refresh dashboard in setup channel
     await refreshDashboard(interaction.client, tournamentId);
@@ -797,7 +799,7 @@ export async function handleConfigurableChannelDelete(channel) {
 
     // Refresh central dashboard
     if (client && registration.tournamentId) {
-      await refreshDashboard(client, registration.tournamentId).catch(() => {});
+      await refreshDashboard(client, registration.tournamentId).catch(() => { });
     }
   } catch (err) {
     console.warn(`[ConfigurableTournament] ⚠️ Error handling channel deletion for #${channel.id}:`, err.message);
@@ -1048,7 +1050,7 @@ export async function handleDeleteTournamentConfirm(interaction, tournamentId) {
       try {
         const fetched = await guild.channels.fetch();
         childChannels = Array.from(fetched.values()).filter((c) => c && c.parentId === categoryId);
-      } catch {}
+      } catch { }
     }
 
     // Setup channel deleted last
@@ -1170,61 +1172,61 @@ export async function handleConfigurableTournamentInteraction(interaction) {
     return true;
   }
 
-/**
- * Resolves tournamentId from rawId or contextual fallbacks (message, channel, category, guild).
- * @param {import('discord.js').Interaction} interaction
- * @param {string} [rawId]
- * @returns {Promise<string|null>}
- */
-async function resolveTournamentId(interaction, rawId) {
-  const cleanRawId = (rawId || '').trim();
-  if (cleanRawId) {
-    const tour = await getConfigurableTournament(cleanRawId);
-    if (tour && tour.status !== 'DELETED' && !tour.isDeleted) return tour.tournamentId;
-  }
-
-  // 1. Check if interaction message matches a tournament verifyMessageId or dashboard message
-  if (interaction.message?.id) {
-    const allTournaments = await getAllConfigurableTournaments(interaction.guildId || null);
-    const matched = allTournaments.find(
-      (t) =>
-        t.standardChannels?.verifyMessageId === interaction.message.id ||
-        t.dashboardMessageId === interaction.message.id
-    );
-    if (matched) return matched.tournamentId;
-  }
-
-  // 2. Check channel ID (verify channel, setup channel, etc.)
-  if (interaction.channelId) {
-    const allTournaments = await getAllConfigurableTournaments(interaction.guildId || null);
-    const matchedChannel = allTournaments.find(
-      (t) =>
-        t.standardChannels?.verifyChannelId === interaction.channelId ||
-        t.standardChannels?.updatesChannelId === interaction.channelId ||
-        t.standardChannels?.infoChannelId === interaction.channelId ||
-        t.setupChannelId === interaction.channelId
-    );
-    if (matchedChannel) return matchedChannel.tournamentId;
-  }
-
-  // 3. Check category / parentId
-  const parentId = interaction.channel?.parentId;
-  if (parentId && interaction.guildId) {
-    const tourByCategory = await getConfigurableTournamentByCategory(interaction.guildId, parentId);
-    if (tourByCategory) return tourByCategory.tournamentId;
-  }
-
-  // 4. If guild has only 1 active tournament, resolve to it
-  if (interaction.guildId) {
-    const allTournaments = await getAllConfigurableTournaments(interaction.guildId);
-    const active = allTournaments.filter((t) => t.status !== 'DELETED' && !t.isDeleted);
-    if (active.length === 1) {
-      return active[0].tournamentId;
+  /**
+   * Resolves tournamentId from rawId or contextual fallbacks (message, channel, category, guild).
+   * @param {import('discord.js').Interaction} interaction
+   * @param {string} [rawId]
+   * @returns {Promise<string|null>}
+   */
+  async function resolveTournamentId(interaction, rawId) {
+    const cleanRawId = (rawId || '').trim();
+    if (cleanRawId) {
+      const tour = await getConfigurableTournament(cleanRawId);
+      if (tour && tour.status !== 'DELETED' && !tour.isDeleted) return tour.tournamentId;
     }
-  }
 
-  return cleanRawId || null;
-}
+    // 1. Check if interaction message matches a tournament verifyMessageId or dashboard message
+    if (interaction.message?.id) {
+      const allTournaments = await getAllConfigurableTournaments(interaction.guildId || null);
+      const matched = allTournaments.find(
+        (t) =>
+          t.standardChannels?.verifyMessageId === interaction.message.id ||
+          t.dashboardMessageId === interaction.message.id
+      );
+      if (matched) return matched.tournamentId;
+    }
+
+    // 2. Check channel ID (verify channel, setup channel, etc.)
+    if (interaction.channelId) {
+      const allTournaments = await getAllConfigurableTournaments(interaction.guildId || null);
+      const matchedChannel = allTournaments.find(
+        (t) =>
+          t.standardChannels?.verifyChannelId === interaction.channelId ||
+          t.standardChannels?.updatesChannelId === interaction.channelId ||
+          t.standardChannels?.infoChannelId === interaction.channelId ||
+          t.setupChannelId === interaction.channelId
+      );
+      if (matchedChannel) return matchedChannel.tournamentId;
+    }
+
+    // 3. Check category / parentId
+    const parentId = interaction.channel?.parentId;
+    if (parentId && interaction.guildId) {
+      const tourByCategory = await getConfigurableTournamentByCategory(interaction.guildId, parentId);
+      if (tourByCategory) return tourByCategory.tournamentId;
+    }
+
+    // 4. If guild has only 1 active tournament, resolve to it
+    if (interaction.guildId) {
+      const allTournaments = await getAllConfigurableTournaments(interaction.guildId);
+      const active = allTournaments.filter((t) => t.status !== 'DELETED' && !t.isDeleted);
+      if (active.length === 1) {
+        return active[0].tournamentId;
+      }
+    }
+
+    return cleanRawId || null;
+  }
 
   // 4. Enroll Squad button (opens modal or manages squad)
   const isEnrollButton =
@@ -1434,33 +1436,26 @@ async function resolveTournamentId(interaction, rawId) {
     return true;
   }
 
-  // 9a. Confirm Registration button
-  if (customId.startsWith('md_cfg_reg_confirm_')) {
-    const payload = customId.replace('md_cfg_reg_confirm_', '');
-    let registrationId, teamId;
-    if (payload.includes(':')) {
-      [registrationId, teamId] = payload.split(':');
-    } else {
-      const parts = payload.split('_');
-      registrationId = parts[0];
-      teamId = parts.slice(1).join('_');
-    }
-    await handleConfirmRegistrationButtonClick(interaction, registrationId, teamId);
+  // 9a. Select Team for Registration (when user has >1 eligible team)
+  if (customId.startsWith('md_cfg_reg_select_team_')) {
+    const payload = customId.replace('md_cfg_reg_select_team_', '');
+    const [registrationId, rawCycle] = payload.split(':');
+    const cycleId = rawCycle ? `${registrationId}:${rawCycle}` : null;
+    await handleSelectRegistrationTeam(interaction, registrationId, cycleId);
     return true;
   }
 
-  // 9b. Cancel Registration button
+  // 9b. Confirm Registration button
+  if (customId.startsWith('md_cfg_reg_confirm_')) {
+    const { registrationId, cycleId, teamId } = parseConfirmationCustomId(customId);
+    await handleConfirmRegistrationButtonClick(interaction, registrationId, teamId, cycleId);
+    return true;
+  }
+
+  // 9c. Cancel Registration button
   if (customId.startsWith('md_cfg_reg_cancel_')) {
-    const payload = customId.replace('md_cfg_reg_cancel_', '');
-    let registrationId, teamId;
-    if (payload.includes(':')) {
-      [registrationId, teamId] = payload.split(':');
-    } else if (payload.includes('_')) {
-      const parts = payload.split('_');
-      registrationId = parts[0];
-      teamId = parts.slice(1).join('_');
-    }
-    await handleCancelRegistrationButtonClick(interaction, registrationId, teamId);
+    const { registrationId, cycleId, teamId } = parseConfirmationCustomId(customId);
+    await handleCancelRegistrationButtonClick(interaction, registrationId, teamId, cycleId);
     return true;
   }
 

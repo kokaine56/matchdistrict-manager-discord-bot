@@ -12,9 +12,42 @@ import {
 } from './configurableTournamentData.js';
 
 /**
+ * Extracts the short code for a tournament name (e.g. "T3 Scrims" -> "T3").
+ * @param {string} [tournamentName]
+ * @returns {string}
+ */
+export function extractTournamentShortCode(tournamentName) {
+  if (!tournamentName || typeof tournamentName !== 'string') return '';
+  const trimmed = tournamentName.trim();
+  if (!trimmed) return '';
+  const words = trimmed
+    .split(/\s+/)
+    .map((w) => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ''))
+    .filter(Boolean);
+  if (words.length === 0) return '';
+  if (words.length === 1) return words[0];
+  const firstWord = words[0];
+  if (firstWord.length <= 4 && /\d/.test(firstWord)) {
+    return firstWord;
+  }
+  const nonNumberWords = words.filter((w) => !/^\d+$/.test(w));
+  if (nonNumberWords.length === 0) return firstWord;
+  if (nonNumberWords.length === 1) return nonNumberWords[0];
+  const initials = nonNumberWords
+    .map((w) => {
+      const m = w.match(/[\p{L}\p{N}]/u);
+      return m ? m[0].toUpperCase() : '';
+    })
+    .filter(Boolean)
+    .join('');
+  return initials || firstWord;
+}
+
+/**
  * Builds the canonical title for a slot list message:
- * Tournament Name + Registration Name + Slotlist
- * e.g. "T3 10PM Slotlist"
+ * "<tournament name> <registration name> Slotlist"
+ * If the registration name already starts with the tournament's short code
+ * (for example "T3 10PM" in tournament "T3 Scrims"), uses only the rest of the name ("10PM").
  *
  * @param {string} [tournamentName]
  * @param {string} [registrationName]
@@ -30,7 +63,20 @@ export function buildSlotListTitle(tournamentName, registrationName) {
 
   // Avoid repeating tournament name if registration name already starts with it
   if (rName.toLowerCase().startsWith(tName.toLowerCase())) {
-    return `${rName} Slotlist`;
+    const rest = rName.slice(tName.length).trim();
+    return rest ? `${tName} ${rest} Slotlist` : `${tName} Slotlist`;
+  }
+
+  // If registration name starts with the tournament's short code (e.g. "T3 10PM" in "T3 Scrims"),
+  // use only the rest of the name ("10PM") so the code isn't repeated.
+  const shortCode = extractTournamentShortCode(tName);
+  if (shortCode) {
+    const escapedCode = shortCode.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const codePrefixRegex = new RegExp(`^${escapedCode}\\s+(.+)$`, 'i');
+    const match = rName.match(codePrefixRegex);
+    if (match && match[1]) {
+      return `${tName} ${match[1].trim()} Slotlist`;
+    }
   }
 
   return `${tName} ${rName} Slotlist`;
@@ -38,20 +84,34 @@ export function buildSlotListTitle(tournamentName, registrationName) {
 
 /**
  * Generates the status circle emoji counter for the bottom of the slot list:
- * - 🟢 when 1 or more available (unlocked) slots are occupied
- * - ⚪ when 0 teams are registered
+ * - ⚪ when 0 filled
+ * - 🟡 when partly filled
+ * - 🟢 when all filled
  *
  * @param {number} occupiedCount
  * @param {number} unlockedTotal
  * @returns {string}
  */
 export function getFilledSlotCounter(occupiedCount, unlockedTotal) {
-  if (unlockedTotal <= 0) {
-    return `⚪ 0/0 filled`;
+  if (unlockedTotal <= 0 || occupiedCount <= 0) {
+    return `⚪ 0/${Math.max(0, unlockedTotal)} filled`;
   }
 
-  const emoji = occupiedCount > 0 ? '🟢' : '⚪';
+  const emoji = occupiedCount >= unlockedTotal ? '🟢' : '🟡';
   return `${emoji} ${occupiedCount}/${unlockedTotal} filled`;
+}
+
+/**
+ * Wraps the slot list text in a triple-backtick code block for one-click copy-paste.
+ * @param {string} text
+ * @returns {string}
+ */
+export function formatSlotListCodeBlock(text) {
+  const trimmed = String(text || '').trim();
+  if (trimmed.startsWith('```') && trimmed.endsWith('```')) {
+    return trimmed;
+  }
+  return `\`\`\`\n${trimmed}\n\`\`\``;
 }
 
 /**
@@ -413,7 +473,7 @@ export async function syncRegistrationSlotList(firstArg, secondArg = null, third
     let discordUpdateResult = 'UPDATED';
 
     for (let i = 0; i < chunks.length; i++) {
-      const chunkText = chunks[i];
+      const chunkText = formatSlotListCodeBlock(chunks[i]);
       let existingMsg = null;
       let fetchErrorCode = null;
       const existingId = storedMessageIds[i];
@@ -432,7 +492,7 @@ export async function syncRegistrationSlotList(firstArg, secondArg = null, third
         try {
           const recent = await channel.messages.fetch({ limit: 10 }).catch(() => null);
           if (recent && typeof recent.find === 'function') {
-            existingMsg = recent.find((m) => m.content && (m.content.startsWith(title) || m.content.includes('Slot 01')));
+            existingMsg = recent.find((m) => m.content && (m.content.includes(title) || m.content.includes('Slot 01')));
           }
         } catch {}
       }
