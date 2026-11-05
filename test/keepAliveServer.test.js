@@ -207,6 +207,12 @@ test('Keep-Alive Web Server - Suite', async (t) => {
     assert.ok(blocked, 'Requests exceeding 120 per minute from same IP must be rate limited to 429');
   });
 
+  await t.test('Idempotency: Repeated calls to startHealthServer return the same instance and prevent EADDRINUSE', () => {
+    const s1 = startHealthServer(0);
+    const s2 = startHealthServer(0);
+    assert.strictEqual(s1, s2, 'Repeated calls must return the identical server instance without attempting to bind port twice');
+  });
+
   // Clean up server
   await new Promise(resolve => server.close(resolve));
 });

@@ -572,7 +572,7 @@ function renderStatusPageHtml({ botName, isDiscordReady, uptimeStr, lastPingDisp
 export function startHealthServer(portOverride) {
   const healthPort = portOverride !== undefined ? portOverride : (process.env.PORT || (isMainModule ? 10000 : null));
   if (healthPort === null || healthPort === undefined) return null;
-  if (healthServer && healthServer.listening) return healthServer;
+  if (healthServer) return healthServer;
 
   try {
     healthServer = http.createServer(async (req, res) => {
@@ -784,6 +784,18 @@ export function startHealthServer(portOverride) {
       // Unknown routes return a normal 404
       res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify({ error: 'NOT_FOUND' }));
+    });
+
+    healthServer.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.warn(`[Discord Bot] ⚠️ Server port ${healthPort} is already in use (EADDRINUSE).`);
+      } else {
+        console.error('[Discord Bot] ❌ Server error:', err.message || err);
+      }
+    });
+
+    healthServer.on('close', () => {
+      healthServer = null;
     });
 
     healthServer.listen(healthPort, '0.0.0.0', () => {
