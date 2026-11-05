@@ -67,6 +67,9 @@ import {
   handleTournamentSettingsButton,
   handleSetRequiredMembers,
   handleConfigurableTournamentInteraction,
+  sortTournamentRegistrations,
+  buildExpectedTournamentChannelOrder,
+  reorderTournamentCategoryChannels,
   TOURNAMENT_DENIED_PERMISSIONS,
 } from '../configurableTournamentService.js';
 
@@ -613,9 +616,9 @@ test('Standard Channels - Creates T3-Verify, T3-Updates, T3-Info with threads di
   assert.ok(deferred);
   assert.match(replyText, /Standard channels created successfully/);
   assert.equal(createdChannels.length, 3);
-  assert.equal(createdChannels[0].name, '𝐓𝟑｜verify');
+  assert.equal(createdChannels[0].name, '𝐓𝟑｜info');
   assert.equal(createdChannels[1].name, '𝐓𝟑｜updates');
-  assert.equal(createdChannels[2].name, '𝐓𝟑｜info');
+  assert.equal(createdChannels[2].name, '𝐓𝟑｜verify');
 
   // Verify threads are explicitly denied on standard channels
   for (const chan of createdChannels) {
@@ -5421,6 +5424,386 @@ test('Exact Timing & Schedule Evaluation - Next due time persisted in MongoDB, e
   assert.ok(regEditIdx < idpEditIdx, 'Critical step (registration message update to OPEN) happens BEFORE slower slot chart work');
   clearAllRegistrationTimers();
 });
+
+test('Tournament Discord Channel Order - Enforces SETUP -> INFO -> UPDATES -> VERIFY -> ALL REGS -> ALL IDPS across creation, 5 registrations, rename, deletion, restart, and rate limits', async () => {
+  const guildId = 'guild-order-suite';
+  const otherCategoryId = 'cat-unrelated-999';
+  const channelCache = new Map();
+  const setPositionsCalls = [];
+
+  // Seed unrelated category and channels to verify they are never touched
+  const unrelatedChan1 = {
+    id: 'chan-other-1',
+    name: 'general-chat',
+    type: ChannelType.GuildText,
+    parentId: otherCategoryId,
+    position: 0,
+    permissionOverwrites: [{ id: guildId, allow: [PermissionFlagsBits.ViewChannel] }],
+  };
+  const unrelatedChan2 = {
+    id: 'chan-other-2',
+    name: 'staff-chat',
+    type: ChannelType.GuildText,
+    parentId: otherCategoryId,
+    position: 1,
+    permissionOverwrites: [{ id: guildId, deny: [PermissionFlagsBits.ViewChannel] }],
+  };
+  channelCache.set(unrelatedChan1.id, unrelatedChan1);
+  channelCache.set(unrelatedChan2.id, unrelatedChan2);
+
+  let nextChanSeq = 1;
+  const makeTextChan = (spec) => {
+    const id = `chan-ord-${nextChanSeq++}`;
+    const messages = new Map();
+    const chan = {
+      id,
+      name: spec.name,
+      type: spec.type,
+      parent: spec.parent || null,
+      parentId: spec.parent || null,
+      position: typeof spec.position === 'number' ? spec.position : channelCache.size,
+      permissionOverwrites: {
+        raw: spec.permissionOverwrites || [],
+        cache: new Map(),
+        edit: async () => {},
+        delete: async () => {},
+      },
+      isTextBased: () => spec.type !== ChannelType.GuildCategory,
+      setName: async (newName) => {
+        chan.name = newName;
+        return chan;
+      },
+      setPosition: async (newPos) => {
+        chan.position = newPos;
+        return chan;
+      },
+      delete: async () => {
+        chan.deleted = true;
+        channelCache.delete(id);
+      },
+      send: async (payload) => {
+        const msgId = `msg-${id}-${messages.size + 1}`;
+        const msg = {
+          id: msgId,
+          content: payload.content ?? '',
+          embeds: payload.embeds || [],
+          components: payload.components || [],
+          edit: async (next) => {
+            if (next.content !== undefined) msg.content = next.content;
+            if (next.embeds !== undefined) msg.embeds = next.embeds;
+            if (next.components !== undefined) msg.components = next.components;
+            return msg;
+          },
+        };
+        messages.set(msgId, msg);
+        return msg;
+      },
+      messages: {
+        fetch: async (mId) => (typeof mId === 'string' ? messages.get(mId) || null : messages),
+      },
+    };
+    channelCache.set(id, chan);
+    return chan;
+  };
+
+  let simulateRateLimitOnce = false;
+  const mockGuild = {
+    id: guildId,
+    roles: { everyone: { id: guildId } },
+    members: { me: { id: 'bot-order-1' } },
+    channels: {
+      cache: channelCache,
+      create: async (spec) => makeTextChan(spec),
+      fetch: async (id) => channelCache.get(id) || null,
+      setPositions: async (positions) => {
+        if (simulateRateLimitOnce) {
+          simulateRateLimitOnce = false;
+          const err = new Error('You are being rate limited.');
+          err.status = 429;
+          err.retryAfter = 0.01;
+          throw err;
+        }
+        setPositionsCalls.push(positions);
+        for (const entry of positions) {
+          const c = channelCache.get(entry.channel);
+          if (c) {
+            c.position = entry.position;
+            if (entry.parent) c.parentId = entry.parent;
+          }
+        }
+      },
+    },
+  };
+
+  const mockClient = {
+    user: { id: 'bot-order-1' },
+    guilds: {
+      cache: new Map([[guildId, mockGuild]]),
+      fetch: async (id) => (id === guildId ? mockGuild : null),
+    },
+    channels: {
+      cache: channelCache,
+      fetch: async (id) => channelCache.get(id) || null,
+    },
+  };
+
+  // 1. Create tournament category ("T3 Scrims") and Setup channel
+  await handleCreateTournamentModalSubmit({
+    guild: mockGuild,
+    client: mockClient,
+    user: { id: 'admin-ord-1' },
+    member: { permissions: { has: () => true } },
+    fields: { getTextInputValue: (cid) => (cid === 'category_name' ? 'T3 Scrims' : '') },
+    deferReply: async () => {},
+    editReply: async () => {},
+  });
+
+  const tour = await getConfigurableTournamentByName(guildId, 'T3 Scrims');
+  assert.ok(tour, 'Tournament created');
+  const categoryId = tour.categoryId;
+
+  // 2. Create Standard Channels (Info, Updates, Verify)
+  await handleCreateStandardChannels(
+    {
+      guild: mockGuild,
+      client: mockClient,
+      deferReply: async () => {},
+      editReply: async () => {},
+    },
+    tour.tournamentId
+  );
+
+  const getCategoryChannelsByPosition = () =>
+    Array.from(channelCache.values())
+      .filter((c) => c.parentId === categoryId && c.type === ChannelType.GuildText && !c.deleted)
+      .sort((a, b) => a.position - b.position);
+
+  const tourWithStd = await getConfigurableTournament(tour.tournamentId);
+  const stdOrder = getCategoryChannelsByPosition();
+  assert.deepEqual(
+    stdOrder.map((c) => c.id),
+    [
+      tourWithStd.setupChannelId,
+      tourWithStd.standardChannels.infoChannelId,
+      tourWithStd.standardChannels.updatesChannelId,
+      tourWithStd.standardChannels.verifyChannelId,
+    ],
+    'Standard channels must be ordered: Setup (0) -> Info (1) -> Updates (2) -> Verify (3)'
+  );
+  assert.deepEqual(
+    stdOrder.map((c) => c.name),
+    ['𝐓𝟑｜setup', '𝐓𝟑｜info', '𝐓𝟑｜updates', '𝐓𝟑｜verify']
+  );
+
+  // 3. Dynamically add 5 registrations (10pm, 11pm, 12am, 1am, 2am)
+  const regSpecs = [
+    { name: '10pm', start: '10:00 AM', reset: '11:59 PM' },
+    { name: '11pm', start: '11:00 AM', reset: '11:59 PM' },
+    { name: '12am', start: '12:00 PM', reset: '11:59 PM' },
+    { name: '1am', start: '01:00 PM', reset: '11:59 PM' },
+    { name: '2am', start: '02:00 PM', reset: '11:59 PM' },
+  ];
+
+  for (const spec of regSpecs) {
+    await handleAddRegistrationModalSubmit(
+      {
+        guild: mockGuild,
+        client: mockClient,
+        deferReply: async () => {},
+        editReply: async () => {},
+        fields: {
+          getTextInputValue: (f) => {
+            if (f === 'registration_name') return spec.name;
+            if (f === 'total_slots') return '18';
+            if (f === 'reserved_slots') return '2';
+            if (f === 'daily_start_time') return spec.start;
+            if (f === 'daily_reset_time') return spec.reset;
+            return '';
+          },
+        },
+      },
+      tour.tournamentId
+    );
+  }
+
+  const fiveRegs = await getConfigurableRegistrationsForTournament(tour.tournamentId);
+  assert.equal(fiveRegs.length, 5, '5 registrations created');
+
+  const orderedWith5 = getCategoryChannelsByPosition();
+  assert.deepEqual(
+    orderedWith5.map((c) => c.id),
+    [
+      tourWithStd.setupChannelId,
+      tourWithStd.standardChannels.infoChannelId,
+      tourWithStd.standardChannels.updatesChannelId,
+      tourWithStd.standardChannels.verifyChannelId,
+      ...fiveRegs.map((r) => r.registrationChannelId),
+      ...fiveRegs.map((r) => r.idpChannelId),
+    ],
+    'With 5 registrations: Setup -> Info -> Updates -> Verify -> Reg 1..5 -> IDP 1..5'
+  );
+  assert.deepEqual(
+    orderedWith5.map((c) => c.name),
+    [
+      '𝐓𝟑｜setup',
+      '𝐓𝟑｜info',
+      '𝐓𝟑｜updates',
+      '𝐓𝟑｜verify',
+      '𝐓𝟑｜10pm-reg',
+      '𝐓𝟑｜11pm-reg',
+      '𝐓𝟑｜12am-reg',
+      '𝐓𝟑｜1am-reg',
+      '𝐓𝟑｜2am-reg',
+      '𝐓𝟑｜10pm-idp',
+      '𝐓𝟑｜11pm-idp',
+      '𝐓𝟑｜12am-idp',
+      '𝐓𝟑｜1am-idp',
+      '𝐓𝟑｜2am-idp',
+    ],
+    'Channel names in category match exact example layout'
+  );
+  assert.deepEqual(
+    orderedWith5.map((c) => c.position),
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+    'Positions are contiguous 0..13'
+  );
+
+  // 4. Verify no-op call makes 0 unnecessary Discord API calls when already ordered
+  const callsBeforeNoop = setPositionsCalls.length;
+  const noopResult = await reorderTournamentCategoryChannels(mockGuild, tour.tournamentId);
+  assert.equal(noopResult.updated, false, 'Already ordered category does not trigger update');
+  assert.equal(noopResult.apiCalls, 0, 'Already ordered category makes 0 API calls');
+  assert.equal(setPositionsCalls.length, callsBeforeNoop, 'setPositions not called when already ordered');
+
+  // 5. Rename Registration 2 ("11pm" -> "1130pm") via Edit Settings and verify position is preserved without recreating channel
+  const reg2 = fiveRegs[1];
+  const reg2ChanIdBefore = reg2.registrationChannelId;
+  const idp2ChanIdBefore = reg2.idpChannelId;
+
+  await handleEditRegistrationModalSubmit(
+    {
+      guildId,
+      guild: mockGuild,
+      client: mockClient,
+      deferReply: async () => {},
+      editReply: async () => {},
+      fields: {
+        getTextInputValue: (f) => {
+          if (f === 'registration_name') return '1130pm';
+          if (f === 'total_slots') return '18';
+          if (f === 'reserved_slots') return '2';
+          if (f === 'matches') return '2';
+          if (f === 'daily_start_time') return '11:30 AM | 11:59 PM';
+          return '';
+        },
+      },
+    },
+    reg2.registrationId
+  );
+
+  const orderedAfterRename = getCategoryChannelsByPosition();
+  assert.equal(orderedAfterRename[5].id, reg2ChanIdBefore, 'Reg 2 channel ID unchanged (not recreated) and stays at index 5');
+  assert.equal(orderedAfterRename[5].name, '𝐓𝟑｜1130pm-reg', 'Reg 2 channel renamed in place');
+  assert.equal(orderedAfterRename[10].id, idp2ChanIdBefore, 'IDP 2 channel ID unchanged (not recreated) and stays at index 10');
+  assert.equal(orderedAfterRename[10].name, '𝐓𝟑｜1130pm-idp', 'IDP 2 channel renamed in place');
+
+  // 6. Delete Registration 2 and Registration 4, verify remaining channels (1, 3, 5) reorganize cleanly
+  await handleDeleteRegistration(
+    {
+      guild: mockGuild,
+      client: mockClient,
+      reply: async () => {},
+    },
+    reg2.registrationId
+  );
+
+  // Also test direct Discord channel deletion on Registration 4
+  const reg4Chan = channelCache.get(fiveRegs[3].registrationChannelId);
+  reg4Chan.client = mockClient;
+  reg4Chan.guild = mockGuild;
+  await handleConfigurableChannelDelete(reg4Chan);
+
+  const remainingRegs = await getConfigurableRegistrationsForTournament(tour.tournamentId);
+  assert.equal(remainingRegs.length, 3, '3 registrations remain (Reg 1, Reg 3, Reg 5)');
+  assert.deepEqual(
+    remainingRegs.map((r) => r.displayName),
+    ['10pm', '12am', '2am']
+  );
+
+  const orderedAfterDeletes = getCategoryChannelsByPosition();
+  assert.deepEqual(
+    orderedAfterDeletes.map((c) => c.name),
+    [
+      '𝐓𝟑｜setup',
+      '𝐓𝟑｜info',
+      '𝐓𝟑｜updates',
+      '𝐓𝟑｜verify',
+      '𝐓𝟑｜10pm-reg',
+      '𝐓𝟑｜12am-reg',
+      '𝐓𝟑｜2am-reg',
+      '𝐓𝟑｜10pm-idp',
+      '𝐓𝟑｜12am-idp',
+      '𝐓𝟑｜2am-idp',
+    ],
+    'After deleting Reg 2 and Reg 4, remaining channels reorganize into Setup -> Info -> Updates -> Verify -> Reg 1,3,5 -> IDP 1,3,5'
+  );
+  assert.deepEqual(
+    orderedAfterDeletes.map((c) => c.position),
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    'Positions compacted to 0..9'
+  );
+
+  // 7. Scramble channel positions & simulate 429 rate-limit on bot restart reconciliation
+  for (let i = 0; i < orderedAfterDeletes.length; i++) {
+    orderedAfterDeletes[i].position = 99 - i;
+  }
+  simulateRateLimitOnce = true;
+
+  await reconcileConfigurableTournaments(mockClient);
+
+  const orderedAfterRestart = getCategoryChannelsByPosition();
+  assert.deepEqual(
+    orderedAfterRestart.map((c) => c.name),
+    [
+      '𝐓𝟑｜setup',
+      '𝐓𝟑｜info',
+      '𝐓𝟑｜updates',
+      '𝐓𝟑｜verify',
+      '𝐓𝟑｜10pm-reg',
+      '𝐓𝟑｜12am-reg',
+      '𝐓𝟑｜2am-reg',
+      '𝐓𝟑｜10pm-idp',
+      '𝐓𝟑｜12am-idp',
+      '𝐓𝟑｜2am-idp',
+    ],
+    'Bot restart reconciliation restores exact SETUP -> INFO -> UPDATES -> VERIFY -> ALL REGS -> ALL IDPS order'
+  );
+  assert.deepEqual(
+    orderedAfterRestart.map((c) => c.position),
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  );
+
+  // 8. Verify unrelated category channels were never reordered or modified
+  assert.equal(unrelatedChan1.parentId, otherCategoryId);
+  assert.equal(unrelatedChan1.position, 0);
+  assert.equal(unrelatedChan2.parentId, otherCategoryId);
+  assert.equal(unrelatedChan2.position, 1);
+  for (const call of setPositionsCalls) {
+    assert.equal(
+      call.some((entry) => entry.channel === unrelatedChan1.id || entry.channel === unrelatedChan2.id),
+      false,
+      'Channels belonging to other categories must never be included in setPositions'
+    );
+    assert.equal(
+      call.every((entry) => entry.lockPermissions === false),
+      true,
+      'lockPermissions must always be false to preserve channel permission overwrites'
+    );
+  }
+
+  clearAllRegistrationTimers();
+});
+
 
 
 

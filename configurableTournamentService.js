@@ -86,7 +86,7 @@ export function buildDashboardEmbed(tournament, registrations = [], enrolledCoun
   const std = tournament.standardChannels;
 
   const channelsText = std
-    ? `• **Verify:** <#${std.verifyChannelId}>\n• **Updates:** <#${std.updatesChannelId}>\n• **Info:** <#${std.infoChannelId}>`
+    ? `• **Info:** <#${std.infoChannelId}>\n• **Updates:** <#${std.updatesChannelId}>\n• **Verify:** <#${std.verifyChannelId}>`
     : `⚠️ *Standard channels not created yet. Click "Create Standard Channels" below.*`;
 
   let regsText = 'ℹ️ *No active registration instances.*';
@@ -214,11 +214,13 @@ export async function createTournamentChannel(guild, {
   parent,
   permissionOverwrites = [],
   topic = '',
+  position,
 }) {
   const cleanSuffix = (fallbackSuffix || '').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
   const cleanPrefix = (rawPrefix || 'md').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'md';
   const plainFallback = `${cleanPrefix}-${cleanSuffix}`;
   const primaryName = `${boldPrefix}\uFF5C${cleanSuffix}`;
+  const posOption = Number.isInteger(position) && position >= 0 ? { position } : {};
 
   try {
     return await guild.channels.create({
@@ -227,6 +229,7 @@ export async function createTournamentChannel(guild, {
       parent,
       permissionOverwrites,
       topic,
+      ...posOption,
     });
   } catch (err) {
     console.warn(`[ConfigurableTournament] ⚠️ Discord rejected channel creation with name "${primaryName}": ${err.message}. Retrying once with plain fallback "${plainFallback}"...`);
@@ -236,8 +239,390 @@ export async function createTournamentChannel(guild, {
       parent,
       permissionOverwrites,
       topic,
+      ...posOption,
     });
   }
+}
+
+/**
+ * Sorts active tournament registrations deterministically by their registration number,
+ * creation timestamp, and registrationId.
+ * @param {Array<object>} registrations
+ * @returns {Array<object>}
+ */
+export function sortTournamentRegistrations(registrations = []) {
+  if (!Array.isArray(registrations)) return [];
+  return registrations
+    .filter((r) => r && r.status !== 'DELETED' && r.isDeleted !== true)
+    .slice()
+    .sort((a, b) => {
+      const numA = Number.isFinite(Number(a.registrationNumber)) && Number(a.registrationNumber) > 0
+        ? Number(a.registrationNumber)
+        : Number.MAX_SAFE_INTEGER;
+      const numB = Number.isFinite(Number(b.registrationNumber)) && Number(b.registrationNumber) > 0
+        ? Number(b.registrationNumber)
+        : Number.MAX_SAFE_INTEGER;
+      if (numA !== numB) return numA - numB;
+      const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      if (timeA !== timeB) return timeA - timeB;
+      return String(a.registrationId || '').localeCompare(String(b.registrationId || ''));
+    });
+}
+
+/**
+ * Builds the canonical expected Discord channel order for a tournament category using
+ * stored channel IDs and registration mappings (never channel names):
+ * SETUP → INFO → UPDATES → VERIFY → ALL REGISTRATION CHANNELS → ALL IDP CHANNELS
+ *
+ * @param {object} tournament
+ * @param {Array<object>} [registrations]
+ * @returns {Array<{ channelId: string, section: 'setup'|'info'|'updates'|'verify'|'registration'|'idp', registrationId: string|null, registrationNumber: number|null, expectedPosition: number }>}
+ */
+export function buildExpectedTournamentChannelOrder(tournament, registrations = []) {
+  if (!tournament || tournament.status === 'DELETED' || tournament.isDeleted) {
+    return [];
+  }
+
+  const sortedRegs = sortTournamentRegistrations(registrations);
+  const std = tournament.standardChannels || {};
+  const rawDescriptors = [];
+
+  if (tournament.setupChannelId) {
+    rawDescriptors.push({
+      channelId: String(tournament.setupChannelId),
+      section: 'setup',
+      registrationId: null,
+      registrationNumber: null,
+    });
+  }
+  if (std.infoChannelId) {
+    rawDescriptors.push({
+      channelId: String(std.infoChannelId),
+      section: 'info',
+      registrationId: null,
+      registrationNumber: null,
+    });
+  }
+  if (std.updatesChannelId) {
+    rawDescriptors.push({
+      channelId: String(std.updatesChannelId),
+      section: 'updates',
+      registrationId: null,
+      registrationNumber: null,
+    });
+  }
+  if (std.verifyChannelId) {
+    rawDescriptors.push({
+      channelId: String(std.verifyChannelId),
+      section: 'verify',
+      registrationId: null,
+      registrationNumber: null,
+    });
+  }
+
+  for (let i = 0; i < sortedRegs.length; i++) {
+    const reg = sortedRegs[i];
+    if (reg.registrationChannelId) {
+      rawDescriptors.push({
+        channelId: String(reg.registrationChannelId),
+        section: 'registration',
+        registrationId: reg.registrationId || null,
+        registrationNumber: Number.isFinite(Number(reg.registrationNumber)) ? Number(reg.registrationNumber) : i + 1,
+      });
+    }
+  }
+
+  for (let i = 0; i < sortedRegs.length; i++) {
+    const reg = sortedRegs[i];
+    if (reg.idpChannelId) {
+      rawDescriptors.push({
+        channelId: String(reg.idpChannelId),
+        section: 'idp',
+        registrationId: reg.registrationId || null,
+        registrationNumber: Number.isFinite(Number(reg.registrationNumber)) ? Number(reg.registrationNumber) : i + 1,
+      });
+    }
+  }
+
+  const seen = new Set();
+  const deduped = [];
+  for (const item of rawDescriptors) {
+    if (!item.channelId || seen.has(item.channelId)) continue;
+    seen.add(item.channelId);
+    deduped.push({
+      ...item,
+      expectedPosition: deduped.length,
+    });
+  }
+
+  return deduped;
+}
+
+const activeCategoryReorderPromises = new Map();
+
+async function executeReorderWithRateLimit(fn, maxRetries = 3) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isRateLimited =
+        err?.status === 429 ||
+        err?.code === 429 ||
+        err?.retryAfter != null ||
+        err?.rawError?.retry_after != null;
+      if (isRateLimited && attempt < maxRetries) {
+        attempt++;
+        const retrySec = Number(err?.retryAfter ?? err?.rawError?.retry_after ?? 0.25) || 0.25;
+        const waitMs = Math.min(5000, Math.max(10, Math.ceil(retrySec * 1000)));
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Enforces the exact tournament category channel order:
+ * SETUP → INFO → UPDATES → VERIFY → ALL REGISTRATION CHANNELS → ALL IDP CHANNELS
+ *
+ * - Identifies channels strictly by stored channel IDs and registration mappings (never names).
+ * - Uses Discord.js channel position editing (`guild.channels.setPositions` or `channel.setPosition`).
+ * - Ensures all tournament channels stay inside the tournament's category without overwriting permissions.
+ * - Never touches channels belonging to other categories.
+ * - Skips Discord API calls when channels are already in the exact target positions and category.
+ *
+ * @param {import('discord.js').Guild|import('discord.js').Client} guildOrClient
+ * @param {object|string} tournamentOrId
+ * @returns {Promise<{ orderedChannelIds: string[], updated: boolean, apiCalls: number }>}
+ */
+export async function reorderTournamentCategoryChannels(guildOrClient, tournamentOrId) {
+  const tournamentId = typeof tournamentOrId === 'string'
+    ? tournamentOrId
+    : tournamentOrId?.tournamentId;
+  if (!tournamentId) {
+    return { orderedChannelIds: [], updated: false, apiCalls: 0 };
+  }
+
+  const prevPromise = activeCategoryReorderPromises.get(tournamentId) || Promise.resolve();
+  const currentTask = prevPromise
+    .catch(() => {})
+    .then(() => performTournamentCategoryReorder(guildOrClient, tournamentOrId));
+
+  activeCategoryReorderPromises.set(tournamentId, currentTask);
+  try {
+    return await currentTask;
+  } finally {
+    if (activeCategoryReorderPromises.get(tournamentId) === currentTask) {
+      activeCategoryReorderPromises.delete(tournamentId);
+    }
+  }
+}
+
+async function performTournamentCategoryReorder(guildOrClient, tournamentOrId) {
+  const tournament = typeof tournamentOrId === 'string'
+    ? await getConfigurableTournament(tournamentOrId)
+    : (await getConfigurableTournament(tournamentOrId.tournamentId)) || tournamentOrId;
+
+  if (!tournament || tournament.status === 'DELETED' || tournament.isDeleted) {
+    return { orderedChannelIds: [], updated: false, apiCalls: 0 };
+  }
+
+  const categoryId = tournament.categoryId || null;
+  const registrations = await getConfigurableRegistrationsForTournament(tournament.tournamentId, false);
+  const expectedOrder = buildExpectedTournamentChannelOrder(tournament, registrations);
+  if (expectedOrder.length === 0) {
+    return { orderedChannelIds: [], updated: false, apiCalls: 0 };
+  }
+
+  let guild = null;
+  let client = null;
+  if (guildOrClient) {
+    if (guildOrClient.guilds) {
+      client = guildOrClient;
+      if (tournament.guildId) {
+        guild =
+          client.guilds.cache?.get?.(tournament.guildId) ||
+          (typeof client.guilds.fetch === 'function'
+            ? await client.guilds.fetch(tournament.guildId).catch(() => null)
+            : null);
+      }
+    } else if (guildOrClient.channels) {
+      guild = guildOrClient;
+      client = guildOrClient.client || null;
+    }
+  }
+
+  const resolveChannel = async (channelId) => {
+    if (!channelId) return null;
+    const cachedGuildChan = guild?.channels?.cache?.get?.(channelId);
+    if (cachedGuildChan) return cachedGuildChan;
+    const cachedClientChan = client?.channels?.cache?.get?.(channelId);
+    if (cachedClientChan) return cachedClientChan;
+    if (typeof guild?.channels?.fetch === 'function') {
+      const fetched = await guild.channels.fetch(channelId).catch(() => null);
+      if (fetched) return fetched;
+    }
+    if (typeof client?.channels?.fetch === 'function') {
+      const fetched = await client.channels.fetch(channelId).catch(() => null);
+      if (fetched) return fetched;
+    }
+    if (typeof guildOrClient?.channels?.fetch === 'function' && guildOrClient !== guild && guildOrClient !== client) {
+      const fetched = await guildOrClient.channels.fetch(channelId).catch(() => null);
+      if (fetched) return fetched;
+    }
+    return null;
+  };
+
+  const resolvedChannels = [];
+  for (const descriptor of expectedOrder) {
+    const chan = await resolveChannel(descriptor.channelId);
+    if (!chan || chan.deleted || chan.type === ChannelType.GuildCategory) continue;
+    if (!guild && chan.guild?.channels) {
+      guild = chan.guild;
+    }
+
+    const currentParentId =
+      chan.parentId !== undefined
+        ? chan.parentId
+        : typeof chan.parent === 'string'
+        ? chan.parent
+        : chan.parent?.id ?? null;
+
+    // Guard: never reorder a channel if it belongs to a different tournament's category
+    if (currentParentId && categoryId && currentParentId !== categoryId) {
+      const otherTour = await getConfigurableTournamentByCategory(currentParentId);
+      if (otherTour && otherTour.tournamentId !== tournament.tournamentId) {
+        continue;
+      }
+    }
+
+    resolvedChannels.push({ descriptor, chan, currentParentId });
+  }
+
+  if (resolvedChannels.length === 0) {
+    return { orderedChannelIds: [], updated: false, apiCalls: 0 };
+  }
+
+  const orderedChannelIds = resolvedChannels.map((r) => r.chan.id);
+
+  // Check if all channels already have the exact target position and parent category
+  const allPositionsAndParentsMatch = resolvedChannels.every(({ chan, currentParentId }, idx) => {
+    const posMatches = typeof chan.position === 'number' && chan.position === idx;
+    const parentMatches = !categoryId || !currentParentId || currentParentId === categoryId;
+    return posMatches && parentMatches;
+  });
+
+  // Also check if guild.channels.cache (when Map) already lists these channels in the exact relative order
+  let cacheOrderMatches = true;
+  if (guild?.channels?.cache instanceof Map) {
+    const targetSet = new Set(orderedChannelIds);
+    const currentCacheTargetIds = [];
+    for (const key of guild.channels.cache.keys()) {
+      if (targetSet.has(key)) currentCacheTargetIds.push(key);
+    }
+    if (currentCacheTargetIds.length === orderedChannelIds.length) {
+      for (let i = 0; i < orderedChannelIds.length; i++) {
+        if (currentCacheTargetIds[i] !== orderedChannelIds[i]) {
+          cacheOrderMatches = false;
+          break;
+        }
+      }
+    }
+  }
+
+  if (allPositionsAndParentsMatch && cacheOrderMatches) {
+    return { orderedChannelIds, updated: false, apiCalls: 0 };
+  }
+
+  let apiCalls = 0;
+
+  if (!allPositionsAndParentsMatch) {
+    const positionPayloads = resolvedChannels.map(({ chan }, idx) => ({
+      channel: chan.id,
+      position: idx,
+      ...(categoryId ? { parent: categoryId, lockPermissions: false } : {}),
+    }));
+
+    if (typeof guild?.channels?.setPositions === 'function') {
+      await executeReorderWithRateLimit(() => guild.channels.setPositions(positionPayloads));
+      apiCalls += 1;
+    } else {
+      for (let idx = 0; idx < resolvedChannels.length; idx++) {
+        const { chan, currentParentId } = resolvedChannels[idx];
+        const needsParentMove = Boolean(categoryId && currentParentId && currentParentId !== categoryId);
+        const needsPositionMove = chan.position !== idx;
+
+        if (needsParentMove && typeof chan.setParent === 'function') {
+          await executeReorderWithRateLimit(() => chan.setParent(categoryId, { lockPermissions: false }));
+          apiCalls += 1;
+        }
+        if (needsPositionMove) {
+          if (typeof chan.setPosition === 'function') {
+            await executeReorderWithRateLimit(() => chan.setPosition(idx));
+            apiCalls += 1;
+          } else if (typeof chan.edit === 'function' && !chan.messages) {
+            await executeReorderWithRateLimit(() =>
+              chan.edit({
+                position: idx,
+                ...(categoryId ? { parent: categoryId, lockPermissions: false } : {}),
+              })
+            );
+            apiCalls += 1;
+          }
+        }
+      }
+    }
+
+    // Ensure in-memory channel state reflects the exact position and parent category
+    for (let idx = 0; idx < resolvedChannels.length; idx++) {
+      const { chan } = resolvedChannels[idx];
+      chan.position = idx;
+      if (categoryId) {
+        chan.parentId = categoryId;
+        if (typeof chan.parent === 'string' || chan.parent == null) {
+          chan.parent = categoryId;
+        }
+      }
+    }
+  }
+
+  // Synchronize Map iteration order for this category's channels without altering any other category's channels
+  if (guild?.channels?.cache instanceof Map) {
+    const targetSet = new Set(orderedChannelIds);
+    const existingEntries = Array.from(guild.channels.cache.entries());
+    const hasAnyInCache = existingEntries.some(([k]) => targetSet.has(k));
+    if (hasAnyInCache) {
+      let insertedGroup = false;
+      const reorderedEntries = [];
+      for (const [k, v] of existingEntries) {
+        if (targetSet.has(k)) {
+          if (!insertedGroup) {
+            for (const { chan } of resolvedChannels) {
+              if (guild.channels.cache.has(chan.id)) {
+                reorderedEntries.push([chan.id, chan]);
+              }
+            }
+            insertedGroup = true;
+          }
+        } else {
+          reorderedEntries.push([k, v]);
+        }
+      }
+      guild.channels.cache.clear();
+      for (const [k, v] of reorderedEntries) {
+        guild.channels.cache.set(k, v);
+      }
+    }
+  }
+
+  return {
+    orderedChannelIds,
+    updated: true,
+    apiCalls,
+  };
 }
 
 /**
@@ -521,6 +906,7 @@ export async function handleCreateTournamentModalSubmit(interaction) {
     };
 
     await saveConfigurableTournament(tournament);
+    await reorderTournamentCategoryChannels(guild, tournament).catch(() => {});
 
     // Post persistent dashboard in setup channel
     await refreshDashboard(interaction.client, tournament.tournamentId);
@@ -543,7 +929,8 @@ export async function handleCreateTournamentModalSubmit(interaction) {
 
 /**
  * Handles "Create Standard Channels" button click.
- * Creates verify, updates, and info channels in the category if they don't already exist.
+ * Creates info, updates, and verify channels in the category if they don't already exist,
+ * enforcing the exact order: Setup → Info → Updates → Verify → Registration channels → IDP channels.
  * The setup channel itself is NEVER deleted or recreated.
  * @param {import('discord.js').ButtonInteraction} interaction
  * @param {string} tournamentId
@@ -560,13 +947,14 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
   const categoryId = tournament.categoryId;
 
   if (tournament.standardChannels?.verifyChannelId) {
+    await reorderTournamentCategoryChannels(guild || interaction.client, tournament).catch(() => {});
     // Channels already created
     return interaction.editReply({
       content:
         `ℹ️ Standard channels already exist for this tournament:\n` +
-        `• **Verify:** <#${tournament.standardChannels.verifyChannelId}>\n` +
+        `• **Info:** <#${tournament.standardChannels.infoChannelId}>\n` +
         `• **Updates:** <#${tournament.standardChannels.updatesChannelId}>\n` +
-        `• **Info:** <#${tournament.standardChannels.infoChannelId}>`,
+        `• **Verify:** <#${tournament.standardChannels.verifyChannelId}>`,
     });
   }
 
@@ -587,11 +975,11 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
       }).catch(() => { });
     }
 
-    // 1. Verify channel (Shared squad enrollment)
-    const verifyChannel = await createTournamentChannel(guild, {
+    // 1. Info channel (2nd channel in category: Rules & Information)
+    const infoChannel = await createTournamentChannel(guild, {
       boldPrefix,
       rawPrefix,
-      fallbackSuffix: 'verify',
+      fallbackSuffix: 'info',
       type: ChannelType.GuildText,
       parent: categoryId,
       permissionOverwrites: [
@@ -603,7 +991,7 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
       ],
     });
 
-    // 2. Updates channel (Announcements)
+    // 2. Updates channel (3rd channel in category: Announcements)
     const updatesChannel = await createTournamentChannel(guild, {
       boldPrefix,
       rawPrefix,
@@ -619,11 +1007,11 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
       ],
     });
 
-    // 3. Info channel (Rules & Information)
-    const infoChannel = await createTournamentChannel(guild, {
+    // 3. Verify channel (4th channel in category: Shared squad enrollment)
+    const verifyChannel = await createTournamentChannel(guild, {
       boldPrefix,
       rawPrefix,
-      fallbackSuffix: 'info',
+      fallbackSuffix: 'verify',
       type: ChannelType.GuildText,
       parent: categoryId,
       permissionOverwrites: [
@@ -644,6 +1032,7 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
     };
 
     await saveConfigurableTournament(tournament);
+    await reorderTournamentCategoryChannels(guild, tournament).catch(() => {});
 
     // Post persistent squad enrollment message in verify channel
     await sendOrUpdateEnrollmentMessage(interaction.client, tournament);
@@ -674,9 +1063,9 @@ export async function handleCreateStandardChannels(interaction, tournamentId) {
     await interaction.editReply({
       content:
         `✅ **Standard channels created successfully!**\n\n` +
-        `• **Verify:** <#${verifyChannel.id}>\n` +
+        `• **Info:** <#${infoChannel.id}>\n` +
         `• **Updates:** <#${updatesChannel.id}>\n` +
-        `• **Info:** <#${infoChannel.id}>`,
+        `• **Verify:** <#${verifyChannel.id}>`,
     });
   } catch (err) {
     console.error('[ConfigurableTournament] ❌ Error creating standard channels:', err);
@@ -702,9 +1091,9 @@ export async function handleViewChannels(interaction, tournamentId) {
 
   const lines = [
     `📁 **Setup Channel:** <#${tournament.setupChannelId}>`,
-    `🛡️ **Verify Channel:** ${std ? `<#${std.verifyChannelId}>` : '*None*'}`,
-    `📢 **Updates Channel:** ${std ? `<#${std.updatesChannelId}>` : '*None*'}`,
     `ℹ️ **Info Channel:** ${std ? `<#${std.infoChannelId}>` : '*None*'}`,
+    `📢 **Updates Channel:** ${std ? `<#${std.updatesChannelId}>` : '*None*'}`,
+    `🛡️ **Verify Channel:** ${std ? `<#${std.verifyChannelId}>` : '*None*'}`,
   ];
 
   if (registrations.length > 0) {
@@ -722,7 +1111,8 @@ export async function handleViewChannels(interaction, tournamentId) {
 
 /**
  * Synchronizes channel renames.
- * When a registration channel is renamed, automatically renames the linked IDP channel.
+ * When a registration channel is renamed, automatically renames the linked IDP channel
+ * and preserves the category channel ordering.
  * Prevents rename loops; renaming an IDP channel does NOT rename the registration channel.
  * @param {import('discord.js').GuildChannel} oldChannel
  * @param {import('discord.js').GuildChannel} newChannel
@@ -751,6 +1141,9 @@ export async function handleConfigurableChannelUpdate(oldChannel, newChannel) {
     if (idpChannel && idpChannel.name !== targetIdpName) {
       await idpChannel.setName(targetIdpName, 'Sync with renamed registration channel');
     }
+    if (registration.tournamentId && newChannel.guild) {
+      await reorderTournamentCategoryChannels(newChannel.guild, registration.tournamentId).catch(() => {});
+    }
   } catch (err) {
     console.warn(`[ConfigurableTournament] ⚠️ Failed to rename linked IDP channel:`, err.message);
   }
@@ -763,6 +1156,7 @@ export async function handleConfigurableChannelUpdate(oldChannel, newChannel) {
  * - Archives current cycle entries (status = 'ARCHIVED', releases slots, never hard deletes)
  * - Revokes IDP access for that registration only
  * - Removes persistent message stored IDs
+ * - Reorganizes remaining tournament channels in the category
  * - Updates central dashboard
  * - Ensures nothing from the deleted registration counts in allocations or counters
  * @param {import('discord.js').GuildChannel} channel
@@ -785,16 +1179,26 @@ export async function handleConfigurableChannelDelete(channel) {
     // Delete and cleanup registration (archives entries, revokes IDP access, marks DELETED)
     await deleteConfigurableRegistration(registration.registrationId, client);
 
+    channel.deleted = true;
+    channel.guild?.channels?.cache?.delete?.(channel.id);
+
     if (otherChannelId && channel.guild) {
       try {
         const otherChan = channel.guild.channels.cache?.get?.(otherChannelId) ||
           await channel.guild.channels.fetch(otherChannelId).catch(() => null);
         if (otherChan) {
           await otherChan.delete('Configurable tournament paired channel cleanup').catch(() => null);
+          otherChan.deleted = true;
+          channel.guild.channels.cache?.delete?.(otherChannelId);
         }
       } catch (err) {
         console.warn(`[ConfigurableTournament] ⚠️ Error cleaning up paired channel ${otherChannelId}:`, err.message);
       }
+    }
+
+    // Reorganize remaining tournament channels in the category
+    if (registration.tournamentId && (channel.guild || client)) {
+      await reorderTournamentCategoryChannels(channel.guild || client, registration.tournamentId).catch(() => {});
     }
 
     // Refresh central dashboard

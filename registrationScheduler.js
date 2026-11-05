@@ -14,7 +14,7 @@ import {
 } from './configurableTournamentData.js';
 import { updateRegistrationMessage, updateManageDashboardMessage } from './configurableRegistrationService.js';
 import { updateSlotChartMessage, syncRegistrationSlotList } from './slotChartService.js';
-import { refreshDashboard } from './configurableTournamentService.js';
+import { refreshDashboard, reorderTournamentCategoryChannels } from './configurableTournamentService.js';
 import { sendOrUpdateEnrollmentMessage } from './teamEnrollmentService.js';
 import { acquireLock, releaseLock } from './mongoService.js';
 
@@ -577,6 +577,9 @@ export async function reconcileConfigurableTournaments(client) {
     await checkRegistrationLifecycles(client);
 
     for (const tour of tournaments) {
+      // 0b. Enforce tournament category channel order (SETUP -> INFO -> UPDATES -> VERIFY -> ALL REGS -> ALL IDPS)
+      await reorderTournamentCategoryChannels(client, tour).catch(() => {});
+
       // 1. Refresh dashboard in setup channel
       await refreshDashboard(client, tour.tournamentId).catch(() => {});
 

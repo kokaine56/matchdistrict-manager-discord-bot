@@ -49,6 +49,7 @@ import {
   buildTournamentPrefix,
   toMathematicalBold,
   createTournamentChannel,
+  reorderTournamentCategoryChannels,
 } from './configurableTournamentService.js';
 import {
   armRegistrationTimer,
@@ -785,6 +786,7 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
     };
 
     const savedRegDoc = await saveConfigurableRegistration(registrationDoc);
+    await reorderTournamentCategoryChannels(guild || interaction.client, tournament).catch(() => {});
     await armRegistrationTimer(interaction.client, savedRegDoc).catch(() => {});
 
     // 3. Post Persistent Registration Message
@@ -1905,6 +1907,9 @@ export async function handleRefreshRegistration(interaction, registrationId) {
     await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
     await syncRegistrationSlotList(registrationId, currentCycleId, interaction.client).catch(() => {});
   }
+  if (registration.tournamentId && (interaction.guild || interaction.client)) {
+    await reorderTournamentCategoryChannels(interaction.guild || interaction.client, registration.tournamentId).catch(() => {});
+  }
 
   const payload = buildManageDashboardPayload(registration, filledCount);
   if (interaction.isButton && interaction.isButton()) {
@@ -2014,6 +2019,9 @@ export async function handleToggleStatus(interaction, registrationId) {
 
   const savedToggleReg = await saveConfigurableRegistration(registration);
   await armRegistrationTimer(interaction.client, savedToggleReg).catch(() => {});
+  if (registration.tournamentId && (guild || interaction.client)) {
+    await reorderTournamentCategoryChannels(guild || interaction.client, registration.tournamentId).catch(() => {});
+  }
 
   if (interaction.client) {
     await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
@@ -2244,6 +2252,9 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
 
   const savedToggleReg = await saveConfigurableRegistration(registration);
   await armRegistrationTimer(interaction.client, savedToggleReg).catch(() => {});
+  if (registration.tournamentId && (interaction.guild || interaction.client)) {
+    await reorderTournamentCategoryChannels(interaction.guild || interaction.client, registration.tournamentId).catch(() => {});
+  }
 
   if (interaction.client) {
     await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
@@ -2309,13 +2320,21 @@ export async function handleDeleteRegistration(interaction, registrationId) {
   }
 
   try {
-    if (registration.registrationChannelId) {
+    if (registration.registrationChannelId && interaction.guild) {
       const regChan = await interaction.guild.channels.fetch(registration.registrationChannelId).catch(() => null);
-      if (regChan) await regChan.delete().catch(() => null);
+      if (regChan) {
+        await regChan.delete().catch(() => null);
+        regChan.deleted = true;
+        interaction.guild.channels.cache?.delete?.(registration.registrationChannelId);
+      }
     }
-    if (registration.idpChannelId) {
+    if (registration.idpChannelId && interaction.guild) {
       const idpChan = await interaction.guild.channels.fetch(registration.idpChannelId).catch(() => null);
-      if (idpChan) await idpChan.delete().catch(() => null);
+      if (idpChan) {
+        await idpChan.delete().catch(() => null);
+        idpChan.deleted = true;
+        interaction.guild.channels.cache?.delete?.(registration.idpChannelId);
+      }
     }
   } catch (err) {
     console.warn(`[ConfigurableRegistration] ⚠️ Error cleaning up channels:`, err.message);
@@ -2323,6 +2342,10 @@ export async function handleDeleteRegistration(interaction, registrationId) {
 
   clearRegistrationTimer(registrationId);
   await deleteConfigurableRegistration(registrationId, interaction.client);
+
+  if (registration.tournamentId && (interaction.guild || interaction.client)) {
+    await reorderTournamentCategoryChannels(interaction.guild || interaction.client, registration.tournamentId).catch(() => {});
+  }
 
   if (interaction.client) {
     await refreshDashboard(interaction.client, registration.tournamentId).catch(() => {});

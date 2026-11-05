@@ -636,16 +636,34 @@ export async function saveConfigurableRegistration(doc) {
   }
   delete cleanDoc._scheduleBaseNow;
 
+  const existingLocal = localRegistrations.get(registrationId);
+  let registrationNumber = cleanDoc.registrationNumber ?? existingLocal?.registrationNumber;
+  if (
+    (!Number.isFinite(Number(registrationNumber)) || Number(registrationNumber) <= 0) &&
+    cleanDoc.tournamentId
+  ) {
+    let maxNum = 0;
+    for (const r of localRegistrations.values()) {
+      if (r.tournamentId === cleanDoc.tournamentId && Number.isFinite(Number(r.registrationNumber))) {
+        maxNum = Math.max(maxNum, Number(r.registrationNumber));
+      }
+    }
+    registrationNumber = maxNum + 1;
+  }
+
   const record = {
     ...cleanDoc,
     ...scheduleFields,
     registrationId,
+    ...(Number.isFinite(Number(registrationNumber)) && Number(registrationNumber) > 0
+      ? { registrationNumber: Number(registrationNumber) }
+      : {}),
     totalSlots,
     reservedSlots,
     matches,
     timezone,
     updatedAt: now,
-    createdAt: cleanDoc.createdAt || now,
+    createdAt: cleanDoc.createdAt || existingLocal?.createdAt || now,
   };
 
   localRegistrations.set(registrationId, { ...record });
@@ -700,7 +718,7 @@ export async function getConfigurableRegistrationsForTournament(tournamentId, in
         query.status = { $ne: 'DELETED' };
         query.isDeleted = { $ne: true };
       }
-      const docs = await col.find(query).sort({ registrationNumber: 1 }).toArray();
+      const docs = await col.find(query).sort({ registrationNumber: 1, createdAt: 1, registrationId: 1 }).toArray();
       for (const d of docs) {
         localRegistrations.set(d.registrationId, d);
       }
@@ -716,7 +734,19 @@ export async function getConfigurableRegistrationsForTournament(tournamentId, in
       if (!includeDeleted && (r.status === 'DELETED' || r.isDeleted === true)) return false;
       return true;
     })
-    .sort((a, b) => (a.registrationNumber || 0) - (b.registrationNumber || 0));
+    .sort((a, b) => {
+      const numA = Number.isFinite(Number(a.registrationNumber)) && Number(a.registrationNumber) > 0
+        ? Number(a.registrationNumber)
+        : Number.MAX_SAFE_INTEGER;
+      const numB = Number.isFinite(Number(b.registrationNumber)) && Number(b.registrationNumber) > 0
+        ? Number(b.registrationNumber)
+        : Number.MAX_SAFE_INTEGER;
+      if (numA !== numB) return numA - numB;
+      const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      if (timeA !== timeB) return timeA - timeB;
+      return String(a.registrationId || '').localeCompare(String(b.registrationId || ''));
+    });
 }
 
 export async function findConfigurableRegistrationByChannelId(channelId, includeDeleted = false) {
