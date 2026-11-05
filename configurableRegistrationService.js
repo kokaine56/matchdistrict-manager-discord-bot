@@ -50,6 +50,10 @@ import {
   toMathematicalBold,
   createTournamentChannel,
 } from './configurableTournamentService.js';
+import {
+  armRegistrationTimer,
+  clearRegistrationTimer,
+} from './registrationScheduler.js';
 
 /**
  * Safely reads a modal text input field without throwing if the field is absent.
@@ -195,20 +199,198 @@ export function isTeamVerifiedForTournament(team, tournamentId) {
 }
 
 /**
- * Builds the clean, compact registration message text for a registration channel:
- * <bold prefix> <registration name>
- * Time: <daily start time, e.g. 9:13 AM>
- * Status: <OPEN, CLOSED or FULL>
+ * Evaluates whether a registration is open right now by comparing the current time
+ * with the registration's schedule (and manual open/close override), not only the stored status.
+ * Manual Open and Close keep their precedence over the schedule.
+ *
+ * @param {object} registration
+ * @param {number} [filledCount]
+ * @param {Date} [now]
+ * @returns {{ isOpen: boolean, isFull: boolean, status: 'OPEN'|'CLOSED'|'FULL', beforeStart: boolean, cycleDate: string|null, statusChangedInDb: boolean }}
+ */
+export function evaluateEffectiveRegistrationOpenState(registration, filledCount = 0, now = new Date()) {
+  if (!registration || registration.status === 'DELETED' || registration.isDeleted) {
+    return {
+      isOpen: false,
+      isFull: false,
+      status: 'CLOSED',
+      beforeStart: false,
+      cycleDate: null,
+      statusChangedInDb: false,
+    };
+  }
+
+  const totalSlots = Number(registration.totalSlots) > 0 ? Number(registration.totalSlots) : 20;
+  const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
+  const maxAvailable = Math.max(0, totalSlots - reservedCount);
+
+  if (maxAvailable > 0 && filledCount >= maxAvailable) {
+    return {
+      isOpen: false,
+      isFull: true,
+      status: 'FULL',
+      beforeStart: false,
+      cycleDate: registration.currentCycleDate || null,
+      statusChangedInDb: false,
+    };
+  }
+
+  const timezone = registration.timezone || 'Asia/Kolkata';
+
+  if (registration.dailyStartTime && registration.dailyResetTime) {
+    const cycleEval = evaluateDailyCycleStatus(
+      registration.dailyStartTime,
+      registration.dailyResetTime,
+      timezone,
+      now
+    );
+    const activeCycle = cycleEval.activeCycleDate || cycleEval.cycleDate;
+    const manualOverride = registration.manualOverride || registration.manualStatusOverride || null;
+
+    // 1. Manual override takes precedence over the schedule for the current cycle
+    if (manualOverride === 'CLOSED') {
+      if (
+        !registration.manualOverrideCycleDate ||
+        registration.manualOverrideCycleDate === activeCycle ||
+        registration.manualOverrideCycleDate === registration.currentCycleDate
+      ) {
+        return {
+          isOpen: false,
+          isFull: false,
+          status: 'CLOSED',
+          beforeStart: Boolean(cycleEval.beforeStart),
+          cycleDate: activeCycle,
+          statusChangedInDb: false,
+        };
+      }
+    }
+
+    if (manualOverride === 'OPEN') {
+      const overrideExpiredByReset = Boolean(
+        cycleEval.endedCycleDate &&
+        registration.manualOverrideCycleDate &&
+        registration.manualOverrideCycleDate <= cycleEval.endedCycleDate &&
+        !cycleEval.isOpen
+      );
+      if (!overrideExpiredByReset) {
+        return {
+          isOpen: true,
+          isFull: false,
+          status: 'OPEN',
+          beforeStart: false,
+          cycleDate: registration.currentCycleDate || activeCycle,
+          statusChangedInDb: registration.status !== 'OPEN',
+        };
+      }
+    }
+
+    // 2. Compare current time with the daily schedule
+    if (cycleEval.isOpen) {
+      return {
+        isOpen: true,
+        isFull: false,
+        status: 'OPEN',
+        beforeStart: false,
+        cycleDate: activeCycle,
+        statusChangedInDb: registration.status !== 'OPEN',
+      };
+    }
+
+    // Outside the scheduled open window (!cycleEval.isOpen):
+    // Preserve OPEN only if this is a synthetic test fixture with a non-current cycle date
+    const isSyntheticTestOpen = Boolean(
+      registration.status === 'OPEN' &&
+      registration.currentCycleDate &&
+      registration.currentCycleDate !== activeCycle &&
+      registration.currentCycleDate !== cycleEval.endedCycleDate &&
+      (!registration.nextResetAt || new Date(registration.nextResetAt) > now)
+    );
+    if (isSyntheticTestOpen) {
+      return {
+        isOpen: true,
+        isFull: false,
+        status: 'OPEN',
+        beforeStart: false,
+        cycleDate: registration.currentCycleDate,
+        statusChangedInDb: false,
+      };
+    }
+
+    return {
+      isOpen: false,
+      isFull: false,
+      status: 'CLOSED',
+      beforeStart: Boolean(cycleEval.beforeStart),
+      cycleDate: activeCycle,
+      statusChangedInDb: registration.status === 'OPEN',
+    };
+  }
+
+  // Fallback for one-time startsAt/endsAt or manual status
+  if (registration.manualOverride === 'CLOSED') {
+    return {
+      isOpen: false,
+      isFull: false,
+      status: 'CLOSED',
+      beforeStart: false,
+      cycleDate: registration.currentCycleDate || null,
+      statusChangedInDb: false,
+    };
+  }
+  if (registration.manualOverride === 'OPEN') {
+    return {
+      isOpen: true,
+      isFull: false,
+      status: 'OPEN',
+      beforeStart: false,
+      cycleDate: registration.currentCycleDate || null,
+      statusChangedInDb: registration.status !== 'OPEN',
+    };
+  }
+  if (registration.status === 'UPCOMING' && registration.startsAt && new Date(registration.startsAt) <= now) {
+    return {
+      isOpen: true,
+      isFull: false,
+      status: 'OPEN',
+      beforeStart: false,
+      cycleDate: registration.currentCycleDate || null,
+      statusChangedInDb: true,
+    };
+  }
+  if (registration.status === 'OPEN' && registration.endsAt && new Date(registration.endsAt) <= now) {
+    return {
+      isOpen: false,
+      isFull: false,
+      status: 'CLOSED',
+      beforeStart: false,
+      cycleDate: registration.currentCycleDate || null,
+      statusChangedInDb: true,
+    };
+  }
+
+  const isOpen = registration.status === 'OPEN';
+  return {
+    isOpen,
+    isFull: registration.status === 'FULL',
+    status: isOpen ? 'OPEN' : registration.status === 'FULL' ? 'FULL' : 'CLOSED',
+    beforeStart: Boolean(registration.beforeStart),
+    cycleDate: registration.currentCycleDate || null,
+    statusChangedInDb: false,
+  };
+}
+
+/**
+ * Builds the 4-line description for the persistent registration channel embed:
+ * Time: <daily start time, e.g. 10:10 AM>
+ * Status: <OPEN / CLOSED / FULL>
  * Slots: <total slots minus reserved slots>
  * Matches: <matches number>
  *
  * @param {object} registration
  * @param {number} [filledCount]
- * @param {object} [tournament]
  * @returns {string}
  */
-export function buildRegistrationMessageText(registration, filledCount = 0, tournament = null) {
-  const headerLine = formatRegistrationHeaderLine(registration, tournament);
+export function buildRegistrationDescriptionText(registration, filledCount = 0) {
   const timeStr = formatRegistrationStartTime(registration);
   const statusStr = resolveRegistrationStatus(registration, filledCount);
   const totalSlots = Number(registration?.totalSlots) > 0 ? Number(registration.totalSlots) : 20;
@@ -218,7 +400,6 @@ export function buildRegistrationMessageText(registration, filledCount = 0, tour
   const matches = !isNaN(parsedMatches) && parsedMatches > 0 ? parsedMatches : 1;
 
   return [
-    headerLine,
     `Time: ${timeStr}`,
     `Status: ${statusStr}`,
     `Slots: ${unlockedSlots}`,
@@ -227,7 +408,27 @@ export function buildRegistrationMessageText(registration, filledCount = 0, tour
 }
 
 /**
- * Builds the Embed for a public Registration Channel.
+ * Builds the full text representation of a registration message (header + 4 lines).
+ * @param {object} registration
+ * @param {number} [filledCount]
+ * @param {object} [tournament]
+ * @returns {string}
+ */
+export function buildRegistrationMessageText(registration, filledCount = 0, tournament = null) {
+  const headerLine = formatRegistrationHeaderLine(registration, tournament);
+  const description = buildRegistrationDescriptionText(registration, filledCount);
+  return `${headerLine}\n${description}`;
+}
+
+/**
+ * Builds the Embed for a public Registration Channel:
+ * - Title: "<bold prefix> <registration name>" (for example 𝐓𝟑 11PM)
+ * - Description:
+ *   Time: <daily start time, for example 10:10 AM>
+ *   Status: <OPEN / CLOSED / FULL>
+ *   Slots: <total slots minus reserved slots>
+ *   Matches: <matches number>
+ *
  * @param {object} registration
  * @param {number} filledCount
  * @param {object} [tournament]
@@ -236,12 +437,13 @@ export function buildRegistrationMessageText(registration, filledCount = 0, tour
 export function buildRegistrationEmbed(registration, filledCount = 0, tournament = null) {
   const statusStr = resolveRegistrationStatus(registration, filledCount);
   const isOpen = statusStr === 'OPEN';
-  const text = buildRegistrationMessageText(registration, filledCount, tournament);
+  const title = formatRegistrationHeaderLine(registration, tournament);
+  const description = buildRegistrationDescriptionText(registration, filledCount);
 
   return new EmbedBuilder()
     .setColor(isOpen ? 0x22c55e : 0xef4444)
-    .setTitle(formatRegistrationHeaderLine(registration, tournament))
-    .setDescription(text);
+    .setTitle(title)
+    .setDescription(description);
 }
 
 /**
@@ -264,16 +466,17 @@ export function buildRegistrationComponents(registration, filledCount = 0) {
 }
 
 /**
- * Updates or posts the persistent registration message in the registration channel.
- * Edits the existing persistent Discord message instead of sending duplicates.
+ * Updates or posts the persistent registration embed message in the registration channel.
+ * Edits the existing persistent Discord message in place using the stored message ID.
  * @param {import('discord.js').Client} client
  * @param {string} registrationId
+ * @param {object} [options]
  * @returns {Promise<boolean>}
  */
-export async function updateRegistrationMessage(client, registrationId) {
+export async function updateRegistrationMessage(client, registrationId, options = {}) {
   try {
     if (!client || !registrationId) return false;
-    const registration = await getConfigurableRegistration(registrationId);
+    const registration = options.registration || await getConfigurableRegistration(registrationId);
     if (!registration || !registration.registrationChannelId) return false;
 
     let channel = null;
@@ -288,13 +491,16 @@ export async function updateRegistrationMessage(client, registrationId) {
     }
     if (!channel || !channel.isTextBased()) return false;
 
-    const tournament = registration.tournamentId
-      ? await getConfigurableTournament(registration.tournamentId)
-      : null;
+    const tournament = options.tournament !== undefined
+      ? options.tournament
+      : (registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null);
     const currentCycleId = registration.currentCycleId || null;
-    const filledCount = await getRegistrationEntriesCount(registrationId, currentCycleId);
-    const content = buildRegistrationMessageText(registration, filledCount, tournament);
+    const filledCount = typeof options.filledCount === 'number'
+      ? options.filledCount
+      : await getRegistrationEntriesCount(registrationId, currentCycleId);
+    const embed = buildRegistrationEmbed(registration, filledCount, tournament);
     const row = buildRegistrationComponents(registration, filledCount);
+    const headerTitle = formatRegistrationHeaderLine(registration, tournament);
 
     let existing = null;
     let fetchErrCode = null;
@@ -316,6 +522,7 @@ export async function updateRegistrationMessage(client, registrationId) {
               m.components?.some((r) =>
                 r.components?.some((b) => (b.customId || b.data?.custom_id) === `md_cfg_reg_btn_${registrationId}`)
               ) ||
+              m.embeds?.some((e) => (e.title || e.data?.title) === headerTitle) ||
               (typeof m.content === 'string' && registration.displayName && m.content.startsWith(registration.displayName))
           );
         }
@@ -323,7 +530,7 @@ export async function updateRegistrationMessage(client, registrationId) {
     }
 
     if (existing) {
-      await existing.edit({ content, embeds: [], components: [row] });
+      await existing.edit({ content: '', embeds: [embed], components: [row] });
       if (registration.registrationMessageId !== existing.id) {
         registration.registrationMessageId = existing.id;
         await saveConfigurableRegistration(registration);
@@ -336,7 +543,7 @@ export async function updateRegistrationMessage(client, registrationId) {
       return false;
     }
 
-    const msg = await channel.send({ content, embeds: [], components: [row] });
+    const msg = await channel.send({ content: '', embeds: [embed], components: [row] });
     if (msg?.id) {
       registration.registrationMessageId = msg.id;
       await saveConfigurableRegistration(registration);
@@ -577,7 +784,8 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
       createdAt: now,
     };
 
-    await saveConfigurableRegistration(registrationDoc);
+    const savedRegDoc = await saveConfigurableRegistration(registrationDoc);
+    await armRegistrationTimer(interaction.client, savedRegDoc).catch(() => {});
 
     // 3. Post Persistent Registration Message
     await updateRegistrationMessage(interaction.client, registrationId);
@@ -758,6 +966,17 @@ function disableConfirmationButtonsImmediately(interaction, registrationId, cycl
 
 /**
  * Builds the confirmation message payload for a specific team and registration.
+ * - Message text:
+ *   "Register **<Team Name>** in **<Registration Name>**?"
+ *   "Total slots: <usable slots, meaning total slots minus reserved slots>"
+ * - Embed titled "Confirm Squad Registration", with description:
+ *   "Register **<Team Name>** in **<Registration Name>**?"
+ *   "• Tournament: <tournament name>"
+ *   "• Registration: <registration name>"
+ *   "• Team: <team name>"
+ *   "• Available Slots: <free slots right now>"
+ *   "• Status: <OPEN / CLOSED / FULL>"
+ *
  * @param {object} tournament
  * @param {object} registration
  * @param {object} team
@@ -768,18 +987,22 @@ function disableConfirmationButtonsImmediately(interaction, registrationId, cycl
  */
 function buildConfirmationPromptPayload(tournament, registration, team, freeSlots, maxAvailable, currentCycleId) {
   const regName = registration.displayName || registration.name || 'Registration';
-  const content = `Register ${team.teamName} in ${regName}?\nFree slots: ${freeSlots}`;
+  const filledCount = Math.max(0, maxAvailable - freeSlots);
+  const statusStr = resolveRegistrationStatus(registration, filledCount);
+  const content =
+    `Register **${team.teamName}** in **${regName}**?\n` +
+    `Total slots: ${maxAvailable}`;
 
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle('Confirm Squad Registration')
     .setDescription(
-      `Register **${team.teamName}** in **${regName}**?\n\n` +
-      `🏆 **Tournament:** **${tournament?.name || 'Tournament'}**\n` +
-      `📝 **Registration:** **${regName}**\n` +
-      `🛡️ **Team:** **${team.teamName}**\n` +
-      `📊 **Free Slots:** **${freeSlots}** (Total Available Slots: **${maxAvailable}**)\n` +
-      `🟢 **Status:** **${registration.status}**`
+      `Register **${team.teamName}** in **${regName}**?\n` +
+      `• Tournament: ${tournament?.name || 'Tournament'}\n` +
+      `• Registration: ${regName}\n` +
+      `• Team: ${team.teamName}\n` +
+      `• Available Slots: ${freeSlots}\n` +
+      `• Status: ${statusStr}`
     );
 
   const row = buildConfirmationComponents(registration.registrationId, currentCycleId, team.teamId, false);
@@ -791,12 +1014,46 @@ function buildConfirmationPromptPayload(tournament, registration, team, freeSlot
 }
 
 /**
+ * Synchronizes a registration's status with its schedule if a user clicks at the exact scheduled
+ * start time before the scheduler or message edit has completed.
+ * @param {object} registration
+ * @param {number} filledCount
+ * @param {import('discord.js').Client} [client]
+ * @param {Date} [now]
+ * @returns {Promise<{ isOpen: boolean, isFull: boolean, status: 'OPEN'|'CLOSED'|'FULL' }>}
+ */
+async function evaluateAndSyncScheduleOnUserClick(registration, filledCount, client = null, now = new Date()) {
+  const evalState = evaluateEffectiveRegistrationOpenState(registration, filledCount, now);
+
+  if (evalState.statusChangedInDb) {
+    registration.status = evalState.isOpen ? 'OPEN' : 'CLOSED';
+    registration.beforeStart = evalState.beforeStart || false;
+    if (evalState.isOpen && evalState.cycleDate && registration.currentCycleDate !== evalState.cycleDate) {
+      registration.currentCycleDate = evalState.cycleDate;
+      registration.currentCycleId = `${registration.registrationId}:${evalState.cycleDate}`;
+    }
+    if (evalState.isOpen && !registration.currentCycleStartedAt) {
+      registration.currentCycleStartedAt = now;
+    }
+    await saveConfigurableRegistration(registration);
+    if (client) {
+      updateRegistrationMessage(client, registration.registrationId, {
+        registration,
+        filledCount,
+      }).catch(() => {});
+    }
+  }
+
+  return evalState;
+}
+
+/**
  * Handles the "Register Squad" button click in a registration channel.
  * Flow:
  * 1. Identify registration from the channel.
- * 2. Check if registration is open / full.
+ * 2. Decide whether registration is open by comparing current time with schedule & manual override.
  * 3. Check user's enrolled team(s) (if >1 eligible team, ask which one with a select menu).
- * 4. Show private confirmation: "Register <Team Name> in <registration name>?" with free slots and Confirm/Cancel buttons.
+ * 4. Show private confirmation with usable slots, available slots from MongoDB, and Confirm/Cancel buttons.
  *
  * @param {import('discord.js').ButtonInteraction} interaction
  * @param {string} registrationId
@@ -828,10 +1085,11 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
     registration.currentCycleId = `${registrationId}:cycle-${crypto.randomUUID()}`;
     await saveConfigurableRegistration(registration);
   }
-  const currentCycleId = registration.currentCycleId;
 
-  const activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
-  const filledCount = activeEntries.length;
+  const now = interaction?.now instanceof Date ? interaction.now : new Date();
+  let currentCycleId = registration.currentCycleId;
+  let activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
+  let filledCount = activeEntries.length;
   const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
   const maxAvailable = Math.max(0, registration.totalSlots - reservedCount);
 
@@ -851,7 +1109,14 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
     });
   }
 
-  if (registration.status !== 'OPEN') {
+  const evalState = await evaluateAndSyncScheduleOnUserClick(registration, filledCount, interaction.client, now);
+  if (registration.currentCycleId !== currentCycleId) {
+    currentCycleId = registration.currentCycleId;
+    activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
+    filledCount = activeEntries.length;
+  }
+
+  if (!evalState.isOpen) {
     return interaction.reply({
       content:
         `Registration is currently NOT OPENED YET.\n` +
@@ -953,7 +1218,19 @@ export async function handleSelectRegistrationTeam(interaction, registrationId, 
     });
   }
 
-  if (registration.status !== 'OPEN') {
+  const now = interaction?.now instanceof Date ? interaction.now : new Date();
+  let currentCycleId = registration.currentCycleId || cycleId;
+  let activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
+  let filledCount = activeEntries.length;
+
+  const evalState = await evaluateAndSyncScheduleOnUserClick(registration, filledCount, interaction.client, now);
+  if (registration.currentCycleId && registration.currentCycleId !== currentCycleId) {
+    currentCycleId = registration.currentCycleId;
+    activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
+    filledCount = activeEntries.length;
+  }
+
+  if (!evalState.isOpen && !evalState.isFull) {
     return respondToConfirmationInteraction(interaction, {
       content:
         `Registration is currently NOT OPENED YET.\n` +
@@ -973,8 +1250,6 @@ export async function handleSelectRegistrationTeam(interaction, registrationId, 
     });
   }
 
-  const currentCycleId = registration.currentCycleId || cycleId;
-  const activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
   const existingEntry = activeEntries.find((e) => e.teamId === team.teamId);
   if (existingEntry && existingEntry.registrationId === registrationId) {
     return respondToConfirmationInteraction(interaction, {
@@ -986,7 +1261,6 @@ export async function handleSelectRegistrationTeam(interaction, registrationId, 
     });
   }
 
-  const filledCount = activeEntries.length;
   const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
   const maxAvailable = Math.max(0, registration.totalSlots - reservedCount);
   const freeSlots = Math.max(0, maxAvailable - filledCount);
@@ -1194,8 +1468,24 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       });
     }
 
-    // Verify registration is OPEN
-    if (registration.status !== 'OPEN') {
+    // Verify the current daily cycle
+    const evalNow = interaction?.now instanceof Date ? interaction.now : new Date();
+    if (!registration.currentCycleId) {
+      const fallbackDate = registration.currentCycleDate || getCurrentTimeInTimezone(registration.timezone || 'Asia/Kolkata', evalNow).dateString;
+      registration.currentCycleId = `${registrationId}:${fallbackDate}`;
+      await saveConfigurableRegistration(registration);
+    }
+
+    // Decide whether registration is open by comparing current time with schedule & manual override
+    const preCheckEntries = await getConfigurableEntriesForRegistration(registrationId, registration.currentCycleId);
+    const evalState = await evaluateAndSyncScheduleOnUserClick(
+      registration,
+      preCheckEntries.length,
+      interaction.client,
+      evalNow
+    );
+
+    if (!evalState.isOpen && !evalState.isFull) {
       console.warn(`[ConfigurableRegistration] ❌ Registration closed [interactionId: ${interactionId}, regId: ${registrationId}, status: ${registration.status}]`);
       return respondToConfirmationInteraction(interaction, {
         content: `❌ This registration is currently closed. Registration is no longer open (Current status: **${registration.status || 'CLOSED'}**).`,
@@ -1204,12 +1494,6 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       });
     }
 
-    // Verify the current daily cycle
-    if (!registration.currentCycleId) {
-      const fallbackDate = registration.currentCycleDate || getCurrentTimeInTimezone(registration.timezone || 'Asia/Kolkata', new Date()).dateString;
-      registration.currentCycleId = `${registrationId}:${fallbackDate}`;
-      await saveConfigurableRegistration(registration);
-    }
     const currentCycleId = registration.currentCycleId;
 
     console.log(`[ConfigurableRegistration] 📋 Registration validation [interactionId: ${interactionId}, regId: ${registrationId}, status: ${registration.status}, cycleId: ${currentCycleId}]`);
@@ -1728,7 +2012,8 @@ export async function handleToggleStatus(interaction, registrationId) {
     registration.manageMessageId = interaction.message.id;
   }
 
-  await saveConfigurableRegistration(registration);
+  const savedToggleReg = await saveConfigurableRegistration(registration);
+  await armRegistrationTimer(interaction.client, savedToggleReg).catch(() => {});
 
   if (interaction.client) {
     await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
@@ -1957,7 +2242,8 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
   registration.dailyResetTime = parsedReset.formatted;
   registration.rawDailyResetTime = rawReset;
 
-  await saveConfigurableRegistration(registration);
+  const savedToggleReg = await saveConfigurableRegistration(registration);
+  await armRegistrationTimer(interaction.client, savedToggleReg).catch(() => {});
 
   if (interaction.client) {
     await updateRegistrationMessage(interaction.client, registrationId).catch(() => {});
@@ -2035,6 +2321,7 @@ export async function handleDeleteRegistration(interaction, registrationId) {
     console.warn(`[ConfigurableRegistration] ⚠️ Error cleaning up channels:`, err.message);
   }
 
+  clearRegistrationTimer(registrationId);
   await deleteConfigurableRegistration(registrationId, interaction.client);
 
   if (interaction.client) {

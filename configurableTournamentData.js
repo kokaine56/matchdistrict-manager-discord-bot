@@ -149,6 +149,130 @@ export function getNextCycleDateString(timezone = 'Asia/Kolkata', baseDate = new
 }
 
 /**
+ * Computes the exact UTC Date for a given wall-clock time (hours, minutes, seconds = 0)
+ * on a specific calendar date (year, month, day) in the given IANA timezone.
+ * @param {number} year
+ * @param {number} month 1-12
+ * @param {number} day
+ * @param {number} hours 0-23
+ * @param {number} minutes 0-59
+ * @param {string} [timezone]
+ * @returns {Date}
+ */
+export function getExactTimeInTimezone(year, month, day, hours, minutes, timezone = 'Asia/Kolkata') {
+  const targetUtcMs = Date.UTC(year, month - 1, day, hours, minutes, 0, 0);
+  let guessMs = targetUtcMs;
+
+  for (let i = 0; i < 2; i++) {
+    const tzParts = getCurrentTimeInTimezone(timezone, new Date(guessMs));
+    const representedUtcMs = Date.UTC(
+      tzParts.year,
+      tzParts.month - 1,
+      tzParts.day,
+      tzParts.hour,
+      tzParts.minute,
+      tzParts.second,
+      0
+    );
+    const diffMs = representedUtcMs - targetUtcMs;
+    guessMs -= diffMs;
+  }
+
+  return new Date(guessMs);
+}
+
+/**
+ * Computes the next due UTC timestamps for daily start and daily reset in the registration's timezone.
+ * @param {string} dailyStartTime
+ * @param {string} dailyResetTime
+ * @param {string} [timezone]
+ * @param {Date} [now]
+ * @returns {{ nextStartAt: Date|null, nextResetAt: Date|null, nextDueAt: Date|null, nextDueAction: 'START'|'RESET'|null }}
+ */
+export function computeNextScheduleTimestamps(
+  dailyStartTime,
+  dailyResetTime,
+  timezone = 'Asia/Kolkata',
+  now = new Date()
+) {
+  const parsedStart = parseTimeString(dailyStartTime);
+  const parsedReset = parseTimeString(dailyResetTime);
+  const tzNow = getCurrentTimeInTimezone(timezone, now);
+  const nowMs = now.getTime();
+
+  let nextStartAt = null;
+  if (parsedStart) {
+    let startCandidate = getExactTimeInTimezone(
+      tzNow.year,
+      tzNow.month,
+      tzNow.day,
+      parsedStart.hours,
+      parsedStart.minutes,
+      timezone
+    );
+    if (startCandidate.getTime() <= nowMs) {
+      startCandidate = getExactTimeInTimezone(
+        tzNow.year,
+        tzNow.month,
+        tzNow.day + 1,
+        parsedStart.hours,
+        parsedStart.minutes,
+        timezone
+      );
+    }
+    nextStartAt = startCandidate;
+  }
+
+  let nextResetAt = null;
+  if (parsedReset) {
+    let resetCandidate = getExactTimeInTimezone(
+      tzNow.year,
+      tzNow.month,
+      tzNow.day,
+      parsedReset.hours,
+      parsedReset.minutes,
+      timezone
+    );
+    if (resetCandidate.getTime() <= nowMs) {
+      resetCandidate = getExactTimeInTimezone(
+        tzNow.year,
+        tzNow.month,
+        tzNow.day + 1,
+        parsedReset.hours,
+        parsedReset.minutes,
+        timezone
+      );
+    }
+    nextResetAt = resetCandidate;
+  }
+
+  let nextDueAt = null;
+  let nextDueAction = null;
+  if (nextStartAt && nextResetAt) {
+    if (nextStartAt.getTime() <= nextResetAt.getTime()) {
+      nextDueAt = nextStartAt;
+      nextDueAction = 'START';
+    } else {
+      nextDueAt = nextResetAt;
+      nextDueAction = 'RESET';
+    }
+  } else if (nextStartAt) {
+    nextDueAt = nextStartAt;
+    nextDueAction = 'START';
+  } else if (nextResetAt) {
+    nextDueAt = nextResetAt;
+    nextDueAction = 'RESET';
+  }
+
+  return {
+    nextStartAt,
+    nextResetAt,
+    nextDueAt,
+    nextDueAction,
+  };
+}
+
+/**
  * Evaluates whether current clock time in the timezone falls within the daily active cycle.
  * Handles both same-day (start < reset) and midnight-crossing (reset <= start) configurations.
  * @param {string} dailyStartTime
@@ -495,8 +619,26 @@ export async function saveConfigurableRegistration(doc) {
   const matches = !isNaN(parsedMatches) && parsedMatches > 0 ? parsedMatches : 1;
   const timezone = cleanDoc.timezone || 'Asia/Kolkata';
 
+  let scheduleFields = {};
+  if (cleanDoc.dailyStartTime || cleanDoc.dailyResetTime) {
+    const computed = computeNextScheduleTimestamps(
+      cleanDoc.dailyStartTime,
+      cleanDoc.dailyResetTime,
+      timezone,
+      cleanDoc._scheduleBaseNow instanceof Date ? cleanDoc._scheduleBaseNow : now
+    );
+    scheduleFields = {
+      nextStartAt: cleanDoc.nextStartAt instanceof Date ? cleanDoc.nextStartAt : computed.nextStartAt,
+      nextResetAt: cleanDoc.nextResetAt instanceof Date ? cleanDoc.nextResetAt : computed.nextResetAt,
+      nextDueAt: cleanDoc.nextDueAt instanceof Date ? cleanDoc.nextDueAt : computed.nextDueAt,
+      nextDueAction: cleanDoc.nextDueAction || computed.nextDueAction,
+    };
+  }
+  delete cleanDoc._scheduleBaseNow;
+
   const record = {
     ...cleanDoc,
+    ...scheduleFields,
     registrationId,
     totalSlots,
     reservedSlots,
@@ -1211,10 +1353,13 @@ export async function archiveActiveRegistrationCycle(registrationId, extraData =
   const reg = await getConfigurableRegistration(registrationId);
   if (!reg) return null;
 
-  const activeEntries = await getConfigurableEntriesForRegistration(registrationId);
+  const { entries: preloadedEntries, ...restExtra } = extraData;
+  const activeEntries = Array.isArray(preloadedEntries)
+    ? preloadedEntries
+    : await getConfigurableEntriesForRegistration(registrationId, restExtra.cycleId || null);
   const now = new Date();
-  const cycleDate = reg.currentCycleDate || getCurrentTimeInTimezone(reg.timezone || 'Asia/Kolkata', now).dateString;
-  const cycleId = reg.currentCycleId || `${registrationId}:${cycleDate}`;
+  const cycleDate = restExtra.cycleDate || reg.currentCycleDate || getCurrentTimeInTimezone(reg.timezone || 'Asia/Kolkata', now).dateString;
+  const cycleId = restExtra.cycleId || reg.currentCycleId || `${registrationId}:${cycleDate}`;
 
   const cycleRecord = {
     cycleId,
@@ -1237,7 +1382,7 @@ export async function archiveActiveRegistrationCycle(registrationId, extraData =
     startedAt: reg.currentCycleStartedAt || null,
     endedAt: now,
     archivedAt: now,
-    ...extraData,
+    ...restExtra,
   };
 
   await saveDailyCycle(cycleRecord);
@@ -1253,8 +1398,12 @@ export async function archiveActiveRegistrationCycle(registrationId, extraData =
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_entries');
+      const archiveQuery = { registrationId, status: 'CONFIRMED' };
+      if (restExtra.cycleId) {
+        archiveQuery.cycleId = { $in: [restExtra.cycleId, 'default', null] };
+      }
       await col.updateMany(
-        { registrationId, status: 'CONFIRMED' },
+        archiveQuery,
         { $set: { status: 'ARCHIVED', archivedAt: now } }
       );
     } catch (err) {

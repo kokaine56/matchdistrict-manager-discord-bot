@@ -45,6 +45,8 @@ import {
   archiveActiveRegistrationCycle,
   cleanUpStaleConfigurableRegistrationsAndEntries,
   getConfigurableTournamentByName,
+  computeNextScheduleTimestamps,
+  getExactTimeInTimezone,
 } from '../configurableTournamentData.js';
 
 import {
@@ -92,8 +94,10 @@ import {
 
 import {
   buildRegistrationEmbed,
+  buildRegistrationDescriptionText,
   buildRegistrationMessageText,
   resolveRegistrationStatus,
+  evaluateEffectiveRegistrationOpenState,
   formatRegistrationStartTime,
   formatRegistrationHeaderLine,
   getTournamentVerifyChannelMention,
@@ -159,9 +163,13 @@ import {
   checkRegistrationLifecycles,
   reconcileConfigurableTournaments,
   executeDailyCycleReset,
+  armRegistrationTimer,
+  clearAllRegistrationTimers,
+  getArmedRegistrationTimer,
 } from '../registrationScheduler.js';
 
 test.beforeEach(() => {
+  clearAllRegistrationTimers();
   clearInMemoryData();
 });
 
@@ -3256,15 +3264,28 @@ test('Registration Confirmation - Initial click opens ephemeral confirmation wit
   // Must reply ephemerally with confirmation message
   assert.ok(replyPayload);
   assert.equal(replyPayload.ephemeral, true);
+  assert.equal(
+    replyPayload.content,
+    `Register **Glory Hunters** in **T3 10PM Qualifier**?\nTotal slots: 18`,
+    'Message text must show Register **<Team Name>** in **<Registration Name>**? and Total slots: <usable slots>'
+  );
   assert.ok(replyPayload.embeds?.length > 0);
 
   const embed = replyPayload.embeds[0].data;
   assert.equal(embed.title, 'Confirm Squad Registration');
-  assert.match(embed.description, /Champions Arena/, 'Tournament name must be displayed');
-  assert.match(embed.description, /T3 10PM Qualifier/, 'Registration name must be displayed');
-  assert.match(embed.description, /Glory Hunters/, 'Team name must be displayed');
-  assert.match(embed.description, /Total Available Slots/, 'Total available slots must be displayed');
-  assert.match(embed.description, /OPEN/, 'Registration status must be displayed');
+  assert.equal(
+    embed.description,
+    [
+      'Register **Glory Hunters** in **T3 10PM Qualifier**?',
+      '• Tournament: Champions Arena',
+      '• Registration: T3 10PM Qualifier',
+      '• Team: Glory Hunters',
+      '• Available Slots: 18',
+      '• Status: OPEN',
+    ].join('\n'),
+    'Embed description must match exact confirmation layout'
+  );
+  assert.doesNotMatch(embed.description, /Total Available Slots/, 'Old Free Slots / Total Available Slots wording must be removed');
 
   // Verify buttons
   const buttons = replyPayload.components[0].components;
@@ -4850,14 +4871,15 @@ test('Registration Message Design & Team Verification Check - Complete End-to-En
   const regMsg = channelStore['chan-reg-t3'].messages.get(regDocAfterInit.registrationMessageId);
   assert.ok(regMsg, 'Persistent registration message stored in MongoDB');
 
-  const expectedInitialText =
-    `𝐓𝟑 10PM\n` +
+  const expectedInitialDescription =
     `Time: 9:08 AM\n` +
     `Status: CLOSED\n` +
     `Slots: 2\n` +
     `Matches: 1`;
-  assert.equal(regMsg.content, expectedInitialText, 'Registration message must match exact 5-line compact design with bold prefix and available slots');
-  assert.equal(regMsg.embeds.length, 0, 'Registration message should have no embeds');
+  assert.equal(regMsg.content, '', 'Persistent registration message should use an embed instead of plain text content');
+  assert.equal(regMsg.embeds.length, 1, 'Registration message should have 1 embed');
+  assert.equal(regMsg.embeds[0].data.title, '𝐓𝟑 10PM', 'Embed title must be <bold prefix> <registration name>');
+  assert.equal(regMsg.embeds[0].data.description, expectedInitialDescription, 'Embed description must match exact 4-line design');
   assert.equal(regMsg.components.length, 1, 'Registration message must include Register Squad button row');
   assert.equal(regMsg.components[0].components[0].data.label, 'Register Squad');
   assert.equal(regMsg.components[0].components[0].data.disabled, true, 'Register Squad button must be disabled when not open');
@@ -4911,7 +4933,7 @@ test('Registration Message Design & Team Verification Check - Complete End-to-En
     players: [{ discordId: 'leader-other-tour', ign: 'OtherLead', uid: '991' }],
   });
 
-  const makeButtonClickInteraction = (userId) => {
+  const makeButtonClickInteraction = (userId, nowOverride = null) => {
     const obj = {
       id: `int-btn-${userId}-${Date.now()}`,
       channelId: 'chan-reg-t3',
@@ -4919,6 +4941,7 @@ test('Registration Message Design & Team Verification Check - Complete End-to-En
       guild: mockGuild,
       client: mockClient,
       user: { id: userId },
+      now: nowOverride,
       lastReply: null,
       reply: async (payload) => {
         obj.lastReply = payload;
@@ -4931,7 +4954,9 @@ test('Registration Message Design & Team Verification Check - Complete End-to-En
   // =========================================================================
   // 1. "NOT OPENED YET" MESSAGE (no reset time shown in registration channel)
   // =========================================================================
-  const notOpenedInt = makeButtonClickInteraction('leader-verified-1');
+  const [y, m, d] = cycleDate.split('-').map(Number);
+  const beforeStartUtc = new Date(Date.UTC(y, m - 1, d, 3, 0, 0)); // 08:30 AM IST (before 09:08 AM)
+  const notOpenedInt = makeButtonClickInteraction('leader-verified-1', beforeStartUtc);
   await handleRegisterSquadButtonClick(notOpenedInt, regId);
   assert.equal(notOpenedInt.lastReply.ephemeral, true);
   assert.equal(
@@ -4948,40 +4973,53 @@ test('Registration Message Design & Team Verification Check - Complete End-to-En
   // =========================================================================
   // Open registration via scheduler and test Unverified / Non-leader checks
   // =========================================================================
-  const [y, m, d] = cycleDate.split('-').map(Number);
   const afterStartUtc = new Date(Date.UTC(y, m - 1, d, 6, 30, 0));
   await checkRegistrationLifecycles(mockClient, afterStartUtc);
 
   assert.equal(channelStore['chan-reg-t3'].messages.size, 1, 'Must edit existing persistent registration message');
+  assert.equal(regMsg.content, '');
+  assert.equal(regMsg.embeds[0].data.title, '𝐓𝟑 10PM');
   assert.equal(
-    regMsg.content,
-    `𝐓𝟑 10PM\nTime: 9:08 AM\nStatus: OPEN\nSlots: 2\nMatches: 1`,
-    'Registration message updates Status to OPEN'
+    regMsg.embeds[0].data.description,
+    `Time: 9:08 AM\nStatus: OPEN\nSlots: 2\nMatches: 1`,
+    'Registration message embed updates Status to OPEN'
   );
   assert.equal(regMsg.components[0].components[0].data.disabled, false, 'Register Squad button enabled when OPEN');
 
-  const unverifiedInt = makeButtonClickInteraction('unverified-user-999');
+  const unverifiedInt = makeButtonClickInteraction('unverified-user-999', afterStartUtc);
   await handleRegisterSquadButtonClick(unverifiedInt, regId);
   assert.equal(
     unverifiedInt.lastReply.content,
     `First verify your squad here <#${verifyChanId}> channel`
   );
 
-  const nonLeaderInt = makeButtonClickInteraction('member-nonleader-1');
+  const nonLeaderInt = makeButtonClickInteraction('member-nonleader-1', afterStartUtc);
   await handleRegisterSquadButtonClick(nonLeaderInt, regId);
   assert.match(nonLeaderInt.lastReply.content, /Only the verified \*\*Team Leader\*\*/);
 
   // =========================================================================
   // 5. CONFIRMATION BEFORE REGISTERING (Single Team & Multi-Team Select Menu)
   // =========================================================================
-  const leader1ClickInt = makeButtonClickInteraction('leader-verified-1');
+  const leader1ClickInt = makeButtonClickInteraction('leader-verified-1', afterStartUtc);
   await handleRegisterSquadButtonClick(leader1ClickInt, regId);
-  assert.match(
+  assert.equal(
     leader1ClickInt.lastReply.content,
-    /Register Verified Squad Alpha in T3 10PM\?/,
-    'Shows private confirmation prompt with team name and registration name'
+    `Register **Verified Squad Alpha** in **T3 10PM**?\nTotal slots: 2`,
+    'Shows private confirmation prompt text with bold team/registration name and Total slots'
   );
-  assert.match(leader1ClickInt.lastReply.content, /Free slots: 2/, 'Shows number of free slots');
+  assert.equal(leader1ClickInt.lastReply.embeds[0].data.title, 'Confirm Squad Registration');
+  assert.equal(
+    leader1ClickInt.lastReply.embeds[0].data.description,
+    [
+      'Register **Verified Squad Alpha** in **T3 10PM**?',
+      '• Tournament: T3 Scrims',
+      '• Registration: T3 10PM',
+      '• Team: Verified Squad Alpha',
+      '• Available Slots: 2',
+      '• Status: OPEN',
+    ].join('\n'),
+    'Shows Confirm Squad Registration embed with exact bullet points'
+  );
   const confirmBtn1 = leader1ClickInt.lastReply.components[0].components[0];
   const cancelBtn1 = leader1ClickInt.lastReply.components[0].components[1];
   assert.equal(confirmBtn1.data.label, 'Confirm');
@@ -5001,7 +5039,7 @@ test('Registration Message Design & Team Verification Check - Complete End-to-En
     verified: true,
     players: [{ discordId: 'leader-verified-1', ign: 'AlphaLead', uid: '111' }],
   });
-  const multiTeamInt = makeButtonClickInteraction('leader-verified-1');
+  const multiTeamInt = makeButtonClickInteraction('leader-verified-1', afterStartUtc);
   await handleRegisterSquadButtonClick(multiTeamInt, regId);
   assert.equal(
     multiTeamInt.lastReply.components[0].components[0].data.custom_id,
@@ -5021,10 +5059,11 @@ test('Registration Message Design & Team Verification Check - Complete End-to-En
     guild: mockGuild,
     guildId,
     client: mockClient,
+    now: afterStartUtc,
     reply: async (p) => { selectMenuUpdated = p; return p; },
   };
   await handleConfigurableTournamentInteraction(selectMenuInt);
-  assert.match(selectMenuUpdated.content, /Register Verified Squad Alpha in T3 10PM\?/);
+  assert.equal(selectMenuUpdated.content, `Register **Verified Squad Alpha** in **T3 10PM**?\nTotal slots: 2`);
   await deleteConfigurableTeam('team-verif-1b');
 
   // Complete registration for team-verif-1 via global interaction router & verify buttons are disabled immediately on click
@@ -5038,6 +5077,7 @@ test('Registration Message Design & Team Verification Check - Complete End-to-En
     guild: mockGuild,
     guildId,
     client: mockClient,
+    now: afterStartUtc,
     message: {
       components: leader1ClickInt.lastReply.components,
       edit: async (p) => {
@@ -5070,7 +5110,7 @@ test('Registration Message Design & Team Verification Check - Complete End-to-En
   // =========================================================================
   // 2. "ALREADY REGISTERED" MESSAGE
   // =========================================================================
-  const dupClickInt = makeButtonClickInteraction('leader-verified-1');
+  const dupClickInt = makeButtonClickInteraction('leader-verified-1', afterStartUtc);
   await handleRegisterSquadButtonClick(dupClickInt, regId);
   assert.equal(
     dupClickInt.lastReply.content,
@@ -5086,6 +5126,7 @@ test('Registration Message Design & Team Verification Check - Complete End-to-En
     user: { id: 'leader-verified-2' },
     guild: mockGuild,
     client: mockClient,
+    now: afterStartUtc,
     deferUpdate: async () => { confirm2SuccessInt.deferred = true; },
     editReply: async (p) => { confirm2SuccessReply = p; return p; },
   };
@@ -5100,14 +5141,15 @@ test('Registration Message Design & Team Verification Check - Complete End-to-En
   // Registration becomes FULL -> persistent message updates to Status: FULL & button disabled
   // =========================================================================
   assert.equal(channelStore['chan-reg-t3'].messages.size, 1, 'Still 1 persistent registration message');
+  assert.equal(regMsg.embeds[0].data.title, '𝐓𝟑 10PM');
   assert.equal(
-    regMsg.content,
-    `𝐓𝟑 10PM\nTime: 9:08 AM\nStatus: FULL\nSlots: 2\nMatches: 1`,
-    'Registration message automatically updates to Status: FULL'
+    regMsg.embeds[0].data.description,
+    `Time: 9:08 AM\nStatus: FULL\nSlots: 2\nMatches: 1`,
+    'Registration message embed automatically updates to Status: FULL'
   );
   assert.equal(regMsg.components[0].components[0].data.disabled, true, 'Button disabled when FULL');
 
-  const leader3FullInt = makeButtonClickInteraction('leader-verified-3');
+  const leader3FullInt = makeButtonClickInteraction('leader-verified-3', afterStartUtc);
   await handleRegisterSquadButtonClick(leader3FullInt, regId);
   assert.match(leader3FullInt.lastReply.content, /Registration is currently \*\*FULL\*\*/);
 
@@ -5160,18 +5202,20 @@ test('Registration Message Design & Team Verification Check - Complete End-to-En
   };
   await handleToggleStatus(toggleOpenInt, regId);
 
+  assert.equal(regMsg.embeds[0].data.title, '𝐓𝟑 10PM');
   assert.equal(
-    regMsg.content,
-    `𝐓𝟑 10PM\nTime: 9:13 AM\nStatus: OPEN\nSlots: 16\nMatches: 3`,
-    'Registration message updates in-place with updated Time (9:13 AM), Slots (20 - 4 = 16), Matches (3), and Status (OPEN)'
+    regMsg.embeds[0].data.description,
+    `Time: 9:13 AM\nStatus: OPEN\nSlots: 16\nMatches: 3`,
+    'Registration message embed updates in-place with updated Time (9:13 AM), Slots (20 - 4 = 16), Matches (3), and Status (OPEN)'
   );
 
   // Manually close registration -> Status: CLOSED
   await handleToggleStatus(toggleOpenInt, regId);
+  assert.equal(regMsg.embeds[0].data.title, '𝐓𝟑 10PM');
   assert.equal(
-    regMsg.content,
-    `𝐓𝟑 10PM\nTime: 9:13 AM\nStatus: CLOSED\nSlots: 16\nMatches: 3`,
-    'Registration message updates in-place to Status: CLOSED when manually closed'
+    regMsg.embeds[0].data.description,
+    `Time: 9:13 AM\nStatus: CLOSED\nSlots: 16\nMatches: 3`,
+    'Registration message embed updates in-place to Status: CLOSED when manually closed'
   );
   assert.equal(regMsg.components[0].components[0].data.disabled, true, 'Button disabled when CLOSED');
 
@@ -5182,11 +5226,200 @@ test('Registration Message Design & Team Verification Check - Complete End-to-En
   await reconcileConfigurableTournaments(mockClient);
   assert.equal(channelStore['chan-reg-t3'].messages.size, 1, 'No duplicate registration messages created on bot restart');
   assert.ok(regMsg.editCount > editCountBeforeRestart, 'Existing persistent registration message reconciled on restart');
+  assert.equal(regMsg.embeds[0].data.title, '𝐓𝟑 10PM');
   assert.equal(
-    regMsg.content,
-    `𝐓𝟑 10PM\nTime: 9:13 AM\nStatus: CLOSED\nSlots: 16\nMatches: 3`,
-    'Persistent registration message retains exact configuration and status across bot restart'
+    regMsg.embeds[0].data.description,
+    `Time: 9:13 AM\nStatus: CLOSED\nSlots: 16\nMatches: 3`,
+    'Persistent registration message embed retains exact configuration and status across bot restart'
   );
+});
+
+test('Exact Timing & Schedule Evaluation - Next due time persisted in MongoDB, exact timer fires within 1s with critical step first, and click compares time with schedule', async () => {
+  const guildId = 'guild-exact-timing';
+  const tourId = 'tour-exact-1';
+  const regId = 'reg-exact-1';
+
+  await saveConfigurableTournament({
+    tournamentId: tourId,
+    guildId,
+    categoryId: 'cat-exact',
+    categoryName: 'T3 Scrims',
+    setupChannelId: 'chan-setup-exact',
+    dashboardMessageId: 'msg-dash-exact',
+    createdChannels: [{ id: 'chan-verify-exact', name: 'T3 Verification' }],
+  });
+
+  await saveConfigurableTeam({
+    teamId: 'team-exact-1',
+    tournamentId: tourId,
+    teamName: 'Exact Second Squad',
+    leaderDiscordId: 'leader-exact-1',
+    verified: true,
+    players: [{ discordId: 'leader-exact-1', ign: 'ExactLead', uid: '101' }],
+  });
+
+  const actionLog = [];
+  const regChannelMessages = new Map();
+  const idpChannelMessages = new Map();
+
+  const makeMockChan = (id, msgMap, label) => ({
+    id,
+    guild: { id: guildId },
+    isTextBased: () => true,
+    permissionOverwrites: {
+      cache: new Map(),
+      edit: async () => {},
+      delete: async () => { actionLog.push('idp_overwrite_delete'); },
+    },
+    send: async (payload) => {
+      actionLog.push(`${label}_send`);
+      const mId = `msg-${label}-${msgMap.size + 1}`;
+      const msg = {
+        id: mId,
+        content: payload.content ?? '',
+        embeds: payload.embeds || [],
+        components: payload.components || [],
+        edit: async (next) => {
+          actionLog.push(`${label}_edit:${next.embeds?.[0]?.data?.description?.match(/Status: (\w+)/)?.[1] || 'slot'}`);
+          if (next.content !== undefined) msg.content = next.content;
+          if (next.embeds !== undefined) msg.embeds = next.embeds;
+          if (next.components !== undefined) msg.components = next.components;
+          return msg;
+        },
+      };
+      msgMap.set(mId, msg);
+      return msg;
+    },
+    messages: {
+      fetch: async (mId) => {
+        if (typeof mId === 'string') {
+          const found = msgMap.get(mId);
+          if (!found) {
+            const err = new Error('Unknown Message');
+            err.code = 10008;
+            throw err;
+          }
+          return found;
+        }
+        return msgMap;
+      },
+    },
+  });
+
+  const regChan = makeMockChan('chan-reg-exact', regChannelMessages, 'reg');
+  const idpChan = makeMockChan('chan-idp-exact', idpChannelMessages, 'idp');
+  const mockGuild = {
+    id: guildId,
+    roles: { everyone: { id: guildId } },
+    channels: {
+      cache: { get: (id) => (id === 'chan-reg-exact' ? regChan : id === 'chan-idp-exact' ? idpChan : null) },
+      fetch: async (id) => (id === 'chan-reg-exact' ? regChan : id === 'chan-idp-exact' ? idpChan : null),
+    },
+  };
+  const mockClient = {
+    guilds: { cache: new Map([[guildId, mockGuild]]), fetch: async () => mockGuild },
+    channels: {
+      cache: { get: (id) => (id === 'chan-reg-exact' ? regChan : id === 'chan-idp-exact' ? idpChan : null) },
+      fetch: async (id) => (id === 'chan-reg-exact' ? regChan : id === 'chan-idp-exact' ? idpChan : null),
+    },
+  };
+
+  // 1. Verify nextStartAt, nextResetAt, nextDueAt, nextDueAction are computed and stored in MongoDB
+  const activeEval = evaluateDailyCycleStatus('10:00', '23:59', 'Asia/Kolkata', new Date());
+  const cycleDate = activeEval.cycleDate;
+  const [y, m, d] = cycleDate.split('-').map(Number);
+
+  const savedReg = await saveConfigurableRegistration({
+    registrationId: regId,
+    tournamentId: tourId,
+    guildId,
+    displayName: 'T3 11PM',
+    totalSlots: 18,
+    reservedSlots: 2,
+    matches: 2,
+    dailyStartTime: '10:00',
+    rawDailyStartTime: '10:00 AM',
+    dailyResetTime: '23:59',
+    timezone: 'Asia/Kolkata',
+    status: 'NOT OPENED YET',
+    beforeStart: true,
+    registrationChannelId: 'chan-reg-exact',
+    idpChannelId: 'chan-idp-exact',
+    currentCycleDate: cycleDate,
+    currentCycleId: `${regId}:${cycleDate}`,
+    lastResetCycleDate: activeEval.endedCycleDate,
+  });
+
+  assert.ok(savedReg.nextStartAt instanceof Date, 'nextStartAt stored as Date in MongoDB');
+  assert.ok(savedReg.nextResetAt instanceof Date, 'nextResetAt stored as Date in MongoDB');
+  assert.ok(savedReg.nextDueAt instanceof Date, 'nextDueAt stored as Date in MongoDB');
+  assert.ok(savedReg.nextDueAction === 'START' || savedReg.nextDueAction === 'RESET', 'nextDueAction stored in MongoDB');
+
+  await updateRegistrationMessage(mockClient, regId);
+  await syncRegistrationSlotList(regId, `${regId}:${cycleDate}`, mockClient);
+  actionLog.length = 0;
+
+  // 2. Test clicking Register at the exact scheduled opening second BEFORE the scheduler flag flips
+  // At 10:00:00 AM IST (04:30:00 UTC), status in DB is still 'NOT OPENED YET' & beforeStart=true,
+  // but user click compares current time with schedule and immediately allows registration!
+  const exactOpenUtc = getExactTimeInTimezone(y, m, d, 10, 0, 'Asia/Kolkata');
+  let clickReply = null;
+  const clickAtOpenInt = {
+    id: 'int-click-at-open',
+    channelId: 'chan-reg-exact',
+    guildId,
+    guild: mockGuild,
+    client: mockClient,
+    user: { id: 'leader-exact-1' },
+    now: exactOpenUtc,
+    reply: async (p) => { clickReply = p; return p; },
+  };
+  await handleRegisterSquadButtonClick(clickAtOpenInt, regId);
+  assert.ok(clickReply, 'Click at exact start time succeeds without waiting for scheduler poll');
+  assert.equal(
+    clickReply.content,
+    `Register **Exact Second Squad** in **T3 11PM**?\nTotal slots: 16`,
+    'Click at exact start time immediately opens confirmation prompt'
+  );
+  const regAfterClickOpen = await getConfigurableRegistration(regId);
+  assert.equal(regAfterClickOpen.status, 'OPEN', 'Click at exact start time persists OPEN status');
+
+  // 3. Verify manual Close override still takes precedence over schedule even during scheduled open window
+  await saveConfigurableRegistration({
+    ...regAfterClickOpen,
+    status: 'CLOSED',
+    beforeStart: false,
+    manualStatusOverride: 'CLOSED',
+    manualOverrideCycleDate: cycleDate,
+  });
+  let closedReply = null;
+  await handleRegisterSquadButtonClick(
+    {
+      ...clickAtOpenInt,
+      id: 'int-click-manual-closed',
+      reply: async (p) => { closedReply = p; return p; },
+    },
+    regId
+  );
+  assert.match(closedReply.content, /Registration is currently NOT OPENED YET/, 'Manual Close keeps precedence over schedule');
+
+  // 4. Verify critical-step-first execution order on scheduled open:
+  // Registration message status is edited to OPEN BEFORE slot chart sync runs
+  await saveConfigurableRegistration({
+    ...regAfterClickOpen,
+    status: 'NOT OPENED YET',
+    beforeStart: true,
+    manualStatusOverride: null,
+    manualOverrideCycleDate: null,
+  });
+  actionLog.length = 0;
+  await checkRegistrationLifecycles(mockClient, exactOpenUtc);
+  const regEditIdx = actionLog.findIndex((entry) => entry === 'reg_edit:OPEN');
+  const idpEditIdx = actionLog.findIndex((entry) => entry.startsWith('idp_'));
+  assert.ok(regEditIdx !== -1, 'Registration message updated to OPEN');
+  assert.ok(idpEditIdx !== -1, 'Slot chart updated after registration message');
+  assert.ok(regEditIdx < idpEditIdx, 'Critical step (registration message update to OPEN) happens BEFORE slower slot chart work');
+  clearAllRegistrationTimers();
 });
 
 
