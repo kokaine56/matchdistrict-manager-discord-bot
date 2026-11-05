@@ -103,7 +103,8 @@ export async function executeDailyCycleReset(client, registrationId, force = fal
     reg.lastResetCycleDate = force ? cycleDateToArchive : (cycleEval.endedCycleDate || cycleDateToArchive);
     reg.currentCycleDate = nextCycleDate;
     reg.currentCycleId = `${registrationId}:${nextCycleDate}`;
-    reg.status = cycleEval.isOpen ? 'OPEN' : 'CLOSED';
+    reg.status = cycleEval.isOpen ? 'OPEN' : cycleEval.status;
+    reg.beforeStart = cycleEval.beforeStart || false;
     reg.currentCycleStartedAt = cycleEval.isOpen ? now : null;
     // Clear manual override when scheduled reset rolls over to next cycle
     reg.manualOverride = null;
@@ -132,11 +133,12 @@ export async function executeDailyCycleReset(client, registrationId, force = fal
 /**
  * Checks active registrations against current time and transitions status if needed.
  * @param {import('discord.js').Client} client
+ * @param {Date} [customNow]
  */
-export async function checkRegistrationLifecycles(client) {
+export async function checkRegistrationLifecycles(client, customNow = null) {
   try {
     const allRegs = await getAllActiveConfigurableRegistrations();
-    const now = new Date();
+    const now = customNow instanceof Date ? customNow : new Date();
 
     for (const reg of allRegs) {
       let stateChanged = false;
@@ -171,8 +173,8 @@ export async function checkRegistrationLifecycles(client) {
           await saveConfigurableRegistration(reg);
         }
 
-        // 2. Check if Daily Start is due (transition CLOSED -> OPEN when in active window)
-        if (cycleEval.isOpen && reg.status === 'CLOSED') {
+        // 2. Check if Daily Start is due (transition CLOSED / NOT OPENED YET / UPCOMING -> OPEN when in active window)
+        if (cycleEval.isOpen && (reg.status === 'CLOSED' || reg.status === 'NOT OPENED YET' || reg.status === 'UPCOMING')) {
           const activeCycle = cycleEval.activeCycleDate || cycleEval.cycleDate;
           // Precedence: If organiser explicitly manually closed for this cycle, do not auto-reopen!
           if (reg.manualOverride === 'CLOSED' && reg.manualOverrideCycleDate === activeCycle) {
@@ -185,6 +187,7 @@ export async function checkRegistrationLifecycles(client) {
 
             if (entries.length < maxAvailable) {
               reg.status = 'OPEN';
+              reg.beforeStart = false;
               if (reg.currentCycleDate !== activeCycle || !reg.currentCycleId) {
                 reg.currentCycleDate = activeCycle;
                 reg.currentCycleId = `${reg.registrationId}:${activeCycle}`;
@@ -194,6 +197,10 @@ export async function checkRegistrationLifecycles(client) {
               console.log(`[RegistrationScheduler] 🟢 Daily cycle opened for "${reg.displayName}" (${reg.registrationId}).`);
             }
           }
+        } else if (!cycleEval.isOpen && cycleEval.cycleEnded && reg.status === 'OPEN' && reg.manualOverride !== 'OPEN') {
+          reg.status = 'CLOSED';
+          reg.beforeStart = false;
+          stateChanged = true;
         }
       }
 
@@ -233,7 +240,6 @@ export async function checkRegistrationLifecycles(client) {
                 await regChan.permissionOverwrites.edit(regChan.guild.roles.everyone.id, {
                   SendMessages: false,
                 }).catch(() => {});
-                await regChan.send('🔒 **Registration is now closed.**').catch(() => {});
               }
             }
           } catch {}

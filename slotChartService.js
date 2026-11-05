@@ -668,6 +668,8 @@ export async function removeTeamFromRegistration(registrationId, teamId, client 
 
   if (resolvedClient) {
     await syncRegistrationSlotList(registrationId, currentCycleId, resolvedClient);
+    const { updateRegistrationMessage } = await import('./configurableRegistrationService.js');
+    await updateRegistrationMessage(resolvedClient, registrationId).catch(() => {});
   }
 
   return { success: true };

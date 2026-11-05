@@ -180,6 +180,8 @@ export function evaluateDailyCycleStatus(dailyStartTime, dailyResetTime, timezon
   const dayBeforeYesterdayDate = getCurrentTimeInTimezone(timezone, new Date(now.getTime() - 48 * 60 * 60 * 1000)).dateString;
 
   let isOpen = false;
+  let beforeStart = false;
+  let cycleEnded = false;
   let activeCycleDate = tzInfo.dateString;
   let endedCycleDate = yesterdayDate;
 
@@ -187,6 +189,7 @@ export function evaluateDailyCycleStatus(dailyStartTime, dailyResetTime, timezon
     // Same-day cycle (e.g. 10:00 to 22:00)
     if (currentMinutes < startMinutes) {
       isOpen = false;
+      beforeStart = true;
       activeCycleDate = tzInfo.dateString;
       endedCycleDate = yesterdayDate;
     } else if (currentMinutes < resetMinutes) {
@@ -195,6 +198,7 @@ export function evaluateDailyCycleStatus(dailyStartTime, dailyResetTime, timezon
       endedCycleDate = yesterdayDate;
     } else {
       isOpen = false;
+      cycleEnded = true;
       activeCycleDate = getNextCycleDateString(timezone, now);
       endedCycleDate = tzInfo.dateString;
     }
@@ -212,6 +216,7 @@ export function evaluateDailyCycleStatus(dailyStartTime, dailyResetTime, timezon
       // Between resetMinutes and startMinutes (e.g. 02:00 AM to 10:00 AM):
       // The cycle that ended at resetMinutes today was yesterday's cycle.
       isOpen = false;
+      beforeStart = true;
       activeCycleDate = tzInfo.dateString;
       endedCycleDate = yesterdayDate;
     }
@@ -219,7 +224,9 @@ export function evaluateDailyCycleStatus(dailyStartTime, dailyResetTime, timezon
 
   return {
     isOpen,
-    status: isOpen ? 'OPEN' : 'CLOSED',
+    beforeStart,
+    cycleEnded,
+    status: isOpen ? 'OPEN' : beforeStart ? 'NOT OPENED YET' : 'CLOSED',
     cycleDate: activeCycleDate,
     activeCycleDate,
     endedCycleDate,
@@ -482,6 +489,10 @@ export async function saveConfigurableRegistration(doc) {
   const registrationId = cleanDoc.registrationId || crypto.randomUUID();
   const totalSlots = typeof cleanDoc.totalSlots === 'number' && cleanDoc.totalSlots > 0 ? cleanDoc.totalSlots : 20;
   const reservedSlots = parseReservedSlots(cleanDoc.reservedSlots, totalSlots);
+  const parsedMatches = typeof cleanDoc.matches === 'number'
+    ? cleanDoc.matches
+    : parseInt(cleanDoc.matches, 10);
+  const matches = !isNaN(parsedMatches) && parsedMatches > 0 ? parsedMatches : 1;
   const timezone = cleanDoc.timezone || 'Asia/Kolkata';
 
   const record = {
@@ -489,6 +500,7 @@ export async function saveConfigurableRegistration(doc) {
     registrationId,
     totalSlots,
     reservedSlots,
+    matches,
     timezone,
     updatedAt: now,
     createdAt: cleanDoc.createdAt || now,

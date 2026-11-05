@@ -51,92 +51,254 @@ import {
 } from './configurableTournamentService.js';
 
 /**
+ * Safely reads a modal text input field without throwing if the field is absent.
+ * @param {import('discord.js').ModalSubmitInteraction} interaction
+ * @param {string} fieldId
+ * @returns {string}
+ */
+function getSafeFieldValue(interaction, fieldId) {
+  try {
+    const val = interaction?.fields?.getTextInputValue?.(fieldId);
+    return typeof val === 'string' ? val.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Formats a registration's daily start time into 12-hour AM/PM clock format (e.g. "11:00 AM").
+ * @param {object} registration
+ * @returns {string}
+ */
+export function formatRegistrationStartTime(registration) {
+  const raw = registration?.rawDailyStartTime || registration?.dailyStartTime;
+  if (!raw || typeof raw !== 'string') return 'N/A';
+  const parsed = parseTimeString(raw);
+  if (!parsed) return raw.trim();
+  const meridiem = parsed.hours >= 12 ? 'PM' : 'AM';
+  const hour12 = parsed.hours % 12 === 0 ? 12 : parsed.hours % 12;
+  const mm = String(parsed.minutes).padStart(2, '0');
+  return `${hour12}:${mm} ${meridiem}`;
+}
+
+/**
+ * Resolves the display status of a registration instance:
+ * - NOT OPENED YET — Before daily start time.
+ * - OPEN — Registration is accepting teams.
+ * - CLOSED — Organiser has manually closed registration or the daily cycle has ended.
+ * - FULL — All available slots are occupied.
+ *
+ * @param {object} registration
+ * @param {number} [filledCount]
+ * @returns {'NOT OPENED YET' | 'OPEN' | 'CLOSED' | 'FULL'}
+ */
+export function resolveRegistrationStatus(registration, filledCount = 0) {
+  if (!registration) return 'CLOSED';
+  const totalSlots = Number(registration.totalSlots) > 0 ? Number(registration.totalSlots) : 20;
+  const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
+  const maxAvailable = Math.max(0, totalSlots - reservedCount);
+
+  if (registration.status === 'FULL' || (maxAvailable > 0 && filledCount >= maxAvailable)) {
+    return 'FULL';
+  }
+  if (
+    registration.status === 'NOT OPENED YET' ||
+    registration.status === 'UPCOMING' ||
+    (registration.status === 'CLOSED' && registration.beforeStart === true && registration.manualOverride !== 'CLOSED')
+  ) {
+    return 'NOT OPENED YET';
+  }
+  if (registration.status === 'OPEN') {
+    return 'OPEN';
+  }
+  if (registration.status === 'CLOSED') {
+    return 'CLOSED';
+  }
+  return 'OPEN';
+}
+
+/**
+ * Retrieves the verification channel ID from the tournament configuration.
+ * @param {object} tournament
+ * @returns {string|null}
+ */
+export function getTournamentVerifyChannelId(tournament) {
+  if (!tournament) return null;
+  return (
+    tournament.standardChannels?.verifyChannelId ||
+    tournament.verifyChannelId ||
+    tournament.verificationChannelId ||
+    tournament.enrollTeamChannelId ||
+    null
+  );
+}
+
+/**
+ * Returns the clickable Discord channel mention (`<#channelId>`) for the tournament's verification channel.
+ * @param {object} tournament
+ * @returns {string}
+ */
+export function getTournamentVerifyChannelMention(tournament) {
+  const channelId = getTournamentVerifyChannelId(tournament);
+  return channelId ? `<#${channelId}>` : '#verify';
+}
+
+/**
+ * Validates whether an enrolled team record is verified and active for the given tournament.
+ * @param {object} team
+ * @param {string} tournamentId
+ * @returns {boolean}
+ */
+export function isTeamVerifiedForTournament(team, tournamentId) {
+  if (!team || !tournamentId) return false;
+  if (team.tournamentId !== tournamentId) return false;
+  if (team.verified === false) return false;
+  if (team.status === 'REVOKED' || team.status === 'UNVERIFIED' || team.status === 'DELETED' || team.isDeleted === true) {
+    return false;
+  }
+  if (!team.leaderDiscordId) return false;
+  return true;
+}
+
+/**
+ * Builds the clean, compact registration message text for a registration channel:
+ * <Registration Name>
+ * Time: <Daily Start Time>
+ * Status: <NOT OPENED YET | OPEN | CLOSED | FULL>
+ * Slots: <Total Slot Capacity>
+ * Matches: <Number of Matches>
+ *
+ * @param {object} registration
+ * @param {number} [filledCount]
+ * @returns {string}
+ */
+export function buildRegistrationMessageText(registration, filledCount = 0) {
+  const regName = registration?.displayName || registration?.name || 'Registration';
+  const timeStr = formatRegistrationStartTime(registration);
+  const statusStr = resolveRegistrationStatus(registration, filledCount);
+  const totalSlots = Number(registration?.totalSlots) > 0 ? Number(registration.totalSlots) : 20;
+  const parsedMatches = parseInt(registration?.matches, 10);
+  const matches = !isNaN(parsedMatches) && parsedMatches > 0 ? parsedMatches : 1;
+
+  return [
+    regName,
+    `Time: ${timeStr}`,
+    `Status: ${statusStr}`,
+    `Slots: ${totalSlots}`,
+    `Matches: ${matches}`,
+  ].join('\n');
+}
+
+/**
  * Builds the Embed for a public Registration Channel.
  * @param {object} registration
  * @param {number} filledCount
  * @returns {EmbedBuilder}
  */
 export function buildRegistrationEmbed(registration, filledCount = 0) {
-  const totalSlots = registration.totalSlots || 20;
-  const reservedCount = parseReservedSlots(registration.reservedSlots, totalSlots);
-  const maxAvailable = Math.max(0, totalSlots - reservedCount);
-  const availableSlots = Math.max(0, maxAvailable - filledCount);
-  const isOpen = registration.status === 'OPEN';
-
-  const reservedSummary = reservedCount > 0
-    ? `${reservedCount} (01-${String(reservedCount).padStart(2, '0')})`
-    : 'None';
-  const scheduleLine = (registration.dailyStartTime || registration.dailyResetTime)
-    ? `\n**Daily Schedule:** Opens at \`${registration.dailyStartTime || 'N/A'}\` | Resets at \`${registration.dailyResetTime || 'N/A'}\``
-    : '';
+  const statusStr = resolveRegistrationStatus(registration, filledCount);
+  const isOpen = statusStr === 'OPEN';
+  const text = buildRegistrationMessageText(registration, filledCount);
 
   return new EmbedBuilder()
-    .setColor(isOpen ? 0x22c55e : registration.status === 'CLOSED' ? 0xef4444 : 0x3b82f6)
-    .setTitle(`🎟️ Registration — ${registration.displayName}`)
-    .setDescription(
-      `**Status:** \`${registration.status || 'OPEN'}\`\n` +
-      `**Total Capacity:** \`${totalSlots}\` slots\n` +
-      `**Reserved / Locked:** \`${reservedSummary}\`\n` +
-      `**Slots Filled:** \`${filledCount}/${maxAvailable}\`\n` +
-      `**Remaining Slots:** \`${availableSlots}\`${scheduleLine}\n\n` +
-      `📌 *Only verified **Team Leaders** can register their squad.*\n` +
-      `📌 *Upon successful registration, the Team Leader will automatically receive access to the private IDP channel!*`
-    )
-    .setFooter({ text: 'Match District Tournament System' })
-    .setTimestamp();
+    .setColor(isOpen ? 0x22c55e : statusStr === 'NOT OPENED YET' ? 0x3b82f6 : 0xef4444)
+    .setTitle(registration?.displayName || registration?.name || 'Registration')
+    .setDescription(text);
 }
 
 /**
  * Builds the register button component row.
  * @param {object} registration
+ * @param {number} [filledCount]
  * @returns {ActionRowBuilder}
  */
-export function buildRegistrationComponents(registration) {
-  const isOpen = registration.status === 'OPEN';
+export function buildRegistrationComponents(registration, filledCount = 0) {
+  const statusStr = resolveRegistrationStatus(registration, filledCount);
+  const isOpen = statusStr === 'OPEN';
   const button = new ButtonBuilder()
     .setCustomId(`md_cfg_reg_btn_${registration.registrationId}`)
-    .setLabel(isOpen ? 'Register Squad' : `Registration ${registration.status || 'Closed'}`)
-    .setEmoji(isOpen ? '⚡' : '🔒')
+    .setLabel('Register Squad')
     .setStyle(isOpen ? ButtonStyle.Success : ButtonStyle.Secondary)
-    .setDisabled(!isOpen);
+    .setDisabled(false);
 
   return new ActionRowBuilder().addComponents(button);
 }
 
 /**
  * Updates or posts the persistent registration message in the registration channel.
+ * Edits the existing persistent Discord message instead of sending duplicates.
  * @param {import('discord.js').Client} client
  * @param {string} registrationId
  * @returns {Promise<boolean>}
  */
 export async function updateRegistrationMessage(client, registrationId) {
   try {
+    if (!client || !registrationId) return false;
     const registration = await getConfigurableRegistration(registrationId);
     if (!registration || !registration.registrationChannelId) return false;
 
-    const channel = await client.channels.fetch(registration.registrationChannelId).catch(() => null);
+    let channel = null;
+    if (client.channels?.fetch) {
+      channel = await client.channels.fetch(registration.registrationChannelId).catch(() => null);
+    }
+    if (!channel && registration.guildId && client.guilds?.fetch) {
+      const guild = await client.guilds.fetch(registration.guildId).catch(() => null);
+      if (guild?.channels?.fetch) {
+        channel = await guild.channels.fetch(registration.registrationChannelId).catch(() => null);
+      }
+    }
     if (!channel || !channel.isTextBased()) return false;
 
     const currentCycleId = registration.currentCycleId || null;
     const filledCount = await getRegistrationEntriesCount(registrationId, currentCycleId);
-    const embed = buildRegistrationEmbed(registration, filledCount);
-    const row = buildRegistrationComponents(registration);
+    const content = buildRegistrationMessageText(registration, filledCount);
+    const row = buildRegistrationComponents(registration, filledCount);
 
-    if (registration.registrationMessageId) {
+    let existing = null;
+    let fetchErrCode = null;
+    if (registration.registrationMessageId && channel.messages?.fetch) {
       try {
-        const existing = await channel.messages.fetch(registration.registrationMessageId).catch(() => null);
-        if (existing) {
-          await existing.edit({ embeds: [embed], components: [row] });
-          return true;
-        }
-      } catch {
-        // Fall through to send new
+        existing = await channel.messages.fetch(registration.registrationMessageId);
+      } catch (err) {
+        fetchErrCode = err?.code || null;
+        existing = null;
       }
     }
 
-    const msg = await channel.send({ embeds: [embed], components: [row] });
-    registration.registrationMessageId = msg.id;
-    await saveConfigurableRegistration(registration);
+    if (!existing && channel.messages?.fetch) {
+      try {
+        const recent = await channel.messages.fetch({ limit: 10 }).catch(() => null);
+        if (recent && typeof recent.find === 'function') {
+          existing = recent.find(
+            (m) =>
+              m.components?.some((r) =>
+                r.components?.some((b) => (b.customId || b.data?.custom_id) === `md_cfg_reg_btn_${registrationId}`)
+              ) ||
+              (typeof m.content === 'string' && registration.displayName && m.content.startsWith(registration.displayName))
+          );
+        }
+      } catch {}
+    }
+
+    if (existing) {
+      await existing.edit({ content, embeds: [], components: [row] });
+      if (registration.registrationMessageId !== existing.id) {
+        registration.registrationMessageId = existing.id;
+        await saveConfigurableRegistration(registration);
+      }
+      return true;
+    }
+
+    if (registration.registrationMessageId && fetchErrCode && fetchErrCode !== 10008) {
+      // Transient error fetching existing message; do not post a duplicate
+      return false;
+    }
+
+    const msg = await channel.send({ content, embeds: [], components: [row] });
+    if (msg?.id) {
+      registration.registrationMessageId = msg.id;
+      await saveConfigurableRegistration(registration);
+    }
     return true;
   } catch (err) {
     console.error(`[ConfigurableRegistration] ❌ Error updating registration message ${registrationId}:`, err);
@@ -224,8 +386,8 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
 
   // Support both new 'registration_name' and fallback 'display_name'
   const displayName = (
-    interaction.fields.getTextInputValue('registration_name') ||
-    interaction.fields.getTextInputValue('display_name') ||
+    getSafeFieldValue(interaction, 'registration_name') ||
+    getSafeFieldValue(interaction, 'display_name') ||
     ''
   ).trim();
 
@@ -233,13 +395,25 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
     return interaction.editReply({ content: '❌ Registration Name must be at least 2 characters long.' });
   }
 
-  const rawTotal = parseInt(interaction.fields.getTextInputValue('total_slots')?.trim(), 10);
+  const rawTotalField = getSafeFieldValue(interaction, 'total_slots') || '';
+  const totalParts = rawTotalField.split('|').map((s) => s.trim()).filter(Boolean);
+  const rawTotal = parseInt(totalParts[0], 10);
   if (isNaN(rawTotal) || rawTotal <= 0) {
     return interaction.editReply({ content: '❌ Total Slots must be a positive integer (e.g. 16, 25, 32, 64).' });
   }
   const totalSlots = rawTotal;
 
-  const rawReserved = interaction.fields.getTextInputValue('reserved_slots')?.trim() || '';
+  const rawMatchesField = getSafeFieldValue(interaction, 'matches') || totalParts[1] || '';
+  let matches = 1;
+  if (rawMatchesField !== '') {
+    const parsedMatches = parseInt(rawMatchesField, 10);
+    if (isNaN(parsedMatches) || parsedMatches <= 0) {
+      return interaction.editReply({ content: '❌ Number of Matches must be a positive integer (e.g. 1, 2, 3).' });
+    }
+    matches = parsedMatches;
+  }
+
+  const rawReserved = getSafeFieldValue(interaction, 'reserved_slots') || '';
   const reservedSlots = parseReservedSlots(rawReserved, totalSlots);
 
   if (reservedSlots >= totalSlots) {
@@ -248,8 +422,8 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
 
   // Daily Start Time (or fallback starts_at)
   const rawStart = (
-    interaction.fields.getTextInputValue('daily_start_time') ||
-    interaction.fields.getTextInputValue('starts_at') ||
+    getSafeFieldValue(interaction, 'daily_start_time') ||
+    getSafeFieldValue(interaction, 'starts_at') ||
     '10:00 AM'
   ).trim();
   const parsedStart = parseTimeString(rawStart);
@@ -261,8 +435,8 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
 
   // Daily Reset Time (or fallback ends_at)
   const rawReset = (
-    interaction.fields.getTextInputValue('daily_reset_time') ||
-    interaction.fields.getTextInputValue('ends_at') ||
+    getSafeFieldValue(interaction, 'daily_reset_time') ||
+    getSafeFieldValue(interaction, 'ends_at') ||
     '02:00 AM'
   ).trim();
   const parsedReset = parseTimeString(rawReset);
@@ -343,6 +517,7 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
       slotChartMessageId: null,
       totalSlots,
       reservedSlots, // integer count (e.g. 2)
+      matches,
       dailyStartTime: parsedStart.formatted,
       rawDailyStartTime: rawStart,
       dailyResetTime: parsedReset.formatted,
@@ -353,6 +528,7 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
       currentCycleStartedAt: cycleEval.isOpen ? now : null,
       lastResetAt: null,
       lastResetCycleDate: cycleEval.endedCycleDate || null,
+      beforeStart: cycleEval.beforeStart || false,
       status,
       createdAt: now,
     };
@@ -378,6 +554,7 @@ export async function handleAddRegistrationModalSubmit(interaction, tournamentId
         `**Name:** ${displayName}\n` +
         `**Status:** \`${status}\` (Cycle: \`${currentCycleDate}\`)\n` +
         `**Total Slots:** ${totalSlots} (Reserved: ${reservedDisplay})\n` +
+        `**Matches:** ${matches}\n` +
         `**Daily Schedule:** Opens at \`${parsedStart.formatted}\` | Resets at \`${parsedReset.formatted}\` (${timezone})\n` +
         `**Registration Channel:** <#${regChannel.id}>\n` +
         `**Private IDP Channel:** <#${idpChannel.id}>`,
@@ -457,37 +634,37 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
   }
 
   registrationId = registration.registrationId;
+  const tournament = await getConfigurableTournament(registration.tournamentId);
 
-  if (registration.status !== 'OPEN') {
-    return interaction.reply({
-      content:
-        `❌ Registration is currently **${registration.status || 'CLOSED'}**.\n` +
-        `Daily Schedule: Opens at \`${registration.dailyStartTime || 'N/A'}\` | Resets at \`${registration.dailyResetTime || 'N/A'}\`.`,
-      ephemeral: true,
-    });
-  }
-
-  // 1. Check if user is an enrolled Team Leader for this tournament
+  // 1. Verification Check FIRST: Check whether user's team is enrolled and verified in this tournament
   const userTeams = await getConfigurableTeamsForUser(registration.tournamentId, interaction.user.id);
-  const leaderTeams = userTeams.filter((t) => t.leaderDiscordId === interaction.user.id);
+  const verifiedTeams = userTeams.filter((t) => isTeamVerifiedForTournament(t, registration.tournamentId));
 
-  if (leaderTeams.length === 0) {
+  if (verifiedTeams.length === 0) {
     return interaction.reply({
-      content:
-        `❌ **Enrollment Required:** You are not a verified Team Leader for this tournament.\n` +
-        `Please enroll your squad first in the tournament verification channel.`,
+      content: `First verify your squad here ${getTournamentVerifyChannelMention(tournament)} channel`,
       ephemeral: true,
     });
   }
 
-  const team = leaderTeams[0]; // Leader's enrolled team
+  // 2. Verify that the user is the team leader
+  const leaderTeams = verifiedTeams.filter((t) => t.leaderDiscordId === interaction.user.id);
+  if (leaderTeams.length === 0) {
+    const enrolledTeam = verifiedTeams[0];
+    return interaction.reply({
+      content: `❌ Only the verified **Team Leader** (<@${enrolledTeam.leaderDiscordId}>) can register **${enrolledTeam.teamName}**.`,
+      ephemeral: true,
+    });
+  }
+
+  const team = leaderTeams[0]; // Leader's enrolled & verified team
   if (!registration.currentCycleId) {
     registration.currentCycleId = `${registrationId}:cycle-${crypto.randomUUID()}`;
     await saveConfigurableRegistration(registration);
   }
   const currentCycleId = registration.currentCycleId;
 
-  // 2. Fetch active entries of THIS registrationId and currentCycleId to check duplicate
+  // 3. Fetch active entries of THIS registrationId and currentCycleId to check duplicate and capacity
   const activeEntries = await getConfigurableEntriesForRegistration(registrationId, currentCycleId);
   const existingEntry = activeEntries.find((e) => e.teamId === team.teamId);
   if (existingEntry && existingEntry.registrationId === registrationId) {
@@ -499,12 +676,12 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
     });
   }
 
-  // 3. Check capacity against non-reserved slots using activeEntries
+  // 4. Check capacity and registration status
   const filledCount = activeEntries.length;
   const reservedCount = parseReservedSlots(registration.reservedSlots, registration.totalSlots);
   const maxAvailable = Math.max(0, registration.totalSlots - reservedCount);
 
-  if (filledCount >= maxAvailable) {
+  if (filledCount >= maxAvailable || registration.status === 'FULL') {
     if (registration.status === 'OPEN') {
       registration.status = 'CLOSED';
       await saveConfigurableRegistration(registration);
@@ -515,13 +692,20 @@ export async function handleRegisterSquadButtonClick(interaction, registrationId
       }
     }
     return interaction.reply({
-      content: '❌ Sorry, all available slots for this registration instance are currently full!',
+      content: '❌ Registration is currently **FULL**. All available slots for this registration instance are occupied!',
       ephemeral: true,
     });
   }
 
-  // 4. Retrieve tournament name for confirmation embed
-  const tournament = await getConfigurableTournament(registration.tournamentId);
+  if (registration.status !== 'OPEN') {
+    const displayStatus = resolveRegistrationStatus(registration, filledCount);
+    return interaction.reply({
+      content:
+        `❌ Registration is currently **${displayStatus}**.\n` +
+        `Daily Schedule: Opens at \`${formatRegistrationStartTime(registration)}\` | Resets at \`${registration.dailyResetTime || 'N/A'}\`.`,
+      ephemeral: true,
+    });
+  }
 
   // 5. Build compact, mobile-friendly Confirmation Message
   const embed = new EmbedBuilder()
@@ -688,12 +872,25 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
   await acquireLock(lockKey, 10, 3000);
 
   try {
-    // Step 2: Validate the team and registration
-    const team = await getConfigurableTeam(teamId);
-    if (!team) {
-      console.warn(`[ConfigurableRegistration] ❌ Team record not found [interactionId: ${interactionId}, teamId: ${teamId}]`);
+    // Retrieve registration and tournament from MongoDB
+    const registration = await getConfigurableRegistration(registrationId);
+    if (!registration || registration.status === 'DELETED' || registration.isDeleted) {
+      console.warn(`[ConfigurableRegistration] ❌ Registration not found or deleted [interactionId: ${interactionId}, regId: ${registrationId}]`);
       return respondToConfirmationInteraction(interaction, {
-        content: '❌ Team record not found. Squad is not enrolled.',
+        content: '❌ Registration instance not found or has been deleted.',
+        embeds: [],
+        components: [],
+      });
+    }
+
+    const tournament = registration.tournamentId ? await getConfigurableTournament(registration.tournamentId) : null;
+
+    // Step 2: Re-verify the team enrollment and verification status
+    const team = await getConfigurableTeam(teamId);
+    if (!team || !isTeamVerifiedForTournament(team, team.tournamentId)) {
+      console.warn(`[ConfigurableRegistration] ❌ Team record not found or unverified [interactionId: ${interactionId}, teamId: ${teamId}]`);
+      return respondToConfirmationInteraction(interaction, {
+        content: `❌ Team record not found. Squad is not enrolled or verification was revoked. First verify your squad here ${getTournamentVerifyChannelMention(tournament)} channel`,
         embeds: [],
         components: [],
       });
@@ -711,22 +908,11 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
       });
     }
 
-    // Retrieve registration from MongoDB
-    const registration = await getConfigurableRegistration(registrationId);
-    if (!registration || registration.status === 'DELETED' || registration.isDeleted) {
-      console.warn(`[ConfigurableRegistration] ❌ Registration not found or deleted [interactionId: ${interactionId}, regId: ${registrationId}]`);
-      return respondToConfirmationInteraction(interaction, {
-        content: '❌ Registration instance not found or has been deleted.',
-        embeds: [],
-        components: [],
-      });
-    }
-
     // Verify team belongs to tournament of this registration
     if (team.tournamentId !== registration.tournamentId) {
       console.warn(`[ConfigurableRegistration] ❌ Team tournament mismatch [interactionId: ${interactionId}, teamTour: ${team.tournamentId}, regTour: ${registration.tournamentId}]`);
       return respondToConfirmationInteraction(interaction, {
-        content: '❌ Team is not enrolled in this tournament.',
+        content: `❌ Team is not enrolled in this tournament. First verify your squad here ${getTournamentVerifyChannelMention(tournament)} channel`,
         embeds: [],
         components: [],
       });
@@ -859,7 +1045,6 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
           await regChannel.permissionOverwrites.edit(interaction.guild.roles.everyone.id, {
             SendMessages: false,
           }).catch(() => {});
-          await regChannel.send('🔒 **Registration is now closed (All available slots are filled).**').catch(() => {});
         }
       } catch {}
 
@@ -945,9 +1130,6 @@ export async function handleConfirmRegistrationButtonClick(interaction, registra
     }
 
     // Display Registration Successful response and remove Confirm Registration and Cancel buttons
-    const tournament = registration.tournamentId
-      ? await getConfigurableTournament(registration.tournamentId)
-      : null;
     const tournamentName = tournament?.name || 'Tournament';
     const regName = registration.displayName || registration.name;
     const successPayload = {
@@ -1078,6 +1260,7 @@ export function buildManageDashboardPayload(registration, filledCount = 0) {
     `• **Current Cycle Status:** \`${registration.status}\` (Cycle: \`${registration.currentCycleDate || 'N/A'}\`)\n` +
     `• **Total Slots:** \`${totalSlots}\`\n` +
     `• **Reserved Slots:** \`${reservedCount}\`\n` +
+    `• **Matches:** \`${registration.matches || 1}\`\n` +
     `• **Registered Teams:** \`${filledCount}/${maxAvailable}\`\n` +
     `• **Available Slots:** \`${availableSlots}\`\n` +
     `• **Daily Start Time:** \`${registration.dailyStartTime || 'N/A'}\` (${registration.timezone || 'IST'})\n` +
@@ -1257,14 +1440,13 @@ export async function handleToggleStatus(interaction, registrationId) {
     registration.manualOverride = 'OPEN';
     registration.manualOverrideCycleDate = registration.currentCycleDate;
   } else {
-    // Lock registration channel for sending and post closing message
+    // Lock registration channel for sending
     if (registration.registrationChannelId && guild) {
       const regChannel = await guild.channels.fetch(registration.registrationChannelId).catch(() => null);
       if (regChannel) {
         await regChannel.permissionOverwrites.edit(guild.roles.everyone.id, {
           SendMessages: false,
         }).catch(() => {});
-        await regChannel.send('🔒 **Registration is now closed.**').catch(() => {});
       }
     }
 
@@ -1308,7 +1490,7 @@ export async function handleToggleStatus(interaction, registrationId) {
 }
 
 /**
- * Opens modal to edit registration settings (Name, Total Slots, Reserved Slots, Daily Start Time, Daily Reset Time).
+ * Opens modal to edit registration settings (Name, Total Slots, Reserved Slots, Number of Matches, Daily Schedule).
  * @param {import('discord.js').ButtonInteraction} interaction
  * @param {string} registrationId
  */
@@ -1345,26 +1527,29 @@ export async function handleEditRegistrationButton(interaction, registrationId) 
     .setPlaceholder('e.g. 2 (locks Slot 01 and Slot 02)')
     .setRequired(false);
 
+  const matchesInput = new TextInputBuilder()
+    .setCustomId('matches')
+    .setLabel('Number of Matches')
+    .setStyle(TextInputStyle.Short)
+    .setValue(String(registration.matches || 1))
+    .setPlaceholder('e.g. 1, 2, 3')
+    .setRequired(false);
+
+  const startVal = registration.rawDailyStartTime || registration.dailyStartTime || '10:00';
+  const resetVal = registration.rawDailyResetTime || registration.dailyResetTime || '02:00';
   const startInput = new TextInputBuilder()
     .setCustomId('daily_start_time')
-    .setLabel('Daily Start Time')
+    .setLabel('Daily Start Time (or Start | Reset)')
     .setStyle(TextInputStyle.Short)
-    .setValue(registration.dailyStartTime || registration.rawDailyStartTime || '10:00')
-    .setRequired(true);
-
-  const resetInput = new TextInputBuilder()
-    .setCustomId('daily_reset_time')
-    .setLabel('Daily Reset Time')
-    .setStyle(TextInputStyle.Short)
-    .setValue(registration.dailyResetTime || registration.rawDailyResetTime || '02:00')
+    .setValue(`${startVal} | ${resetVal}`)
     .setRequired(true);
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(nameInput),
     new ActionRowBuilder().addComponents(capacityInput),
     new ActionRowBuilder().addComponents(reservedInput),
-    new ActionRowBuilder().addComponents(startInput),
-    new ActionRowBuilder().addComponents(resetInput)
+    new ActionRowBuilder().addComponents(matchesInput),
+    new ActionRowBuilder().addComponents(startInput)
   );
 
   await interaction.showModal(modal);
@@ -1385,14 +1570,29 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
     return interaction.editReply({ content: '❌ Registration instance not found.' });
   }
 
-  const newName = interaction.fields.getTextInputValue('registration_name').trim();
-  const rawSlots = parseInt(interaction.fields.getTextInputValue('total_slots').trim(), 10);
-  const rawReserved = interaction.fields.getTextInputValue('reserved_slots')?.trim() || '0';
-  const rawStart = interaction.fields.getTextInputValue('daily_start_time').trim();
-  const rawReset = interaction.fields.getTextInputValue('daily_reset_time').trim();
+  const newName = (getSafeFieldValue(interaction, 'registration_name') || registration.displayName || '').trim();
+  const rawSlotsField = getSafeFieldValue(interaction, 'total_slots') || String(registration.totalSlots || 20);
+  const slotParts = rawSlotsField.split('|').map((s) => s.trim()).filter(Boolean);
+  const rawSlots = parseInt(slotParts[0], 10);
+  const rawReserved = getSafeFieldValue(interaction, 'reserved_slots') ?? '0';
+  const rawMatchesField = getSafeFieldValue(interaction, 'matches') || slotParts[1] || '';
+
+  const rawStartInput = getSafeFieldValue(interaction, 'daily_start_time') || registration.dailyStartTime || '10:00';
+  const startResetParts = rawStartInput.split('|').map((s) => s.trim()).filter(Boolean);
+  const rawStart = startResetParts[0] || rawStartInput;
+  const rawReset = getSafeFieldValue(interaction, 'daily_reset_time') || startResetParts[1] || registration.dailyResetTime || '02:00';
 
   if (isNaN(rawSlots) || rawSlots <= 0) {
     return interaction.editReply({ content: '❌ Total slots must be a positive integer.' });
+  }
+
+  let newMatches = Number.isInteger(registration.matches) && registration.matches > 0 ? registration.matches : 1;
+  if (rawMatchesField !== '') {
+    const parsedMatches = parseInt(rawMatchesField, 10);
+    if (isNaN(parsedMatches) || parsedMatches <= 0) {
+      return interaction.editReply({ content: '❌ Number of Matches must be a positive integer.' });
+    }
+    newMatches = parsedMatches;
   }
 
   const newReservedCount = parseReservedSlots(rawReserved, rawSlots);
@@ -1484,8 +1684,11 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
 
   registration.totalSlots = rawSlots;
   registration.reservedSlots = newReservedCount;
+  registration.matches = newMatches;
   registration.dailyStartTime = parsedStart.formatted;
+  registration.rawDailyStartTime = rawStart;
   registration.dailyResetTime = parsedReset.formatted;
+  registration.rawDailyResetTime = rawReset;
 
   await saveConfigurableRegistration(registration);
 
@@ -1501,6 +1704,7 @@ export async function handleEditRegistrationModalSubmit(interaction, registratio
     `• **Name:** ${registration.displayName}\n` +
     `• **Total Slots:** ${rawSlots}\n` +
     `• **Reserved Slots:** ${newReservedCount > 0 ? `${newReservedCount} (01-${String(newReservedCount).padStart(2, '0')})` : 'None'}\n` +
+    `• **Matches:** ${newMatches}\n` +
     `• **Daily Start:** ${parsedStart.formatted}\n` +
     `• **Daily Reset:** ${parsedReset.formatted}`;
 
