@@ -311,6 +311,7 @@ export {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const isMainModule = Boolean(process.argv[1] && __filename === path.resolve(process.argv[1]));
 
 // Load environment variables across standard local paths
 const candidateEnvPaths = [
@@ -324,18 +325,393 @@ for (const envPath of candidateEnvPaths) {
   }
 }
 
-// HTTP server for health checks & secure backend-to-bot sync endpoints
+// Keep-alive web server state
+const botStartTime = Date.now();
+let pingCount = 0;
+let lastPingTime = null;
 let healthServer = null;
-const healthPort = process.env.PORT;
-if (healthPort) {
+
+// Light rate limiting: 120 requests/minute per IP
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX_REQUESTS = 120;
+const rateLimitMap = new Map();
+
+// Periodic cleanup of expired rate limit entries (every 5 minutes)
+const rateLimitCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of rateLimitMap.entries()) {
+    if (now > entry.resetAt) {
+      rateLimitMap.delete(ip);
+    }
+  }
+}, 5 * 60 * 1000);
+if (rateLimitCleanupInterval?.unref) {
+  rateLimitCleanupInterval.unref();
+}
+
+function checkRateLimit(req) {
+  // Allow Render internal health check probes
+  const userAgent = req.headers['user-agent'] || '';
+  if (/render/i.test(userAgent)) {
+    return true;
+  }
+
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || '127.0.0.1';
+  if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') {
+    return true;
+  }
+
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+
+  entry.count++;
+  if (entry.count > RATE_LIMIT_MAX_REQUESTS) {
+    return false;
+  }
+  return true;
+}
+
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatUptime(uptimeMs) {
+  const totalSeconds = Math.max(0, Math.floor(uptimeMs / 1000));
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+
+  const parts = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0 || days > 0) parts.push(`${hours}h`);
+  parts.push(`${minutes}m`);
+  return parts.join(' ');
+}
+
+function formatIST(timestamp) {
+  if (!timestamp) return 'Never';
+  const d = new Date(timestamp);
+  return d.toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    dateStyle: 'medium',
+    timeStyle: 'medium'
+  }) + ' IST';
+}
+
+function formatMinutesAgo(timestamp) {
+  if (!timestamp) return 'never';
+  const diffMs = Math.max(0, Date.now() - timestamp);
+  const diffMinutes = Math.floor(diffMs / 60000);
+  if (diffMinutes < 1) return '0 minutes ago';
+  if (diffMinutes === 1) return '1 minute ago';
+  return `${diffMinutes} minutes ago`;
+}
+
+function renderStatusPageHtml({ botName, isDiscordReady, uptimeStr, lastPingDisplay, pingCount }) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="30">
+  <title>${escapeHtml(botName)} - Status</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: #0b0e14;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+    .card {
+      background: #151b28;
+      border: 1px solid #1f293d;
+      border-radius: 16px;
+      padding: 2rem;
+      width: 100%;
+      max-width: 480px;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4), 0 8px 10px -6px rgba(0, 0, 0, 0.3);
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #1f293d;
+      padding-bottom: 1.25rem;
+      margin-bottom: 1.5rem;
+    }
+    .title-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+    .title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: #f8fafc;
+      letter-spacing: -0.01em;
+    }
+    .subtitle {
+      font-size: 0.75rem;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.35rem 0.75rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #10b981;
+      box-shadow: 0 0 8px #10b981;
+    }
+    .grid {
+      display: flex;
+      flex-direction: column;
+      gap: 0.85rem;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.75rem 1rem;
+      background: #0f1420;
+      border: 1px solid #1b2333;
+      border-radius: 10px;
+    }
+    .label {
+      font-size: 0.85rem;
+      color: #94a3b8;
+      font-weight: 500;
+    }
+    .value {
+      font-size: 0.9rem;
+      color: #f1f5f9;
+      font-weight: 600;
+      font-feature-settings: "tnum";
+    }
+    .status-ready {
+      color: #34d399;
+    }
+    .status-connecting {
+      color: #fbbf24;
+    }
+    .footer {
+      margin-top: 1.5rem;
+      text-align: center;
+      font-size: 0.75rem;
+      color: #64748b;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="title-group">
+        <span class="subtitle">MatchDistrict Service</span>
+        <h1 class="title">${escapeHtml(botName)}</h1>
+      </div>
+      <div class="badge">
+        <span class="dot"></span>
+        <span>Online</span>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="row">
+        <span class="label">Discord Client</span>
+        <span class="value ${isDiscordReady ? 'status-ready' : 'status-connecting'}">${isDiscordReady ? 'Ready' : 'Connecting...'}</span>
+      </div>
+      <div class="row">
+        <span class="label">Uptime</span>
+        <span class="value">${escapeHtml(uptimeStr)}</span>
+      </div>
+      <div class="row">
+        <span class="label">Last Ping</span>
+        <span class="value">${escapeHtml(lastPingDisplay)}</span>
+      </div>
+      <div class="row">
+        <span class="label">Total Pings</span>
+        <span class="value">${pingCount.toLocaleString('en-IN')}</span>
+      </div>
+    </div>
+    <div class="footer">
+      Auto-refreshes every 30s &bull; Keep-alive active
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+// HTTP server for health checks, keep-alive & secure backend-to-bot sync endpoints
+export function startHealthServer(portOverride) {
+  const healthPort = portOverride !== undefined ? portOverride : (process.env.PORT || (isMainModule ? 10000 : null));
+  if (healthPort === null || healthPort === undefined) return null;
+  if (healthServer && healthServer.listening) return healthServer;
+
   try {
     healthServer = http.createServer(async (req, res) => {
+      // Set response headers "Cache-Control: no-store" so that no proxy serves an old copy of the page
+      res.setHeader('Cache-Control', 'no-store');
+
       const parsedUrl = new URL(req.url, 'http://localhost');
       const pathname = parsedUrl.pathname;
+      const method = (req.method || 'GET').toUpperCase();
 
-      if (req.method === 'GET' && (pathname === '/' || pathname === '/health')) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', service: 'matchdistrict-manager-discord-bot' }));
+      // Check light rate limit on public keep-alive routes
+      if (['/', '/ping', '/health'].includes(pathname)) {
+        if (!checkRateLimit(req)) {
+          res.writeHead(429, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Retry-After': '60',
+            'Cache-Control': 'no-store'
+          });
+          res.end(JSON.stringify({ error: 'TOO_MANY_REQUESTS', message: 'Rate limit exceeded. Try again in 60 seconds.' }));
+          return;
+        }
+      }
+
+      // Handle keep-alive routes: "/", "/ping", "/health"
+      if (pathname === '/' || pathname === '/ping' || pathname === '/health') {
+        // Each request to any of these three routes updates "lastPing" and the ping counter, kept in memory
+        pingCount++;
+        const currentPingTime = Date.now();
+        const priorPingTime = lastPingTime;
+        lastPingTime = currentPingTime;
+
+        const uptimeSeconds = Math.max(0, Math.floor((Date.now() - botStartTime) / 1000));
+        const isDiscordReady = Boolean(client?.isReady?.());
+        const serviceName = 'matchdistrict-manager-discord-bot';
+        const botName = client?.user?.username || serviceName;
+
+        const jsonPayload = {
+          status: 'ok',
+          service: serviceName,
+          discordReady: isDiscordReady,
+          uptimeSeconds: uptimeSeconds,
+          lastPing: new Date(lastPingTime).toISOString()
+        };
+
+        const acceptHeader = req.headers['accept'] || '';
+        const wantsJson = acceptHeader.toLowerCase().includes('application/json');
+
+        // Route: "/" (homepage): accept GET and HEAD
+        if (pathname === '/') {
+          if (method !== 'GET' && method !== 'HEAD') {
+            res.writeHead(405, {
+              'Allow': 'GET, HEAD',
+              'Content-Type': 'application/json; charset=utf-8',
+              'Cache-Control': 'no-store'
+            });
+            res.end(JSON.stringify({ error: 'METHOD_NOT_ALLOWED', message: 'Only GET and HEAD are supported on /' }));
+            return;
+          }
+
+          if (wantsJson) {
+            res.writeHead(200, {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Cache-Control': 'no-store'
+            });
+            if (method === 'HEAD') {
+              res.end();
+            } else {
+              res.end(JSON.stringify(jsonPayload));
+            }
+            return;
+          }
+
+          // Return HTML status page
+          const uptimeStr = formatUptime(Date.now() - botStartTime);
+          const displayPingTime = priorPingTime || currentPingTime;
+          const lastPingIST = formatIST(displayPingTime);
+          const lastPingAgo = formatMinutesAgo(displayPingTime);
+          const lastPingDisplay = `${lastPingIST} (${lastPingAgo})`;
+
+          const html = renderStatusPageHtml({
+            botName,
+            isDiscordReady,
+            uptimeStr,
+            lastPingDisplay,
+            pingCount
+          });
+
+          res.writeHead(200, {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-store'
+          });
+          if (method === 'HEAD') {
+            res.end();
+          } else {
+            res.end(html);
+          }
+          return;
+        }
+
+        // Routes: "/ping" and "/health": accept every method (GET, HEAD, POST, OPTIONS)
+        if (method === 'OPTIONS') {
+          res.writeHead(200, {
+            'Allow': 'GET, HEAD, POST, OPTIONS',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
+            'Access-Control-Allow-Headers': '*',
+            'Cache-Control': 'no-store'
+          });
+          res.end();
+          return;
+        }
+
+        if (method === 'HEAD') {
+          const contentType = (pathname === '/health' || wantsJson)
+            ? 'application/json; charset=utf-8'
+            : 'text/plain; charset=utf-8';
+          res.writeHead(200, {
+            'Content-Type': contentType,
+            'Cache-Control': 'no-store'
+          });
+          res.end();
+          return;
+        }
+
+        if (pathname === '/health' || wantsJson) {
+          res.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store'
+          });
+          res.end(JSON.stringify(jsonPayload));
+          return;
+        }
+
+        // pathname === '/ping' default body: "pong"
+        res.writeHead(200, {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Cache-Control': 'no-store'
+        });
+        res.end('pong');
         return;
       }
 
@@ -344,7 +720,7 @@ if (healthPort) {
         const secret = process.env.MATCHDISTRICT_BOT_SECRET;
         const incoming = req.headers['x-bot-secret'] || (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null);
         if (!secret || incoming !== secret) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
           res.end(JSON.stringify({ success: false, error: 'UNAUTHORIZED' }));
           return;
         }
@@ -363,16 +739,16 @@ if (healthPort) {
                 if (member) {
                   const roleResult = await syncMemberTournamentRoles(member).catch(() => null);
                   const syncResult = await syncMemberTournamentAccess(member).catch(() => null);
-                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
                   res.end(JSON.stringify({ success: true, member_found: true, roleResult, syncResult }));
                   return;
                 }
               }
             }
-            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
             res.end(JSON.stringify({ success: true, member_found: false }));
           } catch (err) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
             res.end(JSON.stringify({ success: false, error: err.message }));
           }
         });
@@ -384,7 +760,7 @@ if (healthPort) {
         const secret = process.env.MATCHDISTRICT_BOT_SECRET;
         const incoming = req.headers['x-bot-secret'] || (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null);
         if (!secret || incoming !== secret) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
           res.end(JSON.stringify({ success: false, error: 'UNAUTHORIZED' }));
           return;
         }
@@ -395,25 +771,47 @@ if (healthPort) {
           if (guild) {
             const roleResults = await reconcileAllTournamentRoles(guild).catch(() => null);
             const accessResults = await reconcileAllTournamentAccess(guild).catch(() => null);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
             res.end(JSON.stringify({ success: true, roleResults, accessResults }));
             return;
           }
         }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({ success: false, message: 'Official guild not found or client not ready' }));
         return;
       }
 
-      res.writeHead(404, { 'Content-Type': 'application/json' });
+      // Unknown routes return a normal 404
+      res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify({ error: 'NOT_FOUND' }));
     });
+
     healthServer.listen(healthPort, '0.0.0.0', () => {
-      console.log(`[Discord Bot] 🌐 Server listening on port ${healthPort}`);
+      console.log(`[Discord Bot] 🌐 Server listening on 0.0.0.0:${healthPort}`);
     });
   } catch (err) {
     console.warn('[Discord Bot] ⚠️ Server error:', err.message);
   }
+  return healthServer;
+}
+
+export function getHealthServer() {
+  return healthServer;
+}
+
+export function getHealthMetrics() {
+  return {
+    botStartTime,
+    pingCount,
+    lastPingTime,
+    uptimeSeconds: Math.max(0, Math.floor((Date.now() - botStartTime) / 1000)),
+    discordReady: Boolean(client?.isReady?.())
+  };
+}
+
+// Start HTTP server immediately if PORT is defined in environment or if executed as main module
+if (process.env.PORT || isMainModule) {
+  startHealthServer();
 }
 
 /**
@@ -3072,6 +3470,9 @@ client.on(Events.ShardError, (error, shardId) => {
  * Start the Discord bot using the configured DISCORD_BOT_TOKEN.
  */
 export async function startBot(tokenOverride) {
+  // Ensure keep-alive web server is listening early before slow startup tasks
+  startHealthServer();
+
   const token = tokenOverride || getBotToken();
 
   if (!token) {
@@ -3128,8 +3529,12 @@ export async function gracefulShutdown(signal) {
   console.log(`\n[Discord Bot] Received ${signal}. Shutting down bot gracefully...`);
   try {
     stopRoleSyncScheduler();
+    if (rateLimitCleanupInterval) {
+      clearInterval(rateLimitCleanupInterval);
+    }
     if (healthServer) {
       healthServer.close();
+      healthServer = null;
     }
     await client.destroy();
     console.log('[Discord Bot] Disconnected from Discord.');
@@ -3147,7 +3552,6 @@ process.once('SIGTERM', () => {
 });
 
 // Auto-start bot only when this file is executed directly (not when imported in test suites)
-const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 if (isMainModule) {
   startBot().catch((error) => {
     console.error('[Discord Bot] ❌ Fatal startup error:', error?.message || error);
