@@ -1179,7 +1179,7 @@ export function getHelpResponse(prefix = PREFIX) {
     `• \`${prefix}select tournament <id>\` — *(Admin Only)* Open or refresh control panel in #bot-commands\n` +
     `• \`${prefix}dash\` — *(Admin Only)* Restore/resynchronize the tournament control panel in #bot-commands\n` +
     `• \`${prefix}delete tournament <id>\` — *(Admin Only)* Permanently delete tournament, channels, roles, and database records\n` +
-    `• \`${prefix}fetch teams [id]\` — *(Admin Only)* Provision tournament channels & sync live registered roster\n` +
+    `• \`${prefix}fetch teams [id]\` — *(Admin Only)* Provision tournament channels & sync live registered squad\n` +
     `• \`${prefix}cred <room_id> <password>\` — *(Admin Only)* Publish match credentials inside a private group channel\n\n` +
     `**ℹ️ General Information:**\n` +
     `• \`${prefix}status\` — Check server configuration & welcome status\n` +

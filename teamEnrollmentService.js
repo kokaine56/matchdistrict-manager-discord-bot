@@ -450,7 +450,7 @@ export async function handleStep2ModalSubmit(interaction, tournamentId) {
       .setColor(0x5865f2)
       .setTitle('📋 Team Enrollment — Step 3 of 5 (Substitute Players)')
       .setDescription(
-        `Main roster players recorded!\n\n` +
+        `Squad players recorded!\n\n` +
         `**Would you like to add substitute players?**\n` +
         `You can add up to 2 optional substitutes, or skip this step.`
       );
@@ -659,7 +659,7 @@ export async function showStep4Confirmation(interaction, tournamentId, session) 
       .setDescription(
         `Please review your squad details before proceeding to Discord member selection:\n\n` +
         `**Team Name:** **${session.teamName}**\n\n` +
-        `**Main Roster:**\n` +
+        `**Main Squad:**\n` +
         `• Player 1: **${session.p1.ign}** (UID: \`${session.p1.uid}\`)\n` +
         `• Player 2: **${session.p2.ign}** (UID: \`${session.p2.uid}\`)\n` +
         `• Player 3: **${session.p3.ign}** (UID: \`${session.p3.uid}\`)\n` +
@@ -914,7 +914,7 @@ export async function handleStep5UserSelect(interaction, tournamentId) {
           `✅ **Your squad has been successfully updated.**\n\n` +
           `**Team:** **${updatedTeamDoc.teamName}**\n` +
           `**Leader:** <@${updatedTeamDoc.leaderDiscordId}>\n\n` +
-          `**Roster:**\n${playerList}\n\n` +
+          `**Squad:**\n${playerList}\n\n` +
           `🎉 All existing registrations and slot allocations have been preserved.`,
         components: [],
       });
@@ -956,7 +956,7 @@ export async function handleStep5UserSelect(interaction, tournamentId) {
           `✅ **Your squad has been successfully enrolled.**\n\n` +
           `**Team:** **${teamDoc.teamName}**\n` +
           `**Leader:** <@${teamDoc.leaderDiscordId}>\n\n` +
-          `**Roster:**\n${playerList}\n\n` +
+          `**Squad:**\n${playerList}\n\n` +
           `🎉 You can now register for tournament slots in the registration channels!`,
         components: [],
       });
@@ -1024,7 +1024,7 @@ export async function handleManageMySquadButton(interaction, tournamentId) {
       .setTitle(`🛡️ Squad Management — ${team.teamName}`)
       .setDescription(
         `**Leader:** <@${team.leaderDiscordId}>\n\n` +
-        `**Main Roster:**\n${playerLines}\n\n` +
+        `**Main Squad:**\n${playerLines}\n\n` +
         `**Substitutes:**\n${subLines}\n\n` +
         `**Active Registrations:**\n${regLines}`
       );

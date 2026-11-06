@@ -152,7 +152,7 @@ export const REQUIRED_TOURNAMENT_CHANNELS = [
   {
     key: 'tournamentTeamsId',
     name: 'registered-team',
-    topic: 'Registered Teams & Tournament Roster (Admin Only)',
+    topic: 'Registered Teams & Tournament Squad (Admin Only)',
     category: 'management',
     participantAccess: 'none',
   },
@@ -1200,8 +1200,6 @@ async function completeTournamentVerification({
     }
 
     const resolvedTeamName = result.team_name || teamName || 'Your team';
-    const slotNumber = result.slot_number;
-
     // 1. Persist verified status in Mongo and local cache
     const verifiedAt = new Date().toISOString();
     savedTournament.verifiedRegistrations ||= {};
@@ -1212,7 +1210,13 @@ async function completeTournamentVerification({
       discordId: String(captainId),
       verifiedAt,
       mentionedMemberIds: teammateIds,
-      slotNumber: slotNumber || null,
+      captain: { ign: result.captain_name || '', uid: result.captain_uid || '', discord_id: String(captainId) },
+      squad: Array.isArray(result.squad) ? result.squad : [
+        { ign: result.captain_name || '', uid: result.captain_uid || '', discord_id: String(captainId) },
+        ...(Array.isArray(result.players) ? result.players : []),
+      ],
+      substitutes: Array.isArray(result.substitutes) ? result.substitutes : [],
+      discordMemberIds: [String(captainId), ...teammateIds.map(String)],
     };
     guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
     await saveTournamentToDb(guild.id, tournamentId, savedTournament);
@@ -1229,7 +1233,7 @@ async function completeTournamentVerification({
 
     // 3. Edit / send confirmation message
     const allMemberMentions = [captainId, ...teammateIds].map(id => `<@${id}>`).join(', ');
-    const confirmationText = `🎉 **Team ${resolvedTeamName} is confirmed!**\n• Captain & Teammates: ${allMemberMentions}`;
+    const confirmationText = `🎉 **Team ${resolvedTeamName} is confirmed!**\n• **Team Leader & Squad:** ${allMemberMentions}`;
 
     if (interaction) {
       if (interaction.deferred) {
@@ -1252,9 +1256,8 @@ async function completeTournamentVerification({
       invokerUser,
       [
         { name: 'Team Name', value: resolvedTeamName },
-        { name: 'Captain', value: `<@${captainId}>` },
-        ...(teammateIds.length > 0 ? [{ name: 'Teammates', value: teammateIds.map(id => `<@${id}>`).join(', ') }] : []),
-        ...(slotNumber ? [{ name: 'Slot Number', value: `#${slotNumber}` }] : []),
+        { name: 'Team Leader', value: `<@${captainId}>` },
+        ...(teammateIds.length > 0 ? [{ name: 'Squad', value: teammateIds.map(id => `<@${id}>`).join(', ') }] : []),
         { name: 'Registration ID', value: String(registrationId) },
       ]
     );
@@ -1276,7 +1279,7 @@ async function completeTournamentVerification({
         }
       }
     } catch (refreshErr) {
-      console.warn('[Discord Bot] Roster refresh after verification error:', refreshErr.message);
+      console.warn('[Discord Bot] Squad refresh after verification error:', refreshErr.message);
     }
 
     return true;
@@ -1450,7 +1453,7 @@ export async function handleTournamentVerificationInteraction(interaction) {
 
   if (interaction.user.id !== captainId) {
     await interaction.reply({
-      content: '⚠️ This verification prompt is not for you. Only the captain who submitted the code can interact with this.',
+      content: '⚠️ This verification prompt is not for you. Only the Team Leader who submitted the code can interact with this.',
       ephemeral: true,
     }).catch(() => {});
     return true;
@@ -2469,46 +2472,47 @@ export async function handleDashboardNavigationInteraction(interaction) {
  */
 export function formatTeamsChannelRoster(tournament, teams = []) {
   const eligibleTeams = teams.filter((t) => t.is_eligible);
-  if (eligibleTeams.length === 0) {
-    return [
-      `📋 **Tournament Registered Teams** — **${tournament.title}** (ID: \`${tournament.id}\`)\n\n` +
-      `*No confirmed or approved teams have been registered yet.*`,
-    ];
-  }
-
-  const chunks = [];
-  let currentChunk = `📋 **Tournament Registered Teams** — **${tournament.title}** (ID: \`${tournament.id}\`)\n` +
+  const updatedAt = Math.floor(Date.now() / 1000);
+  const makeHeader = () => `📋 **Tournament Registered Teams** — **${tournament.title}** (ID: \`${tournament.id}\`)\n` +
     `• **Total Confirmed Teams:** **${eligibleTeams.length}**\n` +
-    `• **Last Updated:** <t:${Math.floor(Date.now() / 1000)}:R>\n` +
+    `• **Last Updated:** <t:${updatedAt}:R>\n` +
     `────────────────────────────────────────\n\n`;
+  if (eligibleTeams.length === 0) return [makeHeader() + '*No confirmed or approved teams have been registered yet.*'];
+
+  const formatPlayer = (player = {}) => `${player.ign || player.name || '—'} — \`${player.uid || '—'}\``;
+  const chunks = [];
+  let currentChunk = makeHeader();
+  let teamsInChunk = 0;
 
   for (let i = 0; i < eligibleTeams.length; i++) {
     const team = eligibleTeams[i];
-    const leaderMention = team.leader?.discord_id ? `<@${team.leader.discord_id}>` : (team.captain || 'Leader');
-    let teamText = `**${i + 1}. ${team.team_name}**\n` +
-      `  • **Captain:** ${leaderMention}\n`;
+    const leader = team.leader || {};
+    const leaderMention = leader.discord_id ? ` (<@${leader.discord_id}>)` : '';
+    const squad = Array.isArray(team.squad) && team.squad.length
+      ? team.squad
+      : [{ ign: team.captain || leader.ign || leader.name || 'Team Leader', uid: team.captain_uid || leader.uid || '' }];
+    const substitutes = Array.isArray(team.substitutes) ? team.substitutes : [];
+    const discordIds = Array.isArray(team.discord_members) ? team.discord_members :
+      (team.members || []).map(member => member.discord_id).filter(Boolean);
+    const discordMentions = [...new Set(discordIds.map(id => String(id || '').trim()).filter(id => /^\d{17,20}$/.test(id)))];
+    const substituteText = substitutes.length ? substitutes.map(formatPlayer).join(', ') : 'None';
+    const squadText = squad.map((player, index) => `  ${index + 1}. ${formatPlayer(player)}`).join('\n');
+    const teamText = `**${i + 1}. ${team.team_name || 'Team'}**\n` +
+      `• **Team Leader:** ${formatPlayer(leader.ign || leader.uid ? leader : { ign: team.captain || 'Team Leader', uid: team.captain_uid })}${leaderMention}\n` +
+      `• **Squad:**\n${squadText}\n` +
+      `• **Substitutes:** ${substituteText}\n` +
+      `• **Discord:** ${discordMentions.length ? discordMentions.map(id => `<@${id}>`).join(', ') : 'None'}\n\n`;
 
-    if (Array.isArray(team.members) && team.members.length > 0) {
-      const memberList = team.members.map((m) => {
-        if (m.discord_id) return `<@${m.discord_id}>`;
-        return m.name || 'Member';
-      }).join(', ');
-      teamText += `  • **Roster:** ${memberList}\n`;
+    if (teamsInChunk >= 5 || (teamsInChunk > 0 && currentChunk.length + teamText.length > 1800)) {
+      chunks.push(currentChunk.trimEnd());
+      currentChunk = makeHeader();
+      teamsInChunk = 0;
     }
-    teamText += '\n';
-
-    if (currentChunk.length + teamText.length > 1950) {
-      chunks.push(currentChunk);
-      currentChunk = teamText;
-    } else {
-      currentChunk += teamText;
-    }
+    currentChunk += teamText;
+    teamsInChunk++;
   }
 
-  if (currentChunk.trim()) {
-    chunks.push(currentChunk);
-  }
-
+  if (currentChunk.trim()) chunks.push(currentChunk.trimEnd());
   return chunks;
 }
 
@@ -2530,6 +2534,40 @@ export function formatRegistrationMessage(tournament, directUrl) {
  */
 export async function updateTeamsRosterMessages(guild, tournament, teams, teamsChannel, savedTournament) {
   if (!teamsChannel || typeof teamsChannel.send !== 'function') return false;
+
+  let backfilledDetails = false;
+  savedTournament.verifiedRegistrations ||= {};
+  for (const team of teams.filter(item => item.is_eligible && item.registration_id)) {
+    const key = String(team.registration_id);
+    const prior = savedTournament.verifiedRegistrations[key];
+    const squad = Array.isArray(team.squad) ? team.squad : [];
+    const substitutes = Array.isArray(team.substitutes) ? team.substitutes : [];
+    const discordMemberIds = Array.isArray(team.discord_members) ? team.discord_members : [];
+    const squadNeedsBackfill = !Array.isArray(prior?.squad) || prior.squad.length < squad.length;
+    const subsNeedBackfill = !Array.isArray(prior?.substitutes) || prior.substitutes.length < substitutes.length;
+    const discordNeedsBackfill = !Array.isArray(prior?.discordMemberIds) || prior.discordMemberIds.length < discordMemberIds.length;
+    if (!prior || squadNeedsBackfill || subsNeedBackfill || discordNeedsBackfill || (prior && Object.hasOwn(prior, 'slotNumber'))) {
+      savedTournament.verifiedRegistrations[key] = {
+        ...(prior || {}),
+        registrationId: key,
+        teamId: prior?.teamId || key,
+        teamName: team.team_name || prior?.teamName,
+        verifiedAt: prior?.verifiedAt || team.discord_verified_at || new Date().toISOString(),
+        discordId: prior?.discordId || team.leader?.discord_id || null,
+        mentionedMemberIds: prior?.mentionedMemberIds || discordMemberIds.filter(id => id !== team.leader?.discord_id),
+        captain: squadNeedsBackfill ? team.leader : (prior?.captain || team.leader),
+        squad: squadNeedsBackfill ? squad : prior?.squad,
+        substitutes: subsNeedBackfill ? substitutes : prior?.substitutes,
+        discordMemberIds: discordNeedsBackfill ? discordMemberIds : prior?.discordMemberIds,
+      };
+      delete savedTournament.verifiedRegistrations[key].slotNumber;
+      backfilledDetails = true;
+    }
+  }
+  if (backfilledDetails) {
+    guildSettingsCache[guild.id].tournaments[savedTournament.tournamentId] = savedTournament;
+    await saveTournamentToDb(guild.id, savedTournament.tournamentId, savedTournament);
+  }
 
   const rosterChunks = formatTeamsChannelRoster(tournament, teams);
   const logicalKeyPrefix = `guild:${guild.id}:tournament:${savedTournament.tournamentId}:teams_roster`;
@@ -4450,14 +4488,14 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
     syncResult.failures.push(`Failed to sync tournament roles: ${err.message}`);
   }
 
-  // 6. Update the shared #tournament-teams channel with the latest registered team roster (stable message editing)
+  // 6. Update the shared #tournament-teams channel with the latest registered team squad (stable message editing)
   const teamsChannel = activeChannels.tournamentTeamsId;
   if (teamsChannel) {
     try {
       await updateTeamsRosterMessages(guild, tournament, teams, teamsChannel, savedTournament);
       syncResult.teamsUpdatedInChannel = true;
     } catch (err) {
-      syncResult.failures.push(`Failed to update roster in #tournament-teams: ${err.message}`);
+      syncResult.failures.push(`Failed to update squad in #tournament-teams: ${err.message}`);
     }
   }
 
@@ -5388,7 +5426,7 @@ export async function renameTournamentChannelsToStandardFormat(guild, tournament
           // 5. Check for partial failures and report clearly
           if (channelSyncError || roleSyncError) {
             const warningMsg = `⚠️ **Sync & Refresh Completed with Warnings:**\n` +
-              (channelSyncError ? `• **Channel/Roster Sync Failed:** ${channelSyncError}\n` : `• **Channels:** Updated successfully.\n`) +
+              (channelSyncError ? `• **Channel/Squad Sync Failed:** ${channelSyncError}\n` : `• **Channels:** Updated successfully.\n`) +
               (roleSyncError ? `• **Role Sync Failed:** ${roleSyncError}\n` : `• **Roles:** ${roleStats ? `${roleStats.assigned} assigned, ${roleStats.alreadyAssigned} verified.` : 'Updated.'}\n`) +
               `• **Dashboard:** Refreshed with latest registrations.`;
             if (typeof interaction.editReply === 'function') {
@@ -10226,7 +10264,7 @@ export async function handlePublishCredentialsCommand(guild, member, channel, ar
       `  - 🧾 **Spec Results:** ${syncResult.channelIds?.specResultId ? `<#${syncResult.channelIds.specResultId}>` : '#spec-result'}\n` +
       `  - 🧾 **Tournament Log:** ${syncResult.channelIds?.tournamentLogId ? `<#${syncResult.channelIds.tournamentLogId}>` : '#tournament-log'}\n` +
       `  - 🔊 **Room Maker:** ${syncResult.channelIds?.roomMakerVcId ? `<#${syncResult.channelIds.roomMakerVcId}>` : '#room-maker-vc'}\n` +
-      `• **Roster Status:** ${syncResult.teamsUpdatedInChannel ? '🟢 **Published to #registered-team**' : '⚪ **Roster ready**'}\n` +
+      `• **Squad Status:** ${syncResult.teamsUpdatedInChannel ? '🟢 **Published to #registered-team**' : '⚪ **Squad ready**'}\n` +
       `• **Permission Overwrites:** **${syncResult.permissionsUpdated}** applied, **${syncResult.permissionsRemoved}** removed\n`;
 
     if (syncResult.obsoleteSquadChannelsDeleted > 0) {
