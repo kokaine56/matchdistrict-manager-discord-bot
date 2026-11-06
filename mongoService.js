@@ -19,6 +19,9 @@ let mongoClient = null;
 let mongoDb = null;
 let isConnected = false;
 let isConnecting = false;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let mongoClosing = false;
 
 const DEFAULT_DB_NAME = 'matchdistrict_discord';
 
@@ -71,6 +74,26 @@ export function ensurePersistenceAvailable() {
   }
 }
 
+function clearMongoReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function scheduleMongoReconnect() {
+  if (mongoClosing || reconnectTimer || !process.env.MONGODB_URI) return;
+  const delayMs = Math.min(60_000, 2_000 * (2 ** Math.min(reconnectAttempts, 5)));
+  reconnectAttempts++;
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+    if (mongoClosing || isConnected || isConnecting) return;
+    const connected = await initMongo().catch(() => false);
+    if (!connected && !isConnected) scheduleMongoReconnect();
+  }, delayMs);
+  reconnectTimer.unref?.();
+}
+
 /**
  * Computes a deterministic SHA-256 hash of a message payload (content, embeds, components).
  * @param {object} payload
@@ -102,6 +125,8 @@ export function computeContentHash(payload) {
 export async function initMongo(connectionUri) {
   const uri = connectionUri || process.env.MONGODB_URI;
 
+  mongoClosing = false;
+
   if (!uri) {
     console.warn('[MongoDB] ⚠️ MONGODB_URI environment variable is not defined. Bot running without database persistence.');
     isConnected = false;
@@ -122,6 +147,12 @@ export async function initMongo(connectionUri) {
   try {
     console.log(`[MongoDB] 🔄 Connecting to MongoDB at ${maskedUri}...`);
 
+    const previousClient = mongoClient;
+    mongoClient = null;
+    mongoDb = null;
+    isConnected = false;
+    if (previousClient) await previousClient.close().catch(() => {});
+
     mongoClient = new MongoClient(uri, {
       maxPoolSize: 10,
       minPoolSize: 2,
@@ -135,6 +166,8 @@ export async function initMongo(connectionUri) {
     mongoDb = mongoClient.db(dbName);
     isConnected = true;
     isConnecting = false;
+    reconnectAttempts = 0;
+    clearMongoReconnectTimer();
 
     console.log(`[MongoDB] 🚀 Connected successfully to database: "${mongoDb.databaseName}"`);
 
@@ -142,14 +175,19 @@ export async function initMongo(connectionUri) {
     await ensureMongoIndexes();
 
     // Listen for client errors or disconnections
-    mongoClient.on('error', (err) => {
+    const activeClient = mongoClient;
+    activeClient.on('error', (err) => {
+      if (mongoClient !== activeClient) return;
       console.error('[MongoDB] ⚠️ Client error event:', err.message);
       isConnected = false;
+      scheduleMongoReconnect();
     });
 
-    mongoClient.on('close', () => {
+    activeClient.on('close', () => {
+      if (mongoClient !== activeClient) return;
       console.warn('[MongoDB] ⚠️ Connection closed.');
       isConnected = false;
+      scheduleMongoReconnect();
     });
 
     return true;
@@ -157,6 +195,7 @@ export async function initMongo(connectionUri) {
     isConnecting = false;
     isConnected = false;
     console.error(`[MongoDB] ❌ Failed to connect to MongoDB (${maskedUri}):`, err.message);
+    scheduleMongoReconnect();
     return false;
   }
 }
@@ -1859,6 +1898,8 @@ export async function deletePendingAnnouncement(announcementId) {
 }
 
 export async function closeMongo() {
+  mongoClosing = true;
+  clearMongoReconnectTimer();
   if (mongoClient) {
     try {
       await mongoClient.close();
