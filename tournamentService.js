@@ -1229,8 +1229,7 @@ async function completeTournamentVerification({
 
     // 3. Edit / send confirmation message
     const allMemberMentions = [captainId, ...teammateIds].map(id => `<@${id}>`).join(', ');
-    const slotText = slotNumber ? ` (Slot #${slotNumber})` : '';
-    const confirmationText = `🎉 **Team ${resolvedTeamName} is confirmed!**${slotText}\n• Captain & Teammates: ${allMemberMentions}`;
+    const confirmationText = `🎉 **Team ${resolvedTeamName} is confirmed!**\n• Captain & Teammates: ${allMemberMentions}`;
 
     if (interaction) {
       if (interaction.deferred) {
