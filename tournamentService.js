@@ -49,8 +49,6 @@ import {
   saveTournamentToDb,
   createPendingTournamentVerification,
   getPendingTournamentVerification,
-  claimPendingTournamentVerificationCheck,
-  activatePendingTournamentVerification,
   claimPendingTournamentVerification,
   releasePendingTournamentVerificationClaim,
   finishPendingTournamentVerification,
@@ -1160,7 +1158,7 @@ const verificationFailedAttempts = new Map();
 const verificationPromptTimers = new Map();
 let legacyVerificationCleanupComplete = false;
 
-/** Remove legacy public selection prompts and restore the persistent private-code entry button. */
+/** Remove legacy public verification prompts and restore the verification instructions. */
 export async function cleanupLegacyPublicVerificationPrompts(guild) {
   if (!guild) return;
   if (!legacyVerificationCleanupComplete) {
@@ -1178,10 +1176,11 @@ export async function cleanupLegacyPublicVerificationPrompts(guild) {
       const messages = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) }).catch(() => null);
       if (!messages?.size) break;
       for (const message of messages.values()) {
-        const hasLegacySelection = message.components?.some((row) => row.components?.some((component) =>
-          String(component.customId || '').startsWith('tver:select:')
-        ));
-        if (hasLegacySelection) await message.delete().catch(() => {});
+        const hasLegacyPrompt = message.components?.some((row) => row.components?.some((component) => {
+          const id = String(component.customId || '');
+          return id.startsWith('tver:select:') || id.startsWith('tver:cancel:') || id.startsWith('tver:continue:') || id === 'tver:open_modal';
+        }));
+        if (hasLegacyPrompt) await message.delete().catch(() => {});
       }
       before = messages.last()?.id;
       if (messages.size < 100) break;
@@ -1194,10 +1193,8 @@ export async function cleanupLegacyPublicVerificationPrompts(guild) {
       messageType: 'tournament_verification_info',
       tournamentId,
       payload: {
-        content: `Verify your team for **${tournament.tournamentTitle || 'this tournament'}** using the code from your registration.`,
-        components: [new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('tver:open_modal').setLabel('Verify with Code').setStyle(ButtonStyle.Primary)
-        )],
+        content: 'Copy your verification code from the website and paste it in this channel.',
+        components: [],
       },
     }).catch((error) => console.warn(`[Discord Bot] Could not restore verification information message for ${tournamentId}:`, error.message));
   }
@@ -1259,12 +1256,6 @@ async function requestVerificationCheck(guild, tournamentId, code) {
   return { ok: response.ok && result.success === true, result, status: response.status };
 }
 
-async function failPendingVerification(interaction, pendingId, message) {
-  await expirePendingTournamentVerificationById(pendingId, interaction.user.id).catch(() => {});
-  await editPrivateReply(interaction, { content: message, components: [] });
-  return true;
-}
-
 async function showVerifiedCodeSelection(interaction, pending, { edit = true } = {}) {
   if (pending.teammatesNeeded <= 0) {
     return completeTournamentVerification({
@@ -1289,86 +1280,19 @@ async function showVerifiedCodeSelection(interaction, pending, { edit = true } =
   return true;
 }
 
-async function verifyCodeForModal(interaction, tournamentId, savedTournament) {
-  const code = String(interaction.fields.getTextInputValue('verification_code') || '').trim().toUpperCase();
-  if (!/^[A-Z0-9]{8}$/.test(code)) {
-    await replyPrivate(interaction, { content: 'Enter a valid 8-character verification code.' });
-    return true;
-  }
-  const attempt = getVerificationAttemptState(interaction.guild.id, interaction.user.id);
-  if (attempt.blocked) {
-    await replyPrivate(interaction, { content: 'Too many failed verification attempts. Please wait 10 minutes before trying again.' });
-    return true;
-  }
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const pendingId = crypto.randomUUID();
-  const starterPending = {
-    pendingId,
-    registrationId: null,
-    starterDiscordId: interaction.user.id,
-    tournamentId,
-    guildId: interaction.guild.id,
-    channelId: interaction.channelId,
-    code,
-    codeHash: crypto.createHash('sha256').update(`${tournamentId}:${code}`).digest('hex'),
-    expiresAt: new Date(Date.now() + 10 * 60 * 1000),
-  };
-  try {
-    try {
-      await createPendingTournamentVerification(starterPending);
-    } catch (error) {
-      if (error?.code === 11000) {
-        await editPrivateReply(interaction, { content: 'A verification for this code is already in progress.' });
-        return true;
-      }
-      throw error;
-    }
-    if (!await claimPendingTournamentVerificationCheck(pendingId, interaction.user.id)) {
-      await expirePendingTournamentVerificationById(pendingId, interaction.user.id).catch(() => {});
-      await editPrivateReply(interaction, { content: 'This verification is no longer active. Please try again.' });
-      return true;
-    }
-    const checked = await requestVerificationCheck(interaction.guild, tournamentId, code);
-    if (!checked.ok) {
-      await expirePendingTournamentVerificationById(pendingId, interaction.user.id).catch(() => {});
-      attempt.attempts.push(Date.now());
-      verificationFailedAttempts.set(attempt.key, attempt.attempts);
-      await editPrivateReply(interaction, { content: checked.result.message || 'The verification code could not be confirmed.' });
-      return true;
-    }
-    let activated;
-    try {
-      activated = await activatePendingTournamentVerification(pendingId, interaction.user.id, checked.result);
-    } catch (error) {
-      await expirePendingTournamentVerificationById(pendingId, interaction.user.id).catch(() => {});
-      if (error?.code === 11000) {
-        await editPrivateReply(interaction, { content: 'A verification for this team is already in progress.' });
-        return true;
-      }
-      throw error;
-    }
-    if (!activated) {
-      await expirePendingTournamentVerificationById(pendingId, interaction.user.id).catch(() => {});
-      await editPrivateReply(interaction, { content: 'A verification for this team is already in progress.' });
-      return true;
-    }
-    verificationFailedAttempts.delete(attempt.key);
-    const pending = await getPendingTournamentVerification(pendingId);
-    return await showVerifiedCodeSelection(interaction, pending);
-  } catch (error) {
-    await expirePendingTournamentVerificationById(pendingId, interaction.user.id).catch(() => {});
-    console.error(`[Discord Bot] Verification code check failed for tournament ${tournamentId}:`, error.message);
-    await editPrivateReply(interaction, { content: 'Verification is temporarily unavailable. Please try again shortly.' });
-    return true;
-  }
-}
-
 /** Finish a verification only after atomically claiming its Mongo pending record. */
 async function completeTournamentVerification({
   guild, channel, tournamentId, savedTournament, registrationId, pendingId,
   captainId, teammateIds = [], invokerUser, interaction,
 }) {
-  const pending = await claimPendingTournamentVerification(pendingId, captainId).catch(() => null);
+  let pending;
+  try {
+    pending = await claimPendingTournamentVerification(pendingId, captainId);
+  } catch (error) {
+    console.error(`[Discord Bot] Could not claim verification ${pendingId} for completion:`, error);
+    await editPrivateReply(interaction, { content: 'Verification is temporarily unavailable. Please try again shortly.', components: [] });
+    return true;
+  }
   if (!pending) {
     await editPrivateReply(interaction, { content: 'This verification is no longer active. Start again with a new code.', components: [] });
     return true;
@@ -1462,37 +1386,81 @@ async function completeTournamentVerification({
     return true;
   } catch (error) {
     if (!backendVerified) await releasePendingTournamentVerificationClaim(pendingId, captainId).catch(() => {});
-    console.error(`[Discord Bot] Verification completion failed for tournament ${tournamentId}:`, error.message);
+    console.error(`[Discord Bot] Verification completion failed for tournament ${tournamentId}:`, error);
     await editPrivateReply(interaction, { content: 'Verification could not be completed. Please try again.', components: [] });
     return true;
   }
 }
 
-/** Delete the posted code immediately and only reveal a neutral Continue prompt publicly. */
+/** Check an 8-character code posted in the verification channel, then show only a neutral prompt. */
 export async function handleTournamentVerificationMessage(message) {
   if (!message?.guild || !message.channel || message.author?.bot) return false;
   const match = findTournamentForVerification(message.guild.id, message.channel.id);
   if (!match) return false;
   const [tournamentId] = match;
-  const code = String(message.content || '').trim().toUpperCase();
+  const code = String(message.content || '').toUpperCase();
   if (!/^[A-Z0-9]{8}$/.test(code)) return false;
 
   await message.delete().catch(() => {});
-  const pendingId = crypto.randomUUID();
+  const attempt = getVerificationAttemptState(message.guild.id, message.author.id);
+  const sendTemporaryReason = async (reason) => {
+    const reply = await message.channel.send({
+      content: `<@${message.author.id}> ${reason}`,
+      allowedMentions: { users: [message.author.id] },
+    }).catch(() => null);
+    if (reply) {
+      const timer = setTimeout(() => reply.delete().catch(() => {}), 10 * 1000);
+      timer.unref?.();
+    }
+  };
+
+  if (attempt.blocked) {
+    await sendTemporaryReason('too many attempts; try again in 10 minutes.');
+    return true;
+  }
+
+  let pendingId = null;
   try {
+    const checked = await requestVerificationCheck(message.guild, tournamentId, code);
+    if (!checked.ok) {
+      const failure = String(checked.result.reason || checked.result.error || '').toLowerCase();
+      if (['not_found', 'different_tournament', 'registration_rejected', 'already_used'].includes(failure)) {
+        attempt.attempts.push(Date.now());
+        verificationFailedAttempts.set(attempt.key, attempt.attempts);
+      }
+      const reason = failure === 'already_used'
+        ? 'that code was already used.'
+        : failure === 'not_approved_yet'
+          ? 'the registration is not approved yet.'
+          : ['not_found', 'different_tournament', 'registration_rejected'].includes(failure)
+            ? 'that code is not valid for this tournament.'
+            : 'verification is temporarily unavailable.';
+      await sendTemporaryReason(reason);
+      return true;
+    }
+
+    if (!checked.result.registration_id) throw new Error('Check-code API returned no registration_id');
+    pendingId = crypto.randomUUID();
     await createPendingTournamentVerification({
       pendingId,
-      registrationId: null,
+      registrationId: String(checked.result.registration_id),
       starterDiscordId: message.author.id,
       tournamentId,
       guildId: message.guild.id,
       channelId: message.channel.id,
-      code,
-      codeHash: crypto.createHash('sha256').update(`${tournamentId}:${code}`).digest('hex'),
+      status: 'active',
+      teamName: String(checked.result.team_name || 'Your team'),
+      captainName: String(checked.result.captain_name || ''),
+      captainUid: String(checked.result.captain_uid || ''),
+      squad: Array.isArray(checked.result.squad) ? checked.result.squad : [],
+      players: Array.isArray(checked.result.players) ? checked.result.players : [],
+      substitutes: Array.isArray(checked.result.substitutes) ? checked.result.substitutes : [],
+      teammatesNeeded: Math.max(0, Number(checked.result.teammates_needed) || 0),
       expiresAt: new Date(Date.now() + 10 * 60 * 1000),
     });
+    verificationFailedAttempts.delete(attempt.key);
     const prompt = await message.channel.send({
-      content: `<@${message.author.id}>, your code was received. Press **Continue** to finish verification.`,
+      content: `<@${message.author.id}> Code accepted. Press **Continue** to select your teammates.`,
       components: [new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`tver:continue:${pendingId}`).setLabel('Continue').setStyle(ButtonStyle.Primary)
       )],
@@ -1505,49 +1473,30 @@ export async function handleTournamentVerificationMessage(message) {
     timer.unref?.();
     verificationPromptTimers.set(pendingId, timer);
   } catch (error) {
-    await expirePendingTournamentVerificationById(pendingId, message.author.id).catch(() => {});
-    console.error(`[Discord Bot] Could not start private verification for tournament ${tournamentId}:`, error.message);
-    await message.channel.send({
-      content: `<@${message.author.id}>, your code could not be received. Please try again later.`,
-      allowedMentions: { users: [message.author.id] },
-    }).catch(() => {});
+    if (pendingId) await expirePendingTournamentVerificationById(pendingId, message.author.id).catch(() => {});
+    console.error(`[Discord Bot] Could not check or start verification for tournament ${tournamentId}, user ${message.author.id}:`, error);
+    await sendTemporaryReason(error?.code === 11000
+      ? 'a verification for this team is already in progress.'
+      : 'verification is temporarily unavailable. Please try again later.');
   }
   return true;
 }
 
-/** Handle modal, Continue, exact-count teammate selection, and cancellation interactions. */
+/** Handle private Continue, exact-count teammate selection, and cancellation interactions. */
 export async function handleTournamentVerificationInteraction(interaction) {
   const customId = String(interaction.customId || '');
   if (!customId.startsWith('tver:')) return false;
   const [, action, pendingId] = customId.split(':');
 
   try {
-    if (action === 'open_modal' && interaction.isButton?.()) {
-      const match = findTournamentForVerification(interaction.guild?.id, interaction.channelId);
-      if (!match) {
-        await replyPrivate(interaction, { content: 'Tournament verification is not configured in this channel.' });
-        return true;
+    if (!interaction.deferred && !interaction.replied) {
+      if (action === 'continue' && interaction.isButton?.()) {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      } else if ((action === 'select' && interaction.isUserSelectMenu?.()) || (action === 'cancel' && interaction.isButton?.())) {
+        await interaction.deferUpdate();
+      } else {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       }
-      const modal = new ModalBuilder().setCustomId('tver:submit_code').setTitle('Verify with Code');
-      const codeInput = new TextInputBuilder()
-        .setCustomId('verification_code')
-        .setLabel('8-character verification code')
-        .setStyle(TextInputStyle.Short)
-        .setMinLength(8)
-        .setMaxLength(8)
-        .setRequired(true);
-      modal.addComponents(new ActionRowBuilder().addComponents(codeInput));
-      await interaction.showModal(modal);
-      return true;
-    }
-
-    if (action === 'submit_code' && interaction.isModalSubmit?.()) {
-      const match = findTournamentForVerification(interaction.guild?.id, interaction.channelId);
-      if (!match) {
-        await replyPrivate(interaction, { content: 'Tournament verification is not configured in this channel.' });
-        return true;
-      }
-      return await verifyCodeForModal(interaction, match[0], match[1]);
     }
 
     if (!pendingId || !interaction.guild || !interaction.channel) {
@@ -1573,56 +1522,15 @@ export async function handleTournamentVerificationInteraction(interaction) {
     }
 
     if (action === 'continue' && interaction.isButton?.()) {
-      if (pending.status !== 'awaiting_continue') {
+      if (pending.status !== 'active' || pending.completionClaimed) {
         await replyPrivate(interaction, { content: 'This verification is no longer active.' });
         return true;
       }
-      const attempt = getVerificationAttemptState(interaction.guild.id, interaction.user.id);
-      if (attempt.blocked) {
-        await replyPrivate(interaction, { content: 'Too many failed verification attempts. Please wait 10 minutes before trying again.' });
-        return true;
-      }
-      const checkClaimed = await claimPendingTournamentVerificationCheck(pendingId, interaction.user.id);
-      if (!checkClaimed) {
-        await replyPrivate(interaction, { content: 'This verification is already being checked or is no longer active.' });
-        return true;
-      }
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const promptTimer = verificationPromptTimers.get(pendingId);
       if (promptTimer) clearTimeout(promptTimer);
       verificationPromptTimers.delete(pendingId);
       await interaction.message.delete().catch(() => {});
-      let checked;
-      try {
-        checked = await requestVerificationCheck(interaction.guild, pending.tournamentId, pending.code);
-      } catch (error) {
-        await expirePendingTournamentVerificationById(pendingId, interaction.user.id).catch(() => {});
-        console.error(`[Discord Bot] Verification code check failed for tournament ${pending.tournamentId}:`, error.message);
-        await editPrivateReply(interaction, { content: 'Verification is temporarily unavailable. Please start again with your code.' });
-        return true;
-      }
-      if (!checked.ok) {
-        attempt.attempts.push(Date.now());
-        verificationFailedAttempts.set(attempt.key, attempt.attempts);
-        await failPendingVerification(interaction, pendingId, checked.result.message || 'The verification code could not be confirmed.');
-        return true;
-      }
-      try {
-        const activated = await activatePendingTournamentVerification(pendingId, interaction.user.id, checked.result);
-        if (!activated) {
-          await failPendingVerification(interaction, pendingId, 'This verification is no longer active. Start again with a new code.');
-          return true;
-        }
-      } catch (error) {
-        if (error?.code === 11000) {
-          await failPendingVerification(interaction, pendingId, 'A verification for this team is already in progress.');
-          return true;
-        }
-        throw error;
-      }
-      verificationFailedAttempts.delete(attempt.key);
-      const activePending = await getPendingTournamentVerification(pendingId);
-      return await showVerifiedCodeSelection(interaction, activePending);
+      return await showVerifiedCodeSelection(interaction, pending);
     }
 
     if (pending.status !== 'active' || pending.completionClaimed) {
@@ -1636,7 +1544,7 @@ export async function handleTournamentVerificationInteraction(interaction) {
         await replyPrivate(interaction, { content: 'This verification is no longer active.' });
         return true;
       }
-      await interaction.update({ content: 'Verification cancelled. The code remains unused.', components: [] }).catch(() => {});
+      await interaction.editReply({ content: 'Verification cancelled. The code remains unused.', components: [] }).catch(() => {});
       return true;
     }
 
@@ -1671,7 +1579,6 @@ export async function handleTournamentVerificationInteraction(interaction) {
         await replyPrivate(interaction, { content: 'Tournament verification is no longer configured.' });
         return true;
       }
-      await interaction.deferUpdate().catch(() => {});
       return await completeTournamentVerification({
         guild: interaction.guild,
         channel: interaction.channel,
@@ -1687,7 +1594,7 @@ export async function handleTournamentVerificationInteraction(interaction) {
     }
     return true;
   } catch (error) {
-    console.error('[Discord Bot] Private verification interaction failed:', error.message);
+    console.error('[Discord Bot] Private verification interaction failed:', error);
     await replyPrivate(interaction, { content: 'Verification could not be completed. Please try again.' });
     return true;
   }
@@ -4852,10 +4759,8 @@ export async function syncTournamentDiscordChannels(guild, tournament, teams = [
       messageType: 'tournament_verification_info',
       tournamentId,
       payload: {
-        content: `Verify your team for **${tournament.title || savedTournament.tournamentTitle || 'this tournament'}** using the code from your registration.`,
-        components: [new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('tver:open_modal').setLabel('Verify with Code').setStyle(ButtonStyle.Primary)
-        )],
+        content: 'Copy your verification code from the website and paste it in this channel.',
+        components: [],
       },
     }).catch((error) => console.warn(`[Discord Bot] Could not update verification information message for ${tournamentId}:`, error.message));
   }

@@ -262,10 +262,6 @@ async function ensureMongoIndexes() {
     const pendingVerCol = mongoDb.collection('pending_tournament_verifications');
     await pendingVerCol.createIndex({ pendingId: 1 }, { unique: true });
     await pendingVerCol.createIndex(
-      { tournamentId: 1, codeHash: 1 },
-      { unique: true, partialFilterExpression: { status: 'awaiting_continue', codeHash: { $type: 'string' } } }
-    );
-    await pendingVerCol.createIndex(
       { tournamentId: 1, registrationId: 1 },
       { unique: true, partialFilterExpression: { status: 'active', registrationId: { $type: 'string' } } }
     );
@@ -354,8 +350,8 @@ export async function createPendingTournamentVerification(record) {
   ensurePersistenceAvailable();
   await mongoDb.collection('pending_tournament_verifications').insertOne({
     ...record,
-    registrationId: null,
-    status: 'awaiting_continue',
+    registrationId: String(record.registrationId),
+    status: record.status || 'active',
     completionClaimed: false,
     createdAt: new Date(),
   });
@@ -364,46 +360,6 @@ export async function createPendingTournamentVerification(record) {
 export async function getPendingTournamentVerification(pendingId) {
   if (!isMongoConnected() || !pendingId) return null;
   return mongoDb.collection('pending_tournament_verifications').findOne({ pendingId: String(pendingId) });
-}
-
-export async function claimPendingTournamentVerificationCheck(pendingId, starterDiscordId) {
-  if (!isMongoConnected()) return false;
-  const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
-    pendingId: String(pendingId),
-    starterDiscordId: String(starterDiscordId),
-    status: 'awaiting_continue',
-    checkClaimed: { $ne: true },
-    expiresAt: { $gt: new Date() },
-  }, { $set: { checkClaimed: true, checkClaimedAt: new Date() } });
-  return result.modifiedCount === 1;
-}
-
-export async function activatePendingTournamentVerification(pendingId, starterDiscordId, result) {
-  ensurePersistenceAvailable();
-  const now = new Date();
-  const update = await mongoDb.collection('pending_tournament_verifications').updateOne({
-    pendingId: String(pendingId),
-    starterDiscordId: String(starterDiscordId),
-    status: 'awaiting_continue',
-    checkClaimed: true,
-    expiresAt: { $gt: now },
-  }, {
-    $set: {
-      status: 'active',
-      registrationId: String(result.registration_id),
-      teamName: String(result.team_name || ''),
-      captainName: String(result.captain_name || ''),
-      captainUid: String(result.captain_uid || ''),
-      squad: Array.isArray(result.squad) ? result.squad : [],
-      players: Array.isArray(result.players) ? result.players : [],
-      substitutes: Array.isArray(result.substitutes) ? result.substitutes : [],
-      teammatesNeeded: Math.max(0, Number(result.teammates_needed) || 0),
-      completionClaimed: false,
-      checkedAt: now,
-    },
-    $unset: { code: '', codeHash: '', checkClaimed: '', checkClaimedAt: '' },
-  });
-  return update.modifiedCount === 1;
 }
 
 export async function claimPendingTournamentVerification(pendingId, starterDiscordId) {
