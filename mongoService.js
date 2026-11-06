@@ -259,6 +259,18 @@ async function ensureMongoIndexes() {
     const pendingAnncCol = mongoDb.collection('discord_pending_announcements');
     await pendingAnncCol.createIndex({ announcementId: 1 }, { unique: true });
 
+    const pendingVerCol = mongoDb.collection('pending_tournament_verifications');
+    await pendingVerCol.createIndex({ pendingId: 1 }, { unique: true });
+    await pendingVerCol.createIndex(
+      { tournamentId: 1, codeHash: 1 },
+      { unique: true, partialFilterExpression: { status: 'awaiting_continue', codeHash: { $type: 'string' } } }
+    );
+    await pendingVerCol.createIndex(
+      { tournamentId: 1, registrationId: 1 },
+      { unique: true, partialFilterExpression: { status: 'active', registrationId: { $type: 'string' } } }
+    );
+    await pendingVerCol.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
     const staffAppCol = mongoDb.collection('discord_staff_applications');
     await staffAppCol.createIndex({ applicationId: 1 }, { unique: true });
     await staffAppCol.createIndex({ guildId: 1, userId: 1 });
@@ -336,6 +348,126 @@ async function ensureMongoIndexes() {
   } catch (err) {
     console.warn('[MongoDB] ⚠️ Error creating indexes:', err.message);
   }
+}
+
+export async function createPendingTournamentVerification(record) {
+  ensurePersistenceAvailable();
+  await mongoDb.collection('pending_tournament_verifications').insertOne({
+    ...record,
+    registrationId: null,
+    status: 'awaiting_continue',
+    completionClaimed: false,
+    createdAt: new Date(),
+  });
+}
+
+export async function getPendingTournamentVerification(pendingId) {
+  if (!isMongoConnected() || !pendingId) return null;
+  return mongoDb.collection('pending_tournament_verifications').findOne({ pendingId: String(pendingId) });
+}
+
+export async function claimPendingTournamentVerificationCheck(pendingId, starterDiscordId) {
+  if (!isMongoConnected()) return false;
+  const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
+    pendingId: String(pendingId),
+    starterDiscordId: String(starterDiscordId),
+    status: 'awaiting_continue',
+    checkClaimed: { $ne: true },
+    expiresAt: { $gt: new Date() },
+  }, { $set: { checkClaimed: true, checkClaimedAt: new Date() } });
+  return result.modifiedCount === 1;
+}
+
+export async function activatePendingTournamentVerification(pendingId, starterDiscordId, result) {
+  ensurePersistenceAvailable();
+  const now = new Date();
+  const update = await mongoDb.collection('pending_tournament_verifications').updateOne({
+    pendingId: String(pendingId),
+    starterDiscordId: String(starterDiscordId),
+    status: 'awaiting_continue',
+    checkClaimed: true,
+    expiresAt: { $gt: now },
+  }, {
+    $set: {
+      status: 'active',
+      registrationId: String(result.registration_id),
+      teamName: String(result.team_name || ''),
+      captainName: String(result.captain_name || ''),
+      captainUid: String(result.captain_uid || ''),
+      squad: Array.isArray(result.squad) ? result.squad : [],
+      players: Array.isArray(result.players) ? result.players : [],
+      substitutes: Array.isArray(result.substitutes) ? result.substitutes : [],
+      teammatesNeeded: Math.max(0, Number(result.teammates_needed) || 0),
+      completionClaimed: false,
+      checkedAt: now,
+    },
+    $unset: { code: '', codeHash: '', checkClaimed: '', checkClaimedAt: '' },
+  });
+  return update.modifiedCount === 1;
+}
+
+export async function claimPendingTournamentVerification(pendingId, starterDiscordId) {
+  if (!isMongoConnected()) return null;
+  const now = new Date();
+  const result = await mongoDb.collection('pending_tournament_verifications').findOneAndUpdate({
+    pendingId: String(pendingId),
+    starterDiscordId: String(starterDiscordId),
+    status: 'active',
+    completionClaimed: { $ne: true },
+    expiresAt: { $gt: now },
+  }, { $set: { completionClaimed: true, completionClaimedAt: now } }, { returnDocument: 'after' });
+  return result?.value || result || null;
+}
+
+export async function releasePendingTournamentVerificationClaim(pendingId, starterDiscordId) {
+  if (!isMongoConnected()) return false;
+  const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
+    pendingId: String(pendingId),
+    starterDiscordId: String(starterDiscordId),
+    status: 'active',
+    completionClaimed: true,
+    expiresAt: { $gt: new Date() },
+  }, { $set: { completionClaimed: false }, $unset: { completionClaimedAt: '' } });
+  return result.modifiedCount === 1;
+}
+
+export async function finishPendingTournamentVerification(pendingId, starterDiscordId, status = 'completed') {
+  if (!isMongoConnected()) return false;
+  const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
+    pendingId: String(pendingId),
+    starterDiscordId: String(starterDiscordId),
+    status: 'active',
+    completionClaimed: true,
+  }, { $set: { status, completedAt: new Date() }, $unset: { code: '', completionClaimed: '' } });
+  return result.modifiedCount === 1;
+}
+
+export async function cancelPendingTournamentVerification(pendingId, starterDiscordId) {
+  if (!isMongoConnected()) return false;
+  const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
+    pendingId: String(pendingId),
+    starterDiscordId: String(starterDiscordId),
+    status: 'active',
+    completionClaimed: { $ne: true },
+    expiresAt: { $gt: new Date() },
+  }, { $set: { status: 'cancelled', cancelledAt: new Date() }, $unset: { code: '' } });
+  return result.modifiedCount === 1;
+}
+
+export async function expirePendingTournamentVerificationById(pendingId, starterDiscordId) {
+  if (!isMongoConnected()) return false;
+  const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
+    pendingId: String(pendingId), starterDiscordId: String(starterDiscordId), status: { $in: ['awaiting_continue', 'active'] },
+  }, { $set: { status: 'expired', expiredAt: new Date() }, $unset: { code: '', completionClaimed: '' } });
+  return result.modifiedCount === 1;
+}
+
+export async function expirePendingTournamentVerifications() {
+  if (!isMongoConnected()) return 0;
+  const result = await mongoDb.collection('pending_tournament_verifications').updateMany({
+    status: { $in: ['awaiting_continue', 'active'] },
+  }, { $set: { status: 'expired', expiredAt: new Date() }, $unset: { code: '', completionClaimed: '' } });
+  return result.modifiedCount;
 }
 
 /**

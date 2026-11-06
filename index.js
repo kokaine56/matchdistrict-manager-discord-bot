@@ -95,6 +95,7 @@ import {
   fetchTournamentRegistrationsFromBackend,
   handleTournamentVerificationMessage,
   handleTournamentVerificationInteraction,
+  cleanupLegacyPublicVerificationPrompts,
   handlePermanentTournamentDeleteCommand,
   executeTournamentPermanentDeletion,
   resumePendingTournamentDeletions,
@@ -2808,6 +2809,12 @@ client.once(Events.ClientReady, async (readyClient) => {
     }
   } catch (recErr) {
     console.warn('[MongoDB] ⚠️ Error in startup recovery and reconciliation:', recErr.message);
+  }
+
+  for (const guild of readyClient.guilds.cache.values()) {
+    await cleanupLegacyPublicVerificationPrompts(guild).catch((error) => {
+      console.warn(`[Discord Bot] Verification prompt cleanup failed in guild ${guild.id}:`, error.message);
+    });
   }
 
   // Populate each guild's member cache once, serially, before dashboard refreshes.
