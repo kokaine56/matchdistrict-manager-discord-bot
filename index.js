@@ -3175,7 +3175,8 @@ client.on(Events.MessageCreate, async (message) => {
           message.channel,
           args,
           (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
-          client
+          client,
+          message
         );
         return;
       }

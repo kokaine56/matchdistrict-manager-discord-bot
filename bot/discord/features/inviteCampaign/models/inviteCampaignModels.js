@@ -154,6 +154,7 @@ export async function createInviteCampaign(data) {
     requiredInvites: threshold,
     minInviteThreshold: threshold,
     rewards,
+    posterUrl: data.posterUrl ? String(data.posterUrl).trim() : null,
     stayHours: data.stayHours !== undefined ? Number(data.stayHours) : 0,
     minAccountAgeDays: data.minAccountAgeDays !== undefined ? Number(data.minAccountAgeDays) : 0,
     inviteChannelId: String(data.inviteChannelId),
@@ -276,6 +277,9 @@ export async function updateInviteCampaign(campaignId, updates) {
     cleanUpdates.requiredInvites = Math.max(1, Number(cleanUpdates.minInviteThreshold));
   } else if (cleanUpdates.requiredInvites !== undefined && cleanUpdates.minInviteThreshold === undefined) {
     cleanUpdates.minInviteThreshold = Math.max(1, Number(cleanUpdates.requiredInvites));
+  }
+  if (cleanUpdates.posterUrl !== undefined) {
+    cleanUpdates.posterUrl = cleanUpdates.posterUrl ? String(cleanUpdates.posterUrl).trim() : null;
   }
 
   if (isMongoConnected()) {

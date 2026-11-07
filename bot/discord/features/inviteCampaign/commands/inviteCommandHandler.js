@@ -49,6 +49,23 @@ import {
 } from '../services/eligibilityService.js';
 import { hasCampaignAdminPermission } from '../components/inviteCampaignInteractionHandler.js';
 
+export function isValidPosterAttachment(attachment) {
+  if (!attachment) return false;
+  const name = String(attachment.name || '').toLowerCase();
+  const contentType = String(attachment.contentType || '').toLowerCase();
+  const rawUrl = String(attachment.url || attachment.proxyURL || '')
+    .split('?')[0]
+    .toLowerCase();
+
+  const validExts = ['.jpg', '.jpeg', '.png', '.webp'];
+  const validMimes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+
+  const hasValidExt = validExts.some((ext) => name.endsWith(ext) || rawUrl.endsWith(ext));
+  const hasValidMime = validMimes.includes(contentType);
+
+  return hasValidExt || hasValidMime;
+}
+
 /**
  * Handles all `.invite` admin commands.
  *
@@ -58,8 +75,9 @@ import { hasCampaignAdminPermission } from '../components/inviteCampaignInteract
  * @param {string[]} args
  * @param {(payload: string|object, opts?: object) => Promise<any>} replyFn
  * @param {import('discord.js').Client} [client]
+ * @param {import('discord.js').Message} [message]
  */
-export async function handleInviteCommand(guild, member, channel, args, replyFn, client = null) {
+export async function handleInviteCommand(guild, member, channel, args, replyFn, client = null, message = null) {
   if (!guild) {
     return replyFn('❌ This command can only be used inside a Discord server.');
   }
@@ -71,7 +89,15 @@ export async function handleInviteCommand(guild, member, channel, args, replyFn,
     );
   }
 
-  const effectiveClient = client || guild.client || member?.client || null;
+  let effectiveClient = client;
+  let effectiveMessage = message;
+  if (client && !message && (client.attachments || client.author || client.content !== undefined)) {
+    effectiveMessage = client;
+    effectiveClient = client.client || guild?.client || null;
+  } else {
+    effectiveClient = client || guild?.client || member?.client || null;
+  }
+
   const subCmd = (args[0] || '').toLowerCase();
 
   if (!subCmd || subCmd === 'help') {
@@ -82,6 +108,9 @@ export async function handleInviteCommand(guild, member, channel, args, replyFn,
         `• \`.invite pause\` — Pause an Active campaign (joins during pause are not counted)\n` +
         `• \`.invite resume\` — Resume a Paused campaign\n` +
         `• \`.invite end\` — End the current campaign (with confirmation step)\n` +
+        `• \`.invite poster\` — Upload an announcement poster image (JPG, JPEG, PNG, WEBP) to display on the panel\n` +
+        `• \`.invite poster remove\` — Remove the announcement poster and restore the text-based panel embed\n` +
+        `• \`.invite min <number>\` — Set the minimum successful invite threshold\n` +
         `• \`.invite status\` — View campaign status, total campaign joins, and summary statistics\n` +
         `• \`.invite leaderboard\` — View total successful joins per user\n` +
         `• \`.invite links [@user]\` — View individual member invite links and join counts\n` +
@@ -115,6 +144,71 @@ export async function handleInviteCommand(guild, member, channel, args, replyFn,
       });
     }
     return replyFn(`Minimum successful invites set to ${minimum}.`);
+  }
+
+  // Upload or manage campaign poster image
+  if (subCmd === 'poster') {
+    const action = (args[1] || '').toLowerCase();
+
+    const campaign = await getCurrentGuildCampaign(guild.id);
+    if (!campaign) {
+      return replyFn('❌ No active Invite & Earn campaign found in this server.');
+    }
+
+    if (action === 'remove' || action === 'clear' || action === 'delete') {
+      const updated = await updateInviteCampaign(campaign.campaignId, {
+        posterUrl: null,
+      });
+
+      if (effectiveClient && updated?.panelMessageId) {
+        await ensureOrUpdateCampaignPanel(effectiveClient, updated, {
+          allowCreateIfMissing: false,
+        });
+      }
+
+      return replyFn(
+        '✅ **Campaign poster removed.** The original text-based announcement embed has been restored on the panel.'
+      );
+    }
+
+    const attachment =
+      effectiveMessage?.attachments instanceof Map
+        ? Array.from(effectiveMessage.attachments.values())[0]
+        : effectiveMessage?.attachments?.first?.() ||
+          (Array.isArray(effectiveMessage?.attachments) ? effectiveMessage.attachments[0] : null) ||
+          effectiveMessage?.attachment ||
+          null;
+
+    if (!attachment) {
+      return replyFn(
+        '❌ **No image attached:** Please attach a poster image (JPG, JPEG, PNG, or WEBP) when using `.invite poster`.\n**Usage:** `.invite poster` with an image attachment.'
+      );
+    }
+
+    if (!isValidPosterAttachment(attachment)) {
+      return replyFn(
+        '❌ **Invalid image format:** Only **JPG**, **JPEG**, **PNG**, and **WEBP** images are supported for campaign posters.'
+      );
+    }
+
+    const posterUrl = String(attachment.url || attachment.proxyURL || '').trim();
+    if (!posterUrl) {
+      return replyFn('❌ Could not retrieve image URL from the attached file.');
+    }
+
+    const updated = await updateInviteCampaign(campaign.campaignId, {
+      posterUrl,
+    });
+
+    if (effectiveClient && updated?.panelMessageId) {
+      await ensureOrUpdateCampaignPanel(effectiveClient, updated, {
+        allowCreateIfMissing: false,
+      });
+    }
+
+    return replyFn(
+      '✅ **Campaign poster updated!** The persistent Invite & Earn panel has been updated with the poster.'
+    );
   }
 
   // 1. .invite create

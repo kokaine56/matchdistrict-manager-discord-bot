@@ -1482,4 +1482,184 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     assert.equal(btn.custom_id, `inv_cmp:refresh_lb:${campaign.campaignId}`);
     assert.equal(btn.disabled, false);
   });
+
+  await t.test('12. Invite Campaign Poster Support — Admin Command, Dynamic Panel Display, Replacement, Removal & Restart Recovery', async () => {
+    const env = createTestEnvironment();
+    const admin = env.addMember('admin-poster', { isAdminPerm: true });
+    const regularMember = env.addMember('member-poster');
+
+    // 1. Create and start a campaign
+    const campaign = await createInviteCampaign({
+      guildId: env.guildId,
+      name: 'Poster Championship',
+      description: 'Invite members to win real cash!',
+      status: CAMPAIGN_STATUS.DRAFT,
+      rewards: [
+        { position: 1, amount: 500 },
+        { position: 2, amount: 250 },
+      ],
+      endAt: new Date(Date.now() + 86400000),
+      inviteChannelId: env.inviteChannel.id,
+      announcementChannelId: env.anncChannel.id,
+      createdBy: admin.id,
+    });
+
+    await handleInviteCommand(env.guild, admin, env.inviteChannel, ['start'], async () => {}, env.client);
+    let activeCampaign = await getInviteCampaignById(campaign.campaignId);
+    assert.equal(activeCampaign.status, CAMPAIGN_STATUS.ACTIVE);
+    assert.equal(env.inviteChannel._sent.length, 1);
+    const panelMsg = env.inviteChannel._sent[0];
+
+    // Initial state: No poster -> Text-based embed + Create Link button
+    let panelPayload = buildCampaignPanelPayload(activeCampaign);
+    assert.equal(panelPayload.embeds.length, 1);
+    let embedJson = panelPayload.embeds[0].toJSON();
+    assert.equal(embedJson.title, '🔗 Poster Championship');
+    assert.equal(embedJson.description, 'Invite members to win real cash!');
+    assert.ok(embedJson.fields.some((f) => f.name === '📌 Status'));
+    assert.ok(embedJson.fields.some((f) => f.name === '🏆 Prize Distribution'));
+    assert.ok(embedJson.fields.some((f) => f.name === '⏰ Ends At (IST)'));
+    assert.equal(embedJson.image, undefined);
+    assert.equal(panelPayload.components[0].components[0].toJSON().label, 'Create Link');
+
+    // 2. Permission check: Non-admin using .invite poster is denied
+    let response = '';
+    await handleInviteCommand(
+      env.guild,
+      regularMember,
+      env.inviteChannel,
+      ['poster'],
+      (text) => { response = text; },
+      env.client,
+      { attachments: [{ name: 'poster.png', url: 'https://cdn.discordapp.com/attachments/1/2/poster.png' }] }
+    );
+    assert.match(response, /Permission Denied/);
+
+    // 3. No image attached -> Shows clear usage message
+    response = '';
+    await handleInviteCommand(
+      env.guild,
+      admin,
+      env.inviteChannel,
+      ['poster'],
+      (text) => { response = text; },
+      env.client,
+      { attachments: [] }
+    );
+    assert.match(response, /No image attached/);
+    assert.match(response, /\.invite poster/);
+
+    // 4. Invalid file format (e.g., .mp4, .pdf) -> Error message
+    response = '';
+    await handleInviteCommand(
+      env.guild,
+      admin,
+      env.inviteChannel,
+      ['poster'],
+      (text) => { response = text; },
+      env.client,
+      { attachments: [{ name: 'clip.mp4', contentType: 'video/mp4', url: 'https://cdn.discordapp.com/attachments/1/2/clip.mp4' }] }
+    );
+    assert.match(response, /Invalid image format/);
+
+    // 5. Valid upload with PNG -> Poster saved, persistent panel updated in place
+    response = '';
+    const pngUrl = 'https://cdn.discordapp.com/attachments/1/2/campaign_banner.png';
+    await handleInviteCommand(
+      env.guild,
+      admin,
+      env.inviteChannel,
+      ['poster'],
+      (text) => { response = text; },
+      env.client,
+      { attachments: [{ name: 'campaign_banner.PNG', contentType: 'image/png', url: pngUrl }] }
+    );
+    assert.match(response, /Campaign poster updated/);
+
+    // Check MongoDB / doc persistence
+    activeCampaign = await getInviteCampaignById(campaign.campaignId);
+    assert.equal(activeCampaign.posterUrl, pngUrl);
+
+    // Check persistent panel message: Edited in place, NO duplicate sent messages
+    assert.equal(env.inviteChannel._sent.length, 1, 'Only 1 persistent panel message exists');
+    assert.equal(panelMsg.edits.length, 1, 'Panel message was edited');
+    const latestEdit = panelMsg.edits[panelMsg.edits.length - 1];
+    assert.equal(latestEdit.embeds.length, 1);
+    const posterEmbedJson = latestEdit.embeds[0].toJSON();
+    // Verification of Dynamic Display Logic:
+    // Poster exists -> Show poster image + Create Link button only.
+    // Text-based fields, title, description are completely absent!
+    assert.equal(posterEmbedJson.image?.url, pngUrl);
+    assert.equal(posterEmbedJson.title, undefined);
+    assert.equal(posterEmbedJson.description, undefined);
+    assert.equal(posterEmbedJson.fields, undefined);
+    assert.equal(latestEdit.components[0].components[0].toJSON().label, 'Create Link');
+    assert.equal(latestEdit.components[0].components[0].toJSON().disabled, false);
+
+    // 6. Support replacing existing poster (testing WEBP format)
+    response = '';
+    const webpUrl = 'https://cdn.discordapp.com/attachments/1/2/updated_poster.webp';
+    await handleInviteCommand(
+      env.guild,
+      admin,
+      env.inviteChannel,
+      ['poster'],
+      (text) => { response = text; },
+      env.client,
+      { attachments: [{ name: 'updated_poster.webp', contentType: 'image/webp', url: webpUrl }] }
+    );
+    assert.match(response, /Campaign poster updated/);
+    activeCampaign = await getInviteCampaignById(campaign.campaignId);
+    assert.equal(activeCampaign.posterUrl, webpUrl);
+    assert.equal(panelMsg.edits.length, 2);
+    assert.equal(panelMsg.edits[1].embeds[0].toJSON().image?.url, webpUrl);
+
+    // 7. Support JPG / JPEG formats
+    response = '';
+    const jpgUrl = 'https://cdn.discordapp.com/attachments/1/2/promo.jpg';
+    await handleInviteCommand(
+      env.guild,
+      admin,
+      env.inviteChannel,
+      ['poster'],
+      (text) => { response = text; },
+      env.client,
+      { attachments: [{ name: 'promo.JPG', contentType: 'image/jpeg', url: jpgUrl }] }
+    );
+    assert.match(response, /Campaign poster updated/);
+    activeCampaign = await getInviteCampaignById(campaign.campaignId);
+    assert.equal(activeCampaign.posterUrl, jpgUrl);
+
+    // 8. Bot Restart & Recovery restores poster URL and updates panel
+    await recoverInviteCampaignsOnStartup(env.client);
+    activeCampaign = await getInviteCampaignById(campaign.campaignId);
+    assert.equal(activeCampaign.posterUrl, jpgUrl);
+    assert.equal(env.inviteChannel._sent.length, 1, 'No duplicate messages created after restart');
+
+    // 9. .invite poster remove removes the poster and restores text-based embed
+    response = '';
+    await handleInviteCommand(
+      env.guild,
+      admin,
+      env.inviteChannel,
+      ['poster', 'remove'],
+      (text) => { response = text; },
+      env.client
+    );
+    assert.match(response, /Campaign poster removed/);
+    activeCampaign = await getInviteCampaignById(campaign.campaignId);
+    assert.equal(activeCampaign.posterUrl, null);
+
+    // Persistent panel restored text-based embed
+    const lastEdit = panelMsg.edits[panelMsg.edits.length - 1];
+    assert.equal(env.inviteChannel._sent.length, 1, 'Still only 1 persistent panel message');
+    const restoredEmbedJson = lastEdit.embeds[0].toJSON();
+    assert.equal(restoredEmbedJson.title, '🔗 Poster Championship');
+    assert.equal(restoredEmbedJson.description, 'Invite members to win real cash!');
+    assert.ok(restoredEmbedJson.fields.some((f) => f.name === '📌 Status'));
+    assert.ok(restoredEmbedJson.fields.some((f) => f.name === '🏆 Prize Distribution'));
+    assert.ok(restoredEmbedJson.fields.some((f) => f.name === '⏰ Ends At (IST)'));
+    assert.equal(restoredEmbedJson.image, undefined);
+    assert.equal(lastEdit.components[0].components[0].toJSON().label, 'Create Link');
+  });
 });

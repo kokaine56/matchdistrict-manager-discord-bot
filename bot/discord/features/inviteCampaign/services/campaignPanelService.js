@@ -54,6 +54,34 @@ export function formatPanelStatusDisplay(campaign) {
  */
 export function buildCampaignPanelPayload(campaign) {
   const isActive = campaign.status === CAMPAIGN_STATUS.ACTIVE;
+
+  const button = new ButtonBuilder()
+    .setCustomId(`inv_cmp:generate:${campaign.campaignId}`)
+    .setLabel('Create Link')
+    .setEmoji('🔗')
+    .setStyle(isActive ? ButtonStyle.Success : ButtonStyle.Secondary)
+    .setDisabled(!isActive);
+
+  const row = new ActionRowBuilder().addComponents(button);
+
+  const posterUrl =
+    campaign?.posterUrl && typeof campaign.posterUrl === 'string'
+      ? campaign.posterUrl.trim()
+      : null;
+
+  // Dynamic Display Logic:
+  // Poster exists -> Show poster image + Create Link button only (no text-based campaign embed info).
+  if (posterUrl) {
+    const posterEmbed = new EmbedBuilder().setImage(posterUrl);
+    return {
+      content: '',
+      embeds: [posterEmbed],
+      files: [],
+      components: [row],
+    };
+  }
+
+  // Poster does not exist -> Show existing text-based embed + Create Link button.
   const color =
     campaign.status === CAMPAIGN_STATUS.ACTIVE
       ? 0x2ecc71
@@ -97,17 +125,10 @@ export function buildCampaignPanelPayload(campaign) {
     .setFooter({ text: 'MatchDistrict Invite Tracker' })
     .setTimestamp(new Date());
 
-  const button = new ButtonBuilder()
-    .setCustomId(`inv_cmp:generate:${campaign.campaignId}`)
-    .setLabel('Create Link')
-    .setEmoji('🔗')
-    .setStyle(isActive ? ButtonStyle.Success : ButtonStyle.Secondary)
-    .setDisabled(!isActive);
-
-  const row = new ActionRowBuilder().addComponents(button);
-
   return {
+    content: '',
     embeds: [embed],
+    files: [],
     components: [row],
   };
 }
