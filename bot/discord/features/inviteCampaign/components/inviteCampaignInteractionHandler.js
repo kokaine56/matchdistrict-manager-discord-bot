@@ -77,13 +77,14 @@ export function clearInviteInteractionCaches() {
  *
  * Shows the live count and a copy-friendly promotional message.
  */
-export function formatUserInviteResponsePayload(campaignId, successfulInvites, inviteUrl) {
+export function formatUserInviteResponsePayload(campaignId, successfulInvites, inviteUrl, campaignName = 'Invite & Earn') {
   const count = Math.max(0, Number(successfulInvites || 0));
   const promotionalMessage =
-    `Want to earn real money?\n\n` +
-    `Invite friends to Match District, earn rewards, participate in tournaments and win exciting prize pools!\n\n` +
-    `Join here: ${inviteUrl}`;
-  const content = `**Your Successful Invites: ${count}**\n\n\`\`\`\n${promotionalMessage}\n\`\`\``;
+    `🎉 Want to earn real money?\n\n` +
+    `Join **Match District's ${campaignName}**! Invite your friends, earn rewards, participate in BGMI tournaments and win exciting prize pools!\n\n` +
+    `🔗 **Join using my personal invite link:** ${inviteUrl}\n\n` +
+    `🚀 Join now and let's win together!`;
+  const content = `**Your Successful Invites: ${count}**\n\n${promotionalMessage}`;
 
   return { content };
 }
@@ -106,7 +107,8 @@ export async function refreshActiveUserInviteView(campaignId, userId, participan
   const payload = formatUserInviteResponsePayload(
     campaignId,
     participant?.successfulInvites ?? 0,
-    view.inviteUrl
+    view.inviteUrl,
+    view.campaignName
   );
 
   try {
@@ -489,7 +491,8 @@ async function handleGenerateInviteButton(interaction, campaignId) {
     const payload = formatUserInviteResponsePayload(
       campaign.campaignId,
       successful,
-      inviteRecord.inviteUrl
+      inviteRecord.inviteUrl,
+      campaign.name
     );
 
     await sendEphemeral(payload);
@@ -498,6 +501,7 @@ async function handleGenerateInviteButton(interaction, campaignId) {
     activeUserInviteViews.set(`${campaign.campaignId}:${userId}`, {
       interaction,
       inviteUrl: inviteRecord.inviteUrl,
+      campaignName: campaign.name,
       updatedAt: Date.now(),
     });
 
@@ -534,12 +538,14 @@ async function handleRefreshInviteButton(interaction, campaignId) {
   const payload = formatUserInviteResponsePayload(
     campaign.campaignId,
     participant?.successfulInvites ?? 0,
-    inviteRecord.inviteUrl
+    inviteRecord.inviteUrl,
+    campaign.name
   );
 
   activeUserInviteViews.set(`${campaign.campaignId}:${userId}`, {
     interaction,
     inviteUrl: inviteRecord.inviteUrl,
+    campaignName: campaign.name,
     updatedAt: Date.now(),
   });
 

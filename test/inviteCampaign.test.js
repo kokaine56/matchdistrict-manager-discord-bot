@@ -355,8 +355,11 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     });
     assert.equal(env.invites.size, 1);
     assert.match(reply1.content, /^\*\*Your Successful Invites: \d+\*\*/);
-    assert.match(reply1.content, /Want to earn real money\?/);
-    assert.match(reply1.content, /Join here: https:\/\/discord\.gg\//);
+    assert.match(reply1.content, /🎉 Want to earn real money\?/);
+    assert.match(reply1.content, /Join \*\*Match District's Create Link Test\*\*!/);
+    assert.match(reply1.content, /participate in BGMI tournaments/);
+    assert.match(reply1.content, /🔗 \*\*Join using my personal invite link:\*\* https:\/\/discord\.gg\//);
+    assert.match(reply1.content, /🚀 Join now and let's win together!/);
     assert.doesNotMatch(reply1.content, /prize distribution|eligibility|Your Invite Link/i);
     assert.equal(reply1.components, undefined);
 
