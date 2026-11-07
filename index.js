@@ -196,6 +196,17 @@ import {
   startInviteCampaignScheduler,
   stopInviteCampaignScheduler,
 } from './bot/discord/features/inviteCampaign/index.js';
+import {
+  handleArenaCommand,
+  handleVolunteerCommand,
+  handleMyMatchesCommand,
+  handleReleaseCommand,
+  handleArenaInteraction,
+  recoverArenaOnStartup,
+  startArenaScheduler,
+  getArenaMatch,
+  processWinnerScreenshot,
+} from './bot/discord/features/arena/index.js';
 
 
 export {
@@ -2843,6 +2854,12 @@ client.once(Events.ClientReady, async (readyClient) => {
   });
   startInviteCampaignScheduler(readyClient);
 
+  // Recover active 1v1 Challenge Arena matches, re-arm timers, and start arena scheduler
+  await recoverArenaOnStartup(readyClient).catch((arenaErr) => {
+    console.warn('[Arena] ⚠️ Startup recovery warning:', arenaErr.message);
+  });
+  startArenaScheduler(readyClient);
+
   // Restore each persisted dashboard in place and clean its command channel after every restart.
   for (const guild of readyClient.guilds.cache.values()) {
     const tournaments = guildSettingsCache[guild.id]?.tournaments || {};
@@ -3179,6 +3196,72 @@ client.on(Events.MessageCreate, async (message) => {
           message
         );
         return;
+      } else if (cmd === 'arena') {
+        await handleArenaCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          args,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+          client,
+          message
+        );
+        return;
+      } else if (cmd === 'volunteer') {
+        await handleVolunteerCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          args,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+          client,
+          message
+        );
+        return;
+      } else if (cmd === 'mymatches') {
+        await handleMyMatchesCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          args,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+          client,
+          message
+        );
+        return;
+      } else if (cmd === 'release') {
+        await handleReleaseCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          args,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+          client,
+          message
+        );
+        return;
+      }
+    }
+
+    // Check if this is an arena match channel screenshot submission from the assigned volunteer
+    if (message.guild && message.channel?.name?.startsWith('match-md-')) {
+      const matchId = message.channel.name.slice('match-'.length).toUpperCase();
+      const match = await getArenaMatch(matchId);
+      if (
+        match &&
+        match.status === 'LIVE' &&
+        match.pendingWinnerId &&
+        match.volunteerId === message.author?.id
+      ) {
+        const attachment =
+          message.attachments instanceof Map
+            ? Array.from(message.attachments.values())[0]
+            : message.attachments?.first?.() ||
+              (Array.isArray(message.attachments) ? message.attachments[0] : null);
+        if (attachment?.url) {
+          await processWinnerScreenshot(message.guild, match, message.member, attachment.url);
+          return;
+        }
       }
     }
 
@@ -3242,6 +3325,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // Handle Invite & Earn campaign interactions (panel generate button, admin modals & channel selects)
   if (interaction.customId?.startsWith('inv_cmp:')) {
     const handled = await handleInviteCampaignInteraction(interaction);
+    if (handled) return;
+  }
+
+  // Handle 1v1 Challenge Arena interactions (buttons, modals, challenge & match lifecycle)
+  if (interaction.customId?.startsWith('arena:')) {
+    const handled = await handleArenaInteraction(interaction);
     if (handled) return;
   }
 

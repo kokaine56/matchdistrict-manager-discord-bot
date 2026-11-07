@@ -2,6 +2,7 @@ import { queueChannelSend, queueMessageEdit } from './discordQueue.js';
 import crypto from 'crypto';
 import { MongoClient } from 'mongodb';
 import { ensureInviteCampaignIndexes } from './bot/discord/features/inviteCampaign/models/inviteCampaignModels.js';
+import { ensureArenaIndexes } from './bot/discord/features/arena/models/arenaModels.js';
 
 let discordAuditClient = null;
 let logTournamentActionFn = null;
@@ -342,6 +343,7 @@ async function ensureMongoIndexes() {
     await cfgPendingCol.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
     await ensureInviteCampaignIndexes(mongoDb);
+    await ensureArenaIndexes(mongoDb);
 
     console.log('[MongoDB] 🔒 Indexes verified across managed collections.');
   } catch (err) {
