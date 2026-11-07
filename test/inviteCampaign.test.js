@@ -319,6 +319,13 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
       },
     });
     assert.equal(env.invites.size, 1);
+    assert.match(reply1.content, /^\*\*Your Successful Invites: \d+\*\*/);
+    assert.match(reply1.content, /Want to earn real money\?/);
+    assert.match(reply1.content, /Join here: https:\/\/discord\.gg\//);
+    assert.doesNotMatch(reply1.content, /prize distribution|eligibility|Your Invite Link/i);
+    const personalButton = reply1.components[0].components[0].toJSON();
+    assert.equal(personalButton.label, 'Copy Message');
+    assert.match(personalButton.custom_id, /^inv_cmp:copy_message:/);
 
     // Clear cooldown and click "Create Link" a second time -> reuses existing link, no duplicate created
     clearInviteInteractionCaches();
@@ -340,6 +347,18 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     });
     assert.equal(env.invites.size, 1);
     assert.equal(reply1.content, reply2.content);
+
+    let copyModal = null;
+    await handleInviteCampaignInteraction({
+      customId: personalButton.custom_id,
+      guild: env.guild,
+      member,
+      user: member.user,
+      isButton: () => true,
+      showModal: async (modal) => { copyModal = modal; },
+    });
+    assert.equal(copyModal.toJSON().title, 'Copy Invite Message');
+    assert.match(copyModal.toJSON().components[0].components[0].value, /Join here: https:\/\/discord\.gg\//);
   });
 
   await t.test('2. Creating a Campaign with Custom Reward Amounts & Custom Minimum Invite Threshold (Plus Editing Before Start)', async () => {

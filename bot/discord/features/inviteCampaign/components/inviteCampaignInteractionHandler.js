@@ -75,25 +75,45 @@ export function clearInviteInteractionCaches() {
 /**
  * Formats the clean user-facing invite counter message:
  *
- * Your Successful Invites: 5
- * Your Invite Link: https://discord.gg/BT9392WMQ5
+ * Shows the live count and a copy-friendly promotional message.
  */
 export function formatUserInviteResponsePayload(campaignId, successfulInvites, inviteUrl) {
   const count = Math.max(0, Number(successfulInvites || 0));
-  const content =
-    `Your Successful Invites: ${count}\n` +
-    `Your Invite Link: ${inviteUrl}`;
+  const promotionalMessage =
+    `Want to earn real money?\n\n` +
+    `Invite friends to Match District, earn rewards, participate in tournaments and win exciting prize pools!\n\n` +
+    `Join here: ${inviteUrl}`;
+  const content = `**Your Successful Invites: ${count}**\n\n\`\`\`\n${promotionalMessage}\n\`\`\``;
 
-  const refreshBtn = new ButtonBuilder()
-    .setCustomId(`inv_cmp:refresh:${campaignId}`)
-    .setLabel('Refresh')
-    .setEmoji('🔄')
+  const copyBtn = new ButtonBuilder()
+    .setCustomId(`inv_cmp:copy_message:${campaignId}`)
+    .setLabel('Copy Message')
+    .setEmoji('📋')
     .setStyle(ButtonStyle.Secondary);
 
   return {
     content,
-    components: [new ActionRowBuilder().addComponents(refreshBtn)],
+    components: [new ActionRowBuilder().addComponents(copyBtn)],
   };
+}
+
+function buildCopyMessageModal(campaignId, inviteUrl) {
+  const promotionalMessage =
+    `Want to earn real money?\n\n` +
+    `Invite friends to Match District, earn rewards, participate in tournaments and win exciting prize pools!\n\n` +
+    `Join here: ${inviteUrl}`;
+  const messageInput = new TextInputBuilder()
+    .setCustomId('message')
+    .setLabel('Copy your complete invite message')
+    .setStyle(TextInputStyle.Paragraph)
+    .setValue(promotionalMessage)
+    .setRequired(true)
+    .setMaxLength(500);
+
+  return new ModalBuilder()
+    .setCustomId(`inv_cmp:copy_message_modal:${campaignId}`)
+    .setTitle('Copy Invite Message')
+    .addComponents(new ActionRowBuilder().addComponents(messageInput));
 }
 
 /**
@@ -747,6 +767,33 @@ export async function handleInviteCampaignInteraction(interaction) {
   if (interaction.isButton?.() && customId.startsWith('inv_cmp:generate:')) {
     const campaignId = customId.slice('inv_cmp:generate:'.length);
     return handleGenerateInviteButton(interaction, campaignId);
+  }
+
+  // Opens the saved invite message in a selectable field for easy mobile copying.
+  if (interaction.isButton?.() && customId.startsWith('inv_cmp:copy_message:')) {
+    const campaignId = customId.slice('inv_cmp:copy_message:'.length);
+    const campaign = await getInviteCampaignById(campaignId);
+    const user = interaction.user || interaction.member?.user;
+    if (!campaign || campaign.guildId !== String(guild?.id) || !user) {
+      await interaction.reply({ content: '❌ This invite message is no longer available.', ephemeral: true });
+      return true;
+    }
+    const inviteRecord = await getCampaignInviteByUser(campaign.campaignId, String(user.id));
+    if (!inviteRecord?.inviteUrl) {
+      await interaction.reply({ content: '❌ Your personal invite link could not be found. Click **Create Link** first.', ephemeral: true });
+      return true;
+    }
+    await interaction.showModal(buildCopyMessageModal(campaignId, inviteRecord.inviteUrl));
+    return true;
+  }
+
+  if (interaction.isModalSubmit?.() && customId.startsWith('inv_cmp:copy_message_modal:')) {
+    const message = getOptionalModalField(interaction, 'message');
+    await interaction.reply({
+      content: `\`\`\`\n${message}\n\`\`\``,
+      ephemeral: true,
+    });
+    return true;
   }
 
   // 1b. Public member button: Refresh personal invite count
