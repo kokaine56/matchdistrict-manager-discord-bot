@@ -215,6 +215,43 @@ export function buildLeaderboardMessagePayload(campaign, rows, pngResult) {
   };
 }
 
+async function fetchLeaderboardAvatars(client, rows) {
+  const avatars = new Map();
+  if (typeof globalThis.fetch !== 'function') return avatars;
+  await Promise.all(rows.map(async (row) => {
+    const userId = String(row.userId || '');
+    if (!userId) return;
+    let avatarUrl = null;
+    try {
+      const user = await client.users?.fetch?.(userId);
+      avatarUrl = user?.displayAvatarURL?.({ extension: 'png', size: 64, forceStatic: true }) || null;
+    } catch {
+      // Fall back to Discord's deterministic default avatar for this user ID below.
+    }
+    const urls = avatarUrl ? [avatarUrl] : [];
+    try {
+      const defaultIndex = Number((BigInt(userId) >> 22n) % 6n);
+      urls.push(`https://cdn.discordapp.com/embed/avatars/${defaultIndex}.png`);
+    } catch {
+      return;
+    }
+    for (const url of urls) {
+      try {
+        const response = await fetch(url, { signal: AbortSignal.timeout(4000) });
+        if (!response.ok) continue;
+        const bytes = Buffer.from(await response.arrayBuffer());
+        if (bytes.length <= 1024 * 1024) {
+          avatars.set(userId, bytes);
+          return;
+        }
+      } catch {
+        // Try the Discord default avatar when the custom avatar is unavailable.
+      }
+    }
+  }));
+  return avatars;
+}
+
 /**
  * Generates the PNG leaderboard image and posts or edits the managed announcement leaderboard message
  * in place using `campaign.leaderboardMessageId`.
@@ -275,7 +312,8 @@ export async function ensureOrUpdateLeaderboardMessage(client, campaign, options
     rows = computeCampaignLeaderboardRows(freshCampaign, participants, guild);
   }
 
-  const png = generateLeaderboardPng(freshCampaign, rows);
+  const avatars = await fetchLeaderboardAvatars(client, rows);
+  const png = generateLeaderboardPng(freshCampaign, rows, avatars);
   const payload = buildLeaderboardMessagePayload(freshCampaign, rows, png);
 
   const dbUpdates = {

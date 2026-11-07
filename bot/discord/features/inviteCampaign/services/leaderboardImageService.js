@@ -336,6 +336,73 @@ function encodePngRgba(width, height, rgba) {
   ]);
 }
 
+function decodeAvatarPng(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.toString('hex', 0, 8) !== '89504e470d0a1a0a') return null;
+  let width = 0, height = 0, bitDepth = 0, colorType = 0;
+  const idat = [];
+  for (let offset = 8; offset + 12 <= buffer.length;) {
+    const length = buffer.readUInt32BE(offset);
+    const type = buffer.toString('ascii', offset + 4, offset + 8);
+    const data = buffer.subarray(offset + 8, offset + 8 + length);
+    if (type === 'IHDR') {
+      width = data.readUInt32BE(0); height = data.readUInt32BE(4);
+      bitDepth = data[8]; colorType = data[9];
+      if (bitDepth !== 8 || ![2, 6].includes(colorType) || data[12] !== 0) return null;
+    } else if (type === 'IDAT') idat.push(data);
+    else if (type === 'IEND') break;
+    offset += length + 12;
+  }
+  const channels = colorType === 6 ? 4 : 3;
+  if (!width || !height || width > 512 || height > 512 || !idat.length) return null;
+  const stride = width * channels;
+  const packed = zlib.inflateSync(Buffer.concat(idat));
+  const raw = Buffer.alloc(stride * height);
+  let sourceOffset = 0;
+  for (let y = 0; y < height; y++) {
+    const filter = packed[sourceOffset++];
+    for (let x = 0; x < stride; x++) {
+      const value = packed[sourceOffset++];
+      const left = x >= channels ? raw[y * stride + x - channels] : 0;
+      const above = y ? raw[(y - 1) * stride + x] : 0;
+      const upperLeft = y && x >= channels ? raw[(y - 1) * stride + x - channels] : 0;
+      let predictor = 0;
+      if (filter === 1) predictor = left;
+      else if (filter === 2) predictor = above;
+      else if (filter === 3) predictor = Math.floor((left + above) / 2);
+      else if (filter === 4) {
+        const p = left + above - upperLeft;
+        const a = Math.abs(p - left), b = Math.abs(p - above), c = Math.abs(p - upperLeft);
+        predictor = a <= b && a <= c ? left : b <= c ? above : upperLeft;
+      } else if (filter !== 0) return null;
+      raw[y * stride + x] = (value + predictor) & 255;
+    }
+  }
+  const rgba = Buffer.alloc(width * height * 4);
+  for (let i = 0, j = 0; i < raw.length; i += channels, j += 4) {
+    rgba[j] = raw[i]; rgba[j + 1] = raw[i + 1]; rgba[j + 2] = raw[i + 2];
+    rgba[j + 3] = channels === 4 ? raw[i + 3] : 255;
+  }
+  return { width, height, rgba };
+}
+
+function drawCircularAvatar(rgba, width, height, avatar, x, y, size) {
+  const decoded = decodeAvatarPng(avatar);
+  if (!decoded) return;
+  const radius = size / 2;
+  for (let dy = 0; dy < size; dy++) {
+    for (let dx = 0; dx < size; dx++) {
+      const ox = dx + 0.5 - radius, oy = dy + 0.5 - radius;
+      if (ox * ox + oy * oy > radius * radius) continue;
+      const sx = Math.min(decoded.width - 1, Math.floor((dx / size) * decoded.width));
+      const sy = Math.min(decoded.height - 1, Math.floor((dy / size) * decoded.height));
+      const si = (sy * decoded.width + sx) * 4;
+      const di = ((y + dy) * width + x + dx) * 4;
+      rgba[di] = decoded.rgba[si]; rgba[di + 1] = decoded.rgba[si + 1];
+      rgba[di + 2] = decoded.rgba[si + 2]; rgba[di + 3] = decoded.rgba[si + 3];
+    }
+  }
+}
+
 function fillRect(rgba, width, height, x, y, w, h, color) {
   const [r, g, b, a = 255] = color;
   const x0 = Math.max(0, Math.floor(x));
@@ -423,7 +490,7 @@ function truncateText(text, maxChars) {
  *   minInviteThreshold: number
  * }}
  */
-export function generateLeaderboardPng(campaign, rows = []) {
+export function generateLeaderboardPng(campaign, rows = [], avatars = new Map()) {
   const safeRows = Array.isArray(rows) ? rows : [];
   const width = 820;
   const headerHeight = 92;
@@ -567,12 +634,17 @@ export function generateLeaderboardPng(campaign, rows = []) {
       }
 
       drawText(rgba, width, height, `#${row.rank}`, colRankX, ry + 15, 2, rankColor, 'center');
+      const avatarSize = 28;
+      const avatarX = 140;
+      const avatarY = ry + Math.floor((rowHeight - avatarSize) / 2);
+      const avatarBuffer = avatars instanceof Map ? avatars.get(String(row.userId)) : avatars?.[String(row.userId)];
+      if (avatarBuffer) drawCircularAvatar(rgba, width, height, avatarBuffer, avatarX, avatarY, avatarSize);
       drawText(
         rgba,
         width,
         height,
         truncateText(row.username, 24),
-        colUserX,
+        176,
         ry + 15,
         2,
         whiteText,
