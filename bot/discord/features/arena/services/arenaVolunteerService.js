@@ -26,23 +26,11 @@ export async function handleClaimMatch(guild, member, matchId) {
   const config = await getArenaConfig(guild.id);
   const limit = Math.max(1, Number(config?.volunteerMatchLimit || 1));
 
-  // Auto-create volunteer record on first volunteer action
-  let volunteer = await getArenaVolunteer(member.id);
-  if (!volunteer) {
-    volunteer = await upsertArenaVolunteer(member.id, {
-      displayName: member.displayName || member.user?.username || 'Volunteer',
-      status: 'AVAILABLE',
-      activeMatches: 0,
-      totalMatches: 0,
-      completedMatches: 0,
-      disputedMatches: 0,
-      suspended: false,
-    });
-  } else if (member.displayName && volunteer.displayName !== member.displayName) {
-    await updateArenaVolunteer(member.id, {
-      displayName: member.displayName,
-    });
-  }
+  // Auto-create or refresh volunteer record with current Discord display name
+  const currentDisplayName = member.displayName || member.user?.username || 'Volunteer';
+  const volunteer = await upsertArenaVolunteer(member.id, {
+    displayName: currentDisplayName,
+  });
 
   // Pre-checks
   if (volunteer.suspended) {

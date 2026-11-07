@@ -12,6 +12,7 @@ import {
   getArenaChallenge,
   getArenaMatch,
   getArenaVolunteer,
+  upsertArenaVolunteer,
   getArenaConfig,
   getOpenDisputes,
   getArenaLogs,
@@ -827,5 +828,83 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.match(disputeSubmitReply, /Dispute Filed/);
     const underReviewMatch = await getArenaMatch(matchId);
     assert.equal(underReviewMatch.status, ARENA_STATUS.UNDER_REVIEW);
+  });
+
+  test('13. Volunteer Profile: First-time creation and updating on accepting subsequent match without path conflicts', async () => {
+    const env = createMockArenaEnvironment();
+    const admin = env.addMember('admin-1', 'AdminUser', { isAdmin: true });
+    await handleArenaCommand(env.guild, admin, null, ['setup'], () => {});
+
+    // Create Match 1
+    const p1 = env.addMember('p1', 'PlayerOne');
+    const p2 = env.addMember('p2', 'PlayerTwo');
+    await upsertArenaPlayer('p1', { displayName: 'PlayerOne', bgmiIgn: 'Ign1', bgmiUid: '1111' });
+    await upsertArenaPlayer('p2', { displayName: 'PlayerTwo', bgmiIgn: 'Ign2', bgmiUid: '2222' });
+
+    const c1 = await handleCreateChallenge(env.guild, p1);
+    const m1 = await handleAcceptChallenge(env.guild, p2, c1.challenge.challengeId, env.client);
+    const matchId1 = m1.match.matchId;
+
+    // --- CASE 1: First-time volunteer profile creation ---
+    const volMember = env.addMember('vol-fresh', 'InitialVolunteerName');
+    const claimRes1 = await handleClaimMatch(env.guild, volMember, matchId1);
+    assert.equal(claimRes1.ok, true, `First-time claim should succeed: ${claimRes1.error}`);
+    assert.equal(claimRes1.match.volunteerId, 'vol-fresh');
+
+    const createdVol = await getArenaVolunteer('vol-fresh');
+    assert.ok(createdVol, 'Volunteer profile should exist in DB');
+    assert.equal(createdVol.displayName, 'InitialVolunteerName');
+    assert.equal(createdVol.activeMatches, 1);
+    assert.equal(createdVol.status, 'AVAILABLE');
+    assert.equal(createdVol.suspended, false);
+
+    // Move to RESULT_PENDING and complete Match 1 to update stats
+    const { updateArenaMatch } = await import('../bot/discord/features/arena/models/arenaModels.js');
+    await updateArenaMatch(matchId1, { status: ARENA_STATUS.RESULT_PENDING });
+    const match1 = await getArenaMatch(matchId1);
+    const completeRes = await completeArenaMatch(env.guild, match1, { winnerId: 'p1' });
+    assert.equal(completeRes.ok, true);
+    const volAfterCompletion = await getArenaVolunteer('vol-fresh');
+    assert.equal(volAfterCompletion.activeMatches, 0);
+    assert.equal(volAfterCompletion.completedMatches, 1);
+    assert.equal(volAfterCompletion.totalMatches, 1);
+
+    // Create Match 2
+    const p3 = env.addMember('p3', 'PlayerThree');
+    const p4 = env.addMember('p4', 'PlayerFour');
+    await upsertArenaPlayer('p3', { displayName: 'PlayerThree', bgmiIgn: 'Ign3', bgmiUid: '3333' });
+    await upsertArenaPlayer('p4', { displayName: 'PlayerFour', bgmiIgn: 'Ign4', bgmiUid: '4444' });
+
+    const c2 = await handleCreateChallenge(env.guild, p3);
+    const m2 = await handleAcceptChallenge(env.guild, p4, c2.challenge.challengeId, env.client);
+    const matchId2 = m2.match.matchId;
+
+    // --- CASE 2: Updating existing volunteer profile when member accepts another match with updated nickname ---
+    volMember.displayName = 'BrandNewDisplayName';
+    const claimRes2 = await handleClaimMatch(env.guild, volMember, matchId2);
+    assert.equal(claimRes2.ok, true, `Existing volunteer claim should succeed without path conflict: ${claimRes2.error}`);
+    assert.equal(claimRes2.match.volunteerId, 'vol-fresh');
+
+    const updatedVol = await getArenaVolunteer('vol-fresh');
+    assert.equal(updatedVol.displayName, 'BrandNewDisplayName', 'Display name should be updated to newest server nickname');
+    assert.equal(updatedVol.activeMatches, 1, 'Active matches counter should now be 1');
+    assert.equal(updatedVol.completedMatches, 1, 'Previous completed matches count must be preserved');
+    assert.equal(updatedVol.totalMatches, 1, 'Previous total matches count must be preserved');
+  });
+
+  test('14. MongoDB Update Operator Safety: No overlapping keys between $set and $setOnInsert', async () => {
+    // 1. Calling upsert with displayName explicitly sets it in $set and omits it from $setOnInsert
+    const resWithDisplay = await upsertArenaVolunteer('test-op-1', { displayName: 'MyCustomName' });
+    assert.equal(resWithDisplay.displayName, 'MyCustomName');
+    assert.equal(resWithDisplay.status, 'AVAILABLE');
+
+    // 2. Calling upsert without displayName puts default 'Volunteer' in $setOnInsert and omits it from $set
+    const resWithoutDisplay = await upsertArenaVolunteer('test-op-2', {});
+    assert.equal(resWithoutDisplay.displayName, 'Volunteer');
+
+    // 3. Updating existing profile updates displayName without resetting default fields
+    const resUpdated = await upsertArenaVolunteer('test-op-1', { displayName: 'ChangedName' });
+    assert.equal(resUpdated.displayName, 'ChangedName');
+    assert.equal(resUpdated.status, 'AVAILABLE');
   });
 });

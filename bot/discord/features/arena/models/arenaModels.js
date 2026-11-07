@@ -185,23 +185,43 @@ export async function getArenaConfig(guildId) {
 export async function saveArenaConfig(guildId, updates) {
   if (!guildId) return null;
   const now = new Date();
-  const cleanUpdates = { ...updates, updatedAt: now };
-  delete cleanUpdates._id;
+  const setFields = { ...updates, updatedAt: now };
+  delete setFields._id;
+  delete setFields.guildId;
+  delete setFields.createdAt;
+
+  const setOnInsertFields = {
+    guildId: String(guildId),
+    createdAt: now,
+  };
+
+  const setKeys = new Set(Object.keys(setFields));
+  for (const insertKey of Object.keys(setOnInsertFields)) {
+    if (setKeys.has(insertKey)) {
+      throw new Error(`Updating the path '${insertKey}' would create a conflict at '${insertKey}'.`);
+    }
+  }
 
   if (isMongoConnected()) {
     const db = getMongoDb();
     const res = await db.collection(ARENA_COLLECTIONS.CONFIG).findOneAndUpdate(
       { guildId: String(guildId) },
-      { $set: cleanUpdates, $setOnInsert: { guildId: String(guildId), createdAt: now } },
+      { $set: setFields, $setOnInsert: setOnInsertFields },
       { upsert: true, returnDocument: 'after' }
     );
     return res?.value !== undefined ? res.value : res;
   }
 
-  const existing = memConfig.get(String(guildId)) || { guildId: String(guildId), createdAt: now };
-  const merged = { ...existing, ...cleanUpdates };
-  memConfig.set(String(guildId), merged);
-  return { ...merged };
+  const existing = memConfig.get(String(guildId));
+  if (existing) {
+    const merged = { ...existing, ...setFields };
+    memConfig.set(String(guildId), merged);
+    return { ...merged };
+  }
+
+  const newDoc = { ...setOnInsertFields, ...setFields };
+  memConfig.set(String(guildId), newDoc);
+  return { ...newDoc };
 }
 
 // ============================================================================
@@ -231,42 +251,60 @@ export async function getArenaPlayerByUid(bgmiUid) {
   return null;
 }
 
-export async function upsertArenaPlayer(discordId, data) {
+export async function upsertArenaPlayer(discordId, data = {}) {
   if (!discordId) return null;
   const now = new Date();
-  const updates = { ...data, updatedAt: now };
-  delete updates._id;
-  delete updates.discordId;
+  const setFields = { ...data, updatedAt: now };
+  delete setFields._id;
+  delete setFields.discordId;
+  delete setFields.createdAt;
+
+  const setOnInsertFields = {
+    discordId: String(discordId),
+    createdAt: now,
+  };
+
+  if (!('suspended' in setFields)) {
+    setOnInsertFields.suspended = false;
+  }
+  if (!('activeMatchId' in setFields)) {
+    setOnInsertFields.activeMatchId = null;
+  }
+  if (!('stats' in setFields)) {
+    setOnInsertFields.stats = { played: 0, won: 0, lost: 0 };
+  }
+
+  // Validate MongoDB operator path conflicts to prevent regressions
+  const setKeys = new Set(Object.keys(setFields));
+  for (const insertKey of Object.keys(setOnInsertFields)) {
+    if (setKeys.has(insertKey)) {
+      throw new Error(`Updating the path '${insertKey}' would create a conflict at '${insertKey}'.`);
+    }
+  }
 
   if (isMongoConnected()) {
     const db = getMongoDb();
     const res = await db.collection(ARENA_COLLECTIONS.PLAYERS).findOneAndUpdate(
       { discordId: String(discordId) },
       {
-        $set: updates,
-        $setOnInsert: {
-          discordId: String(discordId),
-          suspended: false,
-          activeMatchId: null,
-          stats: { played: 0, won: 0, lost: 0 },
-          createdAt: now,
-        },
+        $set: setFields,
+        $setOnInsert: setOnInsertFields,
       },
       { upsert: true, returnDocument: 'after' }
     );
     return res?.value !== undefined ? res.value : res;
   }
 
-  const existing = memPlayers.get(String(discordId)) || {
-    discordId: String(discordId),
-    suspended: false,
-    activeMatchId: null,
-    stats: { played: 0, won: 0, lost: 0 },
-    createdAt: now,
-  };
-  const merged = { ...existing, ...updates };
-  memPlayers.set(String(discordId), merged);
-  return { ...merged };
+  const existing = memPlayers.get(String(discordId));
+  if (existing) {
+    const merged = { ...existing, ...setFields };
+    memPlayers.set(String(discordId), merged);
+    return { ...merged };
+  }
+
+  const newDoc = { ...setOnInsertFields, ...setFields };
+  memPlayers.set(String(discordId), newDoc);
+  return { ...newDoc };
 }
 
 export async function updateArenaPlayer(discordId, updates) {
@@ -550,47 +588,77 @@ export async function getArenaVolunteer(discordId) {
 export async function upsertArenaVolunteer(discordId, data = {}) {
   if (!discordId) return null;
   const now = new Date();
-  const updates = { ...data, updatedAt: now };
-  delete updates._id;
-  delete updates.discordId;
+  const setFields = { ...data, updatedAt: now };
+  delete setFields._id;
+  delete setFields.discordId;
+  delete setFields.createdAt;
+
+  // Defaults strictly for $setOnInsert (only if NOT in setFields!)
+  const setOnInsertFields = {
+    discordId: String(discordId),
+    createdAt: now,
+  };
+
+  // Ensure displayName is assigned in exactly one update operator
+  if (!('displayName' in setFields) || setFields.displayName === undefined || setFields.displayName === null) {
+    delete setFields.displayName;
+    setOnInsertFields.displayName = 'Volunteer';
+  } else {
+    setFields.displayName = String(setFields.displayName);
+  }
+
+  if (!('status' in setFields)) {
+    setOnInsertFields.status = 'AVAILABLE';
+  }
+  if (!('activeMatches' in setFields)) {
+    setOnInsertFields.activeMatches = 0;
+  }
+  if (!('totalMatches' in setFields)) {
+    setOnInsertFields.totalMatches = 0;
+  }
+  if (!('completedMatches' in setFields)) {
+    setOnInsertFields.completedMatches = 0;
+  }
+  if (!('disputedMatches' in setFields)) {
+    setOnInsertFields.disputedMatches = 0;
+  }
+  if (!('suspended' in setFields)) {
+    setOnInsertFields.suspended = false;
+  }
+
+  // Validate MongoDB operator path conflicts to prevent regressions
+  const setKeys = new Set(Object.keys(setFields));
+  for (const insertKey of Object.keys(setOnInsertFields)) {
+    if (setKeys.has(insertKey)) {
+      throw new Error(`Updating the path '${insertKey}' would create a conflict at '${insertKey}'.`);
+    }
+  }
 
   if (isMongoConnected()) {
     const db = getMongoDb();
     const res = await db.collection(ARENA_COLLECTIONS.VOLUNTEERS).findOneAndUpdate(
       { discordId: String(discordId) },
       {
-        $set: updates,
-        $setOnInsert: {
-          discordId: String(discordId),
-          displayName: data.displayName || 'Volunteer',
-          status: 'AVAILABLE',
-          activeMatches: 0,
-          totalMatches: 0,
-          completedMatches: 0,
-          disputedMatches: 0,
-          suspended: false,
-          createdAt: now,
-        },
+        $set: setFields,
+        $setOnInsert: setOnInsertFields,
       },
       { upsert: true, returnDocument: 'after' }
     );
     return res?.value !== undefined ? res.value : res;
   }
 
-  const existing = memVolunteers.get(String(discordId)) || {
-    discordId: String(discordId),
-    displayName: data.displayName || 'Volunteer',
-    status: 'AVAILABLE',
-    activeMatches: 0,
-    totalMatches: 0,
-    completedMatches: 0,
-    disputedMatches: 0,
-    suspended: false,
-    createdAt: now,
-  };
-  const merged = { ...existing, ...updates };
-  memVolunteers.set(String(discordId), merged);
-  return { ...merged };
+  const existing = memVolunteers.get(String(discordId));
+  if (existing) {
+    // Existing document: apply $set updates only, preserving existing counters and status
+    const merged = { ...existing, ...setFields };
+    memVolunteers.set(String(discordId), merged);
+    return { ...merged };
+  }
+
+  // New document: apply both $setOnInsert and $set
+  const newDoc = { ...setOnInsertFields, ...setFields };
+  memVolunteers.set(String(discordId), newDoc);
+  return { ...newDoc };
 }
 
 export async function atomicClaimArenaMatch(matchId, volunteerId, limit = 1) {

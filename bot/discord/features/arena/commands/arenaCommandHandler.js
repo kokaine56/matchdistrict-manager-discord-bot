@@ -453,12 +453,9 @@ export async function handleVolunteerCommand(guild, member, channel, args, reply
 
   // .volunteer profile
   if (subCmd === 'profile' || subCmd === 'stats') {
-    let vol = await getArenaVolunteer(member.id);
-    if (!vol) {
-      vol = await upsertArenaVolunteer(member.id, {
-        displayName: member.displayName || member.user?.username || 'Volunteer',
-      });
-    }
+    const vol = await upsertArenaVolunteer(member.id, {
+      displayName: member.displayName || member.user?.username || 'Volunteer',
+    });
 
     const embed = new EmbedBuilder()
       .setTitle(`Volunteer Profile: ${member.displayName || member.user?.username || 'Volunteer'}`)
@@ -475,12 +472,9 @@ export async function handleVolunteerCommand(guild, member, channel, args, reply
 
   // .volunteer status
   if (subCmd === 'status') {
-    let vol = await getArenaVolunteer(member.id);
-    if (!vol) {
-      vol = await upsertArenaVolunteer(member.id, {
-        displayName: member.displayName || member.user?.username || 'Volunteer',
-      });
-    }
+    const vol = await upsertArenaVolunteer(member.id, {
+      displayName: member.displayName || member.user?.username || 'Volunteer',
+    });
 
     const newStatus = vol.status === 'AVAILABLE' ? 'UNAVAILABLE' : 'AVAILABLE';
     await updateArenaVolunteer(member.id, { status: newStatus });
