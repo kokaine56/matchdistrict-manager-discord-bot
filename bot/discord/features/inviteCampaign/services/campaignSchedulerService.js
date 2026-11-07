@@ -400,8 +400,6 @@ export async function recordOrRestoreCampaignReferral(client, campaign, member, 
     if (freshCampaign.status !== CAMPAIGN_STATUS.ACTIVE) return null;
 
     const existingRef = await getCampaignReferral(campaignId, guildId, invitedUserId);
-    const stayMs = Math.max(0, Number(freshCampaign.stayHours ?? 24) * 3600 * 1000);
-    const dueAt = new Date(joinedAt.getTime() + stayMs);
 
     // Case 1: Member already has a referral record in this campaign & server (rejoin)
     if (existingRef) {
@@ -412,21 +410,21 @@ export async function recordOrRestoreCampaignReferral(client, campaign, member, 
           counted: false,
           dueAt: null,
         });
-        return { ref: updatedDisq, freshCampaign, stayMs, disqualified: true };
+        return { ref: updatedDisq, freshCampaign, disqualified: true };
       }
 
-      // Restore original inviter (never switch inviter) and restart stay period
+      // Restore original inviter relationship and count them again only once (never switch inviter)
       const restoredRef = await updateCampaignReferral(campaignId, guildId, invitedUserId, {
         isActive: true,
         leftAt: null,
-        counted: false,
-        countedAt: null,
+        counted: true,
+        countedAt: joinedAt,
         joinedAt,
-        dueAt,
+        dueAt: null,
       });
 
       await recalculateParticipantEligibility(client, freshCampaign, restoredRef.inviterId);
-      return { ref: restoredRef, freshCampaign, stayMs, disqualified: false };
+      return { ref: restoredRef, freshCampaign, disqualified: false };
     }
 
     // Case 2: First join in this campaign — requires a valid attributed campaign invite
@@ -452,7 +450,7 @@ export async function recordOrRestoreCampaignReferral(client, campaign, member, 
         disqualifyReason: 'Self-invite',
         dueAt: null,
       });
-      return { ref: selfRef, freshCampaign, stayMs, disqualified: true };
+      return { ref: selfRef, freshCampaign, disqualified: true };
     }
 
     // Members who were already in the server before the campaign never count
@@ -475,10 +473,10 @@ export async function recordOrRestoreCampaignReferral(client, campaign, member, 
         disqualifyReason: 'Member was already in the server before the campaign',
         dueAt: null,
       });
-      return { ref: preRef, freshCampaign, stayMs, disqualified: true };
+      return { ref: preRef, freshCampaign, disqualified: true };
     }
 
-    // Create pending referral with stored dueAt
+    // Immediately count the referral and increment the owner's successful join count
     const createdRef = await createCampaignReferral({
       campaignId,
       guildId,
@@ -488,30 +486,18 @@ export async function recordOrRestoreCampaignReferral(client, campaign, member, 
       joinedAt,
       leftAt: null,
       isActive: true,
-      counted: false,
-      countedAt: null,
+      counted: true,
+      countedAt: joinedAt,
       disqualified: false,
       disqualifyReason: null,
-      dueAt,
+      dueAt: null,
     });
 
     await recalculateParticipantEligibility(client, freshCampaign, inviterId);
-    return { ref: createdRef, freshCampaign, stayMs, disqualified: false };
+    return { ref: createdRef, freshCampaign, disqualified: false };
   });
 
   if (!createdOrRestored || !createdOrRestored.ref) return null;
-  if (createdOrRestored.disqualified) return createdOrRestored.ref;
-
-  if (createdOrRestored.stayMs === 0) {
-    return evaluateDueReferral(
-      client,
-      createdOrRestored.freshCampaign,
-      createdOrRestored.ref,
-      joinedAt
-    );
-  }
-
-  armReferralStayTimer(client, createdOrRestored.freshCampaign, createdOrRestored.ref);
   return createdOrRestored.ref;
 }
 

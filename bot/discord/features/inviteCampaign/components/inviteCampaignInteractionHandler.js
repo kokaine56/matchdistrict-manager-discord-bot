@@ -30,7 +30,10 @@ import {
   getGuildInviteSnapshot,
   refreshModerationAllowlistForGuild,
 } from '../services/inviteSnapshotService.js';
-import { recalculateParticipantEligibility } from '../services/eligibilityService.js';
+import {
+  recalculateParticipantEligibility,
+  setLiveUserViewRefreshHook,
+} from '../services/eligibilityService.js';
 import { ensureOrUpdateCampaignPanel } from '../services/campaignPanelService.js';
 import { endCampaign } from '../services/campaignLifecycleService.js';
 import {
@@ -47,10 +50,73 @@ const pendingCreateWizards = new Map();
 // `${guildId}:${userId}` -> timestamp (ms)
 const generateButtonCooldowns = new Map();
 
+// `${campaignId}:${userId}` -> { interaction, inviteUrl, updatedAt }
+const activeUserInviteViews = new Map();
+
 export function clearInviteInteractionCaches() {
   pendingCreateWizards.clear();
   generateButtonCooldowns.clear();
+  activeUserInviteViews.clear();
 }
+
+/**
+ * Formats the clean user-facing invite counter message:
+ *
+ * Your Successful Invites: 0
+ * Your Invite Link:
+ * https://discord.gg/BT9392WMQ5
+ */
+export function formatUserInviteResponsePayload(campaignId, successfulInvites, inviteUrl) {
+  const count = Math.max(0, Number(successfulInvites || 0));
+  const content =
+    `Your Successful Invites: ${count}\n` +
+    `Your Invite Link:\n` +
+    `${inviteUrl}`;
+
+  const refreshBtn = new ButtonBuilder()
+    .setCustomId(`inv_cmp:refresh:${campaignId}`)
+    .setLabel('Refresh')
+    .setEmoji('🔄')
+    .setStyle(ButtonStyle.Secondary);
+
+  return {
+    content,
+    components: [new ActionRowBuilder().addComponents(refreshBtn)],
+  };
+}
+
+/**
+ * Automatically refreshes the inviter's open ephemeral response in real time
+ * whenever a member joins or leaves using their invite link.
+ */
+export async function refreshActiveUserInviteView(campaignId, userId, participant) {
+  const key = `${campaignId}:${userId}`;
+  const view = activeUserInviteViews.get(key);
+  if (!view || !view.interaction || !view.inviteUrl) return;
+
+  // Discord interaction tokens are valid for 15 minutes
+  if (Date.now() - view.updatedAt > 14 * 60 * 1000) {
+    activeUserInviteViews.delete(key);
+    return;
+  }
+
+  const payload = formatUserInviteResponsePayload(
+    campaignId,
+    participant?.successfulInvites ?? 0,
+    view.inviteUrl
+  );
+
+  try {
+    if (typeof view.interaction.editReply === 'function') {
+      await view.interaction.editReply(payload);
+    }
+  } catch {
+    activeUserInviteViews.delete(key);
+  }
+}
+
+// Register the real-time view refresh hook with eligibilityService
+setLiveUserViewRefreshHook(refreshActiveUserInviteView);
 
 /**
  * Server-side permission check: Administrator, Manage Server (ManageGuild), or Server Owner.
@@ -79,7 +145,7 @@ export function buildCreateCampaignModal() {
     .setCustomId('name')
     .setLabel('Campaign Name')
     .setStyle(TextInputStyle.Short)
-    .setPlaceholder('e.g. Diwali Invite & Earn Giveaway')
+    .setPlaceholder('e.g. Diwali Invite & Earn Campaign')
     .setRequired(true)
     .setMaxLength(100);
 
@@ -87,7 +153,7 @@ export function buildCreateCampaignModal() {
     .setCustomId('description')
     .setLabel('Description')
     .setStyle(TextInputStyle.Paragraph)
-    .setPlaceholder('Describe the campaign rules and giveaway details...')
+    .setPlaceholder('Describe the campaign details...')
     .setRequired(true)
     .setMaxLength(1000);
 
@@ -95,7 +161,7 @@ export function buildCreateCampaignModal() {
     .setCustomId('startAt')
     .setLabel('Start Time (IST: DD-MM-YYYY HH:mm or DRAFT)')
     .setStyle(TextInputStyle.Short)
-    .setPlaceholder('e.g. 15-11-2026 18:00 (or leave as current time for Draft)')
+    .setPlaceholder('e.g. 15-11-2026 18:00 (or DRAFT for manual start)')
     .setRequired(true)
     .setMaxLength(32);
 
@@ -107,20 +173,11 @@ export function buildCreateCampaignModal() {
     .setRequired(true)
     .setMaxLength(32);
 
-  const targetInput = new TextInputBuilder()
-    .setCustomId('requiredInvites')
-    .setLabel('Required Successful Invites')
-    .setStyle(TextInputStyle.Short)
-    .setPlaceholder('e.g. 10')
-    .setRequired(true)
-    .setMaxLength(6);
-
   modal.addComponents(
     new ActionRowBuilder().addComponents(nameInput),
     new ActionRowBuilder().addComponents(descInput),
     new ActionRowBuilder().addComponents(startInput),
-    new ActionRowBuilder().addComponents(endInput),
-    new ActionRowBuilder().addComponents(targetInput)
+    new ActionRowBuilder().addComponents(endInput)
   );
 
   return modal;
@@ -138,11 +195,10 @@ function buildChannelSelectionStepPayload(wizard) {
     .setTitle('🛠️ Configure Campaign Channels')
     .setColor(0x3498db)
     .setDescription(
-      'Select the **Invite Channel** (where the persistent Invite Panel will be posted) and the **Announcement Channel** (where qualifier notifications and final results will be posted), then click **Confirm**.'
+      'Select the **Invite Channel** (where the persistent Invite Panel will be posted) and the **Announcement Channel** (where final campaign results will be posted), then click **Confirm**.'
     )
     .addFields(
       { name: '🏷️ Campaign Name', value: wizard.name, inline: true },
-      { name: '🎯 Required Invites', value: `${wizard.requiredInvites}`, inline: true },
       { name: '📌 Initial Status', value: initialStatus, inline: true },
       {
         name: '🕒 Start (IST)',
@@ -150,11 +206,6 @@ function buildChannelSelectionStepPayload(wizard) {
         inline: true,
       },
       { name: '⏰ End (IST)', value: formatISTDateTime(wizard.endAt), inline: true },
-      {
-        name: '⚙️ Defaults',
-        value: 'Stay: **24h** | Min Account Age: **7d** *(configurable via `.invite set`)*',
-        inline: false,
-      },
       {
         name: '📢 Selected Channels',
         value:
@@ -308,7 +359,6 @@ async function handleGenerateInviteButton(interaction, campaignId) {
           'action'
         );
       } catch (err) {
-        // Discord API code 30016 = Maximum number of invites to this server reached (1000)
         if (err?.code === 30016 || /maximum number of invites/i.test(err?.message || '')) {
           await notifyAdminInviteLimitReached(interaction.client, guild, campaign);
           await sendEphemeral(
@@ -354,7 +404,7 @@ async function handleGenerateInviteButton(interaction, campaignId) {
       );
     }
 
-    // 2. Atomically recalculate the user's progress & eligibility from referral records
+    // 2. Atomically recalculate the user's successful invite count from active referral records
     const participant = await recalculateParticipantEligibility(
       interaction.client,
       campaign,
@@ -362,26 +412,71 @@ async function handleGenerateInviteButton(interaction, campaignId) {
     );
 
     const successful = participant?.successfulInvites ?? 0;
-    const pending = participant?.pendingInvites ?? 0;
-    const isEligible = Boolean(participant?.isEligible);
-    const isDisqualified = Boolean(participant?.disqualified);
+    const payload = formatUserInviteResponsePayload(
+      campaign.campaignId,
+      successful,
+      inviteRecord.inviteUrl
+    );
 
-    const statusDisplay = isDisqualified
-      ? 'Disqualified'
-      : isEligible
-        ? 'Eligible'
-        : 'Not Eligible';
+    await sendEphemeral(payload);
 
-    const pendingSuffix = pending > 0 ? ` *(${pending} pending stay/age verification)*` : '';
+    // Track this ephemeral interaction so real-time joins/leaves can auto-refresh the user's count
+    activeUserInviteViews.set(`${campaign.campaignId}:${userId}`, {
+      interaction,
+      inviteUrl: inviteRecord.inviteUrl,
+      updatedAt: Date.now(),
+    });
 
-    const replyContent =
-      `Your Progress: ${successful} / ${campaign.requiredInvites} successful invites${pendingSuffix}\n` +
-      `Your Invite Link: ${inviteRecord.inviteUrl}\n` +
-      `Status: ${statusDisplay}`;
-
-    await sendEphemeral(replyContent);
     return true;
   });
+}
+
+/**
+ * Handles the "Refresh" button on a user's ephemeral invite response.
+ */
+async function handleRefreshInviteButton(interaction, campaignId) {
+  const guild = interaction.guild;
+  const user = interaction.user || interaction.member?.user;
+  if (!guild || !user) return false;
+
+  const userId = String(user.id);
+  const campaign = await getInviteCampaignById(campaignId);
+  if (!campaign || campaign.guildId !== String(guild.id)) {
+    await interaction.reply({ content: '❌ Campaign not found.', ephemeral: true });
+    return true;
+  }
+
+  const inviteRecord = await getCampaignInviteByUser(campaign.campaignId, userId);
+  if (!inviteRecord) {
+    return handleGenerateInviteButton(interaction, campaignId);
+  }
+
+  const participant = await recalculateParticipantEligibility(
+    interaction.client,
+    campaign,
+    userId
+  );
+
+  const payload = formatUserInviteResponsePayload(
+    campaign.campaignId,
+    participant?.successfulInvites ?? 0,
+    inviteRecord.inviteUrl
+  );
+
+  activeUserInviteViews.set(`${campaign.campaignId}:${userId}`, {
+    interaction,
+    inviteUrl: inviteRecord.inviteUrl,
+    updatedAt: Date.now(),
+  });
+
+  if (typeof interaction.update === 'function') {
+    await interaction.update(payload);
+  } else if (typeof interaction.editReply === 'function') {
+    await interaction.editReply({ ...payload, ephemeral: true });
+  } else {
+    await interaction.reply({ ...payload, ephemeral: true });
+  }
+  return true;
 }
 
 /**
@@ -424,10 +519,16 @@ export async function handleInviteCampaignInteraction(interaction) {
   const member = interaction.member;
   const userId = String(interaction.user?.id || member?.id || '');
 
-  // 1. Public member button: Generate My Invite
+  // 1a. Public member button: Generate My Invite
   if (interaction.isButton?.() && customId.startsWith('inv_cmp:generate:')) {
     const campaignId = customId.slice('inv_cmp:generate:'.length);
     return handleGenerateInviteButton(interaction, campaignId);
+  }
+
+  // 1b. Public member button: Refresh count
+  if (interaction.isButton?.() && customId.startsWith('inv_cmp:refresh:')) {
+    const campaignId = customId.slice('inv_cmp:refresh:'.length);
+    return handleRefreshInviteButton(interaction, campaignId);
   }
 
   // All remaining interactions are Admin-only — enforce server-side permission check
@@ -470,20 +571,19 @@ export async function handleInviteCampaignInteraction(interaction) {
     const description = interaction.fields.getTextInputValue('description')?.trim();
     const startRaw = interaction.fields.getTextInputValue('startAt')?.trim();
     const endRaw = interaction.fields.getTextInputValue('endAt')?.trim();
-    const requiredRaw = interaction.fields.getTextInputValue('requiredInvites')?.trim();
+    let requiredInvites = 1;
+    try {
+      const reqRaw = interaction.fields.getTextInputValue('requiredInvites')?.trim();
+      if (reqRaw && /^\d+$/.test(reqRaw)) {
+        requiredInvites = Math.max(1, Number(reqRaw));
+      }
+    } catch {
+      // requiredInvites field is optional
+    }
 
     if (!name || !description) {
       await interaction.reply({
         content: '❌ Campaign name and description are required.',
-        ephemeral: true,
-      });
-      return true;
-    }
-
-    const requiredInvites = /^\d+$/.test(requiredRaw || '') ? Number(requiredRaw) : NaN;
-    if (!Number.isInteger(requiredInvites) || requiredInvites < 1) {
-      await interaction.reply({
-        content: '❌ **Required successful invites** must be a whole number of at least 1.',
         ephemeral: true,
       });
       return true;
@@ -622,9 +722,9 @@ export async function handleInviteCampaignInteraction(interaction) {
         status: initialStatus,
         startAt: wizard.startAt || null,
         endAt: wizard.endAt,
-        requiredInvites: wizard.requiredInvites,
-        stayHours: 24,
-        minAccountAgeDays: 7,
+        requiredInvites: wizard.requiredInvites || 1,
+        stayHours: 0,
+        minAccountAgeDays: 0,
         inviteChannelId: wizard.inviteChannelId,
         announcementChannelId: wizard.announcementChannelId,
         panelMessageId: null,
@@ -645,11 +745,9 @@ export async function handleInviteCampaignInteraction(interaction) {
           `• **Invite Panel Posted In:** <#${campaign.inviteChannelId}>\n` +
           `• **Announcement Channel:** <#${campaign.announcementChannelId}>\n` +
           `• **Start Time (IST):** ${campaign.startAt ? formatISTDateTime(campaign.startAt) : 'Manual (`.invite start`)'}\n` +
-          `• **End Time (IST):** ${formatISTDateTime(campaign.endAt)}\n` +
-          `• **Required Invites:** ${campaign.requiredInvites}\n` +
-          `• **Stay Period:** ${campaign.stayHours}h | **Min Account Age:** ${campaign.minAccountAgeDays}d\n\n` +
+          `• **End Time (IST):** ${formatISTDateTime(campaign.endAt)}\n\n` +
           (campaign.status === CAMPAIGN_STATUS.DRAFT
-            ? `*Use \`.invite set stay <hours>\` or \`.invite set accountage <days>\` to customize rules, then run \`.invite start\` to activate!*`
+            ? `*Run \`.invite start\` to activate the campaign!*`
             : `*The campaign will activate automatically at ${formatISTDateTime(campaign.startAt)} (or run \`.invite start\` to start immediately).*`),
         embeds: [],
         components: [],
@@ -686,7 +784,7 @@ export async function handleInviteCampaignInteraction(interaction) {
     }
 
     await interaction.update({
-      content: `🏁 **Campaign "${res.campaign.name}" has been ended.** Final counts and eligibility have been frozen, campaign invite links have been deleted from Discord, the panel button is disabled, and the final summary was posted in <#${res.campaign.announcementChannelId}>.`,
+      content: `🏁 **Campaign "${res.campaign.name}" has been ended.** Final counts have been frozen, campaign invite links have been deleted from Discord, the panel button is disabled, and the final summary was posted in <#${res.campaign.announcementChannelId}>.`,
       embeds: [],
       components: [],
     });

@@ -8,14 +8,13 @@ import { queueChannelSend, queueMessageEdit } from '../../../../../discordQueue.
 import {
   CAMPAIGN_STATUS,
   updateInviteCampaign,
-  getEligibleParticipantsForCampaign,
   getParticipantsForCampaign,
   getReferralsForCampaign,
 } from '../models/inviteCampaignModels.js';
 import { formatISTDateTime } from './timeUtils.js';
 
 /**
- * Formats the display status string for the Invite Panel according to Section 3:
+ * Formats the display status string for the Invite Panel:
  * "Active / Paused / Ended / Starts <date>"
  *
  * @param {object} campaign
@@ -43,6 +42,7 @@ export function formatPanelStatusDisplay(campaign) {
 
 /**
  * Builds the Embed and ActionRow payload for the persistent Invite Panel message.
+ * Simple user-facing design: no eligibility targets or qualification clutter.
  *
  * @param {object} campaign
  * @returns {{ embeds: EmbedBuilder[], components: ActionRowBuilder[] }}
@@ -61,31 +61,21 @@ export function buildCampaignPanelPayload(campaign) {
   const statusText = formatPanelStatusDisplay(campaign);
 
   const embed = new EmbedBuilder()
-    .setTitle(`🎁 ${campaign.name}`)
-    .setDescription(campaign.description || 'Invite new members to the server using your personal invite link to qualify for the giveaway!')
+    .setTitle(`🔗 ${campaign.name}`)
+    .setDescription(
+      campaign.description ||
+        'Click **Generate My Invite** below to get your personal invite link and track your successful invites!'
+    )
     .setColor(color)
     .addFields(
       { name: '📌 Status', value: statusText, inline: true },
       {
-        name: '🎯 Required Invites',
-        value: `**${campaign.requiredInvites}** successful invite${campaign.requiredInvites === 1 ? '' : 's'}`,
-        inline: true,
-      },
-      {
         name: '⏰ Ends At (IST)',
         value: formatISTDateTime(campaign.endAt),
         inline: true,
-      },
-      {
-        name: '📋 Qualification Rules',
-        value:
-          `• Invited members must stay in the server for at least **${campaign.stayHours ?? 24} hour(s)**.\n` +
-          `• Invited accounts must be at least **${campaign.minAccountAgeDays ?? 7} day(s)** old.\n` +
-          `• Bots, self-invites, and members already in the server do not count.`,
-        inline: false,
       }
     )
-    .setFooter({ text: 'MatchDistrict Invite & Earn Campaign' })
+    .setFooter({ text: 'MatchDistrict Invite Tracker' })
     .setTimestamp(new Date());
 
   const button = new ButtonBuilder()
@@ -146,7 +136,6 @@ export async function ensureOrUpdateCampaignPanel(client, campaign, options = {}
       });
       return existingMsg;
     }
-    // If panelMessageId is set and options.allowCreateIfMissing is false, do not create a duplicate
     if (!allowCreate) {
       return null;
     }
@@ -169,7 +158,7 @@ export async function ensureOrUpdateCampaignPanel(client, campaign, options = {}
 }
 
 /**
- * Posts the final campaign result summary in the announcement channel when the campaign ends.
+ * Posts the final campaign invite totals in the announcement channel when the campaign ends.
  *
  * @param {import('discord.js').Client} client
  * @param {object} campaign
@@ -191,47 +180,46 @@ export async function postCampaignFinalResults(client, campaign) {
       : null);
   if (!anncChannel) return null;
 
-  const [eligibleParticipants, allParticipants, referrals] = await Promise.all([
-    getEligibleParticipantsForCampaign(campaign.campaignId),
+  const [allParticipants, referrals] = await Promise.all([
     getParticipantsForCampaign(campaign.campaignId),
     getReferralsForCampaign(campaign.campaignId),
   ]);
 
-  const countedReferrals = referrals.filter((r) => r.isActive && r.counted && !r.disqualified).length;
+  const activeCountedReferrals = referrals.filter((r) => r.isActive && r.counted && !r.disqualified).length;
+  const topParticipants = allParticipants.filter((p) => !p.disqualified && p.successfulInvites > 0);
 
-  const eligibleLines =
-    eligibleParticipants.length > 0
-      ? eligibleParticipants
+  const topLines =
+    topParticipants.length > 0
+      ? topParticipants
           .slice(0, 25)
           .map(
             (p, idx) =>
-              `**${idx + 1}.** <@${p.userId}> — **${p.successfulInvites} / ${campaign.requiredInvites}** invites *(Qualified: ${formatISTDateTime(p.eligibleAt)})*`
+              `**${idx + 1}.** <@${p.userId}> — **${p.successfulInvites}** successful invite${p.successfulInvites === 1 ? '' : 's'}`
           )
           .join('\n')
-      : '*No members reached the required invite target during this campaign.*';
+      : '*No successful invites were recorded during this campaign.*';
 
   const embed = new EmbedBuilder()
-    .setTitle(`🏁 Campaign Ended — ${campaign.name}`)
+    .setTitle(`🏁 Invite Campaign Ended — ${campaign.name}`)
     .setColor(0xed4245)
     .setDescription(
-      `The **${campaign.name}** Invite & Earn campaign has officially ended and all final counts and eligibility have been frozen.`
+      `The **${campaign.name}** campaign has ended and final invite counts have been frozen.`
     )
     .addFields(
-      { name: '🎯 Target Invites', value: `${campaign.requiredInvites}`, inline: true },
-      { name: '✅ Total Eligible Members', value: `${eligibleParticipants.length}`, inline: true },
-      { name: '👥 Total Verified Referrals', value: `${countedReferrals}`, inline: true },
+      { name: '👥 Total Successful Joins', value: `${activeCountedReferrals}`, inline: true },
+      { name: '🔗 Active Inviters', value: `${topParticipants.length}`, inline: true },
       {
         name: '🕒 Ended At (IST)',
         value: formatISTDateTime(campaign.endedAt || new Date()),
-        inline: false,
+        inline: true,
       },
       {
-        name: `🏆 Eligible Members (${eligibleParticipants.length})`,
-        value: eligibleLines.slice(0, 1024),
+        name: '📊 Final Invite Totals',
+        value: topLines.slice(0, 1024),
         inline: false,
       }
     )
-    .setFooter({ text: `Total Participants: ${allParticipants.length} • Use .invite eligible for full details` })
+    .setFooter({ text: 'MatchDistrict Invite Tracker' })
     .setTimestamp(new Date());
 
   return queueChannelSend(anncChannel, { embeds: [embed] }).catch((err) => {
