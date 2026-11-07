@@ -3,15 +3,20 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  AttachmentBuilder,
 } from 'discord.js';
 import { queueChannelSend, queueMessageEdit } from '../../../../../discordQueue.js';
 import {
   CAMPAIGN_STATUS,
+  getInviteCampaignById,
   updateInviteCampaign,
   getParticipantsForCampaign,
-  getReferralsForCampaign,
 } from '../models/inviteCampaignModels.js';
 import { formatISTDateTime } from './timeUtils.js';
+import {
+  computeCampaignLeaderboardRows,
+  generateLeaderboardPng,
+} from './leaderboardImageService.js';
 
 /**
  * Formats the display status string for the Invite Panel:
@@ -42,7 +47,7 @@ export function formatPanelStatusDisplay(campaign) {
 
 /**
  * Builds the Embed and ActionRow payload for the persistent Invite Panel message.
- * Simple user-facing design: no eligibility targets or qualification clutter.
+ * Button label is "Create Link".
  *
  * @param {object} campaign
  * @returns {{ embeds: EmbedBuilder[], components: ActionRowBuilder[] }}
@@ -64,7 +69,7 @@ export function buildCampaignPanelPayload(campaign) {
     .setTitle(`🔗 ${campaign.name}`)
     .setDescription(
       campaign.description ||
-        'Click **Generate My Invite** below to get your personal invite link and track your successful invites!'
+        'Click **Create Link** below to get your personal invite link and track your successful invites!'
     )
     .setColor(color)
     .addFields(
@@ -80,7 +85,7 @@ export function buildCampaignPanelPayload(campaign) {
 
   const button = new ButtonBuilder()
     .setCustomId(`inv_cmp:generate:${campaign.campaignId}`)
-    .setLabel('Generate My Invite')
+    .setLabel('Create Link')
     .setEmoji('🔗')
     .setStyle(isActive ? ButtonStyle.Success : ButtonStyle.Secondary)
     .setDisabled(!isActive);
@@ -158,72 +163,178 @@ export async function ensureOrUpdateCampaignPanel(client, campaign, options = {}
 }
 
 /**
- * Posts the final campaign invite totals in the announcement channel when the campaign ends.
+ * Builds the Discord message payload containing the generated PNG leaderboard image attachment
+ * and the "Refresh Leaderboard" button below it.
+ *
+ * @param {object} campaign
+ * @param {Array<object>} rows
+ * @param {{ buffer: Buffer, width: number, height: number, rows: Array<object> }} pngResult
+ */
+export function buildLeaderboardMessagePayload(campaign, rows, pngResult) {
+  const isEnded = campaign.status === CAMPAIGN_STATUS.ENDED;
+  const attachment = new AttachmentBuilder(pngResult.buffer, {
+    name: 'leaderboard.png',
+  });
+  attachment._leaderboardMeta = {
+    campaignId: campaign.campaignId,
+    status: isEnded ? 'EVENT ENDED' : String(campaign.status).toUpperCase(),
+    width: pngResult.width,
+    height: pngResult.height,
+    rows: pngResult.rows,
+  };
+
+  const refreshBtn = new ButtonBuilder()
+    .setCustomId(`inv_cmp:refresh_lb:${campaign.campaignId}`)
+    .setLabel('Refresh Leaderboard')
+    .setEmoji('🔄')
+    .setStyle(isEnded ? ButtonStyle.Secondary : ButtonStyle.Primary)
+    .setDisabled(isEnded);
+
+  const actionRow = new ActionRowBuilder().addComponents(refreshBtn);
+
+  return {
+    content: '',
+    embeds: [],
+    files: [attachment],
+    components: [actionRow],
+    _leaderboardMeta: attachment._leaderboardMeta,
+  };
+}
+
+/**
+ * Generates the PNG leaderboard image and posts or edits the managed announcement leaderboard message
+ * in place using `campaign.leaderboardMessageId`.
+ *
+ * Rules enforced:
+ * - Never sends a new message when refreshing if the managed leaderboard message exists.
+ * - Preserves the same `leaderboardMessageId`.
+ * - If the campaign is already `Ended` and not currently being finalized (`options.isFinalizing !== true`),
+ *   uses the frozen `finalLeaderboardSnapshot` and refuses to overwrite finalized rankings.
+ *
+ * @param {import('discord.js').Client} client
+ * @param {object} campaign
+ * @param {object} [options]
+ * @param {boolean} [options.allowCreateIfMissing=true]
+ * @param {boolean} [options.isFinalizing=false]
+ * @returns {Promise<{ message: any, rows: Array<object>, png: object } | null>}
+ */
+export async function ensureOrUpdateLeaderboardMessage(client, campaign, options = {}) {
+  if (!client || !campaign || !campaign.announcementChannelId) return null;
+  const allowCreate = options.allowCreateIfMissing !== false;
+  const isFinalizing = Boolean(options.isFinalizing);
+
+  const freshCampaign = (await getInviteCampaignById(campaign.campaignId)) || campaign;
+
+  // Once a campaign is finalized and Ended, never allow non-finalizing refreshes to alter it
+  if (
+    freshCampaign.status === CAMPAIGN_STATUS.ENDED &&
+    !isFinalizing &&
+    freshCampaign.finalizedAt &&
+    options.fromRefreshInteraction
+  ) {
+    return null;
+  }
+
+  const guild =
+    client.guilds?.cache?.get(freshCampaign.guildId) ||
+    (typeof client.guilds?.fetch === 'function'
+      ? await client.guilds.fetch(freshCampaign.guildId).catch(() => null)
+      : null);
+  if (!guild) return null;
+
+  const anncChannel =
+    guild.channels?.cache?.get(freshCampaign.announcementChannelId) ||
+    (typeof guild.channels?.fetch === 'function'
+      ? await guild.channels.fetch(freshCampaign.announcementChannelId).catch(() => null)
+      : null);
+  if (!anncChannel) return null;
+
+  let rows;
+  if (
+    freshCampaign.status === CAMPAIGN_STATUS.ENDED &&
+    !isFinalizing &&
+    Array.isArray(freshCampaign.finalLeaderboardSnapshot)
+  ) {
+    rows = freshCampaign.finalLeaderboardSnapshot;
+  } else {
+    const participants = await getParticipantsForCampaign(freshCampaign.campaignId);
+    rows = computeCampaignLeaderboardRows(freshCampaign, participants, guild);
+  }
+
+  const png = generateLeaderboardPng(freshCampaign, rows);
+  const payload = buildLeaderboardMessagePayload(freshCampaign, rows, png);
+
+  const dbUpdates = {
+    currentLeaderboardSnapshot: rows,
+  };
+  if (freshCampaign.status === CAMPAIGN_STATUS.ENDED || isFinalizing) {
+    dbUpdates.finalLeaderboardSnapshot = rows;
+    if (!freshCampaign.finalizedAt) {
+      dbUpdates.finalizedAt = new Date();
+    }
+  }
+
+  const messageId = freshCampaign.leaderboardMessageId || campaign.leaderboardMessageId;
+
+  // 1. Edit existing managed leaderboard message in place if present
+  if (messageId) {
+    let existingMsg = anncChannel.messages?.cache?.get?.(messageId) || null;
+    if (!existingMsg && typeof anncChannel.messages?.fetch === 'function') {
+      existingMsg = await anncChannel.messages.fetch(messageId).catch(() => null);
+    }
+
+    if (existingMsg) {
+      await queueMessageEdit(existingMsg, payload).catch((err) => {
+        console.warn(
+          `[InviteCampaign] ⚠️ Failed to edit leaderboard message ${messageId}:`,
+          err.message
+        );
+      });
+      await updateInviteCampaign(freshCampaign.campaignId, dbUpdates);
+      Object.assign(campaign, dbUpdates, { leaderboardMessageId: messageId });
+      return { message: existingMsg, rows, png };
+    }
+
+    if (!allowCreate) {
+      return null;
+    }
+  }
+
+  if (!allowCreate) return null;
+
+  // 2. Post initial managed leaderboard message only if none exists yet
+  try {
+    const sent = await queueChannelSend(anncChannel, payload);
+    if (sent?.id) {
+      dbUpdates.leaderboardMessageId = sent.id;
+      await updateInviteCampaign(freshCampaign.campaignId, dbUpdates);
+      Object.assign(campaign, dbUpdates);
+    }
+    return { message: sent, rows, png };
+  } catch (err) {
+    console.warn(
+      `[InviteCampaign] ⚠️ Failed to send leaderboard message in channel ${freshCampaign.announcementChannelId}:`,
+      err.message
+    );
+    return null;
+  }
+}
+
+/**
+ * Finalizes the campaign leaderboard in the announcement channel when the campaign ends:
+ * - Generates the final leaderboard image with status `EVENT ENDED`.
+ * - Updates the existing announcement message (`leaderboardMessageId`) one last time (or creates it if never posted).
+ * - Disables the `Refresh Leaderboard` button.
+ * - Stores `finalLeaderboardSnapshot` and `finalizedAt` in MongoDB.
  *
  * @param {import('discord.js').Client} client
  * @param {object} campaign
  */
 export async function postCampaignFinalResults(client, campaign) {
   if (!client || !campaign || !campaign.announcementChannelId) return null;
-
-  const guild =
-    client.guilds?.cache?.get(campaign.guildId) ||
-    (typeof client.guilds?.fetch === 'function'
-      ? await client.guilds.fetch(campaign.guildId).catch(() => null)
-      : null);
-  if (!guild) return null;
-
-  const anncChannel =
-    guild.channels?.cache?.get(campaign.announcementChannelId) ||
-    (typeof guild.channels?.fetch === 'function'
-      ? await guild.channels.fetch(campaign.announcementChannelId).catch(() => null)
-      : null);
-  if (!anncChannel) return null;
-
-  const [allParticipants, referrals] = await Promise.all([
-    getParticipantsForCampaign(campaign.campaignId),
-    getReferralsForCampaign(campaign.campaignId),
-  ]);
-
-  const activeCountedReferrals = referrals.filter((r) => r.isActive && r.counted && !r.disqualified).length;
-  const topParticipants = allParticipants.filter((p) => !p.disqualified && p.successfulInvites > 0);
-
-  const topLines =
-    topParticipants.length > 0
-      ? topParticipants
-          .slice(0, 25)
-          .map(
-            (p, idx) =>
-              `**${idx + 1}.** <@${p.userId}> — **${p.successfulInvites}** successful invite${p.successfulInvites === 1 ? '' : 's'}`
-          )
-          .join('\n')
-      : '*No successful invites were recorded during this campaign.*';
-
-  const embed = new EmbedBuilder()
-    .setTitle(`🏁 Invite Campaign Ended — ${campaign.name}`)
-    .setColor(0xed4245)
-    .setDescription(
-      `The **${campaign.name}** campaign has ended and final invite counts have been frozen.`
-    )
-    .addFields(
-      { name: '👥 Total Successful Joins', value: `${activeCountedReferrals}`, inline: true },
-      { name: '🔗 Active Inviters', value: `${topParticipants.length}`, inline: true },
-      {
-        name: '🕒 Ended At (IST)',
-        value: formatISTDateTime(campaign.endedAt || new Date()),
-        inline: true,
-      },
-      {
-        name: '📊 Final Invite Totals',
-        value: topLines.slice(0, 1024),
-        inline: false,
-      }
-    )
-    .setFooter({ text: 'MatchDistrict Invite Tracker' })
-    .setTimestamp(new Date());
-
-  return queueChannelSend(anncChannel, { embeds: [embed] }).catch((err) => {
-    console.warn(`[InviteCampaign] ⚠️ Failed to post final campaign result:`, err.message);
-    return null;
+  const res = await ensureOrUpdateLeaderboardMessage(client, campaign, {
+    allowCreateIfMissing: true,
+    isFinalizing: true,
   });
+  return res?.message || null;
 }

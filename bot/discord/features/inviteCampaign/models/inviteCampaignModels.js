@@ -130,6 +130,19 @@ export async function ensureInviteCampaignIndexes(dbInstance = null) {
 
 export async function createInviteCampaign(data) {
   const now = new Date();
+  const threshold = Math.max(
+    1,
+    Number(data.minInviteThreshold ?? data.requiredInvites ?? 1)
+  );
+  const rewards = Array.isArray(data.rewards)
+    ? data.rewards
+        .map((r, idx) => ({
+          position: Number(r.position ?? idx + 1),
+          amount: Math.max(0, Number(r.amount ?? 0)),
+        }))
+        .sort((a, b) => a.position - b.position)
+    : [];
+
   const doc = {
     campaignId: data.campaignId || `cmp_${crypto.randomBytes(6).toString('hex')}`,
     guildId: String(data.guildId),
@@ -138,12 +151,22 @@ export async function createInviteCampaign(data) {
     status: data.status || CAMPAIGN_STATUS.DRAFT,
     startAt: data.startAt ? new Date(data.startAt) : null,
     endAt: data.endAt ? new Date(data.endAt) : null,
-    requiredInvites: Math.max(1, Number(data.requiredInvites || 1)),
+    requiredInvites: threshold,
+    minInviteThreshold: threshold,
+    rewards,
     stayHours: data.stayHours !== undefined ? Number(data.stayHours) : 0,
     minAccountAgeDays: data.minAccountAgeDays !== undefined ? Number(data.minAccountAgeDays) : 0,
     inviteChannelId: String(data.inviteChannelId),
     announcementChannelId: String(data.announcementChannelId),
     panelMessageId: data.panelMessageId ? String(data.panelMessageId) : null,
+    leaderboardMessageId: data.leaderboardMessageId ? String(data.leaderboardMessageId) : null,
+    currentLeaderboardSnapshot: Array.isArray(data.currentLeaderboardSnapshot)
+      ? [...data.currentLeaderboardSnapshot]
+      : [],
+    finalLeaderboardSnapshot: Array.isArray(data.finalLeaderboardSnapshot)
+      ? [...data.finalLeaderboardSnapshot]
+      : null,
+    finalizedAt: data.finalizedAt ? new Date(data.finalizedAt) : null,
     createdBy: String(data.createdBy),
     createdAt: data.createdAt ? new Date(data.createdAt) : now,
     endedAt: data.endedAt ? new Date(data.endedAt) : null,
@@ -249,6 +272,11 @@ export async function updateInviteCampaign(campaignId, updates) {
   if (!campaignId) return null;
   const cleanUpdates = { ...updates };
   delete cleanUpdates._id;
+  if (cleanUpdates.minInviteThreshold !== undefined && cleanUpdates.requiredInvites === undefined) {
+    cleanUpdates.requiredInvites = Math.max(1, Number(cleanUpdates.minInviteThreshold));
+  } else if (cleanUpdates.requiredInvites !== undefined && cleanUpdates.minInviteThreshold === undefined) {
+    cleanUpdates.minInviteThreshold = Math.max(1, Number(cleanUpdates.requiredInvites));
+  }
 
   if (isMongoConnected()) {
     const db = getMongoDb();

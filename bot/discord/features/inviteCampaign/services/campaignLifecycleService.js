@@ -9,6 +9,7 @@ import {
   getCampaignInvitesForCampaign,
   getPendingReferralsForCampaign,
   updateCampaignReferral,
+  getParticipantsForCampaign,
 } from '../models/inviteCampaignModels.js';
 import {
   syncGuildInviteSnapshot,
@@ -17,8 +18,10 @@ import {
 import { recalculateAllCampaignParticipants } from './eligibilityService.js';
 import {
   ensureOrUpdateCampaignPanel,
+  ensureOrUpdateLeaderboardMessage,
   postCampaignFinalResults,
 } from './campaignPanelService.js';
+import { computeCampaignLeaderboardRows } from './leaderboardImageService.js';
 
 /**
  * Checks whether a Discord client has a specific GatewayIntentBit enabled.
@@ -175,6 +178,7 @@ export async function startCampaign(client, guild, campaignOrId, now = new Date(
     await refreshModerationAllowlistForGuild(effectiveGuild.id, updated);
     if (client) {
       await ensureOrUpdateCampaignPanel(client, updated);
+      await ensureOrUpdateLeaderboardMessage(client, updated);
     }
 
     return { ok: true, campaign: updated };
@@ -262,6 +266,7 @@ export async function resumeCampaign(client, guild, campaignOrId) {
     await refreshModerationAllowlistForGuild(effectiveGuild.id, updated);
     if (client) {
       await ensureOrUpdateCampaignPanel(client, updated);
+      await ensureOrUpdateLeaderboardMessage(client, updated);
     }
 
     return { ok: true, campaign: updated };
@@ -350,10 +355,16 @@ export async function endCampaign(client, guild, campaignOrId, now = new Date())
       });
     }
 
-    // 3. Mark campaign as Ended in MongoDB
+    // 3. Compute final leaderboard snapshot and mark campaign as Ended in MongoDB
+    const participants = await getParticipantsForCampaign(campaign.campaignId);
+    const finalRows = computeCampaignLeaderboardRows(campaign, participants, effectiveGuild);
+
     const endedCampaign = await updateInviteCampaign(campaign.campaignId, {
       status: CAMPAIGN_STATUS.ENDED,
       endedAt: now,
+      finalizedAt: now,
+      currentLeaderboardSnapshot: finalRows,
+      finalLeaderboardSnapshot: finalRows,
     });
 
     // 4. Remove campaign invites from moderation allowlist
@@ -369,7 +380,7 @@ export async function endCampaign(client, guild, campaignOrId, now = new Date())
       await deleteCampaignDiscordInvites(effectiveGuild, endedCampaign.campaignId);
     }
 
-    // 7. Post final result in the announcement channel
+    // 7. Update/post final leaderboard image in the announcement channel with Refresh disabled
     if (client) {
       await postCampaignFinalResults(client, endedCampaign);
     }

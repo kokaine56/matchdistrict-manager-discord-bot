@@ -24,7 +24,11 @@ import {
   startCampaign,
   endCampaign,
 } from './campaignLifecycleService.js';
-import { ensureOrUpdateCampaignPanel } from './campaignPanelService.js';
+import {
+  ensureOrUpdateCampaignPanel,
+  ensureOrUpdateLeaderboardMessage,
+} from './campaignPanelService.js';
+import { isAccountOldEnough } from './timeUtils.js';
 
 export const SAFETY_CHECK_INTERVAL_MS = 5 * 1000;
 export const MAX_TIMER_CHUNK_MS = 10 * 60 * 1000;
@@ -269,6 +273,26 @@ export async function recordOrRestoreCampaignReferral(
       });
     }
 
+    // Account age check when minAccountAgeDays > 0 is configured
+    const minAgeDays = Math.max(0, Number(freshCampaign.minAccountAgeDays || 0));
+    if (minAgeDays > 0 && !isAccountOldEnough(member.user, minAgeDays, joinedAt)) {
+      return createCampaignReferral({
+        campaignId,
+        guildId,
+        invitedUserId,
+        inviterId,
+        inviteCode,
+        joinedAt,
+        leftAt: null,
+        isActive: true,
+        counted: false,
+        countedAt: null,
+        disqualified: true,
+        disqualifyReason: `Discord account younger than required ${minAgeDays} day(s)`,
+        dueAt: null,
+      });
+    }
+
     // Immediately count the referral and increment the owner's successfulInvites count
     const createdRef = await createCampaignReferral({
       campaignId,
@@ -415,6 +439,12 @@ export async function reconcileSingleCampaignOnStartup(client, campaign, now = n
   await ensureOrUpdateCampaignPanel(client, updatedCampaign, {
     allowCreateIfMissing: !updatedCampaign.panelMessageId,
   });
+
+  if (updatedCampaign.status !== CAMPAIGN_STATUS.ENDED) {
+    await ensureOrUpdateLeaderboardMessage(client, updatedCampaign, {
+      allowCreateIfMissing: !updatedCampaign.leaderboardMessageId,
+    });
+  }
 }
 
 /**

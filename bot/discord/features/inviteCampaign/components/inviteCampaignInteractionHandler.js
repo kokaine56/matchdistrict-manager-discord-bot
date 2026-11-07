@@ -32,9 +32,17 @@ import {
 } from '../services/inviteSnapshotService.js';
 import {
   recalculateParticipantEligibility,
+  recalculateAllCampaignParticipants,
   setLiveUserViewRefreshHook,
 } from '../services/eligibilityService.js';
-import { ensureOrUpdateCampaignPanel } from '../services/campaignPanelService.js';
+import {
+  ensureOrUpdateCampaignPanel,
+  ensureOrUpdateLeaderboardMessage,
+} from '../services/campaignPanelService.js';
+import {
+  parseAndValidateRewards,
+  formatRewardsSummary,
+} from '../services/leaderboardImageService.js';
 import { endCampaign } from '../services/campaignLifecycleService.js';
 import {
   evaluateAndArmCampaignTimers,
@@ -42,6 +50,7 @@ import {
 } from '../services/campaignSchedulerService.js';
 
 export const GENERATE_BUTTON_COOLDOWN_MS = 5000;
+export const LEADERBOARD_REFRESH_COOLDOWN_MS = 3000;
 export const MAX_DISCORD_GUILD_INVITES = 1000;
 
 // `${guildId}:${userId}` -> wizard draft state
@@ -50,12 +59,16 @@ const pendingCreateWizards = new Map();
 // `${guildId}:${userId}` -> timestamp (ms)
 const generateButtonCooldowns = new Map();
 
+// `${campaignId}` -> timestamp (ms)
+const leaderboardRefreshCooldowns = new Map();
+
 // `${campaignId}:${userId}` -> { interaction, inviteUrl, updatedAt }
 const activeUserInviteViews = new Map();
 
 export function clearInviteInteractionCaches() {
   pendingCreateWizards.clear();
   generateButtonCooldowns.clear();
+  leaderboardRefreshCooldowns.clear();
   activeUserInviteViews.clear();
 }
 
@@ -132,7 +145,7 @@ export function hasCampaignAdminPermission(member, guild = null) {
 }
 
 /**
- * Builds the Campaign Creation Modal.
+ * Builds the Campaign Creation Modal (up to 5 inputs: Name, Start, End, Min Invite Threshold, Rewards).
  */
 export function buildCreateCampaignModal() {
   const modal = new ModalBuilder()
@@ -146,14 +159,6 @@ export function buildCreateCampaignModal() {
     .setPlaceholder('e.g. Diwali Invite & Earn Campaign')
     .setRequired(true)
     .setMaxLength(100);
-
-  const descInput = new TextInputBuilder()
-    .setCustomId('description')
-    .setLabel('Description')
-    .setStyle(TextInputStyle.Paragraph)
-    .setPlaceholder('Describe the campaign details...')
-    .setRequired(true)
-    .setMaxLength(1000);
 
   const startInput = new TextInputBuilder()
     .setCustomId('startAt')
@@ -171,18 +176,81 @@ export function buildCreateCampaignModal() {
     .setRequired(true)
     .setMaxLength(32);
 
+  const thresholdInput = new TextInputBuilder()
+    .setCustomId('minInviteThreshold')
+    .setLabel('Minimum Valid Invite Threshold')
+    .setStyle(TextInputStyle.Short)
+    .setPlaceholder('e.g. 10 (only users >= threshold appear on leaderboard)')
+    .setRequired(false)
+    .setMaxLength(10);
+
+  const rewardsInput = new TextInputBuilder()
+    .setCustomId('rewards')
+    .setLabel('Rewards by Rank (e.g. #1=50, #2=20, #3=10)')
+    .setStyle(TextInputStyle.Paragraph)
+    .setPlaceholder('#1 = ₹50\n#2 = ₹20\n#3 = ₹10\n#4 = ₹5\n#5 = ₹2')
+    .setRequired(false)
+    .setMaxLength(500);
+
   modal.addComponents(
     new ActionRowBuilder().addComponents(nameInput),
-    new ActionRowBuilder().addComponents(descInput),
     new ActionRowBuilder().addComponents(startInput),
-    new ActionRowBuilder().addComponents(endInput)
+    new ActionRowBuilder().addComponents(endInput),
+    new ActionRowBuilder().addComponents(thresholdInput),
+    new ActionRowBuilder().addComponents(rewardsInput)
   );
 
   return modal;
 }
 
 /**
- * Builds the Channel Select Menus (Invite Channel & Announcement Channel) + Confirm/Cancel buttons.
+ * Builds the Modal for editing Rewards & Minimum Invite Threshold before campaign start.
+ */
+export function buildRewardsConfigModal(currentThreshold = 1, currentRewards = [], campaignId = null) {
+  const customId = campaignId
+    ? `inv_cmp:rewards_modal:${campaignId}`
+    : 'inv_cmp:rewards_modal';
+
+  const modal = new ModalBuilder()
+    .setCustomId(customId)
+    .setTitle('Configure Rewards & Threshold');
+
+  const thresholdInput = new TextInputBuilder()
+    .setCustomId('minInviteThreshold')
+    .setLabel('Minimum Valid Invite Threshold')
+    .setStyle(TextInputStyle.Short)
+    .setValue(String(Math.max(1, Number(currentThreshold || 1))))
+    .setPlaceholder('e.g. 10')
+    .setRequired(true)
+    .setMaxLength(10);
+
+  const defaultRewardsText =
+    Array.isArray(currentRewards) && currentRewards.length > 0
+      ? currentRewards.map((r) => `#${r.position}=${r.amount}`).join('\n')
+      : '';
+
+  const rewardsInput = new TextInputBuilder()
+    .setCustomId('rewards')
+    .setLabel('Winning Amounts by Position (₹)')
+    .setStyle(TextInputStyle.Paragraph)
+    .setPlaceholder('#1 = 50\n#2 = 20\n#3 = 10\n#4 = 5\n#5 = 2')
+    .setRequired(false)
+    .setMaxLength(500);
+
+  if (defaultRewardsText) {
+    rewardsInput.setValue(defaultRewardsText);
+  }
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(thresholdInput),
+    new ActionRowBuilder().addComponents(rewardsInput)
+  );
+
+  return modal;
+}
+
+/**
+ * Builds the Channel Select Menus (Invite Channel & Announcement Channel) + Edit Rewards + Confirm/Cancel buttons.
  */
 function buildChannelSelectionStepPayload(wizard) {
   const now = new Date();
@@ -190,20 +258,30 @@ function buildChannelSelectionStepPayload(wizard) {
   const initialStatus = willBeScheduled ? CAMPAIGN_STATUS.SCHEDULED : CAMPAIGN_STATUS.DRAFT;
 
   const embed = new EmbedBuilder()
-    .setTitle('🛠️ Configure Campaign Channels')
+    .setTitle('🛠️ Configure Campaign Channels & Rewards')
     .setColor(0x3498db)
     .setDescription(
-      'Select the **Invite Channel** (where the persistent Invite Panel will be posted) and the **Announcement Channel** (where final campaign results will be posted), then click **Confirm**.'
+      'Select the **Invite Channel** (where the persistent Invite Panel will be posted) and the **Announcement Channel** (where the live image leaderboard will be posted), then click **Confirm**.'
     )
     .addFields(
       { name: '🏷️ Campaign Name', value: wizard.name, inline: true },
       { name: '📌 Initial Status', value: initialStatus, inline: true },
+      {
+        name: '🎯 Min Invite Threshold',
+        value: `${wizard.minInviteThreshold ?? wizard.requiredInvites ?? 1} valid invite(s)`,
+        inline: true,
+      },
       {
         name: '🕒 Start (IST)',
         value: wizard.startAt ? formatISTDateTime(wizard.startAt) : 'Manual (.invite start)',
         inline: true,
       },
       { name: '⏰ End (IST)', value: formatISTDateTime(wizard.endAt), inline: true },
+      {
+        name: '💰 Reward Distribution',
+        value: formatRewardsSummary(wizard.rewards),
+        inline: false,
+      },
       {
         name: '📢 Selected Channels',
         value:
@@ -223,6 +301,12 @@ function buildChannelSelectionStepPayload(wizard) {
     .setPlaceholder('2️⃣ Select Announcement Channel...')
     .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement);
 
+  const editRewardsBtn = new ButtonBuilder()
+    .setCustomId('inv_cmp:open_rewards_modal')
+    .setLabel('Edit Rewards & Threshold')
+    .setEmoji('💰')
+    .setStyle(ButtonStyle.Primary);
+
   const confirmBtn = new ButtonBuilder()
     .setCustomId('inv_cmp:confirm_create')
     .setLabel('Confirm & Create Campaign')
@@ -239,14 +323,14 @@ function buildChannelSelectionStepPayload(wizard) {
     components: [
       new ActionRowBuilder().addComponents(inviteChannelSelect),
       new ActionRowBuilder().addComponents(anncChannelSelect),
-      new ActionRowBuilder().addComponents(confirmBtn, cancelBtn),
+      new ActionRowBuilder().addComponents(editRewardsBtn, confirmBtn, cancelBtn),
     ],
     ephemeral: true,
   };
 }
 
 /**
- * Handles the "Generate My Invite" button click on the persistent Invite Panel.
+ * Handles the "Create Link" button click on the persistent Invite Panel.
  */
 async function handleGenerateInviteButton(interaction, campaignId) {
   const guild = interaction.guild;
@@ -267,7 +351,7 @@ async function handleGenerateInviteButton(interaction, campaignId) {
   if (nowMs - lastClickMs < GENERATE_BUTTON_COOLDOWN_MS) {
     const waitSec = Math.ceil((GENERATE_BUTTON_COOLDOWN_MS - (nowMs - lastClickMs)) / 1000);
     await interaction.reply({
-      content: `⏳ Please wait **${waitSec}s** before clicking **Generate My Invite** again.`,
+      content: `⏳ Please wait **${waitSec}s** before clicking **Create Link** again.`,
       ephemeral: true,
     });
     return true;
@@ -478,6 +562,117 @@ async function handleRefreshInviteButton(interaction, campaignId) {
 }
 
 /**
+ * Handles the "Refresh Leaderboard" button below the image leaderboard in the announcement channel.
+ *
+ * Requirements:
+ * - Verifies the user has permission to refresh the leaderboard (must be a guild member, not a bot).
+ * - Fetches the latest campaign data from MongoDB.
+ * - Rejects refresh if campaign has already ended (never modifies finalized leaderboard).
+ * - Protects against simultaneous clicks (per-campaign mutex lock) and excessive refresh spam (cooldown).
+ * - Recalculates valid invite counts, applies minimum threshold, recalculates rankings & rewards,
+ *   generates updated PNG image, and edits the existing announcement message in place.
+ */
+async function handleRefreshLeaderboardButton(interaction, campaignId) {
+  const guild = interaction.guild;
+  const user = interaction.user || interaction.member?.user;
+  if (!guild || !user || user.bot) {
+    if (typeof interaction.reply === 'function') {
+      await interaction.reply({
+        content: '❌ You do not have permission to refresh this leaderboard.',
+        ephemeral: true,
+      });
+    }
+    return true;
+  }
+
+  const campaign = await getInviteCampaignById(campaignId);
+  if (!campaign || campaign.guildId !== String(guild.id)) {
+    if (typeof interaction.reply === 'function') {
+      await interaction.reply({
+        content: '❌ Campaign not found.',
+        ephemeral: true,
+      });
+    }
+    return true;
+  }
+
+  // Never modify the leaderboard once the campaign has ended
+  if (campaign.status === CAMPAIGN_STATUS.ENDED) {
+    if (typeof interaction.reply === 'function') {
+      await interaction.reply({
+        content: '🏁 This campaign has ended and the leaderboard is permanently finalized.',
+        ephemeral: true,
+      });
+    }
+    return true;
+  }
+
+  // Protection against excessive refresh requests
+  const nowMs = Date.now();
+  const lastRefreshMs = leaderboardRefreshCooldowns.get(campaign.campaignId) || 0;
+  if (nowMs - lastRefreshMs < LEADERBOARD_REFRESH_COOLDOWN_MS) {
+    const waitSec = Math.ceil((LEADERBOARD_REFRESH_COOLDOWN_MS - (nowMs - lastRefreshMs)) / 1000);
+    if (typeof interaction.reply === 'function') {
+      await interaction.reply({
+        content: `⏳ Leaderboard was just refreshed. Please wait **${waitSec}s** before refreshing again.`,
+        ephemeral: true,
+      });
+    }
+    return true;
+  }
+
+  const lockKey = `lock:inv_cmp:lb_refresh:${campaign.campaignId}`;
+
+  return withCampaignLock(lockKey, async () => {
+    const freshCampaign = await getInviteCampaignById(campaign.campaignId);
+    if (!freshCampaign || freshCampaign.status === CAMPAIGN_STATUS.ENDED) {
+      if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
+        await interaction.reply({
+          content: '🏁 This campaign has ended and the leaderboard is permanently finalized.',
+          ephemeral: true,
+        });
+      }
+      return true;
+    }
+
+    const currentMs = Date.now();
+    const recentMs = leaderboardRefreshCooldowns.get(freshCampaign.campaignId) || 0;
+    if (currentMs - recentMs < LEADERBOARD_REFRESH_COOLDOWN_MS) {
+      const waitSec = Math.ceil((LEADERBOARD_REFRESH_COOLDOWN_MS - (currentMs - recentMs)) / 1000);
+      if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
+        await interaction.reply({
+          content: `⏳ Leaderboard was just refreshed. Please wait **${waitSec}s** before refreshing again.`,
+          ephemeral: true,
+        });
+      }
+      return true;
+    }
+
+    leaderboardRefreshCooldowns.set(freshCampaign.campaignId, currentMs);
+
+    // Recalculate all participant counts from MongoDB referral source of truth
+    await recalculateAllCampaignParticipants(interaction.client, freshCampaign);
+
+    // Regenerate PNG leaderboard and edit existing announcement message in place
+    const updatedLb = await ensureOrUpdateLeaderboardMessage(interaction.client, freshCampaign, {
+      allowCreateIfMissing: true,
+      fromRefreshInteraction: true,
+    });
+
+    if (typeof interaction.deferUpdate === 'function' && !interaction.replied && !interaction.deferred) {
+      await interaction.deferUpdate().catch(() => {});
+    } else if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
+      await interaction.reply({
+        content: `✅ Leaderboard refreshed! (${updatedLb?.rows?.length ?? 0} qualified participant(s) shown)`,
+        ephemeral: true,
+      });
+    }
+
+    return true;
+  });
+}
+
+/**
  * Notifies the admin in the announcement channel when the server hits Discord's 1000-invite limit.
  */
 async function notifyAdminInviteLimitReached(client, guild, campaign) {
@@ -504,6 +699,18 @@ async function notifyAdminInviteLimitReached(client, guild, campaign) {
 }
 
 /**
+ * Safely reads a modal text input field without throwing if the field was not included.
+ */
+function getOptionalModalField(interaction, fieldName) {
+  try {
+    const val = interaction.fields?.getTextInputValue?.(fieldName);
+    return typeof val === 'string' ? val.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * Main router for all `inv_cmp:` interactions (buttons, modals, channel select menus).
  *
  * @param {import('discord.js').Interaction} interaction
@@ -517,16 +724,22 @@ export async function handleInviteCampaignInteraction(interaction) {
   const member = interaction.member;
   const userId = String(interaction.user?.id || member?.id || '');
 
-  // 1a. Public member button: Generate My Invite
+  // 1a. Public member button: Create Link (customId: inv_cmp:generate:<campaignId>)
   if (interaction.isButton?.() && customId.startsWith('inv_cmp:generate:')) {
     const campaignId = customId.slice('inv_cmp:generate:'.length);
     return handleGenerateInviteButton(interaction, campaignId);
   }
 
-  // 1b. Public member button: Refresh count
+  // 1b. Public member button: Refresh personal invite count
   if (interaction.isButton?.() && customId.startsWith('inv_cmp:refresh:')) {
     const campaignId = customId.slice('inv_cmp:refresh:'.length);
     return handleRefreshInviteButton(interaction, campaignId);
+  }
+
+  // 1c. Public member button: Refresh Leaderboard image in announcement channel
+  if (interaction.isButton?.() && customId.startsWith('inv_cmp:refresh_lb:')) {
+    const campaignId = customId.slice('inv_cmp:refresh_lb:'.length);
+    return handleRefreshLeaderboardButton(interaction, campaignId);
   }
 
   // All remaining interactions are Admin-only — enforce server-side permission check
@@ -565,23 +778,42 @@ export async function handleInviteCampaignInteraction(interaction) {
       return true;
     }
 
-    const name = interaction.fields.getTextInputValue('name')?.trim();
-    const description = interaction.fields.getTextInputValue('description')?.trim();
-    const startRaw = interaction.fields.getTextInputValue('startAt')?.trim();
-    const endRaw = interaction.fields.getTextInputValue('endAt')?.trim();
-    let requiredInvites = 1;
-    try {
-      const reqRaw = interaction.fields.getTextInputValue('requiredInvites')?.trim();
-      if (reqRaw && /^\d+$/.test(reqRaw)) {
-        requiredInvites = Math.max(1, Number(reqRaw));
-      }
-    } catch {
-      // requiredInvites field is optional
+    const name = getOptionalModalField(interaction, 'name');
+    const description =
+      getOptionalModalField(interaction, 'description') ||
+      'Click **Create Link** below to get your personal invite link and climb the leaderboard!';
+    const startRaw = getOptionalModalField(interaction, 'startAt');
+    const endRaw = getOptionalModalField(interaction, 'endAt');
+    const thresholdRaw =
+      getOptionalModalField(interaction, 'minInviteThreshold') ||
+      getOptionalModalField(interaction, 'requiredInvites');
+    const rewardsRaw = getOptionalModalField(interaction, 'rewards');
+
+    if (!name) {
+      await interaction.reply({
+        content: '❌ Campaign name is required.',
+        ephemeral: true,
+      });
+      return true;
     }
 
-    if (!name || !description) {
+    let minInviteThreshold = 1;
+    if (thresholdRaw !== '') {
+      const parsedThresh = Number(thresholdRaw);
+      if (!Number.isInteger(parsedThresh) || parsedThresh < 1) {
+        await interaction.reply({
+          content: '❌ **Invalid Minimum Invite Threshold:** Must be a positive whole number (>= 1).',
+          ephemeral: true,
+        });
+        return true;
+      }
+      minInviteThreshold = parsedThresh;
+    }
+
+    const parsedRewards = parseAndValidateRewards(rewardsRaw);
+    if (!parsedRewards.valid) {
       await interaction.reply({
-        content: '❌ Campaign name and description are required.',
+        content: `❌ **Invalid Reward Configuration:** ${parsedRewards.error}`,
         ephemeral: true,
       });
       return true;
@@ -635,13 +867,157 @@ export async function handleInviteCampaignInteraction(interaction) {
       description,
       startAt,
       endAt,
-      requiredInvites,
+      requiredInvites: minInviteThreshold,
+      minInviteThreshold,
+      rewards: parsedRewards.rewards,
       inviteChannelId: null,
       announcementChannelId: null,
     };
     pendingCreateWizards.set(wizardKey, wizard);
 
     await interaction.reply(buildChannelSelectionStepPayload(wizard));
+    return true;
+  }
+
+  // 3b. Admin button: Open Rewards & Threshold Modal during wizard OR for existing Draft/Scheduled campaign
+  if (
+    interaction.isButton?.() &&
+    (customId === 'inv_cmp:open_rewards_modal' || customId.startsWith('inv_cmp:edit_campaign_rewards:'))
+  ) {
+    if (customId.startsWith('inv_cmp:edit_campaign_rewards:')) {
+      const campaignId = customId.slice('inv_cmp:edit_campaign_rewards:'.length);
+      const campaign = await getInviteCampaignById(campaignId);
+      if (!campaign || campaign.guildId !== String(guild.id)) {
+        await interaction.reply({ content: '❌ Campaign not found.', ephemeral: true });
+        return true;
+      }
+      if (
+        campaign.status !== CAMPAIGN_STATUS.DRAFT &&
+        campaign.status !== CAMPAIGN_STATUS.SCHEDULED
+      ) {
+        await interaction.reply({
+          content: `❌ Rewards and threshold can only be edited before the campaign starts (current status: **${campaign.status}**).`,
+          ephemeral: true,
+        });
+        return true;
+      }
+
+      const modal = buildRewardsConfigModal(
+        campaign.minInviteThreshold ?? campaign.requiredInvites ?? 1,
+        campaign.rewards || [],
+        campaign.campaignId
+      );
+      await interaction.showModal(modal);
+      return true;
+    }
+
+    const wizardKey = `${guild.id}:${userId}`;
+    const wizard = pendingCreateWizards.get(wizardKey);
+    if (!wizard) {
+      await interaction.reply({
+        content: '⚠️ Your campaign creation session expired. Please run `.invite create` again.',
+        ephemeral: true,
+      });
+      return true;
+    }
+
+    const modal = buildRewardsConfigModal(
+      wizard.minInviteThreshold ?? 1,
+      wizard.rewards || [],
+      null
+    );
+    await interaction.showModal(modal);
+    return true;
+  }
+
+  // 3c. Admin modal submit: Rewards & Threshold Config Modal
+  if (
+    interaction.isModalSubmit?.() &&
+    (customId === 'inv_cmp:rewards_modal' || customId.startsWith('inv_cmp:rewards_modal:'))
+  ) {
+    const thresholdRaw = getOptionalModalField(interaction, 'minInviteThreshold');
+    const rewardsRaw = getOptionalModalField(interaction, 'rewards');
+
+    const parsedThresh = thresholdRaw === '' ? 1 : Number(thresholdRaw);
+    if (!Number.isInteger(parsedThresh) || parsedThresh < 1) {
+      await interaction.reply({
+        content: '❌ **Invalid Minimum Invite Threshold:** Must be a positive integer (>= 1).',
+        ephemeral: true,
+      });
+      return true;
+    }
+
+    const parsedRewards = parseAndValidateRewards(rewardsRaw);
+    if (!parsedRewards.valid) {
+      await interaction.reply({
+        content: `❌ **Invalid Reward Configuration:** ${parsedRewards.error}`,
+        ephemeral: true,
+      });
+      return true;
+    }
+
+    if (customId.startsWith('inv_cmp:rewards_modal:')) {
+      const campaignId = customId.slice('inv_cmp:rewards_modal:'.length);
+      const campaign = await getInviteCampaignById(campaignId);
+      if (!campaign || campaign.guildId !== String(guild.id)) {
+        await interaction.reply({ content: '❌ Campaign not found.', ephemeral: true });
+        return true;
+      }
+      if (
+        campaign.status !== CAMPAIGN_STATUS.DRAFT &&
+        campaign.status !== CAMPAIGN_STATUS.SCHEDULED
+      ) {
+        await interaction.reply({
+          content: `❌ Cannot modify rewards or threshold once the campaign is **${campaign.status}**.`,
+          ephemeral: true,
+        });
+        return true;
+      }
+
+      const updated = await updateInviteCampaign(campaign.campaignId, {
+        minInviteThreshold: parsedThresh,
+        requiredInvites: parsedThresh,
+        rewards: parsedRewards.rewards,
+      });
+
+      if (interaction.client && updated.leaderboardMessageId) {
+        await ensureOrUpdateLeaderboardMessage(interaction.client, updated, {
+          allowCreateIfMissing: false,
+        });
+      }
+
+      await interaction.reply({
+        content:
+          `✅ **Updated Rewards & Threshold for "${updated.name}":**\n` +
+          `• **Min Invite Threshold:** ${updated.minInviteThreshold}\n` +
+          `• **Rewards:** ${formatRewardsSummary(updated.rewards)}`,
+        ephemeral: true,
+      });
+      return true;
+    }
+
+    const wizardKey = `${guild.id}:${userId}`;
+    const wizard = pendingCreateWizards.get(wizardKey);
+    if (!wizard) {
+      await interaction.reply({
+        content: '⚠️ Your campaign creation session expired. Please run `.invite create` again.',
+        ephemeral: true,
+      });
+      return true;
+    }
+
+    wizard.minInviteThreshold = parsedThresh;
+    wizard.requiredInvites = parsedThresh;
+    wizard.rewards = parsedRewards.rewards;
+    pendingCreateWizards.set(wizardKey, wizard);
+
+    const payload = buildChannelSelectionStepPayload(wizard);
+    if (typeof interaction.update === 'function') {
+      delete payload.ephemeral;
+      await interaction.update(payload);
+    } else {
+      await interaction.reply(payload);
+    }
     return true;
   }
 
@@ -720,12 +1096,15 @@ export async function handleInviteCampaignInteraction(interaction) {
         status: initialStatus,
         startAt: wizard.startAt || null,
         endAt: wizard.endAt,
-        requiredInvites: wizard.requiredInvites || 1,
+        requiredInvites: wizard.minInviteThreshold || wizard.requiredInvites || 1,
+        minInviteThreshold: wizard.minInviteThreshold || wizard.requiredInvites || 1,
+        rewards: wizard.rewards || [],
         stayHours: 0,
         minAccountAgeDays: 0,
         inviteChannelId: wizard.inviteChannelId,
         announcementChannelId: wizard.announcementChannelId,
         panelMessageId: null,
+        leaderboardMessageId: null,
         createdBy: userId,
         createdAt: now,
         endedAt: null,
@@ -735,13 +1114,16 @@ export async function handleInviteCampaignInteraction(interaction) {
 
       await refreshModerationAllowlistForGuild(guild.id, campaign);
       await ensureOrUpdateCampaignPanel(interaction.client, campaign);
+      await ensureOrUpdateLeaderboardMessage(interaction.client, campaign);
       await evaluateAndArmCampaignTimers(interaction.client, campaign, now);
 
       await interaction.update({
         content:
           `✅ **Campaign "${campaign.name}" created as \`${campaign.status}\`!**\n` +
           `• **Invite Panel Posted In:** <#${campaign.inviteChannelId}>\n` +
-          `• **Announcement Channel:** <#${campaign.announcementChannelId}>\n` +
+          `• **Live Image Leaderboard Posted In:** <#${campaign.announcementChannelId}>\n` +
+          `• **Minimum Invite Threshold:** ${campaign.minInviteThreshold} valid invite(s)\n` +
+          `• **Rewards:** ${formatRewardsSummary(campaign.rewards)}\n` +
           `• **Start Time (IST):** ${campaign.startAt ? formatISTDateTime(campaign.startAt) : 'Manual (`.invite start`)'}\n` +
           `• **End Time (IST):** ${formatISTDateTime(campaign.endAt)}\n\n` +
           (campaign.status === CAMPAIGN_STATUS.DRAFT
@@ -782,7 +1164,7 @@ export async function handleInviteCampaignInteraction(interaction) {
     }
 
     await interaction.update({
-      content: `🏁 **Campaign "${res.campaign.name}" has been ended.** Final counts have been frozen, campaign invite links have been deleted from Discord, the panel button is disabled, and the final summary was posted in <#${res.campaign.announcementChannelId}>.`,
+      content: `🏁 **Campaign "${res.campaign.name}" has been ended.** Final counts have been frozen, campaign invite links have been deleted from Discord, the panel button is disabled, and the final leaderboard image was updated in <#${res.campaign.announcementChannelId}>.`,
       embeds: [],
       components: [],
     });

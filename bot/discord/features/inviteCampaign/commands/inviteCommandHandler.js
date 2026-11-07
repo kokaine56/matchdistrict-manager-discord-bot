@@ -34,7 +34,15 @@ import {
   clearCampaignTimers,
   clearReferralTimer,
 } from '../services/campaignSchedulerService.js';
-import { ensureOrUpdateCampaignPanel } from '../services/campaignPanelService.js';
+import {
+  ensureOrUpdateCampaignPanel,
+  ensureOrUpdateLeaderboardMessage,
+} from '../services/campaignPanelService.js';
+import {
+  parseAndValidateRewards,
+  formatRewardsSummary,
+  computeCampaignLeaderboardRows,
+} from '../services/leaderboardImageService.js';
 import { recalculateParticipantEligibility } from '../services/eligibilityService.js';
 import { hasCampaignAdminPermission } from '../components/inviteCampaignInteractionHandler.js';
 
@@ -240,7 +248,87 @@ export async function handleInviteCommand(guild, member, channel, args, replyFn,
       return replyFn(`✅ **Account age setting updated:** \`${days}\` day(s).`);
     }
 
-    return replyFn('ℹ️ **Usage:** `.invite set stay <hours>` or `.invite set accountage <days>`');
+    if (prop === 'threshold' || prop === 'mininvites' || prop === 'required') {
+      const thresh = rawVal !== undefined && rawVal !== '' ? Number(rawVal) : NaN;
+      if (!Number.isInteger(thresh) || thresh < 1) {
+        return replyFn(
+          '❌ **Usage:** `.invite set threshold <number>` (must be a positive whole number >= 1).'
+        );
+      }
+
+      const updated = await updateInviteCampaign(campaign.campaignId, {
+        minInviteThreshold: thresh,
+        requiredInvites: thresh,
+      });
+      if (effectiveClient && updated.leaderboardMessageId) {
+        await ensureOrUpdateLeaderboardMessage(effectiveClient, updated, {
+          allowCreateIfMissing: false,
+        });
+      }
+      return replyFn(
+        `✅ **Minimum valid invite threshold updated:** \`${thresh}\` invite(s) required to appear on the leaderboard.`
+      );
+    }
+
+    if (prop === 'rewards' || prop === 'reward') {
+      const rewardsStr = args.slice(2).join(' ').trim();
+      if (!rewardsStr) {
+        return replyFn(
+          '❌ **Usage:** `.invite set rewards #1=50, #2=20, #3=10` (or `.invite set rewards 50, 20, 10`).'
+        );
+      }
+
+      const parsed = parseAndValidateRewards(rewardsStr);
+      if (!parsed.valid) {
+        return replyFn(`❌ **Invalid Reward Configuration:** ${parsed.error}`);
+      }
+
+      const updated = await updateInviteCampaign(campaign.campaignId, {
+        rewards: parsed.rewards,
+      });
+      if (effectiveClient && updated.leaderboardMessageId) {
+        await ensureOrUpdateLeaderboardMessage(effectiveClient, updated, {
+          allowCreateIfMissing: false,
+        });
+      }
+      return replyFn(
+        `✅ **Reward configuration updated:** ${formatRewardsSummary(updated.rewards)}`
+      );
+    }
+
+    return replyFn(
+      'ℹ️ **Usage:** `.invite set threshold <number>`, `.invite set rewards <#1=50, #2=20...>`, `.invite set stay <hours>`, or `.invite set accountage <days>`'
+    );
+  }
+
+  // 6b. .invite rewards | .invite config — View or interactively edit rewards & threshold before start
+  if (subCmd === 'rewards' || subCmd === 'config') {
+    const campaign = (await getCurrentGuildCampaign(guild.id)) || (await getLatestGuildCampaign(guild.id));
+    if (!campaign) {
+      return replyFn('ℹ️ No Invite campaign found in this server.');
+    }
+
+    const canEdit =
+      campaign.status === CAMPAIGN_STATUS.DRAFT ||
+      campaign.status === CAMPAIGN_STATUS.SCHEDULED;
+
+    const components = [];
+    if (canEdit) {
+      const editBtn = new ButtonBuilder()
+        .setCustomId(`inv_cmp:edit_campaign_rewards:${campaign.campaignId}`)
+        .setLabel('Edit Rewards & Threshold')
+        .setEmoji('💰')
+        .setStyle(ButtonStyle.Primary);
+      components.push(new ActionRowBuilder().addComponents(editBtn));
+    }
+
+    return replyFn({
+      content:
+        `💰 **Reward & Threshold Configuration — ${campaign.name} (\`${campaign.status}\`)**\n` +
+        `• **Minimum Valid Invite Threshold:** ${campaign.minInviteThreshold ?? campaign.requiredInvites ?? 1} invite(s)\n` +
+        `• **Rewards by Position:** ${formatRewardsSummary(campaign.rewards)}`,
+      components,
+    });
   }
 
   // 7. .invite status | .invite stats
@@ -267,6 +355,11 @@ export async function handleInviteCommand(guild, member, channel, args, replyFn,
       .addFields(
         { name: '📌 Status', value: `**${campaign.status}**`, inline: true },
         {
+          name: '🎯 Min Threshold',
+          value: `${campaign.minInviteThreshold ?? campaign.requiredInvites ?? 1} invite(s)`,
+          inline: true,
+        },
+        {
           name: '🕒 Start (IST)',
           value: campaign.startAt ? formatISTDateTime(campaign.startAt) : 'Not started',
           inline: true,
@@ -285,6 +378,11 @@ export async function handleInviteCommand(guild, member, channel, args, replyFn,
           name: '📍 Channels',
           value: `Panel: <#${campaign.inviteChannelId}> | Announcements: <#${campaign.announcementChannelId}>`,
           inline: true,
+        },
+        {
+          name: '💰 Rewards',
+          value: formatRewardsSummary(campaign.rewards),
+          inline: false,
         },
         {
           name: '📈 Campaign Statistics',
@@ -309,34 +407,29 @@ export async function handleInviteCommand(guild, member, channel, args, replyFn,
       return replyFn('ℹ️ No Invite campaign found in this server.');
     }
 
-    const participants = (await getParticipantsForCampaign(campaign.campaignId)).filter(
-      (p) => !p.disqualified && p.successfulInvites > 0
-    );
+    const participants = await getParticipantsForCampaign(campaign.campaignId);
+    const qualifiedRows =
+      campaign.status === CAMPAIGN_STATUS.ENDED && Array.isArray(campaign.finalLeaderboardSnapshot)
+        ? campaign.finalLeaderboardSnapshot
+        : computeCampaignLeaderboardRows(campaign, participants, guild);
 
-    if (participants.length === 0) {
-      return replyFn(`📊 **Invite Leaderboard — ${campaign.name}**\nNo successful joins recorded yet for this campaign.`);
-    }
-
-    const rows = [];
-    for (let i = 0; i < Math.min(participants.length, 25); i++) {
-      const p = participants[i];
-      const cachedMember = guild.members?.cache?.get?.(p.userId);
-      const username =
-        cachedMember?.user?.username ||
-        cachedMember?.displayName ||
-        `User#${String(p.userId).slice(-4)}`;
-
-      rows.push(
-        `**#${i + 1}** • **${username}** (<@${p.userId}>) — **${p.successfulInvites}** successful invite${p.successfulInvites === 1 ? '' : 's'}`
+    if (qualifiedRows.length === 0) {
+      return replyFn(
+        `📊 **Invite Leaderboard — ${campaign.name}**\nNo participants have reached the minimum threshold of **${campaign.minInviteThreshold ?? campaign.requiredInvites ?? 1}** valid invite(s) yet.`
       );
     }
+
+    const rows = qualifiedRows.slice(0, 25).map(
+      (r) =>
+        `**#${r.rank}** • **${r.username}** (<@${r.userId}>) — **${r.invites}** invite${r.invites === 1 ? '' : 's'} — **${r.winningAmountFormatted}**`
+    );
 
     const embed = new EmbedBuilder()
       .setTitle(`📊 Invite Leaderboard — ${campaign.name}`)
       .setColor(0xf1c40f)
       .setDescription(rows.join('\n'))
       .setFooter({
-        text: `Campaign Status: ${campaign.status}`,
+        text: `Campaign Status: ${campaign.status} • Min Threshold: ${campaign.minInviteThreshold ?? 1}`,
       })
       .setTimestamp(new Date());
 

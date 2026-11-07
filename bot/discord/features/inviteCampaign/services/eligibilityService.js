@@ -58,37 +58,60 @@ export async function recalculateParticipantEligibility(client, campaign, userId
     );
 
     let successfulInvites = 0;
+    let pendingInvites = 0;
+    const hasStayOrAgeRule =
+      Number(freshCampaign.stayHours || 0) > 0 ||
+      Number(freshCampaign.minAccountAgeDays || 0) > 0;
 
     for (const ref of referrals) {
       if (!ref.isActive || ref.disqualified) continue;
-      // Upgrade any legacy pending referral to counted immediately
-      if (!ref.counted) {
+      if (ref.counted) {
+        successfulInvites++;
+      } else if (!hasStayOrAgeRule && !ref.dueAt) {
+        // Upgrade any legacy pending referral when campaign has no stay/age wait
         await updateCampaignReferral(
           freshCampaign.campaignId,
           freshCampaign.guildId,
           ref.invitedUserId,
           { counted: true, countedAt: ref.joinedAt || new Date(), dueAt: null }
         ).catch(() => {});
+        successfulInvites++;
+      } else {
+        pendingInvites++;
       }
-      successfulInvites++;
     }
 
     const existing = await getCampaignParticipant(freshCampaign.campaignId, userId);
     const disqualified = Boolean(existing?.disqualified);
+    const inviterLeftServer = Boolean(existing?.inviterLeftServer);
+    const effectiveSuccessful = disqualified ? 0 : successfulInvites;
+    const effectivePending = disqualified ? 0 : pendingInvites;
+
+    const threshold = Math.max(
+      1,
+      Number(freshCampaign.minInviteThreshold ?? freshCampaign.requiredInvites ?? 1)
+    );
+    const isEligible =
+      !disqualified && !inviterLeftServer && effectiveSuccessful >= threshold;
+
+    let eligibleAt = null;
+    if (isEligible) {
+      eligibleAt = existing?.eligibleAt ? new Date(existing.eligibleAt) : new Date();
+    }
 
     const updatedParticipant = await upsertCampaignParticipant(
       freshCampaign.campaignId,
       freshCampaign.guildId,
       userId,
       {
-        successfulInvites: disqualified ? 0 : successfulInvites,
-        pendingInvites: 0,
-        isEligible: false,
-        eligibleAt: null,
-        notified: false,
+        successfulInvites: effectiveSuccessful,
+        pendingInvites: effectivePending,
+        isEligible,
+        eligibleAt,
+        notified: Boolean(existing?.notified),
         disqualified,
         disqualifyReason: existing?.disqualifyReason || null,
-        inviterLeftServer: Boolean(existing?.inviterLeftServer),
+        inviterLeftServer,
       }
     );
 

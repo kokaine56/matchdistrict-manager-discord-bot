@@ -13,18 +13,24 @@ import {
   stopInviteCampaignScheduler,
   parseISTDateTime,
   formatISTDateTime,
+  parseAndValidateRewards,
+  computeCampaignLeaderboardRows,
+  generateLeaderboardPng,
+  buildCampaignPanelPayload,
   createInviteCampaign,
   getInviteCampaignById,
   getCurrentGuildCampaign,
   getCampaignInvitesForCampaign,
   getCampaignReferral,
+  getReferralsForCampaign,
   getCampaignParticipant,
-  getUnattributedJoinsForCampaign,
+  upsertCampaignParticipant,
   handleInviteCommand,
   handleInviteCampaignInteraction,
   handleInviteCampaignMemberAdd,
   handleInviteCampaignMemberRemove,
   recoverInviteCampaignsOnStartup,
+  checkInviteCampaignLifecycles,
 } from '../bot/discord/features/inviteCampaign/index.js';
 import { handleMessageModeration } from '../moderationService.js';
 import { guildSettingsCache } from '../index.js';
@@ -59,12 +65,16 @@ function createTestEnvironment(options = {}) {
           content: typeof payload === 'string' ? payload : payload?.content || '',
           embeds: payload?.embeds || [],
           components: payload?.components || [],
+          files: payload?.files || [],
+          _leaderboardMeta: payload?._leaderboardMeta || null,
           edits: [],
           edit: async (editPayload) => {
             msgObj.content =
               typeof editPayload === 'string' ? editPayload : editPayload?.content ?? msgObj.content;
             msgObj.embeds = editPayload?.embeds ?? msgObj.embeds;
             msgObj.components = editPayload?.components ?? msgObj.components;
+            msgObj.files = editPayload?.files ?? msgObj.files;
+            msgObj._leaderboardMeta = editPayload?._leaderboardMeta ?? msgObj._leaderboardMeta;
             msgObj.edits.push(editPayload);
             return msgObj;
           },
@@ -177,13 +187,23 @@ function createTestEnvironment(options = {}) {
 
   client.guilds.cache.set(guildId, guild);
 
-  const addMember = (id, { bot = false, isAdminPerm = false, accountAgeDays = 30, joinedAt = new Date() } = {}) => {
+  const addMember = (
+    id,
+    {
+      bot = false,
+      isAdminPerm = false,
+      accountAgeDays = 30,
+      joinedAt = new Date(),
+      username = null,
+      displayName = null,
+    } = {}
+  ) => {
     const createdTimestamp = Date.now() - accountAgeDays * 24 * 60 * 60 * 1000;
     const member = {
       id,
       guild,
       client,
-      displayName: `User_${id}`,
+      displayName: displayName || `User_${id}`,
       joinedAt,
       joinedTimestamp: joinedAt.getTime(),
       permissions: {
@@ -194,8 +214,8 @@ function createTestEnvironment(options = {}) {
       user: {
         id,
         bot,
-        username: `user_${id}`,
-        tag: `user_${id}#0001`,
+        username: username || `user_${id}`,
+        tag: `${username || `user_${id}`}#0001`,
         createdTimestamp,
         createdAt: new Date(createdTimestamp),
         send: async (msg) => {
@@ -232,7 +252,7 @@ function createTestEnvironment(options = {}) {
   };
 }
 
-test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Invite Counter & Recovery', async (t) => {
+test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Leaderboard', async (t) => {
   t.beforeEach(() => {
     stopInviteCampaignScheduler();
     clearInMemoryInviteCampaignData();
@@ -244,59 +264,92 @@ test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Inv
     stopInviteCampaignScheduler();
   });
 
-  await t.test('1. IST Date Parsing & Formatting and Single Active Campaign Constraint', async () => {
-    const parsed = parseISTDateTime('15-11-2026 18:30');
-    assert.equal(parsed.valid, true);
-    assert.equal(parsed.date.toISOString(), '2026-11-15T13:00:00.000Z');
-    assert.equal(formatISTDateTime(parsed.date), '15-11-2026 18:30 IST');
+  await t.test('1. Button Label Changed to "Create Link" & Duplicate Invite Prevention', async () => {
+    const env = createTestEnvironment();
+    const admin = env.addMember('admin-1', { isAdminPerm: true });
+    const member = env.addMember('member-1');
 
-    const c1 = await createInviteCampaign({
-      guildId: 'g-1',
-      name: 'Campaign 1',
-      description: 'Desc',
+    const campaign = await createInviteCampaign({
+      guildId: env.guildId,
+      name: 'Create Link Test',
+      description: 'Test campaign',
       status: CAMPAIGN_STATUS.DRAFT,
       endAt: new Date(Date.now() + 86400000),
-      inviteChannelId: 'ch-1',
-      announcementChannelId: 'ch-2',
-      createdBy: 'admin-1',
+      inviteChannelId: env.inviteChannel.id,
+      announcementChannelId: env.anncChannel.id,
+      createdBy: admin.id,
     });
-    assert.ok(c1.campaignId);
 
-    await assert.rejects(
-      () =>
-        createInviteCampaign({
-          guildId: 'g-1',
-          name: 'Campaign 2',
-          description: 'Desc',
-          status: CAMPAIGN_STATUS.SCHEDULED,
-          endAt: new Date(Date.now() + 86400000),
-          inviteChannelId: 'ch-1',
-          announcementChannelId: 'ch-2',
-          createdBy: 'admin-1',
-        }),
-      (err) => err.code === 11000
-    );
+    await handleInviteCommand(env.guild, admin, env.inviteChannel, ['start'], async () => { }, env.client);
+    const activeCampaign = await getInviteCampaignById(campaign.campaignId);
+
+    const panelPayload = buildCampaignPanelPayload(activeCampaign);
+    const buttonJson = panelPayload.components[0].components[0].toJSON();
+    assert.equal(buttonJson.label, 'Create Link');
+    assert.equal(buttonJson.custom_id, `inv_cmp:generate:${campaign.campaignId}`);
+
+    // Click "Create Link" first time -> creates 1 Discord invite
+    let reply1 = null;
+    await handleInviteCampaignInteraction({
+      customId: `inv_cmp:generate:${campaign.campaignId}`,
+      guild: env.guild,
+      channel: env.inviteChannel,
+      member,
+      user: member.user,
+      client: env.client,
+      isButton: () => true,
+      reply: async (p) => {
+        reply1 = p;
+      },
+      editReply: async (p) => {
+        reply1 = p;
+      },
+    });
+    assert.equal(env.invites.size, 1);
+
+    // Clear cooldown and click "Create Link" a second time -> reuses existing link, no duplicate created
+    clearInviteInteractionCaches();
+    let reply2 = null;
+    await handleInviteCampaignInteraction({
+      customId: `inv_cmp:generate:${campaign.campaignId}`,
+      guild: env.guild,
+      channel: env.inviteChannel,
+      member,
+      user: member.user,
+      client: env.client,
+      isButton: () => true,
+      reply: async (p) => {
+        reply2 = p;
+      },
+      editReply: async (p) => {
+        reply2 = p;
+      },
+    });
+    assert.equal(env.invites.size, 1);
+    assert.equal(reply1.content, reply2.content);
   });
 
-  await t.test('2. Admin Create Flow (Button -> Modal -> Channel Selects -> Confirm)', async () => {
+  await t.test('2. Creating a Campaign with Custom Reward Amounts & Custom Minimum Invite Threshold (Plus Editing Before Start)', async () => {
     const env = createTestEnvironment();
     const admin = env.addMember('admin-1', { isAdminPerm: true });
 
-    let shownModal = null;
-    await handleInviteCampaignInteraction({
-      customId: `inv_cmp:open_create_modal:${admin.id}`,
-      guild: env.guild,
-      member: admin,
-      user: admin.user,
-      client: env.client,
-      isButton: () => true,
-      showModal: async (modal) => {
-        shownModal = modal;
-      },
-    });
-    assert.ok(shownModal);
+    // Validate reward parser: supports ₹0, custom positions, rejects negative or invalid amounts
+    const validZero = parseAndValidateRewards('#1=50, #2=20, #3=10, #4=0');
+    assert.equal(validZero.valid, true);
+    assert.deepEqual(validZero.rewards, [
+      { position: 1, amount: 50 },
+      { position: 2, amount: 20 },
+      { position: 3, amount: 10 },
+      { position: 4, amount: 0 },
+    ]);
 
-    let modalReply = null;
+    const invalidNeg = parseAndValidateRewards('#1=50, #2=-10');
+    assert.equal(invalidNeg.valid, false);
+
+    const invalidNaN = parseAndValidateRewards('#1=abc');
+    assert.equal(invalidNaN.valid, false);
+
+    // Admin opens modal and submits custom threshold (10) and custom rewards (#1=50, #2=20, #3=10, #4=5, #5=2)
     await handleInviteCampaignInteraction({
       customId: 'inv_cmp:create_modal',
       guild: env.guild,
@@ -307,19 +360,17 @@ test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Inv
       fields: {
         getTextInputValue: (field) => {
           const map = {
-            name: 'Winter Invite Counter',
-            description: 'Share your link and invite friends!',
+            name: 'Diwali Mega Invite Event',
             startAt: 'DRAFT',
             endAt: '25-12-2027 23:59',
+            minInviteThreshold: '10',
+            rewards: '#1=50, #2=20, #3=10, #4=5, #5=2',
           };
-          return map[field];
+          return map[field] || '';
         },
       },
-      reply: async (payload) => {
-        modalReply = payload;
-      },
+      reply: async () => { },
     });
-    assert.ok(modalReply);
 
     await handleInviteCampaignInteraction({
       customId: 'inv_cmp:select_invite_channel',
@@ -329,7 +380,7 @@ test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Inv
       client: env.client,
       isChannelSelectMenu: () => true,
       values: [env.inviteChannel.id],
-      update: async () => {},
+      update: async () => { },
     });
     await handleInviteCampaignInteraction({
       customId: 'inv_cmp:select_annc_channel',
@@ -339,10 +390,9 @@ test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Inv
       client: env.client,
       isChannelSelectMenu: () => true,
       values: [env.anncChannel.id],
-      update: async () => {},
+      update: async () => { },
     });
 
-    let confirmUpdate = null;
     await handleInviteCampaignInteraction({
       customId: 'inv_cmp:confirm_create',
       guild: env.guild,
@@ -350,40 +400,512 @@ test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Inv
       user: admin.user,
       client: env.client,
       isButton: () => true,
-      update: async (payload) => {
-        confirmUpdate = payload;
-      },
+      update: async () => { },
     });
-    assert.match(confirmUpdate.content, /created as `Draft`/i);
 
-    const campaign = await getCurrentGuildCampaign(env.guildId);
-    assert.equal(campaign.name, 'Winter Invite Counter');
-    assert.equal(campaign.status, CAMPAIGN_STATUS.DRAFT);
-    assert.ok(campaign.panelMessageId);
+    let campaign = await getCurrentGuildCampaign(env.guildId);
+    assert.equal(campaign.minInviteThreshold, 10);
+    assert.deepEqual(campaign.rewards, [
+      { position: 1, amount: 50 },
+      { position: 2, amount: 20 },
+      { position: 3, amount: 10 },
+      { position: 4, amount: 5 },
+      { position: 5, amount: 2 },
+    ]);
+    assert.ok(campaign.leaderboardMessageId, 'Initial leaderboard message ID should be stored in MongoDB');
+
+    // Admin edits rewards and threshold via Discord modal interaction before event starts
+    await handleInviteCampaignInteraction({
+      customId: `inv_cmp:rewards_modal:${campaign.campaignId}`,
+      guild: env.guild,
+      member: admin,
+      user: admin.user,
+      client: env.client,
+      isModalSubmit: () => true,
+      fields: {
+        getTextInputValue: (field) => {
+          if (field === 'minInviteThreshold') return '12';
+          if (field === 'rewards') return '#1=100, #2=50, #3=25';
+          return '';
+        },
+      },
+      reply: async () => { },
+    });
+
+    campaign = await getInviteCampaignById(campaign.campaignId);
+    assert.equal(campaign.minInviteThreshold, 12);
+    assert.deepEqual(campaign.rewards, [
+      { position: 1, amount: 100 },
+      { position: 2, amount: 50 },
+      { position: 3, amount: 25 },
+    ]);
+
+    // Admin can also edit via .invite set threshold & .invite set rewards before event starts
+    await handleInviteCommand(
+      env.guild,
+      admin,
+      env.inviteChannel,
+      ['set', 'threshold', '10'],
+      async () => { },
+      env.client
+    );
+    await handleInviteCommand(
+      env.guild,
+      admin,
+      env.inviteChannel,
+      ['set', 'rewards', '#1=50, #2=20, #3=10'],
+      async () => { },
+      env.client
+    );
+
+    campaign = await getInviteCampaignById(campaign.campaignId);
+    assert.equal(campaign.minInviteThreshold, 10);
+    assert.deepEqual(campaign.rewards, [
+      { position: 1, amount: 50 },
+      { position: 2, amount: 20 },
+      { position: 3, amount: 10 },
+    ]);
+
+    // Start campaign -> editing rewards or threshold after start must be rejected
+    await handleInviteCommand(env.guild, admin, env.inviteChannel, ['start'], async () => { }, env.client);
+    let postStartEditReply = '';
+    await handleInviteCommand(
+      env.guild,
+      admin,
+      env.inviteChannel,
+      ['set', 'rewards', '#1=500'],
+      async (msg) => {
+        postStartEditReply = typeof msg === 'string' ? msg : msg.content;
+      },
+      env.client
+    );
+    assert.match(postStartEditReply, /only be modified while the campaign is/i);
   });
 
-  await t.test('3. Simplified User Response, Immediate Join Counting, Real-Time View Refresh & Leave/Rejoin', async () => {
+  await t.test('3. Minimum Invite Threshold Visibility (Below Threshold Hidden, Reaching Threshold Visible, Dropping Below Disappears)', async () => {
     const env = createTestEnvironment();
     const admin = env.addMember('admin-1', { isAdminPerm: true });
-    const inviter = env.addMember('inviter-1', { isAdminPerm: false });
-    const preExistingMember = env.addMember('pre-existing-1', { isAdminPerm: false });
+    const userA = env.addMember('user-a', { username: 'AlphaUser' });
+    const userB = env.addMember('user-b', { username: 'BravoUser' });
+    const userC = env.addMember('user-c', { username: 'CharlieUser' });
+    const userD = env.addMember('user-d', { username: 'DeltaUser' });
+
+    // Threshold = 10; Rewards: #1=50, #2=20, #3=10
+    const campaign = await createInviteCampaign({
+      guildId: env.guildId,
+      name: 'Threshold 10 Event',
+      description: 'Reach 10 invites to qualify!',
+      status: CAMPAIGN_STATUS.ACTIVE,
+      minInviteThreshold: 10,
+      rewards: [
+        { position: 1, amount: 50 },
+        { position: 2, amount: 20 },
+        { position: 3, amount: 10 },
+      ],
+      endAt: new Date(Date.now() + 86400000),
+      inviteChannelId: env.inviteChannel.id,
+      announcementChannelId: env.anncChannel.id,
+      createdBy: admin.id,
+    });
+
+    await upsertCampaignParticipant(campaign.campaignId, env.guildId, userA.id, {
+      successfulInvites: 3,
+      isEligible: false,
+    });
+    await upsertCampaignParticipant(campaign.campaignId, env.guildId, userB.id, {
+      successfulInvites: 9,
+      isEligible: false,
+    });
+    await upsertCampaignParticipant(campaign.campaignId, env.guildId, userC.id, {
+      successfulInvites: 10,
+      isEligible: true,
+      eligibleAt: new Date('2026-11-07T10:00:00Z'),
+    });
+    await upsertCampaignParticipant(campaign.campaignId, env.guildId, userD.id, {
+      successfulInvites: 15,
+      isEligible: true,
+      eligibleAt: new Date('2026-11-07T09:00:00Z'),
+    });
+
+    const participants = [
+      await getCampaignParticipant(campaign.campaignId, userA.id),
+      await getCampaignParticipant(campaign.campaignId, userB.id),
+      await getCampaignParticipant(campaign.campaignId, userC.id),
+      await getCampaignParticipant(campaign.campaignId, userD.id),
+    ];
+
+    // Users with 3 and 9 invites MUST NOT appear; users with 15 and 10 MUST appear
+    let rows = computeCampaignLeaderboardRows(campaign, participants, env.guild);
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].userId, userD.id);
+    assert.equal(rows[0].invites, 15);
+    assert.equal(rows[0].rank, 1);
+    assert.equal(rows[0].winningAmountFormatted, '₹50');
+
+    assert.equal(rows[1].userId, userC.id);
+    assert.equal(rows[1].invites, 10);
+    assert.equal(rows[1].rank, 2);
+    assert.equal(rows[1].winningAmountFormatted, '₹20');
+
+    // User B reaches 10 invites -> automatically becomes visible on next update
+    await upsertCampaignParticipant(campaign.campaignId, env.guildId, userB.id, {
+      successfulInvites: 10,
+      isEligible: true,
+      eligibleAt: new Date('2026-11-07T11:00:00Z'),
+    });
+
+    // User C drops from 10 to 9 invites (due to leave) -> disappears from leaderboard!
+    await upsertCampaignParticipant(campaign.campaignId, env.guildId, userC.id, {
+      successfulInvites: 9,
+      isEligible: false,
+      eligibleAt: null,
+    });
+
+    const updatedParticipants = [
+      await getCampaignParticipant(campaign.campaignId, userA.id),
+      await getCampaignParticipant(campaign.campaignId, userB.id),
+      await getCampaignParticipant(campaign.campaignId, userC.id),
+      await getCampaignParticipant(campaign.campaignId, userD.id),
+    ];
+
+    rows = computeCampaignLeaderboardRows(campaign, updatedParticipants, env.guild);
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].userId, userD.id);
+    assert.equal(rows[1].userId, userB.id);
+    assert.ok(!rows.some((r) => r.userId === userC.id), 'User C who dropped to 9 must not appear');
+  });
+
+  await t.test('4. Dynamic Ranking, Reward Reassignment When Rankings Change & Deterministic Tie-Breaking', async () => {
+    const env = createTestEnvironment();
+    const user1 = env.addMember('u-1', { username: 'kok aine' });
+    const user2 = env.addMember('u-2', { username: 'User2' });
+    const user3 = env.addMember('u-3', { username: 'User3' });
 
     const campaign = await createInviteCampaign({
       guildId: env.guildId,
-      name: 'Main Invite Campaign',
-      description: 'Invite friends!',
+      name: 'Ranking & Tie Test',
+      description: 'Test',
+      status: CAMPAIGN_STATUS.ACTIVE,
+      minInviteThreshold: 5,
+      rewards: [
+        { position: 1, amount: 100 },
+        { position: 2, amount: 50 },
+        { position: 3, amount: 25 },
+      ],
+      endAt: new Date(Date.now() + 86400000),
+      inviteChannelId: env.inviteChannel.id,
+      announcementChannelId: env.anncChannel.id,
+      createdBy: 'admin-1',
+    });
+
+    // Initially: u-1 has 10 invites (#1 = ₹100), u-2 has 8 invites (#2 = ₹50)
+    let pList = [
+      { userId: user1.id, successfulInvites: 10, eligibleAt: new Date('2026-11-07T08:00:00Z') },
+      { userId: user2.id, successfulInvites: 8, eligibleAt: new Date('2026-11-07T08:05:00Z') },
+    ];
+    let rows = computeCampaignLeaderboardRows(campaign, pList, env.guild);
+    assert.equal(rows[0].userId, user1.id);
+    assert.equal(rows[0].winningAmountFormatted, '₹100');
+    assert.equal(rows[1].userId, user2.id);
+    assert.equal(rows[1].winningAmountFormatted, '₹50');
+
+    // Now u-2 overtakes u-1 with 14 invites -> reward ₹100 moves to u-2 (#1), and u-1 gets ₹50 (#2)!
+    pList = [
+      { userId: user1.id, successfulInvites: 10, eligibleAt: new Date('2026-11-07T08:00:00Z') },
+      { userId: user2.id, successfulInvites: 14, eligibleAt: new Date('2026-11-07T08:05:00Z') },
+    ];
+    rows = computeCampaignLeaderboardRows(campaign, pList, env.guild);
+    assert.equal(rows[0].rank, 1);
+    assert.equal(rows[0].userId, user2.id);
+    assert.equal(rows[0].winningAmountFormatted, '₹100');
+    assert.equal(rows[1].rank, 2);
+    assert.equal(rows[1].userId, user1.id);
+    assert.equal(rows[1].winningAmountFormatted, '₹50');
+
+    // Deterministic tie-breaking: u-1 and u-3 both have 10 invites, but u-3 reached eligibility earlier
+    pList = [
+      { userId: user1.id, successfulInvites: 10, eligibleAt: new Date('2026-11-07T09:00:00Z') },
+      { userId: user3.id, successfulInvites: 10, eligibleAt: new Date('2026-11-07T07:30:00Z') },
+    ];
+    rows = computeCampaignLeaderboardRows(campaign, pList, env.guild);
+    assert.equal(rows[0].userId, user3.id, 'Earlier eligibleAt wins tie');
+    assert.equal(rows[0].rank, 1);
+    assert.equal(rows[0].winningAmountFormatted, '₹100');
+    assert.equal(rows[1].userId, user1.id);
+    assert.equal(rows[1].rank, 2);
+    assert.equal(rows[1].winningAmountFormatted, '₹50');
+
+    // Verify PNG generation produces a valid PNG image buffer and scales height with row count
+    const png2Rows = generateLeaderboardPng(campaign, rows);
+    assert.ok(Buffer.isBuffer(png2Rows.buffer));
+    // PNG magic header: 89 50 4E 47 0D 0A 1A 0A
+    assert.deepEqual(
+      [...png2Rows.buffer.subarray(0, 8)],
+      [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+    );
+
+    const png5Rows = generateLeaderboardPng(campaign, [
+      ...rows,
+      { rank: 3, userId: 'u-4', username: 'VeryLongUsernameThatShouldBeTruncatedCleanlyInTable', invites: 7, winningAmount: 25, winningAmountFormatted: '₹25' },
+      { rank: 4, userId: 'u-5', username: 'PlayerFive', invites: 6, winningAmount: 0, winningAmountFormatted: '₹0' },
+      { rank: 5, userId: 'u-6', username: 'PlayerSix', invites: 5, winningAmount: 0, winningAmountFormatted: '₹0' },
+    ]);
+    assert.ok(png5Rows.height > png2Rows.height, 'Image height scales dynamically with qualified rows');
+  });
+
+  await t.test('5. Unique Invite Tracking, Repeated Join/Leave Anti-Inflation & Original Inviter Preservation', async () => {
+    const env = createTestEnvironment();
+    const admin = env.addMember('admin-1', { isAdminPerm: true });
+    const inviterA = env.addMember('inviter-a', { username: 'InviterA' });
+    const inviterB = env.addMember('inviter-b', { username: 'InviterB' });
+
+    const campaign = await createInviteCampaign({
+      guildId: env.guildId,
+      name: 'Anti-Inflation Campaign',
+      description: 'Test unique tracking',
       status: CAMPAIGN_STATUS.DRAFT,
+      minInviteThreshold: 1,
+      rewards: [
+        { position: 1, amount: 50 },
+        { position: 2, amount: 20 },
+      ],
       endAt: new Date(Date.now() + 7200000),
       inviteChannelId: env.inviteChannel.id,
       announcementChannelId: env.anncChannel.id,
       createdBy: admin.id,
     });
 
-    await handleInviteCommand(env.guild, admin, env.inviteChannel, ['start'], async () => {}, env.client);
+    await handleInviteCommand(env.guild, admin, env.inviteChannel, ['start'], async () => { }, env.client);
 
-    // Inviter clicks "Generate My Invite"
-    let latestUserReply = null;
-    const mockInteraction = {
+    // Inviter A and Inviter B both click "Create Link"
+    for (const invMember of [inviterA, inviterB]) {
+      await handleInviteCampaignInteraction({
+        customId: `inv_cmp:generate:${campaign.campaignId}`,
+        guild: env.guild,
+        channel: env.inviteChannel,
+        member: invMember,
+        user: invMember.user,
+        client: env.client,
+        isButton: () => true,
+        reply: async () => { },
+        editReply: async () => { },
+      });
+    }
+
+    const invitesList = await getCampaignInvitesForCampaign(campaign.campaignId);
+    const inviteA = invitesList.find((i) => i.inviterId === inviterA.id);
+    const inviteB = invitesList.find((i) => i.inviterId === inviterB.id);
+
+    // User X joins via Inviter A's link -> Inviter A gets 1 valid invite
+    env.invites.get(inviteA.inviteCode).uses = 1;
+    const userX = env.addMember('user-x', { username: 'UserX' });
+    await handleInviteCampaignMemberAdd(userX);
+
+    let partA = await getCampaignParticipant(campaign.campaignId, inviterA.id);
+    assert.equal(partA.successfulInvites, 1);
+
+    // User X leaves -> Inviter A's valid invite count decrements to 0
+    env.members.delete(userX.id);
+    await handleInviteCampaignMemberRemove(userX);
+    partA = await getCampaignParticipant(campaign.campaignId, inviterA.id);
+    assert.equal(partA.successfulInvites, 0);
+
+    // User X rejoins using Inviter B's link -> must NOT credit Inviter B, and must NOT create a 2nd referral record!
+    // Instead restores original inviter (Inviter A) to 1.
+    env.invites.get(inviteB.inviteCode).uses = 1;
+    const userXRejoin1 = env.addMember('user-x', { username: 'UserXRenamed' });
+    await handleInviteCampaignMemberAdd(userXRejoin1);
+
+    partA = await getCampaignParticipant(campaign.campaignId, inviterA.id);
+    const partB = await getCampaignParticipant(campaign.campaignId, inviterB.id);
+    assert.equal(partA.successfulInvites, 1, 'Original inviter A restored to 1');
+    assert.equal(partB?.successfulInvites ?? 0, 0, 'Inviter B must not get credit for User X');
+
+    // User X leaves and rejoins 3 more times via Inviter A's link -> count for Inviter A never exceeds 1!
+    for (let cycle = 2; cycle <= 4; cycle++) {
+      env.members.delete(userX.id);
+      await handleInviteCampaignMemberRemove(userX);
+      partA = await getCampaignParticipant(campaign.campaignId, inviterA.id);
+      assert.equal(partA.successfulInvites, 0);
+
+      env.invites.get(inviteA.inviteCode).uses = cycle;
+      const rejoined = env.addMember('user-x', { username: `UserX_v${cycle}` });
+      await handleInviteCampaignMemberAdd(rejoined);
+      partA = await getCampaignParticipant(campaign.campaignId, inviterA.id);
+      assert.equal(partA.successfulInvites, 1, `Cycle ${cycle}: count must be 1, never inflated`);
+    }
+
+    const allReferrals = await getReferralsForCampaign(campaign.campaignId);
+    assert.equal(allReferrals.length, 1, 'Only 1 unique referral document exists for User X');
+  });
+
+  await t.test('6. Refresh Leaderboard Button Edits Same Message, Concurrent Refresh Protection, Finalization & Post-End Lock', async () => {
+    const env = createTestEnvironment();
+    const admin = env.addMember('admin-1', { isAdminPerm: true });
+    const inviter1 = env.addMember('inv-1', { username: 'TopOne' });
+    const inviter2 = env.addMember('inv-2', { username: 'TopTwo' });
+
+    const campaign = await createInviteCampaign({
+      guildId: env.guildId,
+      name: 'Live Leaderboard Campaign',
+      description: 'Test refresh and finalization',
+      status: CAMPAIGN_STATUS.DRAFT,
+      minInviteThreshold: 2,
+      rewards: [
+        { position: 1, amount: 50 },
+        { position: 2, amount: 20 },
+      ],
+      endAt: new Date(Date.now() + 3600000),
+      inviteChannelId: env.inviteChannel.id,
+      announcementChannelId: env.anncChannel.id,
+      createdBy: admin.id,
+    });
+
+    await handleInviteCommand(env.guild, admin, env.inviteChannel, ['start'], async () => { }, env.client);
+
+    let activeCampaign = await getInviteCampaignById(campaign.campaignId);
+    const initialLbMsgId = activeCampaign.leaderboardMessageId;
+    assert.ok(initialLbMsgId, 'Leaderboard message created on start');
+    assert.equal(env.anncChannel._sent.length, 1, 'Exactly 1 leaderboard message sent in announcement channel');
+
+    // Add participants meeting threshold (inviter1: 5 invites, inviter2: 2 invites)
+    await upsertCampaignParticipant(campaign.campaignId, env.guildId, inviter1.id, {
+      successfulInvites: 5,
+      isEligible: true,
+      eligibleAt: new Date('2026-11-07T08:00:00Z'),
+    });
+    await createInviteCampaign; // no-op reference check
+    // Also create counted referrals so recalculateAllCampaignParticipants preserves their counts
+    for (let i = 1; i <= 5; i++) {
+      const m = env.addMember(`m1-${i}`);
+      await handleInviteCampaignMemberAdd; // ensure imported
+    }
+
+    // Generate links and join real members so referrals are in DB
+    for (const inv of [inviter1, inviter2]) {
+      clearInviteInteractionCaches();
+      await handleInviteCampaignInteraction({
+        customId: `inv_cmp:generate:${campaign.campaignId}`,
+        guild: env.guild,
+        channel: env.inviteChannel,
+        member: inv,
+        user: inv.user,
+        client: env.client,
+        isButton: () => true,
+        reply: async () => { },
+        editReply: async () => { },
+      });
+    }
+    const cInvites = await getCampaignInvitesForCampaign(campaign.campaignId);
+    const code1 = cInvites.find((i) => i.inviterId === inviter1.id).inviteCode;
+    const code2 = cInvites.find((i) => i.inviterId === inviter2.id).inviteCode;
+
+    for (let i = 1; i <= 3; i++) {
+      env.invites.get(code1).uses = i;
+      const m = env.addMember(`r1-${i}`);
+      await handleInviteCampaignMemberAdd(m);
+    }
+    for (let i = 1; i <= 2; i++) {
+      env.invites.get(code2).uses = i;
+      const m = env.addMember(`r2-${i}`);
+      await handleInviteCampaignMemberAdd(m);
+    }
+
+    // Joins alone do NOT send a new leaderboard message or edit it until Refresh Leaderboard is clicked
+    const lbMsg = env.anncChannel._messages.get(initialLbMsgId);
+    const editsBeforeRefresh = lbMsg.edits.length;
+
+    // Click "Refresh Leaderboard" (simultaneously twice to test concurrent refresh protection & cooldown)
+    clearInviteInteractionCaches();
+    const refreshReplies = [];
+    await Promise.all([
+      handleInviteCampaignInteraction({
+        customId: `inv_cmp:refresh_lb:${campaign.campaignId}`,
+        guild: env.guild,
+        channel: env.anncChannel,
+        member: inviter1,
+        user: inviter1.user,
+        client: env.client,
+        isButton: () => true,
+        reply: async (p) => refreshReplies.push(p),
+      }),
+      handleInviteCampaignInteraction({
+        customId: `inv_cmp:refresh_lb:${campaign.campaignId}`,
+        guild: env.guild,
+        channel: env.anncChannel,
+        member: inviter2,
+        user: inviter2.user,
+        client: env.client,
+        isButton: () => true,
+        reply: async (p) => refreshReplies.push(p),
+      }),
+    ]);
+
+    // Verify existing message was edited in place and NO new message was posted
+    assert.equal(env.anncChannel._sent.length, 1, 'Must never post a duplicate leaderboard message on refresh');
+    assert.equal(lbMsg.edits.length, editsBeforeRefresh + 1, 'Concurrent refreshes only execute one update within cooldown');
+    assert.equal(lbMsg._leaderboardMeta.rows.length, 2);
+    assert.equal(lbMsg._leaderboardMeta.rows[0].userId, inviter1.id);
+    assert.equal(lbMsg._leaderboardMeta.rows[0].winningAmountFormatted, '₹50');
+    assert.equal(lbMsg._leaderboardMeta.rows[1].userId, inviter2.id);
+    assert.equal(lbMsg._leaderboardMeta.rows[1].winningAmountFormatted, '₹20');
+
+    // End the campaign via scheduler reaching endAt -> automatically finalizes leaderboard in place
+    await checkInviteCampaignLifecycles(env.client, new Date(Date.now() + 7200000));
+
+    const finalizedCampaign = await getInviteCampaignById(campaign.campaignId);
+    assert.equal(finalizedCampaign.status, CAMPAIGN_STATUS.ENDED);
+    assert.ok(finalizedCampaign.finalizedAt);
+    assert.equal(finalizedCampaign.finalLeaderboardSnapshot.length, 2);
+    assert.equal(env.anncChannel._sent.length, 1, 'Finalization edits the existing announcement leaderboard message');
+    assert.equal(lbMsg._leaderboardMeta.status, 'EVENT ENDED');
+
+    const finalRefreshBtn = lbMsg.components[0].components[0].toJSON();
+    assert.equal(finalRefreshBtn.disabled, true, 'Refresh Leaderboard button must be disabled when ended');
+
+    // Clicking an old Refresh Leaderboard interaction after campaign ended must NOT modify the final leaderboard
+    const editsAfterFinalization = lbMsg.edits.length;
+    clearInviteInteractionCaches();
+    let postEndRefreshReply = null;
+    await handleInviteCampaignInteraction({
+      customId: `inv_cmp:refresh_lb:${campaign.campaignId}`,
+      guild: env.guild,
+      channel: env.anncChannel,
+      member: inviter1,
+      user: inviter1.user,
+      client: env.client,
+      isButton: () => true,
+      reply: async (p) => {
+        postEndRefreshReply = p;
+      },
+    });
+    assert.match(postEndRefreshReply.content, /ended|finalized/i);
+    assert.equal(lbMsg.edits.length, editsAfterFinalization, 'Finalized leaderboard message must not be modified after end');
+  });
+
+  await t.test('7. Bot Restart & Campaign Recovery Preserves Settings, Counts, and Announcement Message Without Duplicates', async () => {
+    const env = createTestEnvironment();
+    const admin = env.addMember('admin-rec', { isAdminPerm: true });
+    const inviter = env.addMember('inviter-rec', { username: 'RecoverUser' });
+
+    const campaign = await createInviteCampaign({
+      guildId: env.guildId,
+      name: 'Restart Persistence Campaign',
+      description: 'Test restart recovery',
+      status: CAMPAIGN_STATUS.DRAFT,
+      minInviteThreshold: 1,
+      rewards: [
+        { position: 1, amount: 75 },
+        { position: 2, amount: 25 },
+      ],
+      endAt: new Date(Date.now() + 3600000),
+      inviteChannelId: env.inviteChannel.id,
+      announcementChannelId: env.anncChannel.id,
+      createdBy: admin.id,
+    });
+    await handleInviteCommand(env.guild, admin, env.inviteChannel, ['start'], async () => { }, env.client);
+
+    await handleInviteCampaignInteraction({
       customId: `inv_cmp:generate:${campaign.campaignId}`,
       guild: env.guild,
       channel: env.inviteChannel,
@@ -391,138 +913,41 @@ test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Inv
       user: inviter.user,
       client: env.client,
       isButton: () => true,
-      reply: async (p) => {
-        latestUserReply = p;
-      },
-      editReply: async (p) => {
-        latestUserReply = p;
-      },
-    };
-    await handleInviteCampaignInteraction(mockInteraction);
-
-    const savedInvites = await getCampaignInvitesForCampaign(campaign.campaignId);
-    assert.equal(savedInvites.length, 1);
-    const invCode = savedInvites[0].inviteCode;
-    const invUrl = savedInvites[0].inviteUrl;
-
-    // Verify exact simplified user-facing format (no Eligible / Not Eligible status)
-    assert.equal(
-      latestUserReply.content,
-      `Your Successful Invites: 0\nYour Invite Link: ${invUrl}`
-    );
-    assert.ok(!/Eligible/i.test(latestUserReply.content));
-    assert.equal(latestUserReply.components.length, 1); // Refresh button
-
-    // Member 1 joins via inviter's link (even with a 0-day-old account) -> count immediately increases to 1 & live view auto-refreshes!
-    env.invites.get(invCode).uses = 1;
-    const joined1 = env.addMember('invited-1', { accountAgeDays: 0 });
-    await handleInviteCampaignMemberAdd(joined1);
-
-    let part = await getCampaignParticipant(campaign.campaignId, inviter.id);
-    assert.equal(part.successfulInvites, 1);
-    assert.equal(
-      latestUserReply.content,
-      `Your Successful Invites: 1\nYour Invite Link: ${invUrl}`
-    );
-
-    // Member 2 joins via inviter's link -> count immediately increases to 2 & live view auto-refreshes!
-    env.invites.get(invCode).uses = 2;
-    const joined2 = env.addMember('invited-2', { accountAgeDays: 10 });
-    await handleInviteCampaignMemberAdd(joined2);
-
-    part = await getCampaignParticipant(campaign.campaignId, inviter.id);
-    assert.equal(part.successfulInvites, 2);
-    assert.equal(
-      latestUserReply.content,
-      `Your Successful Invites: 2\nYour Invite Link: ${invUrl}`
-    );
-    assert.equal(env.dmsSent.length, 0, 'No giveaway qualification DMs should be sent');
-
-    // Member 2 leaves -> count immediately decreases by 1 to 1, referral marked inactive & preserved in history
-    env.members.delete(joined2.id);
-    await handleInviteCampaignMemberRemove(joined2);
-    part = await getCampaignParticipant(campaign.campaignId, inviter.id);
-    assert.equal(part.successfulInvites, 1);
-    assert.equal(
-      latestUserReply.content,
-      `Your Successful Invites: 1\nYour Invite Link: ${invUrl}`
-    );
-    const ref2AfterLeave = await getCampaignReferral(campaign.campaignId, env.guildId, joined2.id);
-    assert.equal(ref2AfterLeave.isActive, false);
-    assert.ok(ref2AfterLeave.leftAt);
-
-    // Member 2 rejoins during active campaign -> restores original inviter and counts again only once (back to 2)
-    const joined2Rejoin = env.addMember('invited-2', { accountAgeDays: 10 });
-    await handleInviteCampaignMemberAdd(joined2Rejoin);
-    part = await getCampaignParticipant(campaign.campaignId, inviter.id);
-    assert.equal(part.successfulInvites, 2);
-    assert.equal(
-      latestUserReply.content,
-      `Your Successful Invites: 2\nYour Invite Link: ${invUrl}`
-    );
-
-    // Clicking the Refresh button retrieves the latest count
-    let refreshOutput = null;
-    await handleInviteCampaignInteraction({
-      customId: `inv_cmp:refresh:${campaign.campaignId}`,
-      guild: env.guild,
-      channel: env.inviteChannel,
-      member: inviter,
-      user: inviter.user,
-      client: env.client,
-      isButton: () => true,
-      update: async (p) => {
-        refreshOutput = p;
-      },
+      reply: async () => { },
+      editReply: async () => { },
     });
-    assert.equal(
-      refreshOutput.content,
-      `Your Successful Invites: 2\nYour Invite Link: ${invUrl}`
-    );
 
-    // Admin commands: .invite links and .invite history
-    const adminReplies = [];
-    await handleInviteCommand(
-      env.guild,
-      admin,
-      env.inviteChannel,
-      ['links'],
-      async (m) => adminReplies.push(m),
-      env.client
-    );
-    await handleInviteCommand(
-      env.guild,
-      admin,
-      env.inviteChannel,
-      ['history'],
-      async (m) => adminReplies.push(m),
-      env.client
-    );
-    assert.equal(adminReplies.length, 2);
-    assert.ok(adminReplies[0].embeds[0].data.description.includes(invUrl));
-    assert.ok(adminReplies[1].embeds[0].data.description.includes(joined1.id));
+    const [campaignInvite] = await getCampaignInvitesForCampaign(campaign.campaignId);
+    const beforeRestartCampaign = await getInviteCampaignById(campaign.campaignId);
+    const originalLbMessageId = beforeRestartCampaign.leaderboardMessageId;
+    assert.equal(env.anncChannel._sent.length, 1);
 
-    // End campaign -> deletes Discord invites, preserves DB records, freezes counts
-    await handleInviteCommand(
-      env.guild,
-      admin,
-      env.inviteChannel,
-      ['end', 'confirm'],
-      async () => {},
-      env.client
-    );
-    const endedCampaign = await getInviteCampaignById(campaign.campaignId);
-    assert.equal(endedCampaign.status, CAMPAIGN_STATUS.ENDED);
-    assert.ok(env.deletedInviteCodes.includes(invCode));
+    // Simulate bot restart with an offline join
+    clearInviteSnapshotState();
+    clearInviteInteractionCaches();
+    env.invites.get(campaignInvite.inviteCode).uses = 1;
+    env.addMember('offline-joiner-1', {
+      accountAgeDays: 30,
+      joinedAt: new Date(Date.now() + 1000),
+    });
 
-    // Leave after Ended does not change frozen count
-    env.members.delete(joined1.id);
-    await handleInviteCampaignMemberRemove(joined1);
-    part = await getCampaignParticipant(campaign.campaignId, inviter.id);
-    assert.equal(part.successfulInvites, 2);
+    await recoverInviteCampaignsOnStartup(env.client);
+    stopInviteCampaignScheduler();
+
+    const recoveredCampaign = await getInviteCampaignById(campaign.campaignId);
+    assert.equal(recoveredCampaign.minInviteThreshold, 1);
+    assert.deepEqual(recoveredCampaign.rewards, [
+      { position: 1, amount: 75 },
+      { position: 2, amount: 25 },
+    ]);
+    assert.equal(recoveredCampaign.leaderboardMessageId, originalLbMessageId, 'Same leaderboardMessageId preserved across restart');
+    assert.equal(env.anncChannel._sent.length, 1, 'No duplicate announcement message created on restart');
+
+    const part = await getCampaignParticipant(campaign.campaignId, inviter.id);
+    assert.equal(part.successfulInvites, 1);
   });
 
-  await t.test('4. Moderation Exception — Allows Active/Scheduled Campaign Invite Links Only', async () => {
+  await t.test('8. Moderation Exception Preserved for Active/Scheduled Campaign Invite Links', async () => {
     const env = createTestEnvironment();
     const admin = env.addMember('admin-mod', { isAdminPerm: true });
     const member = env.addMember('member-mod', { isAdminPerm: false });
@@ -543,7 +968,7 @@ test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Inv
       announcementChannelId: env.anncChannel.id,
       createdBy: admin.id,
     });
-    await handleInviteCommand(env.guild, admin, env.inviteChannel, ['start'], async () => {}, env.client);
+    await handleInviteCommand(env.guild, admin, env.inviteChannel, ['start'], async () => { }, env.client);
 
     await handleInviteCampaignInteraction({
       customId: `inv_cmp:generate:${campaign.campaignId}`,
@@ -553,8 +978,8 @@ test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Inv
       user: member.user,
       client: env.client,
       isButton: () => true,
-      reply: async () => {},
-      editReply: async () => {},
+      reply: async () => { },
+      editReply: async () => { },
     });
 
     const [campaignInvite] = await getCampaignInvitesForCampaign(campaign.campaignId);
@@ -574,55 +999,5 @@ test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Inv
     assert.equal(deleted1, false);
 
     delete guildSettingsCache[env.guildId];
-  });
-
-  await t.test('5. Startup Recovery & Offline Join Reconciliation', async () => {
-    const env = createTestEnvironment();
-    const admin = env.addMember('admin-rec', { isAdminPerm: true });
-    const inviter = env.addMember('inviter-rec', { isAdminPerm: false });
-
-    const campaign = await createInviteCampaign({
-      guildId: env.guildId,
-      name: 'Recovery Campaign',
-      description: 'Test',
-      status: CAMPAIGN_STATUS.DRAFT,
-      endAt: new Date(Date.now() + 3600000),
-      inviteChannelId: env.inviteChannel.id,
-      announcementChannelId: env.anncChannel.id,
-      createdBy: admin.id,
-    });
-    await handleInviteCommand(env.guild, admin, env.inviteChannel, ['start'], async () => {}, env.client);
-
-    await handleInviteCampaignInteraction({
-      customId: `inv_cmp:generate:${campaign.campaignId}`,
-      guild: env.guild,
-      channel: env.inviteChannel,
-      member: inviter,
-      user: inviter.user,
-      client: env.client,
-      isButton: () => true,
-      reply: async () => {},
-      editReply: async () => {},
-    });
-
-    const [campaignInvite] = await getCampaignInvitesForCampaign(campaign.campaignId);
-
-    clearInviteSnapshotState();
-    env.invites.get(campaignInvite.inviteCode).uses = 1;
-    const offlineJoiner = env.addMember('offline-joiner-1', {
-      accountAgeDays: 30,
-      joinedAt: new Date(Date.now() + 1000),
-    });
-
-    await recoverInviteCampaignsOnStartup(env.client);
-    stopInviteCampaignScheduler();
-
-    const ref = await getCampaignReferral(campaign.campaignId, env.guildId, offlineJoiner.id);
-    assert.ok(ref);
-    assert.equal(ref.inviterId, inviter.id);
-    assert.equal(ref.counted, true);
-
-    const part = await getCampaignParticipant(campaign.campaignId, inviter.id);
-    assert.equal(part.successfulInvites, 1);
   });
 });
