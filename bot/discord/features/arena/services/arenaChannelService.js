@@ -27,25 +27,7 @@ export async function setupArenaChannels(guild, adminUser) {
 
   const config = (await getArenaConfig(guild.id)) || { guildId: guild.id };
 
-  // 1. Ensure Volunteer Role
-  let volunteerRole = null;
-  if (config.volunteerRoleId) {
-    volunteerRole =
-      guild.roles.cache.get(config.volunteerRoleId) ||
-      (await guild.roles.fetch(config.volunteerRoleId).catch(() => null));
-  }
-  if (!volunteerRole) {
-    volunteerRole = findInCache(guild.roles?.cache, (r) => r.name.toLowerCase() === 'volunteer');
-  }
-  if (!volunteerRole) {
-    volunteerRole = await guild.roles.create({
-      name: 'Volunteer',
-      color: 0xF97316,
-      reason: '1v1 Challenge Arena Volunteer Role',
-    });
-  }
-
-  // 2. Ensure Main Category: "1V1 CHALLENGE ARENA"
+  // 1. Ensure Main Category: "1V1 CHALLENGE ARENA"
   let mainCategory = null;
   if (config.categoryId) {
     mainCategory =
@@ -95,7 +77,7 @@ export async function setupArenaChannels(guild, adminUser) {
     return ch;
   }
 
-  // 3. Channels inside main category:
+  // 2. Channels inside main category:
   // #create-challenge (read only for @everyone)
   const createChannel = await ensureChannel(config.createChannelId, 'create-challenge', {
     permissionOverwrites: [
@@ -118,20 +100,25 @@ export async function setupArenaChannels(guild, adminUser) {
     ],
   });
 
-  // #volunteer-panel (visible only to Volunteer role and Admins)
+  // #volunteer-panel (public visibility for all server members, read only for @everyone)
   const volunteerPanel = await ensureChannel(config.volunteerPanelId, 'volunteer-panel', {
     permissionOverwrites: [
       {
         id: guild.id, // @everyone
-        deny: [PermissionFlagsBits.ViewChannel],
-      },
-      {
-        id: volunteerRole.id, // Volunteer role
         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
         deny: [PermissionFlagsBits.SendMessages],
       },
     ],
   });
+
+  // Ensure @everyone can view if overwrites were previously configured with denial
+  if (typeof volunteerPanel.permissionOverwrites?.edit === 'function') {
+    await volunteerPanel.permissionOverwrites.edit(guild.id, {
+      ViewChannel: true,
+      ReadMessageHistory: true,
+      SendMessages: false,
+    }).catch(() => {});
+  }
 
   // #match-results (read only for @everyone)
   const matchResults = await ensureChannel(config.matchResultsId, 'match-results', {
@@ -243,7 +230,6 @@ export async function setupArenaChannels(guild, adminUser) {
     matchResultsId: matchResults.id,
     supportChannelId: supportChannel.id,
     evidenceChannelId: evidenceChannel.id,
-    volunteerRoleId: volunteerRole.id,
     panelMessageId,
     matchCategories,
   });
@@ -257,7 +243,6 @@ export async function setupArenaChannels(guild, adminUser) {
     matchResults,
     supportChannel,
     evidenceChannel,
-    volunteerRole,
   };
 }
 

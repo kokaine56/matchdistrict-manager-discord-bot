@@ -91,7 +91,7 @@ export function buildVolunteerPanelEmbed(match, volunteerDisplayName = null) {
       { name: 'Player B', value: match.playerB.displayName, inline: true },
       {
         name: 'Volunteer',
-        value: isAssigned ? volunteerDisplayName || `<@${match.volunteerId}>` : '*None*',
+        value: isAssigned ? volunteerDisplayName || `<@${match.volunteerId}>` : '*Available for any member*',
         inline: true,
       }
     )

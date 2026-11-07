@@ -4,6 +4,7 @@ import {
 } from 'discord.js';
 import {
   ARENA_STATUS,
+  ARENA_FINAL_STATUSES,
   ARENA_CONSTANTS,
   getArenaConfig,
   saveArenaConfig,
@@ -30,7 +31,6 @@ import {
 } from '../services/arenaChannelService.js';
 import {
   handleReleaseMatch,
-  hasVolunteerRole,
 } from '../services/arenaVolunteerService.js';
 import {
   handleAdminResolveDispute,
@@ -81,7 +81,7 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
         '• `.arena reassign <id> @volunteer` — Reassign an active match to another volunteer.\n' +
         '• `.arena dispute` — List open disputes and evidence.\n' +
         '• `.arena result <id> <A|B> <reason>` — Finalize a disputed match.\n' +
-        '• `.arena volunteer add|remove @user` — Manage the Volunteer role.\n' +
+        '• `.arena volunteer add|remove @user` — Register or deactivate an arena volunteer profile.\n' +
         '• `.arena volunteer limit <n>` — Set the active match limit per volunteer (default 1).\n' +
         '• `.arena suspend|unsuspend @player` — Suspend or restore player access.\n' +
         '• `.arena resetuid @player` — Clear player BGMI details for re-registration.\n' +
@@ -104,8 +104,7 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
         `• Volunteer Queue: <#${res.volunteerPanel.id}>\n` +
         `• Match Results: <#${res.matchResults.id}>\n` +
         `• Support: <#${res.supportChannel.id}>\n` +
-        `• Evidence Archive: <#${res.evidenceChannel.id}>\n` +
-        `• Volunteer Role: <@&${res.volunteerRole.id}>`
+        `• Evidence Archive: <#${res.evidenceChannel.id}>`
       );
     } catch (err) {
       return replyFn(`❌ Setup failed: ${err.message}`);
@@ -236,8 +235,14 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
       (await guild.members.fetch(targetUserId).catch(() => null));
     if (!newVolMember) return replyFn('❌ Volunteer member not found in server.');
 
-    const isVol = await hasVolunteerRole(newVolMember, config);
-    if (!isVol) return replyFn('❌ Target member does not have the `Volunteer` role.');
+    if (targetUserId === match.playerA.discordId || targetUserId === match.playerB.discordId) {
+      return replyFn('❌ Cannot reassign match to one of its players.');
+    }
+
+    const targetVol = await getArenaVolunteer(targetUserId);
+    if (targetVol?.suspended) {
+      return replyFn('❌ That volunteer is currently suspended.');
+    }
 
     const prevVolunteerId = match.volunteerId;
 
@@ -349,24 +354,20 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
       (await guild.members.fetch(targetUserId).catch(() => null));
     if (!targetMember) return replyFn('❌ Member not found in this server.');
 
-    const volunteerRole =
-      guild.roles.cache.get(config?.volunteerRoleId) ||
-      guild.roles.cache.find((r) => r.name.toLowerCase() === 'volunteer');
+    const targetDisplayName = targetMember.displayName || targetMember.user?.username || 'Volunteer';
 
     if (volSub === 'add') {
-      if (volunteerRole) {
-        await targetMember.roles.add(volunteerRole).catch(() => {});
-      }
-      await upsertArenaVolunteer(targetUserId, { status: 'AVAILABLE', suspended: false });
-      return replyFn(`✅ <@${targetUserId}> has been granted the Volunteer role and registered in the arena.`);
+      await upsertArenaVolunteer(targetUserId, {
+        displayName: targetDisplayName,
+        status: 'AVAILABLE',
+        suspended: false,
+      });
+      return replyFn(`✅ <@${targetUserId}> has been registered as an active arena volunteer.`);
     }
 
     if (volSub === 'remove') {
-      if (volunteerRole) {
-        await targetMember.roles.remove(volunteerRole).catch(() => {});
-      }
       await updateArenaVolunteer(targetUserId, { status: 'UNAVAILABLE' });
-      return replyFn(`✅ Volunteer role removed from <@${targetUserId}>.`);
+      return replyFn(`✅ Volunteer status set to \`UNAVAILABLE\` for <@${targetUserId}>.`);
     }
 
     return replyFn('❌ Invalid action. Use `add`, `remove`, or `limit`.');
@@ -448,23 +449,19 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
 export async function handleVolunteerCommand(guild, member, channel, args, replyFn, client = null, message = null) {
   if (!guild) return replyFn('❌ This command can only be used inside a Discord server.');
 
-  const config = await getArenaConfig(guild.id);
-  const isVol = await hasVolunteerRole(member, config);
-  if (!isVol && !isArenaAdmin(member, guild)) {
-    return replyFn('❌ **Permission Denied:** You must have the `Volunteer` role to use `.volunteer` commands.');
-  }
-
   const subCmd = (args[0] || 'profile').toLowerCase();
 
   // .volunteer profile
   if (subCmd === 'profile' || subCmd === 'stats') {
     let vol = await getArenaVolunteer(member.id);
     if (!vol) {
-      vol = await upsertArenaVolunteer(member.id);
+      vol = await upsertArenaVolunteer(member.id, {
+        displayName: member.displayName || member.user?.username || 'Volunteer',
+      });
     }
 
     const embed = new EmbedBuilder()
-      .setTitle(`Volunteer Profile: ${member.displayName}`)
+      .setTitle(`Volunteer Profile: ${member.displayName || member.user?.username || 'Volunteer'}`)
       .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
       .addFields(
         { name: 'Status', value: vol.status === 'AVAILABLE' ? '🟢 `AVAILABLE`' : '🔴 `UNAVAILABLE`', inline: true },
@@ -479,7 +476,11 @@ export async function handleVolunteerCommand(guild, member, channel, args, reply
   // .volunteer status
   if (subCmd === 'status') {
     let vol = await getArenaVolunteer(member.id);
-    if (!vol) vol = await upsertArenaVolunteer(member.id);
+    if (!vol) {
+      vol = await upsertArenaVolunteer(member.id, {
+        displayName: member.displayName || member.user?.username || 'Volunteer',
+      });
+    }
 
     const newStatus = vol.status === 'AVAILABLE' ? 'UNAVAILABLE' : 'AVAILABLE';
     await updateArenaVolunteer(member.id, { status: newStatus });
@@ -492,12 +493,6 @@ export async function handleVolunteerCommand(guild, member, channel, args, reply
 
 export async function handleMyMatchesCommand(guild, member, channel, args, replyFn, client = null, message = null) {
   if (!guild) return replyFn('❌ This command can only be used inside a Discord server.');
-
-  const config = await getArenaConfig(guild.id);
-  const isVol = await hasVolunteerRole(member, config);
-  if (!isVol && !isArenaAdmin(member, guild)) {
-    return replyFn('❌ **Permission Denied:** You must have the `Volunteer` role to use `.mymatches`.');
-  }
 
   const allMatches = await getArenaMatchesByStatus(null, guild.id);
   const myActive = allMatches.filter(

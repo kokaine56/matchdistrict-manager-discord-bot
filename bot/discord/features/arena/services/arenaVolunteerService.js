@@ -7,6 +7,7 @@ import {
   updateArenaVolunteer,
   getArenaConfig,
   getArenaPlayer,
+  atomicClaimArenaMatch,
   logArenaAction,
 } from '../models/arenaModels.js';
 import {
@@ -19,59 +20,49 @@ import {
 } from './arenaNotificationService.js';
 import { queueMessageEdit, queueChannelSend } from '../../../../../discordQueue.js';
 
-export async function hasVolunteerRole(member, config) {
-  if (!member) return false;
-  if (config?.volunteerRoleId && member.roles?.cache?.has?.(config.volunteerRoleId)) {
-    return true;
-  }
-  const rolesArray = typeof member.roles?.cache?.values === 'function'
-    ? Array.from(member.roles.cache.values())
-    : Array.isArray(member.roles?.cache) ? member.roles.cache : [];
-  return rolesArray.some((r) => r.name?.toLowerCase() === 'volunteer');
-}
-
 export async function handleClaimMatch(guild, member, matchId) {
   if (!guild || !member || !matchId) throw new Error('Missing arguments');
 
   const config = await getArenaConfig(guild.id);
-  const isVol = await hasVolunteerRole(member, config);
-  if (!isVol) {
-    return {
-      ok: false,
-      error: '❌ **Permission Denied:** You must have the `Volunteer` role to officiate arena matches.',
-    };
-  }
+  const limit = Math.max(1, Number(config?.volunteerMatchLimit || 1));
 
-  // Get or initialize volunteer record
+  // Auto-create volunteer record on first volunteer action
   let volunteer = await getArenaVolunteer(member.id);
   if (!volunteer) {
     volunteer = await upsertArenaVolunteer(member.id, {
+      displayName: member.displayName || member.user?.username || 'Volunteer',
       status: 'AVAILABLE',
       activeMatches: 0,
       totalMatches: 0,
+      completedMatches: 0,
+      disputedMatches: 0,
+      suspended: false,
+    });
+  } else if (member.displayName && volunteer.displayName !== member.displayName) {
+    await updateArenaVolunteer(member.id, {
+      displayName: member.displayName,
     });
   }
 
+  // Pre-checks
   if (volunteer.suspended) {
     return {
       ok: false,
-      error: '❌ **Volunteer Suspended:** Your volunteer privileges are currently suspended.',
+      error: '❌ You are suspended from volunteering.',
     };
   }
 
   if (volunteer.status === 'UNAVAILABLE') {
     return {
       ok: false,
-      error: '❌ **Currently Unavailable:** You are marked as unavailable. Use `.volunteer status` to toggle your availability.',
+      error: '❌ You are marked as unavailable. Use `.volunteer status` to toggle your availability.',
     };
   }
 
-  // Enforce active match limit
-  const limit = Math.max(1, Number(config?.volunteerMatchLimit || 1));
   if (volunteer.activeMatches >= limit) {
     return {
       ok: false,
-      error: `❌ **Match Limit Reached:** You already have **${volunteer.activeMatches}** active match (limit: ${limit}). Complete or release it before claiming another.`,
+      error: `❌ You have reached your active match limit of ${limit}. Complete or release your active match first.`,
     };
   }
 
@@ -83,15 +74,23 @@ export async function handleClaimMatch(guild, member, matchId) {
   if (match.status !== ARENA_STATUS.WAITING_FOR_VOLUNTEER || match.volunteerId) {
     return {
       ok: false,
-      error: '❌ This match has already been claimed by another volunteer or is no longer waiting.',
+      error: 'This match has already been claimed by another volunteer.',
     };
   }
 
-  // Prevent players from claiming their own match
+  // Prevent players from volunteering for their own match
   if (match.playerA.discordId === member.id || match.playerB.discordId === member.id) {
     return {
       ok: false,
-      error: '❌ **Self-Officiation Prohibited:** You cannot officiate a match you are playing in.',
+      error: '❌ You cannot volunteer for your own match.',
+    };
+  }
+
+  // Check if already assigned to this match
+  if (match.volunteerId === member.id) {
+    return {
+      ok: false,
+      error: 'You are already assigned to this match.',
     };
   }
 
@@ -104,26 +103,21 @@ export async function handleClaimMatch(guild, member, matchId) {
     ) {
       return {
         ok: false,
-        error: '❌ **Conflict of Interest:** Your registered BGMI UID matches one of the players in this match.',
+        error: '❌ Conflict of Interest: Your registered BGMI UID matches one of the players in this match.',
       };
     }
   }
 
-  // Atomic claim
-  const now = new Date();
-  const updatedMatch = await updateArenaMatch(matchId, {
-    status: ARENA_STATUS.VOLUNTEER_ASSIGNED,
-    volunteerId: member.id,
-    assignedAt: now,
-  });
+  // Atomic conditional claim
+  const claimRes = await atomicClaimArenaMatch(matchId, member.id, limit);
+  if (!claimRes.ok) {
+    return claimRes;
+  }
 
-  await updateArenaVolunteer(member.id, {
-    activeMatches: volunteer.activeMatches + 1,
-  });
-
+  const updatedMatch = claimRes.match;
   const volunteerName = member.displayName || member.user?.username || 'Volunteer';
 
-  // 1. Grant volunteer access to match channel
+  // 1. Grant volunteer access to private match channel
   if (match.matchChannelId) {
     const matchChannel =
       guild.channels.cache.get(match.matchChannelId) ||
@@ -142,9 +136,8 @@ export async function handleClaimMatch(guild, member, matchId) {
         }
       }
 
-      // Send assignment announcement in channel
       await queueChannelSend(matchChannel, {
-        content: `📋 <@${member.id}> has claimed this match as the volunteer.\nPlease submit the room credentials when ready using **Submit Room Details**.`,
+        content: `📋 <@${member.id}> has volunteered to officiate this match.\nPlease submit the room credentials when ready using **Submit Room Details**.`,
       });
     }
   }

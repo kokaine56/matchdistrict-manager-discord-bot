@@ -562,6 +562,7 @@ export async function upsertArenaVolunteer(discordId, data = {}) {
         $set: updates,
         $setOnInsert: {
           discordId: String(discordId),
+          displayName: data.displayName || 'Volunteer',
           status: 'AVAILABLE',
           activeMatches: 0,
           totalMatches: 0,
@@ -578,6 +579,7 @@ export async function upsertArenaVolunteer(discordId, data = {}) {
 
   const existing = memVolunteers.get(String(discordId)) || {
     discordId: String(discordId),
+    displayName: data.displayName || 'Volunteer',
     status: 'AVAILABLE',
     activeMatches: 0,
     totalMatches: 0,
@@ -589,6 +591,114 @@ export async function upsertArenaVolunteer(discordId, data = {}) {
   const merged = { ...existing, ...updates };
   memVolunteers.set(String(discordId), merged);
   return { ...merged };
+}
+
+export async function atomicClaimArenaMatch(matchId, volunteerId, limit = 1) {
+  if (!matchId || !volunteerId) {
+    return { ok: false, error: 'Match ID and Volunteer ID are required.' };
+  }
+
+  if (isMongoConnected()) {
+    const db = getMongoDb();
+    const matchCol = db.collection(ARENA_COLLECTIONS.MATCHES);
+    const volCol = db.collection(ARENA_COLLECTIONS.VOLUNTEERS);
+    const now = new Date();
+
+    // 1. Atomically attempt to claim match
+    const matchRes = await matchCol.findOneAndUpdate(
+      {
+        matchId: String(matchId),
+        status: ARENA_STATUS.WAITING_FOR_VOLUNTEER,
+        volunteerId: null,
+      },
+      {
+        $set: {
+          status: ARENA_STATUS.VOLUNTEER_ASSIGNED,
+          volunteerId: String(volunteerId),
+          assignedAt: now,
+          updatedAt: now,
+        },
+      },
+      { returnDocument: 'after' }
+    );
+
+    const claimedMatch = matchRes?.value !== undefined ? matchRes.value : matchRes;
+    if (!claimedMatch) {
+      return { ok: false, error: 'This match has already been claimed by another volunteer.' };
+    }
+
+    // 2. Atomically increment volunteer activeMatches if below limit
+    const volRes = await volCol.findOneAndUpdate(
+      {
+        discordId: String(volunteerId),
+        suspended: false,
+        status: 'AVAILABLE',
+        activeMatches: { $lt: limit },
+      },
+      {
+        $inc: { activeMatches: 1 },
+        $set: { updatedAt: now },
+      },
+      { returnDocument: 'after' }
+    );
+
+    const updatedVol = volRes?.value !== undefined ? volRes.value : volRes;
+    if (!updatedVol) {
+      // Rollback match claim if volunteer was at limit or unavailable
+      await matchCol.updateOne(
+        { matchId: String(matchId), volunteerId: String(volunteerId) },
+        {
+          $set: {
+            status: ARENA_STATUS.WAITING_FOR_VOLUNTEER,
+            volunteerId: null,
+            assignedAt: null,
+            updatedAt: new Date(),
+          },
+        }
+      );
+      return { ok: false, error: `❌ You have reached your active match limit of ${limit}.` };
+    }
+
+    return { ok: true, match: claimedMatch, volunteer: updatedVol };
+  }
+
+  // In-memory fallback for testing
+  const match = memMatches.get(String(matchId));
+  if (!match || match.status !== ARENA_STATUS.WAITING_FOR_VOLUNTEER || match.volunteerId) {
+    return { ok: false, error: 'This match has already been claimed by another volunteer.' };
+  }
+
+  const vol = memVolunteers.get(String(volunteerId)) || {
+    discordId: String(volunteerId),
+    displayName: 'Volunteer',
+    status: 'AVAILABLE',
+    activeMatches: 0,
+    suspended: false,
+  };
+
+  if (vol.suspended) {
+    return { ok: false, error: '❌ You are suspended from volunteering.' };
+  }
+
+  if (vol.status === 'UNAVAILABLE') {
+    return { ok: false, error: '❌ You are marked as unavailable.' };
+  }
+
+  if (vol.activeMatches >= limit) {
+    return { ok: false, error: `❌ You have reached your active match limit of ${limit}.` };
+  }
+
+  const now = new Date();
+  match.status = ARENA_STATUS.VOLUNTEER_ASSIGNED;
+  match.volunteerId = String(volunteerId);
+  match.assignedAt = now;
+  match.updatedAt = now;
+
+  vol.activeMatches = (vol.activeMatches || 0) + 1;
+  vol.updatedAt = now;
+  memVolunteers.set(String(volunteerId), vol);
+
+  return { ok: true, match: { ...match }, volunteer: { ...vol } };
 }
 
 export async function updateArenaVolunteer(discordId, updates) {

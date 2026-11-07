@@ -208,7 +208,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     clearInMemoryArenaData();
   });
 
-  test('1. Setup Command creates categories, channels, Volunteer role, and persistent panel idempotently', async () => {
+  test('1. Setup Command creates categories, channels, public volunteer panel, and persistent panel idempotently', async () => {
     const env = createMockArenaEnvironment();
     const admin = env.addMember('admin-1', 'AdminUser', { isAdmin: true });
 
@@ -224,8 +224,17 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.ok(config.matchResultsId);
     assert.ok(config.supportChannelId);
     assert.ok(config.evidenceChannelId);
-    assert.ok(config.volunteerRoleId);
+    assert.ok(!config.volunteerRoleId, 'No Volunteer role should be created or stored');
     assert.ok(config.panelMessageId);
+
+    // Verify volunteer panel is public for @everyone
+    const volPanel = env.channels.get(config.volunteerPanelId);
+    assert.ok(volPanel);
+    const everyonePerms = volPanel.permissionOverwrites.cache.get(env.guild.id);
+    assert.ok(everyonePerms);
+    assert.equal(everyonePerms.ViewChannel, true);
+    assert.equal(everyonePerms.ReadMessageHistory, true);
+    assert.equal(everyonePerms.SendMessages, false);
 
     // Verify channel count
     const initialChannelCount = env.channels.size;
@@ -383,14 +392,16 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(acceptRes.matchChannel.name, `match-${challengeId.toLowerCase()}`);
   });
 
-  test('6. Volunteer claiming, self-claim prevention, active limit & release flow', async () => {
+  test('6. Volunteer claiming, self-claim prevention, active limit & release flow with concurrency safety', async () => {
     const env = createMockArenaEnvironment();
     const admin = env.addMember('admin-1', 'AdminUser', { isAdmin: true });
     await handleArenaCommand(env.guild, admin, null, ['setup'], () => {});
 
     const playerA = env.addMember('pA', 'AlphaPlayer');
     const playerB = env.addMember('pB', 'BravoPlayer');
-    const volunteer = env.addMember('vol-1', 'VolunteerOne', { isVolunteer: true });
+    // Ordinary members without any volunteer role
+    const volunteer1 = env.addMember('vol-1', 'VolunteerOne');
+    const volunteer2 = env.addMember('vol-2', 'VolunteerTwo');
 
     await upsertArenaPlayer('pA', { displayName: 'AlphaPlayer', bgmiIgn: 'AlphaIgn', bgmiUid: '1001' });
     await upsertArenaPlayer('pB', { displayName: 'BravoPlayer', bgmiIgn: 'BravoIgn', bgmiUid: '1002' });
@@ -402,16 +413,26 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     // Player cannot claim own match
     const selfClaim = await handleClaimMatch(env.guild, playerA, matchId);
     assert.equal(selfClaim.ok, false);
+    assert.match(selfClaim.error, /cannot volunteer for your own match/i);
 
-    // Volunteer claims match
-    const claimRes = await handleClaimMatch(env.guild, volunteer, matchId);
-    assert.equal(claimRes.ok, true);
-    assert.equal(claimRes.match.status, ARENA_STATUS.VOLUNTEER_ASSIGNED);
-    assert.equal(claimRes.match.volunteerId, 'vol-1');
+    // Concurrent claim test: volunteer1 and volunteer2 try to claim simultaneously
+    const [res1, res2] = await Promise.all([
+      handleClaimMatch(env.guild, volunteer1, matchId),
+      handleClaimMatch(env.guild, volunteer2, matchId),
+    ]);
+
+    // Exactly one must win, the other gets exact collision error
+    const winner = res1.ok ? res1 : res2;
+    const loser = res1.ok ? res2 : res1;
+    assert.equal(winner.ok, true);
+    assert.equal(winner.match.status, ARENA_STATUS.VOLUNTEER_ASSIGNED);
+    assert.equal(loser.ok, false);
+    assert.equal(loser.error, 'This match has already been claimed by another volunteer.');
+
+    const winningVolId = winner.match.volunteerId;
+    const winningMember = winningVolId === 'vol-1' ? volunteer1 : volunteer2;
 
     // Volunteer active match limit enforcement (limit: 1)
-    const secondChallenge = await handleCreateChallenge(env.guild, playerA); // wait, playerA is active
-    // create with new players
     const playerC = env.addMember('pC', 'Charlie');
     const playerD = env.addMember('pD', 'Delta');
     await upsertArenaPlayer('pC', { displayName: 'Charlie', bgmiIgn: 'CIgn', bgmiUid: '3001' });
@@ -419,18 +440,23 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     const c2 = await handleCreateChallenge(env.guild, playerC);
     const m2 = await handleAcceptChallenge(env.guild, playerD, c2.challenge.challengeId, env.client);
 
-    const secondClaim = await handleClaimMatch(env.guild, volunteer, m2.match.matchId);
+    const secondClaim = await handleClaimMatch(env.guild, winningMember, m2.match.matchId);
     assert.equal(secondClaim.ok, false);
-    assert.match(secondClaim.error, /Match Limit Reached/);
+    assert.match(secondClaim.error, /active match limit/i);
 
     // Volunteer releases first match
-    const releaseRes = await handleReleaseMatch(env.guild, volunteer, matchId);
+    const releaseRes = await handleReleaseMatch(env.guild, winningMember, matchId);
     assert.equal(releaseRes.ok, true);
     assert.equal(releaseRes.match.status, ARENA_STATUS.WAITING_FOR_VOLUNTEER);
     assert.equal(releaseRes.match.volunteerId, null);
 
-    const volDoc = await getArenaVolunteer('vol-1');
+    const volDoc = await getArenaVolunteer(winningVolId);
     assert.equal(volDoc.activeMatches, 0);
+
+    // Another volunteer can now claim the released match
+    const reclaimRes = await handleClaimMatch(env.guild, volunteer2, matchId);
+    assert.equal(reclaimRes.ok, true);
+    assert.equal(reclaimRes.match.volunteerId, 'vol-2');
   });
 
   test('7. Complete match lifecycle: Room Details -> Start -> Winner Submit -> Confirmation -> Completed', async () => {
@@ -440,7 +466,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
 
     const playerA = env.addMember('pA', 'AlphaPlayer');
     const playerB = env.addMember('pB', 'BravoPlayer');
-    const volunteer = env.addMember('vol-1', 'VolunteerOne', { isVolunteer: true });
+    const volunteer = env.addMember('vol-1', 'VolunteerOne');
 
     await upsertArenaPlayer('pA', { displayName: 'AlphaPlayer', bgmiIgn: 'AlphaIgn', bgmiUid: '1001' });
     await upsertArenaPlayer('pB', { displayName: 'BravoPlayer', bgmiIgn: 'BravoIgn', bgmiUid: '1002' });
@@ -522,7 +548,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
 
     const playerA = env.addMember('pA', 'AlphaPlayer');
     const playerB = env.addMember('pB', 'BravoPlayer');
-    const volunteer = env.addMember('vol-1', 'VolunteerOne', { isVolunteer: true });
+    const volunteer = env.addMember('vol-1', 'VolunteerOne');
 
     await upsertArenaPlayer('pA', { displayName: 'AlphaPlayer', bgmiIgn: 'AlphaIgn', bgmiUid: '1001' });
     await upsertArenaPlayer('pB', { displayName: 'BravoPlayer', bgmiIgn: 'BravoIgn', bgmiUid: '1002' });
@@ -584,19 +610,27 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(expiredChallenge.status, ARENA_STATUS.EXPIRED);
   });
 
-  test('11. Volunteer profile & status toggle commands', async () => {
+  test('11. Volunteer profile & status toggle commands work for any member without roles', async () => {
     const env = createMockArenaEnvironment();
-    const volunteer = env.addMember('vol-1', 'VolunteerOne', { isVolunteer: true });
+    // Ordinary member without any role
+    const member = env.addMember('member-vol-1', 'CommunityUser');
 
     let reply = '';
-    await handleVolunteerCommand(env.guild, volunteer, null, ['profile'], (text) => { reply = typeof text === 'string' ? text : text.content; });
-    const volDoc = await getArenaVolunteer('vol-1');
+    await handleVolunteerCommand(env.guild, member, null, ['profile'], (text) => { reply = typeof text === 'string' ? text : text.content; });
+    const volDoc = await getArenaVolunteer('member-vol-1');
+    assert.ok(volDoc);
     assert.equal(volDoc.status, 'AVAILABLE');
+    assert.equal(volDoc.displayName, 'CommunityUser');
 
-    await handleVolunteerCommand(env.guild, volunteer, null, ['status'], (text) => { reply = typeof text === 'string' ? text : text.content; });
+    await handleVolunteerCommand(env.guild, member, null, ['status'], (text) => { reply = typeof text === 'string' ? text : text.content; });
     assert.match(reply, /UNAVAILABLE/);
-    const toggled = await getArenaVolunteer('vol-1');
+    const toggled = await getArenaVolunteer('member-vol-1');
     assert.equal(toggled.status, 'UNAVAILABLE');
+
+    // .mymatches works for any member without roles
+    let myMatchesReply = null;
+    await handleMyMatchesCommand(env.guild, member, null, [], (res) => { myMatchesReply = res; });
+    assert.ok(myMatchesReply);
   });
 
   test('12. Full end-to-end interaction handling: button routing, modals, room modal, winner modal & dispute modal', async () => {
@@ -606,7 +640,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
 
     const playerA = env.addMember('pA', 'AlphaPlayer');
     const playerB = env.addMember('pB', 'BravoPlayer');
-    const volunteer = env.addMember('vol-1', 'VolunteerOne', { isVolunteer: true });
+    const volunteer = env.addMember('vol-1', 'VolunteerOne');
 
     // 1. Player A clicks Create Challenge without registration -> shows modal
     let modalShown = null;

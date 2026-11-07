@@ -132,15 +132,14 @@ async function sendVolunteerWarning(client, match) {
 
   const config = await getArenaConfig(guild.id);
 
-  // Ping Volunteer role in #volunteer-panel
+  // Announce in public #volunteer-panel
   if (config?.volunteerPanelId) {
     const volPanel =
       guild.channels.cache.get(config.volunteerPanelId) ||
       (await guild.channels.fetch(config.volunteerPanelId).catch(() => null));
     if (volPanel) {
-      const roleMention = config.volunteerRoleId ? `<@&${config.volunteerRoleId}>` : '@Volunteer';
       await queueChannelSend(volPanel, {
-        content: `⚠️ ${roleMention} **Match ${match.matchId}** has been waiting for an official for **15 minutes**! Please accept the match if available.`,
+        content: `⚠️ **Match ${match.matchId}** has been waiting for a volunteer for **15 minutes**! Any member can click **Accept Match** to officiate.`,
       });
     }
   }
@@ -152,7 +151,7 @@ async function sendVolunteerWarning(client, match) {
       (await guild.channels.fetch(match.matchChannelId).catch(() => null));
     if (channel) {
       await queueChannelSend(channel, {
-        content: `⏳ Volunteers have been alerted. Thank you for your patience while an official claims your match.`,
+        content: `⏳ A reminder has been posted in the volunteer panel. Thank you for your patience while a member claims your match.`,
       });
     }
   }
