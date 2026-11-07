@@ -284,12 +284,17 @@ export async function ensureOrUpdateLeaderboardMessage(client, campaign, options
     }
 
     if (existingMsg) {
+      let editError = null;
       await queueMessageEdit(existingMsg, payload).catch((err) => {
+        editError = err;
         console.warn(
           `[InviteCampaign] ⚠️ Failed to edit leaderboard message ${messageId}:`,
           err.message
         );
       });
+      if (editError && options.fromRefreshInteraction) {
+        throw editError;
+      }
       await updateInviteCampaign(freshCampaign.campaignId, dbUpdates);
       Object.assign(campaign, dbUpdates, { leaderboardMessageId: messageId });
       return { message: existingMsg, rows, png };

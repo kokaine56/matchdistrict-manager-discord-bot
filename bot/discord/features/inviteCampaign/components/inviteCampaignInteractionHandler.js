@@ -562,113 +562,132 @@ async function handleRefreshInviteButton(interaction, campaignId) {
 }
 
 /**
+ * Safely sends an ephemeral follow-up or reply without calling reply() after deferUpdate().
+ *
+ * @param {import('discord.js').Interaction} interaction
+ * @param {string} content
+ */
+async function sendEphemeralFeedback(interaction, content) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      if (typeof interaction.followUp === 'function') {
+        return await interaction.followUp({ content, ephemeral: true });
+      }
+      if (typeof interaction.reply === 'function') {
+        return await interaction.reply({ content, ephemeral: true });
+      }
+      return null;
+    }
+    if (typeof interaction.reply === 'function') {
+      return await interaction.reply({ content, ephemeral: true });
+    }
+  } catch (err) {
+    console.warn('[InviteCampaign] ⚠️ Failed to send interaction feedback:', err?.message);
+    return null;
+  }
+}
+
+/**
  * Handles the "Refresh Leaderboard" button below the image leaderboard in the announcement channel.
  *
  * Requirements:
+ * - Immediately acknowledge the button interaction using deferUpdate() before performing any time-consuming operations.
  * - Verifies the user has permission to refresh the leaderboard (must be a guild member, not a bot).
- * - Fetches the latest campaign data from MongoDB.
- * - Rejects refresh if campaign has already ended (never modifies finalized leaderboard).
- * - Protects against simultaneous clicks (per-campaign mutex lock) and excessive refresh spam (cooldown).
- * - Recalculates valid invite counts, applies minimum threshold, recalculates rankings & rewards,
- *   generates updated PNG image, and edits the existing announcement message in place.
+ * - After acknowledging, perform the following operations:
+ *   1. Fetch the latest campaign data from MongoDB.
+ *   2. Recalculate valid invite counts.
+ *   3. Recalculate leaderboard rankings.
+ *   4. Apply the minimum invite threshold.
+ *   5. Calculate winning amounts according to rank.
+ *   6. Generate the updated leaderboard image.
+ *   7. Edit the existing Discord leaderboard message with the new image.
+ * - Do not send a new leaderboard message.
+ * - Preserve the existing leaderboard message ID.
+ * - Do not use reply() or update() after deferUpdate() because the interaction has already been acknowledged.
+ * - If image generation or message editing fails, handle the error properly and log the actual error.
+ * - If appropriate, send an ephemeral follow-up error message when the refresh fails.
+ * - Prevent multiple simultaneous refresh operations from causing duplicate edits or race conditions.
+ * - Ensure the interaction handler does not acknowledge the same interaction more than once.
+ * - Keep the refresh button functional after every successful refresh.
  */
 async function handleRefreshLeaderboardButton(interaction, campaignId) {
+  // 1. Immediately acknowledge the button interaction using deferUpdate() before performing any time-consuming operations
+  if (typeof interaction.deferUpdate === 'function' && !interaction.deferred && !interaction.replied) {
+    try {
+      await interaction.deferUpdate();
+    } catch (err) {
+      console.warn('[InviteCampaign] ⚠️ Failed to acknowledge refresh interaction with deferUpdate:', err?.message);
+    }
+  }
+
   const guild = interaction.guild;
   const user = interaction.user || interaction.member?.user;
   if (!guild || !user || user.bot) {
-    if (typeof interaction.reply === 'function') {
-      await interaction.reply({
-        content: '❌ You do not have permission to refresh this leaderboard.',
-        ephemeral: true,
-      });
-    }
+    await sendEphemeralFeedback(interaction, '❌ You do not have permission to refresh this leaderboard.');
     return true;
   }
 
-  const campaign = await getInviteCampaignById(campaignId);
-  if (!campaign || campaign.guildId !== String(guild.id)) {
-    if (typeof interaction.reply === 'function') {
-      await interaction.reply({
-        content: '❌ Campaign not found.',
-        ephemeral: true,
-      });
-    }
-    return true;
-  }
-
-  // Never modify the leaderboard once the campaign has ended
-  if (campaign.status === CAMPAIGN_STATUS.ENDED) {
-    if (typeof interaction.reply === 'function') {
-      await interaction.reply({
-        content: '🏁 This campaign has ended and the leaderboard is permanently finalized.',
-        ephemeral: true,
-      });
-    }
-    return true;
-  }
-
-  // Protection against excessive refresh requests
-  const nowMs = Date.now();
-  const lastRefreshMs = leaderboardRefreshCooldowns.get(campaign.campaignId) || 0;
-  if (nowMs - lastRefreshMs < LEADERBOARD_REFRESH_COOLDOWN_MS) {
-    const waitSec = Math.ceil((LEADERBOARD_REFRESH_COOLDOWN_MS - (nowMs - lastRefreshMs)) / 1000);
-    if (typeof interaction.reply === 'function') {
-      await interaction.reply({
-        content: `⏳ Leaderboard was just refreshed. Please wait **${waitSec}s** before refreshing again.`,
-        ephemeral: true,
-      });
-    }
-    return true;
-  }
-
-  const lockKey = `lock:inv_cmp:lb_refresh:${campaign.campaignId}`;
+  // 2. Prevent multiple simultaneous refresh operations from causing duplicate edits or race conditions
+  const lockKey = `lock:inv_cmp:lb_refresh:${campaignId}`;
 
   return withCampaignLock(lockKey, async () => {
-    const freshCampaign = await getInviteCampaignById(campaign.campaignId);
-    if (!freshCampaign || freshCampaign.status === CAMPAIGN_STATUS.ENDED) {
-      if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
-        await interaction.reply({
-          content: '🏁 This campaign has ended and the leaderboard is permanently finalized.',
-          ephemeral: true,
-        });
-      }
+    // 3. Fetch latest campaign data from MongoDB
+    const freshCampaign = await getInviteCampaignById(campaignId);
+    if (!freshCampaign || freshCampaign.guildId !== String(guild.id)) {
+      await sendEphemeralFeedback(interaction, '❌ Campaign not found.');
       return true;
     }
 
+    // Never modify the leaderboard once the campaign has ended
+    if (freshCampaign.status === CAMPAIGN_STATUS.ENDED) {
+      await sendEphemeralFeedback(
+        interaction,
+        '🏁 This campaign has ended and the leaderboard is permanently finalized.'
+      );
+      return true;
+    }
+
+    // Protection against excessive refresh requests (cooldown)
     const currentMs = Date.now();
     const recentMs = leaderboardRefreshCooldowns.get(freshCampaign.campaignId) || 0;
     if (currentMs - recentMs < LEADERBOARD_REFRESH_COOLDOWN_MS) {
       const waitSec = Math.ceil((LEADERBOARD_REFRESH_COOLDOWN_MS - (currentMs - recentMs)) / 1000);
-      if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
-        await interaction.reply({
-          content: `⏳ Leaderboard was just refreshed. Please wait **${waitSec}s** before refreshing again.`,
-          ephemeral: true,
-        });
-      }
+      await sendEphemeralFeedback(
+        interaction,
+        `⏳ Leaderboard was just refreshed. Please wait **${waitSec}s** before refreshing again.`
+      );
       return true;
     }
 
     leaderboardRefreshCooldowns.set(freshCampaign.campaignId, currentMs);
 
-    // Recalculate all participant counts from MongoDB referral source of truth
-    await recalculateAllCampaignParticipants(interaction.client, freshCampaign);
+    try {
+      // 4. Recalculate valid invite counts from MongoDB referral source of truth
+      await recalculateAllCampaignParticipants(interaction.client, freshCampaign);
 
-    // Regenerate PNG leaderboard and edit existing announcement message in place
-    const updatedLb = await ensureOrUpdateLeaderboardMessage(interaction.client, freshCampaign, {
-      allowCreateIfMissing: true,
-      fromRefreshInteraction: true,
-    });
-
-    if (typeof interaction.deferUpdate === 'function' && !interaction.replied && !interaction.deferred) {
-      await interaction.deferUpdate().catch(() => {});
-    } else if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
-      await interaction.reply({
-        content: `✅ Leaderboard refreshed! (${updatedLb?.rows?.length ?? 0} qualified participant(s) shown)`,
-        ephemeral: true,
+      // 5. Recalculate rankings, apply minimum threshold, calculate winning amounts,
+      // generate updated PNG image, and edit existing message in place without creating a new message
+      const updatedLb = await ensureOrUpdateLeaderboardMessage(interaction.client, freshCampaign, {
+        allowCreateIfMissing: false,
+        fromRefreshInteraction: true,
       });
-    }
 
-    return true;
+      if (!updatedLb) {
+        throw new Error(
+          `Leaderboard message ${freshCampaign.leaderboardMessageId || ''} could not be found or edited.`
+        );
+      }
+
+      // Do not use reply() or update() after deferUpdate() - interaction already acknowledged
+      return true;
+    } catch (error) {
+      console.error('[InviteCampaign] ❌ Failed to refresh leaderboard:', error);
+      await sendEphemeralFeedback(
+        interaction,
+        '❌ Failed to refresh the leaderboard. Please try again later.'
+      );
+      return true;
+    }
   });
 }
 

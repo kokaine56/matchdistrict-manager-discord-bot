@@ -15,9 +15,12 @@ import {
   formatISTDateTime,
   parseAndValidateRewards,
   computeCampaignLeaderboardRows,
+
   generateLeaderboardPng,
+  ensureOrUpdateLeaderboardMessage,
   buildCampaignPanelPayload,
   createInviteCampaign,
+  createCampaignReferral,
   getInviteCampaignById,
   getCurrentGuildCampaign,
   getCampaignInvitesForCampaign,
@@ -999,5 +1002,425 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     assert.equal(deleted1, false);
 
     delete guildSettingsCache[env.guildId];
+  });
+
+  await t.test('9. Leaderboard Refresh Interaction — Immediate deferUpdate(), No reply/update on Success, Message Preserved, Button Enabled, Error Handling', async () => {
+    const env = createTestEnvironment();
+    const admin = env.addMember('admin-rf-1', { isAdminPerm: true });
+    const user1 = env.addMember('user-rf-1', { username: 'AcePlayer' });
+    const user2 = env.addMember('user-rf-2', { username: 'BravoPlayer' });
+
+    const campaign = await createInviteCampaign({
+      guildId: env.guildId,
+      name: 'DeferUpdate Verification Campaign',
+      description: 'Testing immediate acknowledgement and error handling',
+      status: CAMPAIGN_STATUS.ACTIVE,
+      startAt: new Date(Date.now() - 3600000),
+      endAt: new Date(Date.now() + 3600000),
+      minInviteThreshold: 1,
+      rewards: [
+        { position: 1, amount: 100 },
+        { position: 2, amount: 50 },
+      ],
+      inviteChannelId: env.inviteChannel.id,
+      announcementChannelId: env.anncChannel.id,
+      createdBy: admin.id,
+    });
+
+    // Post initial managed leaderboard message
+    const initialLb = await ensureOrUpdateLeaderboardMessage(env.client, campaign);
+    assert.ok(initialLb?.message?.id);
+    const originalLbMessageId = initialLb.message.id;
+    assert.equal(env.anncChannel._sent.length, 1);
+
+    // Setup participant with 2 valid counted referrals
+    await createCampaignReferral({
+      campaignId: campaign.campaignId,
+      guildId: env.guildId,
+      invitedUserId: 'joined-user-rf-1',
+      inviterId: user1.id,
+      inviteCode: 'CODERF1',
+      inviteUrl: 'https://discord.gg/CODERF1',
+      joinedAt: new Date(),
+      isActive: true,
+      counted: true,
+    });
+    await createCampaignReferral({
+      campaignId: campaign.campaignId,
+      guildId: env.guildId,
+      invitedUserId: 'joined-user-rf-2',
+      inviterId: user1.id,
+      inviteCode: 'CODERF1',
+      inviteUrl: 'https://discord.gg/CODERF1',
+      joinedAt: new Date(),
+      isActive: true,
+      counted: true,
+    });
+    await upsertCampaignParticipant(campaign.campaignId, user1.id, {
+      successfulInvites: 2,
+      eligibleAt: new Date(),
+    });
+
+    // Create a mock button interaction representing a real Discord.js button interaction
+    const callLog = [];
+    const interaction1 = {
+      customId: `inv_cmp:refresh_lb:${campaign.campaignId}`,
+      guild: env.guild,
+      channel: env.anncChannel,
+      member: user1,
+      user: user1.user,
+      client: env.client,
+      deferred: false,
+      replied: false,
+      isButton: () => true,
+      deferUpdate: async () => {
+        callLog.push('deferUpdate');
+        if (interaction1.deferred || interaction1.replied) {
+          throw new Error('DiscordAPIError: Interaction has already been acknowledged');
+        }
+        interaction1.deferred = true;
+      },
+      reply: async (p) => {
+        callLog.push({ type: 'reply', payload: p });
+        if (interaction1.deferred || interaction1.replied) {
+          throw new Error('DiscordAPIError: Interaction has already been acknowledged');
+        }
+        interaction1.replied = true;
+        return p;
+      },
+      update: async (p) => {
+        callLog.push({ type: 'update', payload: p });
+        if (interaction1.deferred || interaction1.replied) {
+          throw new Error('DiscordAPIError: Interaction has already been acknowledged');
+        }
+        interaction1.replied = true;
+        return p;
+      },
+      followUp: async (p) => {
+        callLog.push({ type: 'followUp', payload: p });
+        return p;
+      },
+    };
+
+    clearInviteInteractionCaches();
+    const handled1 = await handleInviteCampaignInteraction(interaction1);
+    assert.equal(handled1, true);
+
+    // 1. Immediately acknowledged via deferUpdate()
+    assert.equal(callLog[0], 'deferUpdate', 'deferUpdate() must be called immediately');
+    assert.equal(interaction1.deferred, true);
+
+    // 2. On success, reply() and update() must NOT be called (would cause Interaction already acknowledged)
+    assert.equal(
+      callLog.some((e) => typeof e === 'object' && (e.type === 'reply' || e.type === 'update')),
+      false,
+      'Must never call reply() or update() after deferUpdate()'
+    );
+
+    // 3. Leaderboard message was edited in place, never sending a duplicate message
+    const lbMsg = env.anncChannel._messages.get(originalLbMessageId);
+    assert.equal(env.anncChannel._sent.length, 1, 'Must never send a new leaderboard message');
+    assert.equal(lbMsg.edits.length, 1, 'Existing message must be edited in place');
+    assert.equal(lbMsg._leaderboardMeta.rows.length, 1);
+    assert.equal(lbMsg._leaderboardMeta.rows[0].userId, user1.id);
+    assert.equal(lbMsg._leaderboardMeta.rows[0].winningAmountFormatted, '₹100');
+
+    // 4. Existing leaderboard message ID is preserved in DB and campaign
+    const freshDbCampaign = await getInviteCampaignById(campaign.campaignId);
+    assert.equal(freshDbCampaign.leaderboardMessageId, originalLbMessageId);
+
+    // 5. Refresh button remains functional and enabled on the edited message
+    const buttonOnMessage = lbMsg.components[0].components[0].toJSON();
+    assert.equal(buttonOnMessage.custom_id, `inv_cmp:refresh_lb:${campaign.campaignId}`);
+    assert.equal(buttonOnMessage.disabled, false);
+
+    // 6. Test already acknowledged interaction: does not call deferUpdate() again
+    let duplicateDeferCalls = 0;
+    const interactionAlreadyAcked = {
+      ...interaction1,
+      deferred: true,
+      deferUpdate: async () => {
+        duplicateDeferCalls++;
+      },
+    };
+    await handleInviteCampaignInteraction(interactionAlreadyAcked);
+    assert.equal(duplicateDeferCalls, 0, 'Must not acknowledge the same interaction more than once');
+
+    // 7. Test error handling: when message editing fails, handle properly and send ephemeral followUp
+    clearInviteInteractionCaches();
+    const originalEdit = lbMsg.edit;
+    lbMsg.edit = async () => {
+      throw new Error('Discord API 500: Internal Server Error');
+    };
+
+    const errorCallLog = [];
+    const interactionWithError = {
+      customId: `inv_cmp:refresh_lb:${campaign.campaignId}`,
+      guild: env.guild,
+      channel: env.anncChannel,
+      member: user1,
+      user: user1.user,
+      client: env.client,
+      deferred: false,
+      replied: false,
+      isButton: () => true,
+      deferUpdate: async () => {
+        errorCallLog.push('deferUpdate');
+        interactionWithError.deferred = true;
+      },
+      followUp: async (p) => {
+        errorCallLog.push({ type: 'followUp', payload: p });
+        return p;
+      },
+    };
+
+    await handleInviteCampaignInteraction(interactionWithError);
+
+    // Verify deferUpdate was called, error caught, and followUp sent
+    assert.equal(errorCallLog[0], 'deferUpdate');
+    const followUpEntry = errorCallLog.find((e) => typeof e === 'object' && e.type === 'followUp');
+    assert.ok(followUpEntry, 'Must send ephemeral follow-up on error');
+    assert.match(followUpEntry.payload.content, /Failed to refresh the leaderboard/i);
+    assert.equal(followUpEntry.payload.ephemeral, true);
+
+    // Restore lbMsg.edit
+    lbMsg.edit = originalEdit;
+  });
+
+  await t.test('10. Leaderboard Refresh Interaction — Multiple Simultaneous Refreshes & Cooldown Enforcement Without Duplicate Edits', async () => {
+    const env = createTestEnvironment();
+    const admin = env.addMember('admin-sim-1', { isAdminPerm: true });
+    const userA = env.addMember('user-sim-a', { username: 'Alpha' });
+    const userB = env.addMember('user-sim-b', { username: 'Beta' });
+
+    const campaign = await createInviteCampaign({
+      guildId: env.guildId,
+      name: 'Simultaneous Refresh Campaign',
+      description: 'Testing race conditions and duplicate edit prevention',
+      status: CAMPAIGN_STATUS.ACTIVE,
+      startAt: new Date(Date.now() - 3600000),
+      endAt: new Date(Date.now() + 3600000),
+      minInviteThreshold: 1,
+      rewards: [{ position: 1, amount: 200 }],
+      inviteChannelId: env.inviteChannel.id,
+      announcementChannelId: env.anncChannel.id,
+      createdBy: admin.id,
+    });
+
+    const initialLb = await ensureOrUpdateLeaderboardMessage(env.client, campaign);
+    const lbMsg = env.anncChannel._messages.get(initialLb.message.id);
+    const initialEdits = lbMsg.edits.length;
+
+    await upsertCampaignParticipant(campaign.campaignId, userA.id, {
+      successfulInvites: 5,
+      eligibleAt: new Date(),
+    });
+
+    clearInviteInteractionCaches();
+
+    // Create 3 simultaneous button interactions from different users
+    const interactions = [userA, userB, admin].map((member, i) => {
+      const logs = [];
+      const interaction = {
+        customId: `inv_cmp:refresh_lb:${campaign.campaignId}`,
+        guild: env.guild,
+        channel: env.anncChannel,
+        member,
+        user: member.user,
+        client: env.client,
+        deferred: false,
+        replied: false,
+        isButton: () => true,
+        deferUpdate: async () => {
+          logs.push('deferUpdate');
+          interaction.deferred = true;
+        },
+        followUp: async (p) => {
+          logs.push({ type: 'followUp', payload: p });
+          return p;
+        },
+        logs,
+      };
+      return interaction;
+    });
+
+    // Execute simultaneously
+    await Promise.all(interactions.map((int) => handleInviteCampaignInteraction(int)));
+
+    // ALL 3 interactions must have had deferUpdate() called immediately (no timeouts in Discord)
+    for (const int of interactions) {
+      assert.equal(int.deferred, true, 'Every button interaction must be acknowledged with deferUpdate()');
+      assert.equal(int.logs[0], 'deferUpdate');
+    }
+
+    // Only ONE edit must have occurred (race condition prevented)
+    assert.equal(
+      lbMsg.edits.length,
+      initialEdits + 1,
+      'Exactly one message edit must occur despite 3 concurrent clicks'
+    );
+    assert.equal(env.anncChannel._sent.length, 1, 'No duplicate messages sent');
+
+    // The other two interactions received the cooldown notice via followUp
+    const cooldownFollowUps = interactions
+      .flatMap((int) => int.logs)
+      .filter((log) => typeof log === 'object' && log.type === 'followUp');
+
+    assert.equal(cooldownFollowUps.length, 2, '2 concurrent requests hit the cooldown check');
+    for (const f of cooldownFollowUps) {
+      assert.match(f.payload.content, /just refreshed/i);
+      assert.equal(f.payload.ephemeral, true);
+    }
+  });
+
+  await t.test('11. Leaderboard Refresh Interaction — Sequential Refreshes Over Time & Button Remains Functional', async () => {
+    const env = createTestEnvironment();
+    const admin = env.addMember('admin-seq-1', { isAdminPerm: true });
+    const user = env.addMember('user-seq-1', { username: 'SeqRunner' });
+
+    const campaign = await createInviteCampaign({
+      guildId: env.guildId,
+      name: 'Sequential Refresh Campaign',
+      description: 'Testing multiple refreshes over time',
+      status: CAMPAIGN_STATUS.ACTIVE,
+      startAt: new Date(Date.now() - 3600000),
+      endAt: new Date(Date.now() + 3600000),
+      minInviteThreshold: 1,
+      rewards: [{ position: 1, amount: 50 }],
+      inviteChannelId: env.inviteChannel.id,
+      announcementChannelId: env.anncChannel.id,
+      createdBy: admin.id,
+    });
+
+    const initialLb = await ensureOrUpdateLeaderboardMessage(env.client, campaign);
+    const lbMsg = env.anncChannel._messages.get(initialLb.message.id);
+
+    await createCampaignReferral({
+      campaignId: campaign.campaignId,
+      guildId: env.guildId,
+      invitedUserId: 'joined-user-seq-1',
+      inviterId: user.id,
+      inviteCode: 'CODESEQ1',
+      inviteUrl: 'https://discord.gg/CODESEQ1',
+      joinedAt: new Date(),
+      isActive: true,
+      counted: true,
+    });
+    await upsertCampaignParticipant(campaign.campaignId, user.id, {
+      successfulInvites: 1,
+      eligibleAt: new Date(),
+    });
+
+    clearInviteInteractionCaches();
+
+    // 1st Click: Successful refresh
+    const logs1 = [];
+    const interaction1 = {
+      customId: `inv_cmp:refresh_lb:${campaign.campaignId}`,
+      guild: env.guild,
+      channel: env.anncChannel,
+      member: user,
+      user: user.user,
+      client: env.client,
+      deferred: false,
+      replied: false,
+      isButton: () => true,
+      deferUpdate: async () => {
+        logs1.push('deferUpdate');
+        interaction1.deferred = true;
+      },
+      followUp: async (p) => {
+        logs1.push({ type: 'followUp', payload: p });
+        return p;
+      },
+    };
+
+    await handleInviteCampaignInteraction(interaction1);
+    assert.equal(logs1[0], 'deferUpdate');
+    assert.equal(lbMsg.edits.length, 1);
+    assert.equal(env.anncChannel._sent.length, 1);
+
+    // Refresh button is still attached and enabled on edited message
+    let btn = lbMsg.components[0].components[0].toJSON();
+    assert.equal(btn.custom_id, `inv_cmp:refresh_lb:${campaign.campaignId}`);
+    assert.equal(btn.disabled, false);
+
+    // 2nd Click immediately: Hits cooldown
+    const logs2 = [];
+    const interaction2 = {
+      customId: `inv_cmp:refresh_lb:${campaign.campaignId}`,
+      guild: env.guild,
+      channel: env.anncChannel,
+      member: user,
+      user: user.user,
+      client: env.client,
+      deferred: false,
+      replied: false,
+      isButton: () => true,
+      deferUpdate: async () => {
+        logs2.push('deferUpdate');
+        interaction2.deferred = true;
+      },
+      followUp: async (p) => {
+        logs2.push({ type: 'followUp', payload: p });
+        return p;
+      },
+    };
+
+    await handleInviteCampaignInteraction(interaction2);
+    assert.equal(logs2[0], 'deferUpdate');
+    assert.equal(lbMsg.edits.length, 1, 'No new edit during cooldown');
+    assert.equal(logs2.length, 2);
+    assert.equal(logs2[1].type, 'followUp');
+    assert.match(logs2[1].payload.content, /just refreshed/i);
+
+    // Add another referral for user
+    await createCampaignReferral({
+      campaignId: campaign.campaignId,
+      guildId: env.guildId,
+      invitedUserId: 'joined-user-seq-2',
+      inviterId: user.id,
+      inviteCode: 'CODESEQ1',
+      inviteUrl: 'https://discord.gg/CODESEQ1',
+      joinedAt: new Date(),
+      isActive: true,
+      counted: true,
+    });
+
+    // Clear cooldown cache to simulate time passage
+    clearInviteInteractionCaches();
+
+    // 3rd Click after cooldown: Successful 2nd refresh
+    const logs3 = [];
+    const interaction3 = {
+      customId: `inv_cmp:refresh_lb:${campaign.campaignId}`,
+      guild: env.guild,
+      channel: env.anncChannel,
+      member: user,
+      user: user.user,
+      client: env.client,
+      deferred: false,
+      replied: false,
+      isButton: () => true,
+      deferUpdate: async () => {
+        logs3.push('deferUpdate');
+        interaction3.deferred = true;
+      },
+      followUp: async (p) => {
+        logs3.push({ type: 'followUp', payload: p });
+        return p;
+      },
+    };
+
+    await handleInviteCampaignInteraction(interaction3);
+    assert.equal(logs3[0], 'deferUpdate');
+    assert.equal(lbMsg.edits.length, 2, 'Message edited a second time');
+    assert.equal(env.anncChannel._sent.length, 1, 'Still only 1 sent message in channel');
+    assert.equal(lbMsg._leaderboardMeta.rows[0].invites, 2);
+
+    // Refresh button still present and functional
+    btn = lbMsg.components[0].components[0].toJSON();
+    assert.equal(btn.custom_id, `inv_cmp:refresh_lb:${campaign.campaignId}`);
+    assert.equal(btn.disabled, false);
   });
 });
