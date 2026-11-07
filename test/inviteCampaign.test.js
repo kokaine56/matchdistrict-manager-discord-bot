@@ -450,7 +450,7 @@ test('Invite & Earn Campaign System — Full Lifecycle, Tracking, Counting, Mode
 
   await t.test('3. Missing Intents/Permissions Check, Unique Invites, Tracking, Counting, Leave/Rejoin & Eligibility', async () => {
     // Verify missing permissions prevent starting
-    const badEnv = createTestEnvironment({ botManageGuild: false });
+    const badEnv = createTestEnvironment({ guildId: 'guild-bad-perm', botManageGuild: false });
     const badAdmin = badEnv.addMember('admin-bad', { isAdminPerm: true });
     await createInviteCampaign({
       guildId: badEnv.guildId,

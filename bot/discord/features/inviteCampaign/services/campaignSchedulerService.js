@@ -395,7 +395,7 @@ export async function recordOrRestoreCampaignReferral(client, campaign, member, 
   const campaignId = String(campaign.campaignId);
   const lockKey = `lock:inv_cmp:ref:${campaignId}:${invitedUserId}`;
 
-  return withCampaignLock(lockKey, async () => {
+  const createdOrRestored = await withCampaignLock(lockKey, async () => {
     const freshCampaign = (await getInviteCampaignById(campaignId)) || campaign;
     if (freshCampaign.status !== CAMPAIGN_STATUS.ACTIVE) return null;
 
@@ -412,7 +412,7 @@ export async function recordOrRestoreCampaignReferral(client, campaign, member, 
           counted: false,
           dueAt: null,
         });
-        return updatedDisq;
+        return { ref: updatedDisq, freshCampaign, stayMs, disqualified: true };
       }
 
       // Restore original inviter (never switch inviter) and restart stay period
@@ -426,12 +426,7 @@ export async function recordOrRestoreCampaignReferral(client, campaign, member, 
       });
 
       await recalculateParticipantEligibility(client, freshCampaign, restoredRef.inviterId);
-
-      if (stayMs === 0) {
-        return evaluateDueReferral(client, freshCampaign, restoredRef, joinedAt);
-      }
-      armReferralStayTimer(client, freshCampaign, restoredRef);
-      return restoredRef;
+      return { ref: restoredRef, freshCampaign, stayMs, disqualified: false };
     }
 
     // Case 2: First join in this campaign — requires a valid attributed campaign invite
@@ -442,7 +437,7 @@ export async function recordOrRestoreCampaignReferral(client, campaign, member, 
 
     // Self-invites never count
     if (invitedUserId === inviterId) {
-      return createCampaignReferral({
+      const selfRef = await createCampaignReferral({
         campaignId,
         guildId,
         invitedUserId,
@@ -457,6 +452,7 @@ export async function recordOrRestoreCampaignReferral(client, campaign, member, 
         disqualifyReason: 'Self-invite',
         dueAt: null,
       });
+      return { ref: selfRef, freshCampaign, stayMs, disqualified: true };
     }
 
     // Members who were already in the server before the campaign never count
@@ -464,7 +460,7 @@ export async function recordOrRestoreCampaignReferral(client, campaign, member, 
       ? freshCampaign.initialMemberIds
       : [];
     if (initialMembers.includes(invitedUserId)) {
-      return createCampaignReferral({
+      const preRef = await createCampaignReferral({
         campaignId,
         guildId,
         invitedUserId,
@@ -479,6 +475,7 @@ export async function recordOrRestoreCampaignReferral(client, campaign, member, 
         disqualifyReason: 'Member was already in the server before the campaign',
         dueAt: null,
       });
+      return { ref: preRef, freshCampaign, stayMs, disqualified: true };
     }
 
     // Create pending referral with stored dueAt
@@ -499,13 +496,23 @@ export async function recordOrRestoreCampaignReferral(client, campaign, member, 
     });
 
     await recalculateParticipantEligibility(client, freshCampaign, inviterId);
-
-    if (stayMs === 0) {
-      return evaluateDueReferral(client, freshCampaign, createdRef, joinedAt);
-    }
-    armReferralStayTimer(client, freshCampaign, createdRef);
-    return createdRef;
+    return { ref: createdRef, freshCampaign, stayMs, disqualified: false };
   });
+
+  if (!createdOrRestored || !createdOrRestored.ref) return null;
+  if (createdOrRestored.disqualified) return createdOrRestored.ref;
+
+  if (createdOrRestored.stayMs === 0) {
+    return evaluateDueReferral(
+      client,
+      createdOrRestored.freshCampaign,
+      createdOrRestored.ref,
+      joinedAt
+    );
+  }
+
+  armReferralStayTimer(client, createdOrRestored.freshCampaign, createdOrRestored.ref);
+  return createdOrRestored.ref;
 }
 
 /**
