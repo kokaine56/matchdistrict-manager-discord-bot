@@ -185,6 +185,17 @@ import {
   reconcileConfigurableTournaments,
 } from './registrationScheduler.js';
 import { setSlotChartClient } from './slotChartService.js';
+import {
+  handleInviteCommand,
+  handleInviteCampaignInteraction,
+  handleInviteCampaignMemberAdd,
+  handleInviteCampaignMemberRemove,
+  handleInviteCampaignInviteCreate,
+  handleInviteCampaignInviteDelete,
+  recoverInviteCampaignsOnStartup,
+  startInviteCampaignScheduler,
+  stopInviteCampaignScheduler,
+} from './bot/discord/features/inviteCampaign/index.js';
 
 
 export {
@@ -2737,6 +2748,7 @@ export const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers, // Privileged Server Members Intent
+    GatewayIntentBits.GuildInvites, // Server Invites Intent (for Invite & Earn tracking)
     GatewayIntentBits.GuildMessages, // Message receive intent
     GatewayIntentBits.MessageContent, // Privileged Message Content Intent (for prefix commands & message logs)
     GatewayIntentBits.GuildModeration, // Ban & Unban audit tracking (intent 4)
@@ -2824,6 +2836,12 @@ client.once(Events.ClientReady, async (readyClient) => {
     await refreshMemberCountChannel(startupGuilds[index]);
     if (index < startupGuilds.length - 1) await new Promise((resolve) => setTimeout(resolve, 1500));
   }
+
+  // Recover active Invite & Earn campaigns, reconcile offline joins, and start campaign scheduler
+  await recoverInviteCampaignsOnStartup(readyClient).catch((invRecErr) => {
+    console.warn('[InviteCampaign] ⚠️ Startup recovery warning:', invRecErr.message);
+  });
+  startInviteCampaignScheduler(readyClient);
 
   // Restore each persisted dashboard in place and clean its command channel after every restart.
   for (const guild of readyClient.guilds.cache.values()) {
@@ -3150,6 +3168,16 @@ client.on(Events.MessageCreate, async (message) => {
       } else if (cmd === 'website' || cmd === 'site') {
         await message.reply(getWebsiteResponse());
         return;
+      } else if (cmd === 'invite') {
+        await handleInviteCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          args,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+          client
+        );
+        return;
       }
     }
 
@@ -3207,6 +3235,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // Handle tournament verification interactions (teammate select & cancel)
   if (interaction.customId?.startsWith('tver:')) {
     const handled = await handleTournamentVerificationInteraction(interaction);
+    if (handled) return;
+  }
+
+  // Handle Invite & Earn campaign interactions (panel generate button, admin modals & channel selects)
+  if (interaction.customId?.startsWith('inv_cmp:')) {
+    const handled = await handleInviteCampaignInteraction(interaction);
     if (handled) return;
   }
 
@@ -3452,10 +3486,32 @@ client.on(Events.GuildMemberRemove, (member) => scheduleMemberCountChannelRefres
 
 client.on(Events.GuildMemberRemove, async (member) => {
   await handleGuildMemberRemove(member);
+  await handleInviteCampaignMemberRemove(member).catch((err) => {
+    console.warn(`[InviteCampaign] ⚠️ Error handling member leave for ${member?.id}:`, err.message);
+  });
+});
+
+// Invite tracking listeners for Invite & Earn campaigns
+client.on(Events.InviteCreate, async (invite) => {
+  await handleInviteCampaignInviteCreate(invite).catch((err) => {
+    console.warn(`[InviteCampaign] ⚠️ Error handling InviteCreate:`, err.message);
+  });
+});
+
+client.on(Events.InviteDelete, async (invite) => {
+  await handleInviteCampaignInviteDelete(invite).catch((err) => {
+    console.warn(`[InviteCampaign] ⚠️ Error handling InviteDelete:`, err.message);
+  });
 });
 
 // Member join listener
 client.on(Events.GuildMemberAdd, async (member) => {
+  try {
+    await handleInviteCampaignMemberAdd(member);
+  } catch (invErr) {
+    console.warn(`[InviteCampaign] ⚠️ Error in invite campaign join handler for member ${member?.id}:`, invErr.message);
+  }
+
   try {
     await handleGuildMemberAdd(member);
   } catch (welcErr) {
@@ -3548,6 +3604,7 @@ export async function gracefulShutdown(signal) {
   console.log(`\n[Discord Bot] Received ${signal}. Shutting down bot gracefully...`);
   try {
     stopRoleSyncScheduler();
+    stopInviteCampaignScheduler();
     if (rateLimitCleanupInterval) {
       clearInterval(rateLimitCleanupInterval);
     }

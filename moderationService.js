@@ -5,6 +5,7 @@ import {
 import { queueChannelSend, queueMessageDelete } from './discordQueue.js';
 import { checkAbusiveWord } from './badWordsConfig.js';
 import { getGuildChannelId, isModerationEnabled, isAdmin } from './index.js';
+import { stripAllowedCampaignInviteLinks } from './bot/discord/features/inviteCampaign/services/inviteSnapshotService.js';
 
 /**
  * Regex detecting:
@@ -189,9 +190,10 @@ export async function handleMessageModeration(message) {
   }
 
   const content = message.content || '';
+  const contentForLinkCheck = await stripAllowedCampaignInviteLinks(message.guild.id, content);
 
   // 1. LINK BLOCKING CHECK
-  if (containsLink(content) && !isAdmin(message.member)) {
+  if (containsLink(contentForLinkCheck) && !isAdmin(message.member)) {
     // Delete message
     await queueMessageDelete(message).catch((delErr) => {
       console.warn('[Moderation] ⚠️ Failed to delete link message:', delErr.message);
@@ -272,9 +274,10 @@ export async function handleMessageUpdateModeration(oldMessage, newMessage) {
   }
 
   const content = newMessage.content || '';
+  const contentForLinkCheck = await stripAllowedCampaignInviteLinks(newMessage.guild.id, content);
 
   // Check link blocking on edited content
-  if (containsLink(content) && !isAdmin(newMessage.member)) {
+  if (containsLink(contentForLinkCheck) && !isAdmin(newMessage.member)) {
     await queueMessageDelete(newMessage).catch(() => {});
 
     let timeoutNote = '';
