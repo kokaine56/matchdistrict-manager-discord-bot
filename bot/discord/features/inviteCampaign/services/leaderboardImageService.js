@@ -492,11 +492,11 @@ function truncateText(text, maxChars) {
  */
 export function generateLeaderboardPng(campaign, rows = [], avatars = new Map()) {
   const safeRows = Array.isArray(rows) ? rows : [];
-  const width = 820;
-  const headerHeight = 92;
-  const tableHeaderHeight = 46;
-  const rowHeight = 44;
-  const footerHeight = 36;
+  const width = 960;
+  const headerHeight = 150;
+  const tableHeaderHeight = 72;
+  const rowHeight = 72;
+  const footerHeight = 50;
   const displayRowCount = Math.max(1, safeRows.length);
   const height = headerHeight + tableHeaderHeight + displayRowCount * rowHeight + footerHeight;
 
@@ -525,8 +525,8 @@ export function generateLeaderboardPng(campaign, rows = [], avatars = new Map())
   fillRect(rgba, width, height, 16, 14, width - 32, headerHeight - 20, headerBg);
   fillRect(rgba, width, height, 16, 14, width - 32, 3, [56, 189, 248, 255]);
 
-  const title = truncateText(campaign?.name || 'INVITE & EARN LEADERBOARD', 34);
-  drawText(rgba, width, height, title, 34, 30, 3, whiteText, 'left');
+  const title = truncateText(campaign?.name || 'INVITE & EARN LEADERBOARD', 23);
+  drawText(rgba, width, height, title, 34, 36, 4, whiteText, 'left');
 
   const rawStatus = String(campaign?.status || 'Active');
   const isEnded = rawStatus.toLowerCase() === 'ended';
@@ -542,8 +542,8 @@ export function generateLeaderboardPng(campaign, rows = [], avatars = new Map())
     height,
     `MIN INVITES: ${minInviteThreshold}`,
     34,
-    62,
-    2,
+    100,
+    3,
     mutedText,
     'left'
   );
@@ -554,16 +554,16 @@ export function generateLeaderboardPng(campaign, rows = [], avatars = new Map())
     : rawStatus.toLowerCase() === 'active'
       ? [46, 204, 113, 255]
       : [243, 156, 18, 255];
-  const badgeWidth = Math.max(120, statusText.length * 12 + 28);
-  fillRect(rgba, width, height, width - 32 - badgeWidth, 30, badgeWidth, 34, badgeColor);
+  const badgeWidth = Math.max(144, statusText.length * 18 + 36);
+  fillRect(rgba, width, height, width - 32 - badgeWidth, 52, badgeWidth, 46, badgeColor);
   drawText(
     rgba,
     width,
     height,
     statusText,
     width - 32 - badgeWidth / 2,
-    40,
-    2,
+    69,
+    3,
     [15, 23, 42, 255],
     'center'
   );
@@ -576,24 +576,24 @@ export function generateLeaderboardPng(campaign, rows = [], avatars = new Map())
   fillRect(rgba, width, height, tableX, tableY + tableHeaderHeight - 2, tableW, 2, borderColor);
 
   // Column X positions:
-  // Col 1: Rank (16..130)
-  // Col 2: Username (130..470)
-  // Col 3: Invites (470..620)
-  // Col 4: Winning Amount (620..804)
-  const colRankX = 72;
-  const colUserX = 148;
-  const colInvitesX = 545;
-  const colAmountX = 784;
+  // Col 1: Rank (16..145)
+  // Col 2: Username and avatar (145..570)
+  // Col 3: Invites (570..730)
+  // Col 4: Winning Amount (730..944)
+  const colRankX = 80;
+  const colInvitesX = 650;
+  const colAmountX = 930;
 
-  drawText(rgba, width, height, 'RANK', colRankX, tableY + 16, 2, mutedText, 'center');
-  drawText(rgba, width, height, 'USERNAME', colUserX, tableY + 16, 2, mutedText, 'left');
-  drawText(rgba, width, height, 'INVITES', colInvitesX, tableY + 16, 2, mutedText, 'center');
-  drawText(rgba, width, height, 'WINNING AMOUNT', colAmountX, tableY + 16, 2, mutedText, 'right');
+  drawText(rgba, width, height, 'RANK', colRankX, tableY + 27, 3, mutedText, 'center');
+  drawText(rgba, width, height, 'USERNAME', 220, tableY + 27, 3, mutedText, 'left');
+  drawText(rgba, width, height, 'INVITES', colInvitesX, tableY + 27, 3, mutedText, 'center');
+  drawText(rgba, width, height, 'WINNING', colAmountX, tableY + 16, 3, mutedText, 'right');
+  drawText(rgba, width, height, 'AMOUNT', colAmountX, tableY + 43, 3, mutedText, 'right');
 
   // Column vertical dividers in header
-  fillRect(rgba, width, height, 130, tableY, 1, tableHeaderHeight + displayRowCount * rowHeight, borderColor);
-  fillRect(rgba, width, height, 470, tableY, 1, tableHeaderHeight + displayRowCount * rowHeight, borderColor);
-  fillRect(rgba, width, height, 620, tableY, 1, tableHeaderHeight + displayRowCount * rowHeight, borderColor);
+  fillRect(rgba, width, height, 145, tableY, 1, tableHeaderHeight + displayRowCount * rowHeight, borderColor);
+  fillRect(rgba, width, height, 570, tableY, 1, tableHeaderHeight + displayRowCount * rowHeight, borderColor);
+  fillRect(rgba, width, height, 730, tableY, 1, tableHeaderHeight + displayRowCount * rowHeight, borderColor);
 
   // 4. Table Body Rows
   if (safeRows.length === 0) {
@@ -605,8 +605,8 @@ export function generateLeaderboardPng(campaign, rows = [], avatars = new Map())
       height,
       `NO PARTICIPANTS WITH ${minInviteThreshold}+ INVITES YET`,
       width / 2,
-      ry + 15,
-      2,
+      ry + 25,
+      3,
       mutedText,
       'center'
     );
@@ -633,9 +633,9 @@ export function generateLeaderboardPng(campaign, rows = [], avatars = new Map())
         rankColor = bronzeAccent;
       }
 
-      drawText(rgba, width, height, `#${row.rank}`, colRankX, ry + 15, 2, rankColor, 'center');
-      const avatarSize = 28;
-      const avatarX = 140;
+      drawText(rgba, width, height, `#${row.rank}`, colRankX, ry + 22, 4, rankColor, 'center');
+      const avatarSize = 56;
+      const avatarX = 155;
       const avatarY = ry + Math.floor((rowHeight - avatarSize) / 2);
       const avatarBuffer = avatars instanceof Map ? avatars.get(String(row.userId)) : avatars?.[String(row.userId)];
       if (avatarBuffer) drawCircularAvatar(rgba, width, height, avatarBuffer, avatarX, avatarY, avatarSize);
@@ -643,10 +643,10 @@ export function generateLeaderboardPng(campaign, rows = [], avatars = new Map())
         rgba,
         width,
         height,
-        truncateText(row.username, 24),
-        176,
-        ry + 15,
-        2,
+        truncateText(row.username, 14),
+        220,
+        ry + 22,
+        4,
         whiteText,
         'left'
       );
@@ -656,8 +656,8 @@ export function generateLeaderboardPng(campaign, rows = [], avatars = new Map())
         height,
         String(row.invites),
         colInvitesX,
-        ry + 15,
-        2,
+        ry + 22,
+        4,
         whiteText,
         'center'
       );
@@ -667,8 +667,8 @@ export function generateLeaderboardPng(campaign, rows = [], avatars = new Map())
         height,
         row.winningAmountFormatted || formatRupeeAmount(row.winningAmount),
         colAmountX,
-        ry + 15,
-        2,
+        ry + 25,
+        3,
         row.winningAmount > 0 ? greenMoney : mutedText,
         'right'
       );
@@ -689,8 +689,8 @@ export function generateLeaderboardPng(campaign, rows = [], avatars = new Map())
     height,
     'MATCH DISTRICT INVITE & EARN LEADERBOARD',
     width / 2,
-    height - 20,
-    1,
+    height - 30,
+    2,
     mutedText,
     'center'
   );

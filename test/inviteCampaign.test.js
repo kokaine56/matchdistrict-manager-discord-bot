@@ -695,6 +695,8 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     // Verify PNG generation produces a valid PNG image buffer and scales height with row count
     const png2Rows = generateLeaderboardPng(campaign, rows);
     assert.ok(Buffer.isBuffer(png2Rows.buffer));
+    assert.equal(png2Rows.width, 960, 'Leaderboard uses a higher-resolution mobile layout');
+    assert.ok(png2Rows.height > 150 + 72 + 2 * 72, 'Rows include enlarged vertical spacing');
     // PNG magic header: 89 50 4E 47 0D 0A 1A 0A
     assert.deepEqual(
       [...png2Rows.buffer.subarray(0, 8)],
