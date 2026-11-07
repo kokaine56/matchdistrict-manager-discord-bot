@@ -267,6 +267,41 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     stopInviteCampaignScheduler();
   });
 
+  await t.test('0. Admin .invite min updates and persists the current campaign threshold', async () => {
+    const env = createTestEnvironment();
+    const admin = env.addMember('admin-min', { isAdminPerm: true });
+    const member = env.addMember('member-min', { isAdminPerm: false });
+    const campaign = await createInviteCampaign({
+      guildId: env.guildId,
+      name: 'Minimum Threshold Campaign',
+      status: CAMPAIGN_STATUS.ACTIVE,
+      endAt: new Date(Date.now() + 86400000),
+      inviteChannelId: env.inviteChannel.id,
+      announcementChannelId: env.anncChannel.id,
+      createdBy: admin.id,
+      minInviteThreshold: 2,
+      rewards: [{ position: 1, amount: 50 }],
+    });
+
+    let response = '';
+    await handleInviteCommand(env.guild, admin, env.inviteChannel, ['min', '10'], (text) => { response = text; }, env.client);
+    assert.equal(response, 'Minimum successful invites set to 10.');
+    let updated = await getInviteCampaignById(campaign.campaignId);
+    assert.equal(updated.minInviteThreshold, 10);
+    assert.equal(updated.requiredInvites, 10);
+    assert.deepEqual(computeCampaignLeaderboardRows(updated, [
+      { userId: 'u1', successfulInvites: 9 },
+      { userId: 'u2', successfulInvites: 10 },
+    ], env.guild).map((row) => row.userId), ['u2']);
+
+    await handleInviteCommand(env.guild, admin, env.inviteChannel, ['min', '0'], (text) => { response = text; }, env.client);
+    assert.match(response, /positive whole number/);
+    await handleInviteCommand(env.guild, member, env.inviteChannel, ['min', '5'], (text) => { response = text; }, env.client);
+    assert.match(response, /Permission Denied/);
+    updated = await getInviteCampaignById(campaign.campaignId);
+    assert.equal(updated.minInviteThreshold, 10);
+  });
+
   await t.test('1. Button Label Changed to "Create Link" & Duplicate Invite Prevention', async () => {
     const env = createTestEnvironment();
     const admin = env.addMember('admin-1', { isAdminPerm: true });

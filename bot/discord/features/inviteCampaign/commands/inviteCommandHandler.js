@@ -43,7 +43,10 @@ import {
   formatRewardsSummary,
   computeCampaignLeaderboardRows,
 } from '../services/leaderboardImageService.js';
-import { recalculateParticipantEligibility } from '../services/eligibilityService.js';
+import {
+  recalculateParticipantEligibility,
+  recalculateAllCampaignParticipants,
+} from '../services/eligibilityService.js';
 import { hasCampaignAdminPermission } from '../components/inviteCampaignInteractionHandler.js';
 
 /**
@@ -86,6 +89,32 @@ export async function handleInviteCommand(guild, member, channel, args, replyFn,
         `• \`.invite disqualify <@user> [reason]\` — Exclude a user or a single referral from counts\n` +
         `• \`.invite review\` — View joins that could not be attributed with certainty`
     );
+  }
+
+  // Set the qualification threshold on the existing current campaign.
+  if (subCmd === 'min') {
+    const rawMinimum = args[1];
+    const minimum = rawMinimum === undefined || String(rawMinimum).trim() === '' ? NaN : Number(rawMinimum);
+    if (!Number.isSafeInteger(minimum) || minimum < 1) {
+      return replyFn('❌ **Invalid minimum:** Use `.invite min <number>` with a positive whole number (for example, `.invite min 5`).');
+    }
+
+    const campaign = await getCurrentGuildCampaign(guild.id);
+    if (!campaign) {
+      return replyFn('❌ No active Invite & Earn campaign found to update.');
+    }
+
+    const updated = await updateInviteCampaign(campaign.campaignId, {
+      minInviteThreshold: minimum,
+      requiredInvites: minimum,
+    });
+    await recalculateAllCampaignParticipants(effectiveClient, updated);
+    if (effectiveClient && updated.leaderboardMessageId) {
+      await ensureOrUpdateLeaderboardMessage(effectiveClient, updated, {
+        allowCreateIfMissing: false,
+      });
+    }
+    return replyFn(`Minimum successful invites set to ${minimum}.`);
   }
 
   // 1. .invite create
