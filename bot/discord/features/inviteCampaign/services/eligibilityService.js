@@ -3,6 +3,7 @@ import {
   withCampaignLock,
   getInviteCampaignById,
   getReferralsByInviter,
+  updateCampaignReferral,
   getCampaignParticipant,
   upsertCampaignParticipant,
   getReferralsForCampaign,
@@ -24,6 +25,8 @@ export function setLiveUserViewRefreshHook(fn) {
 /**
  * Atomically recalculates a participant's successfulInvites count directly from their
  * active CampaignReferral records in MongoDB and refreshes their open Discord view if present.
+ *
+ * Every active, non-disqualified referral counts immediately toward successfulInvites.
  *
  * @param {import('discord.js').Client|null} client
  * @param {object} campaign
@@ -55,20 +58,23 @@ export async function recalculateParticipantEligibility(client, campaign, userId
     );
 
     let successfulInvites = 0;
-    let pendingInvites = 0;
 
     for (const ref of referrals) {
       if (!ref.isActive || ref.disqualified) continue;
-      if (ref.counted) {
-        successfulInvites++;
-      } else {
-        pendingInvites++;
+      // Upgrade any legacy pending referral to counted immediately
+      if (!ref.counted) {
+        await updateCampaignReferral(
+          freshCampaign.campaignId,
+          freshCampaign.guildId,
+          ref.invitedUserId,
+          { counted: true, countedAt: ref.joinedAt || new Date(), dueAt: null }
+        ).catch(() => {});
       }
+      successfulInvites++;
     }
 
     const existing = await getCampaignParticipant(freshCampaign.campaignId, userId);
     const disqualified = Boolean(existing?.disqualified);
-    const inviterLeftServer = Boolean(existing?.inviterLeftServer);
 
     const updatedParticipant = await upsertCampaignParticipant(
       freshCampaign.campaignId,
@@ -76,13 +82,13 @@ export async function recalculateParticipantEligibility(client, campaign, userId
       userId,
       {
         successfulInvites: disqualified ? 0 : successfulInvites,
-        pendingInvites: disqualified ? 0 : pendingInvites,
+        pendingInvites: 0,
         isEligible: false,
         eligibleAt: null,
         notified: false,
         disqualified,
         disqualifyReason: existing?.disqualifyReason || null,
-        inviterLeftServer,
+        inviterLeftServer: Boolean(existing?.inviterLeftServer),
       }
     );
 

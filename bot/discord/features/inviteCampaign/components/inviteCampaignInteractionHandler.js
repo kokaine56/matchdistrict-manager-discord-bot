@@ -62,16 +62,14 @@ export function clearInviteInteractionCaches() {
 /**
  * Formats the clean user-facing invite counter message:
  *
- * Your Successful Invites: 0
- * Your Invite Link:
- * https://discord.gg/BT9392WMQ5
+ * Your Successful Invites: 5
+ * Your Invite Link: https://discord.gg/BT9392WMQ5
  */
 export function formatUserInviteResponsePayload(campaignId, successfulInvites, inviteUrl) {
   const count = Math.max(0, Number(successfulInvites || 0));
   const content =
     `Your Successful Invites: ${count}\n` +
-    `Your Invite Link:\n` +
-    `${inviteUrl}`;
+    `Your Invite Link: ${inviteUrl}`;
 
   const refreshBtn = new ButtonBuilder()
     .setCustomId(`inv_cmp:refresh:${campaignId}`)

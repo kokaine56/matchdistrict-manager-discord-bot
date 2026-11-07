@@ -3,10 +3,7 @@ import {
   getCurrentGuildCampaign,
   getCampaignReferral,
   updateCampaignReferral,
-  getCampaignParticipant,
-  upsertCampaignParticipant,
   createUnattributedJoin,
-  updateInviteCampaign,
 } from '../models/inviteCampaignModels.js';
 import {
   diffAndRefreshInviteSnapshot,
@@ -15,10 +12,7 @@ import {
   recordInviteDeleted,
 } from '../services/inviteSnapshotService.js';
 import { recalculateParticipantEligibility } from '../services/eligibilityService.js';
-import {
-  recordOrRestoreCampaignReferral,
-  clearReferralTimer,
-} from '../services/campaignSchedulerService.js';
+import { recordOrRestoreCampaignReferral } from '../services/campaignSchedulerService.js';
 
 // Per-guild sequential event processing queue (ensures joins/leaves in a guild run strictly one at a time)
 const guildEventQueues = new Map(); // guildId -> Promise
@@ -65,7 +59,7 @@ export function enqueueGuildInviteTask(guildId, taskFn) {
 /**
  * Handles GuildMemberAdd for the Invite & Earn campaign system.
  * Processes joins one at a time per server, diffs invite uses against the snapshot,
- * and attributes only when unambiguous.
+ * immediately increments the inviter's successfulInvites count, and refreshes their displayed count.
  *
  * @param {import('discord.js').GuildMember} member
  */
@@ -80,33 +74,15 @@ export async function handleInviteCampaignMemberAdd(member) {
       return null;
     }
 
-    // Bots never count, but keep snapshot updated if needed
+    // Bots never count, but keep snapshot updated
     if (member.user?.bot) {
       await syncGuildInviteSnapshot(guild, campaign);
       return null;
     }
 
-    // If an inviter who previously left the server rejoins while campaign is non-ended, restore their presence
-    const existingParticipant = await getCampaignParticipant(campaign.campaignId, member.id);
-    if (existingParticipant && existingParticipant.inviterLeftServer) {
-      await upsertCampaignParticipant(campaign.campaignId, guild.id, member.id, {
-        inviterLeftServer: false,
-      });
-      if (campaign.status === CAMPAIGN_STATUS.ACTIVE) {
-        await recalculateParticipantEligibility(client, campaign, member.id);
-      }
-    }
-
-    // Joins while campaign is Paused, Scheduled, or Draft are never counted afterwards:
-    // baseline the invite snapshot and record the member in initialMemberIds so they cannot be counted later.
+    // Joins while campaign is Paused, Scheduled, or Draft are not counted:
+    // baseline the invite snapshot so uses during pause are consumed.
     if (campaign.status !== CAMPAIGN_STATUS.ACTIVE) {
-      const initialIds = new Set((campaign.initialMemberIds || []).map(String));
-      if (!initialIds.has(String(member.id))) {
-        initialIds.add(String(member.id));
-        await updateInviteCampaign(campaign.campaignId, {
-          initialMemberIds: [...initialIds],
-        });
-      }
       await syncGuildInviteSnapshot(guild, campaign);
       return { status: 'ignored_not_active', campaignStatus: campaign.status };
     }
@@ -119,13 +95,40 @@ export async function handleInviteCampaignMemberAdd(member) {
     // Check if this member already has a referral record in this campaign (rejoin during active campaign)
     const priorReferral = await getCampaignReferral(campaign.campaignId, guild.id, member.id);
     if (priorReferral) {
-      const restored = await recordOrRestoreCampaignReferral(client, campaign, member, null, joinedAt);
+      const restored = await recordOrRestoreCampaignReferral(
+        client,
+        campaign,
+        member,
+        null,
+        joinedAt
+      );
       return { status: 'rejoined_restored', referral: restored };
     }
 
-    const { changedInvites, hadRecentlyDeletedInvite, fetchFailed } = diff;
+    const {
+      changedCampaignInvites = [],
+      changedInvites = [],
+      hadRecentlyDeletedInvite,
+      fetchFailed,
+    } = diff;
 
-    // 1. Fetch failed -> cannot attribute with certainty
+    // 1. Exact attribution to a personal campaign invite (delta === 1)
+    if (
+      changedCampaignInvites.length === 1 &&
+      changedCampaignInvites[0].delta === 1 &&
+      changedCampaignInvites[0].campaignInvite
+    ) {
+      const referral = await recordOrRestoreCampaignReferral(
+        client,
+        campaign,
+        member,
+        changedCampaignInvites[0].campaignInvite,
+        joinedAt
+      );
+      return { status: 'attributed', referral };
+    }
+
+    // 2. Fetch failed -> cannot attribute with certainty
     if (fetchFailed) {
       const unattr = await createUnattributedJoin({
         campaignId: campaign.campaignId,
@@ -138,72 +141,56 @@ export async function handleInviteCampaignMemberAdd(member) {
       return { status: 'unattributed', unattributed: unattr };
     }
 
-    // 2. No invite usage increased -> vanity URL, deleted invite, or OAuth join
-    if (changedInvites.length === 0) {
-      const reason = hadRecentlyDeletedInvite
-        ? 'Invite was deleted immediately before/after join (ambiguous uses)'
-        : 'No invite usage change detected (possible vanity URL, server discovery, or deleted invite)';
-      const unattr = await createUnattributedJoin({
-        campaignId: campaign.campaignId,
-        guildId: guild.id,
-        userId: member.id,
-        joinedAt,
-        reason,
-        reviewed: false,
-      });
-      return { status: 'unattributed', unattributed: unattr };
-    }
-
-    // 3. Multiple invites changed, or a single invite increased by more than 1 -> ambiguous
-    if (changedInvites.length > 1 || changedInvites[0].delta !== 1) {
+    // 3. Multiple campaign invites changed or jumped by >1
+    if (changedCampaignInvites.length > 1 || (changedCampaignInvites.length === 1 && changedCampaignInvites[0].delta !== 1)) {
       const unattr = await createUnattributedJoin({
         campaignId: campaign.campaignId,
         guildId: guild.id,
         userId: member.id,
         joinedAt,
         reason:
-          changedInvites.length > 1
-            ? `Multiple invites changed simultaneously (${changedInvites.map((c) => c.code).join(', ')})`
-            : `Invite ${changedInvites[0].code} usage jumped by ${changedInvites[0].delta} instead of 1`,
+          changedCampaignInvites.length > 1
+            ? `Multiple campaign invites changed simultaneously (${changedCampaignInvites.map((c) => c.code).join(', ')})`
+            : `Campaign invite ${changedCampaignInvites[0].code} usage jumped by ${changedCampaignInvites[0].delta} instead of 1`,
         reviewed: false,
       });
       return { status: 'unattributed', unattributed: unattr };
     }
 
-    const matchedChange = changedInvites[0];
-
-    // 4. Single invite increased by 1, but it is NOT a campaign invite for the active campaign
-    if (!matchedChange.isCampaignInvite || !matchedChange.campaignInvite) {
+    // 4. Joined via a non-campaign invite
+    if (changedInvites.length >= 1) {
       const unattr = await createUnattributedJoin({
         campaignId: campaign.campaignId,
         guildId: guild.id,
         userId: member.id,
         joinedAt,
-        reason: `Joined via non-campaign invite (${matchedChange.code})`,
+        reason: `Joined via non-campaign invite (${changedInvites.map((c) => c.code).join(', ')})`,
         reviewed: false,
       });
       return { status: 'unattributed', unattributed: unattr };
     }
 
-    // 5. Exact attribution to a campaign invite! Apply Section 6 Counting Rules
-    const referral = await recordOrRestoreCampaignReferral(
-      client,
-      campaign,
-      member,
-      matchedChange.campaignInvite,
-      joinedAt
-    );
-
-    return { status: 'attributed', referral };
+    // 5. No invite usage increased -> vanity URL, deleted invite, or OAuth join
+    const reason = hadRecentlyDeletedInvite
+      ? 'Invite was deleted immediately before/after join (ambiguous uses)'
+      : 'No invite usage change detected (possible vanity URL, server discovery, or deleted invite)';
+    const unattr = await createUnattributedJoin({
+      campaignId: campaign.campaignId,
+      guildId: guild.id,
+      userId: member.id,
+      joinedAt,
+      reason,
+      reviewed: false,
+    });
+    return { status: 'unattributed', unattributed: unattr };
   });
 }
 
 /**
  * Handles GuildMemberRemove for the Invite & Earn campaign system.
  * - If an invited member leaves while the campaign is not Ended:
- *   referral becomes inactive (leftAt saved, counted = false) and inviter's count/eligibility is recalculated.
- * - If an inviter leaves the server while the campaign is not Ended:
- *   their referrals stay in history, but the inviter is no longer eligible.
+ *   referral becomes inactive (leftAt saved, counted = false) and original inviter's successfulInvites
+ *   count is immediately decreased by 1.
  * - Later leaves must never change an Ended campaign.
  *
  * @param {import('discord.js').GuildMember} member
@@ -215,7 +202,6 @@ export async function handleInviteCampaignMemberRemove(member) {
 
   return enqueueGuildInviteTask(guild.id, async () => {
     const campaign = await getCurrentGuildCampaign(guild.id);
-    // If there is no non-ended campaign (or campaign is Ended), do nothing
     if (!campaign || campaign.status === CAMPAIGN_STATUS.ENDED) {
       return null;
     }
@@ -223,10 +209,8 @@ export async function handleInviteCampaignMemberRemove(member) {
     const now = new Date();
     const userId = String(member.id);
 
-    // 1. Check if the departing member was an invited user in this campaign
     const referral = await getCampaignReferral(campaign.campaignId, guild.id, userId);
     if (referral && referral.isActive) {
-      clearReferralTimer(campaign.campaignId, userId);
       await updateCampaignReferral(campaign.campaignId, guild.id, userId, {
         isActive: false,
         counted: false,
@@ -234,17 +218,6 @@ export async function handleInviteCampaignMemberRemove(member) {
         dueAt: null,
       });
       await recalculateParticipantEligibility(client, campaign, referral.inviterId);
-    }
-
-    // 2. Check if the departing member is an inviter (participant) in this campaign
-    const participant = await getCampaignParticipant(campaign.campaignId, userId);
-    if (participant) {
-      await upsertCampaignParticipant(campaign.campaignId, guild.id, userId, {
-        inviterLeftServer: true,
-        isEligible: false,
-        eligibleAt: null,
-      });
-      await recalculateParticipantEligibility(client, campaign, userId);
     }
 
     return true;
@@ -266,4 +239,3 @@ export async function handleInviteCampaignInviteDelete(invite) {
   if (!invite) return;
   await recordInviteDeleted(invite);
 }
-

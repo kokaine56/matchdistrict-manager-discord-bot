@@ -29,7 +29,14 @@ export function clearInviteSnapshotState() {
 /**
  * Registers a campaign invite in the in-memory moderation allowlist and snapshot.
  */
-export function registerCampaignInviteInCache(guildId, inviteCode, inviteUrl, uses = 0, inviterId = null, campaignStatus = CAMPAIGN_STATUS.ACTIVE) {
+export function registerCampaignInviteInCache(
+  guildId,
+  inviteCode,
+  inviteUrl,
+  uses = 0,
+  inviterId = null,
+  campaignStatus = CAMPAIGN_STATUS.ACTIVE
+) {
   if (!guildId || !inviteCode) return;
   const gId = String(guildId);
   const code = String(inviteCode);
@@ -47,12 +54,15 @@ export function registerCampaignInviteInCache(guildId, inviteCode, inviteUrl, us
     allowedGuildInviteUrls.get(gId).add(url);
   }
 
-  if (!guildSnapshots.has(gId)) {
-    guildSnapshots.set(gId, new Map());
-  }
-  const snap = guildSnapshots.get(gId);
-  if (!snap.has(code)) {
-    snap.set(code, { code, uses: Number(uses || 0), inviterId: inviterId ? String(inviterId) : null });
+  // Only add to guildSnapshots if the guild snapshot is already initialized in memory,
+  // so we never mask a full guild snapshot that needs to be hydrated from MongoDB.
+  if (guildSnapshots.has(gId)) {
+    const snap = guildSnapshots.get(gId);
+    snap.set(code, {
+      code,
+      uses: Number(uses || 0),
+      inviterId: inviterId ? String(inviterId) : null,
+    });
   }
 }
 
@@ -167,7 +177,10 @@ export async function syncGuildInviteSnapshot(guild, campaign = null) {
 
   // Seed from stored campaign invites first
   if (currentCampaign) {
-    if (currentCampaign.guildInviteSnapshot && typeof currentCampaign.guildInviteSnapshot === 'object') {
+    if (
+      currentCampaign.guildInviteSnapshot &&
+      typeof currentCampaign.guildInviteSnapshot === 'object'
+    ) {
       for (const [code, entry] of Object.entries(currentCampaign.guildInviteSnapshot)) {
         map.set(code, {
           code,
@@ -229,13 +242,15 @@ export async function syncGuildInviteSnapshot(guild, campaign = null) {
  */
 export async function getGuildInviteSnapshot(guildId, campaign = null) {
   const gId = String(guildId);
-  if (guildSnapshots.has(gId)) {
-    return guildSnapshots.get(gId);
-  }
   const currentCampaign = campaign || (await getCurrentGuildCampaign(gId));
-  const map = new Map();
-  if (currentCampaign) {
-    if (currentCampaign.guildInviteSnapshot && typeof currentCampaign.guildInviteSnapshot === 'object') {
+
+  let map = guildSnapshots.get(gId);
+  if (!map) {
+    map = new Map();
+    if (
+      currentCampaign?.guildInviteSnapshot &&
+      typeof currentCampaign.guildInviteSnapshot === 'object'
+    ) {
       for (const [code, entry] of Object.entries(currentCampaign.guildInviteSnapshot)) {
         map.set(code, {
           code,
@@ -244,6 +259,11 @@ export async function getGuildInviteSnapshot(guildId, campaign = null) {
         });
       }
     }
+    guildSnapshots.set(gId, map);
+  }
+
+  // Always ensure all CampaignInvite records from MongoDB are present in the snapshot map
+  if (currentCampaign) {
     const dbInvites = await getCampaignInvitesForCampaign(currentCampaign.campaignId);
     for (const inv of dbInvites) {
       if (!map.has(inv.inviteCode)) {
@@ -255,7 +275,7 @@ export async function getGuildInviteSnapshot(guildId, campaign = null) {
       }
     }
   }
-  guildSnapshots.set(gId, map);
+
   return map;
 }
 
@@ -334,6 +354,7 @@ export async function recordInviteDeleted(invite) {
  * @param {object} campaign
  * @returns {Promise<{
  *   changedInvites: Array<{ code: string, priorUses: number, currentUses: number, delta: number, isCampaignInvite: boolean, campaignInvite: object | null }>,
+ *   changedCampaignInvites: Array<{ code: string, priorUses: number, currentUses: number, delta: number, isCampaignInvite: boolean, campaignInvite: object }>,
  *   hadRecentlyDeletedInvite: boolean,
  *   deletedInviteCodes: string[],
  *   fetchFailed: boolean
@@ -370,6 +391,7 @@ export async function diffAndRefreshInviteSnapshot(guild, campaign) {
     console.warn(`[InviteCampaign] ⚠️ Failed to fetch invites on join in guild ${gId}:`, err.message);
     return {
       changedInvites: [],
+      changedCampaignInvites: [],
       hadRecentlyDeletedInvite: activeRecentDeletes.length > 0,
       deletedInviteCodes: activeRecentDeletes,
       fetchFailed: true,
@@ -379,6 +401,7 @@ export async function diffAndRefreshInviteSnapshot(guild, campaign) {
   if (!fetchedInvites || typeof fetchedInvites.values !== 'function') {
     return {
       changedInvites: [],
+      changedCampaignInvites: [],
       hadRecentlyDeletedInvite: activeRecentDeletes.length > 0,
       deletedInviteCodes: activeRecentDeletes,
       fetchFailed: true,
@@ -386,6 +409,7 @@ export async function diffAndRefreshInviteSnapshot(guild, campaign) {
   }
 
   const changedInvites = [];
+  const changedCampaignInvites = [];
   const nextSnapshot = new Map();
   const seenCodes = new Set();
 
@@ -397,28 +421,46 @@ export async function diffAndRefreshInviteSnapshot(guild, campaign) {
     const currentUses = Number(inv.uses || 0);
     const campaignInvite = campaignInviteByCode.get(code) || null;
     const snapEntry = priorSnapshot.get(code);
-    const priorUses = snapEntry !== undefined
-      ? Number(snapEntry.uses || 0)
-      : campaignInvite
-        ? Number(campaignInvite.lastKnownUses || 0)
-        : 0;
+
+    let priorUses;
+    if (campaignInvite) {
+      // For campaign invites, CampaignInvite.lastKnownUses in MongoDB and snapshot are authoritative
+      priorUses =
+        snapEntry !== undefined
+          ? Number(snapEntry.uses || 0)
+          : Number(campaignInvite.lastKnownUses || 0);
+    } else if (snapEntry !== undefined) {
+      priorUses = Number(snapEntry.uses || 0);
+    } else {
+      // If a non-campaign invite was not in the snapshot and already had >1 uses, baseline it at currentUses
+      priorUses = currentUses === 1 ? 0 : currentUses;
+    }
 
     const delta = currentUses - priorUses;
     if (delta > 0) {
-      changedInvites.push({
+      const changeObj = {
         code,
         priorUses,
         currentUses,
         delta,
         isCampaignInvite: Boolean(campaignInvite),
         campaignInvite,
-      });
+      };
+      changedInvites.push(changeObj);
+      if (campaignInvite) {
+        changedCampaignInvites.push(changeObj);
+      }
     }
 
     nextSnapshot.set(code, {
       code,
       uses: currentUses,
-      inviterId: campaignInvite?.inviterId || inv.inviter?.id || inv.inviterId || snapEntry?.inviterId || null,
+      inviterId:
+        campaignInvite?.inviterId ||
+        inv.inviter?.id ||
+        inv.inviterId ||
+        snapEntry?.inviterId ||
+        null,
     });
 
     if (campaignInvite && currentUses !== campaignInvite.lastKnownUses) {
@@ -448,9 +490,9 @@ export async function diffAndRefreshInviteSnapshot(guild, campaign) {
 
   return {
     changedInvites,
+    changedCampaignInvites,
     hadRecentlyDeletedInvite: activeRecentDeletes.length > 0,
     deletedInviteCodes: activeRecentDeletes,
     fetchFailed: false,
   };
 }
-

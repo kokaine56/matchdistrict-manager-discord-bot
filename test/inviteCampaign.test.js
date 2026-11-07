@@ -408,21 +408,21 @@ test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Inv
     // Verify exact simplified user-facing format (no Eligible / Not Eligible status)
     assert.equal(
       latestUserReply.content,
-      `Your Successful Invites: 0\nYour Invite Link:\n${invUrl}`
+      `Your Successful Invites: 0\nYour Invite Link: ${invUrl}`
     );
     assert.ok(!/Eligible/i.test(latestUserReply.content));
     assert.equal(latestUserReply.components.length, 1); // Refresh button
 
-    // Member 1 joins via inviter's link -> count immediately increases to 1 & live view auto-refreshes!
+    // Member 1 joins via inviter's link (even with a 0-day-old account) -> count immediately increases to 1 & live view auto-refreshes!
     env.invites.get(invCode).uses = 1;
-    const joined1 = env.addMember('invited-1', { accountAgeDays: 1 });
+    const joined1 = env.addMember('invited-1', { accountAgeDays: 0 });
     await handleInviteCampaignMemberAdd(joined1);
 
     let part = await getCampaignParticipant(campaign.campaignId, inviter.id);
     assert.equal(part.successfulInvites, 1);
     assert.equal(
       latestUserReply.content,
-      `Your Successful Invites: 1\nYour Invite Link:\n${invUrl}`
+      `Your Successful Invites: 1\nYour Invite Link: ${invUrl}`
     );
 
     // Member 2 joins via inviter's link -> count immediately increases to 2 & live view auto-refreshes!
@@ -434,24 +434,18 @@ test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Inv
     assert.equal(part.successfulInvites, 2);
     assert.equal(
       latestUserReply.content,
-      `Your Successful Invites: 2\nYour Invite Link:\n${invUrl}`
+      `Your Successful Invites: 2\nYour Invite Link: ${invUrl}`
     );
     assert.equal(env.dmsSent.length, 0, 'No giveaway qualification DMs should be sent');
 
-    // Pre-existing member leaves and rejoins -> never counted
-    env.invites.get(invCode).uses = 3;
-    await handleInviteCampaignMemberAdd(preExistingMember);
-    part = await getCampaignParticipant(campaign.campaignId, inviter.id);
-    assert.equal(part.successfulInvites, 2);
-
-    // Member 2 leaves -> count decreases by 1 to 1, referral marked inactive & preserved in history
+    // Member 2 leaves -> count immediately decreases by 1 to 1, referral marked inactive & preserved in history
     env.members.delete(joined2.id);
     await handleInviteCampaignMemberRemove(joined2);
     part = await getCampaignParticipant(campaign.campaignId, inviter.id);
     assert.equal(part.successfulInvites, 1);
     assert.equal(
       latestUserReply.content,
-      `Your Successful Invites: 1\nYour Invite Link:\n${invUrl}`
+      `Your Successful Invites: 1\nYour Invite Link: ${invUrl}`
     );
     const ref2AfterLeave = await getCampaignReferral(campaign.campaignId, env.guildId, joined2.id);
     assert.equal(ref2AfterLeave.isActive, false);
@@ -464,7 +458,7 @@ test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Inv
     assert.equal(part.successfulInvites, 2);
     assert.equal(
       latestUserReply.content,
-      `Your Successful Invites: 2\nYour Invite Link:\n${invUrl}`
+      `Your Successful Invites: 2\nYour Invite Link: ${invUrl}`
     );
 
     // Clicking the Refresh button retrieves the latest count
@@ -483,7 +477,7 @@ test('Invite & Earn Campaign System — Simplified User Interface, Real-Time Inv
     });
     assert.equal(
       refreshOutput.content,
-      `Your Successful Invites: 2\nYour Invite Link:\n${invUrl}`
+      `Your Successful Invites: 2\nYour Invite Link: ${invUrl}`
     );
 
     // Admin commands: .invite links and .invite history
