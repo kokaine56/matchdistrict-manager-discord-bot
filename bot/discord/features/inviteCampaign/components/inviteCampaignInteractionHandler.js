@@ -912,10 +912,11 @@ export async function handleInviteCampaignInteraction(interaction) {
       }
       if (
         campaign.status !== CAMPAIGN_STATUS.DRAFT &&
-        campaign.status !== CAMPAIGN_STATUS.SCHEDULED
+        campaign.status !== CAMPAIGN_STATUS.SCHEDULED &&
+        campaign.status !== CAMPAIGN_STATUS.ACTIVE
       ) {
         await interaction.reply({
-          content: `❌ Rewards and threshold can only be edited before the campaign starts (current status: **${campaign.status}**).`,
+          content: `❌ Rewards can only be edited while the campaign is active or before it starts (current status: **${campaign.status}**).`,
           ephemeral: true,
         });
         return true;
@@ -984,20 +985,26 @@ export async function handleInviteCampaignInteraction(interaction) {
       }
       if (
         campaign.status !== CAMPAIGN_STATUS.DRAFT &&
-        campaign.status !== CAMPAIGN_STATUS.SCHEDULED
+        campaign.status !== CAMPAIGN_STATUS.SCHEDULED &&
+        campaign.status !== CAMPAIGN_STATUS.ACTIVE
       ) {
         await interaction.reply({
-          content: `❌ Cannot modify rewards or threshold once the campaign is **${campaign.status}**.`,
+          content: `❌ Cannot modify prizes once the campaign is **${campaign.status}**.`,
           ephemeral: true,
         });
         return true;
       }
 
       const updated = await updateInviteCampaign(campaign.campaignId, {
-        minInviteThreshold: parsedThresh,
-        requiredInvites: parsedThresh,
+        ...(campaign.status === CAMPAIGN_STATUS.ACTIVE
+          ? {}
+          : { minInviteThreshold: parsedThresh, requiredInvites: parsedThresh }),
         rewards: parsedRewards.rewards,
       });
+
+      if (interaction.client) {
+        await ensureOrUpdateCampaignPanel(interaction.client, updated, { allowCreateIfMissing: false });
+      }
 
       if (interaction.client && updated.leaderboardMessageId) {
         await ensureOrUpdateLeaderboardMessage(interaction.client, updated, {

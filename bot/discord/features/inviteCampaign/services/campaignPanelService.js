@@ -64,6 +64,16 @@ export function buildCampaignPanelPayload(campaign) {
           : 0x3498db;
 
   const statusText = formatPanelStatusDisplay(campaign);
+  const prizes = Array.isArray(campaign.rewards)
+    ? campaign.rewards
+        .filter((reward) => Number.isInteger(Number(reward.position)) && Number(reward.position) > 0 && Number.isFinite(Number(reward.amount)) && Number(reward.amount) >= 0)
+        .sort((a, b) => Number(a.position) - Number(b.position))
+    : [];
+  const ordinal = (rank) => {
+    const mod100 = rank % 100;
+    const suffix = mod100 >= 11 && mod100 <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[rank % 10] || 'th');
+    return `${rank}${suffix} Place`;
+  };
 
   const embed = new EmbedBuilder()
     .setTitle(`🔗 ${campaign.name}`)
@@ -72,14 +82,18 @@ export function buildCampaignPanelPayload(campaign) {
         'Click **Create Link** below to get your personal invite link and track your successful invites!'
     )
     .setColor(color)
-    .addFields(
-      { name: '📌 Status', value: statusText, inline: true },
-      {
-        name: '⏰ Ends At (IST)',
-        value: formatISTDateTime(campaign.endAt),
-        inline: true,
-      }
-    )
+    .addFields({ name: '📌 Status', value: statusText, inline: true });
+
+  if (prizes.length) {
+    embed.addFields({
+      name: '🏆 Prize Distribution',
+      value: prizes.map(({ position, amount }) => `${ordinal(Number(position))} — ₹${Number(amount)}`).join('\n'),
+      inline: false,
+    });
+  }
+  embed.addFields({ name: '⏰ Ends At (IST)', value: formatISTDateTime(campaign.endAt), inline: true });
+
+  embed
     .setFooter({ text: 'MatchDistrict Invite Tracker' })
     .setTimestamp(new Date());
 

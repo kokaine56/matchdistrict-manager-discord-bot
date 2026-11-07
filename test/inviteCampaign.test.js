@@ -277,6 +277,13 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
       name: 'Create Link Test',
       description: 'Test campaign',
       status: CAMPAIGN_STATUS.DRAFT,
+      rewards: [
+        { position: 1, amount: 100 },
+        { position: 2, amount: 50 },
+        { position: 3, amount: 30 },
+        { position: 4, amount: 10 },
+        { position: 5, amount: 5 },
+      ],
       endAt: new Date(Date.now() + 86400000),
       inviteChannelId: env.inviteChannel.id,
       announcementChannelId: env.anncChannel.id,
@@ -290,6 +297,9 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     const buttonJson = panelPayload.components[0].components[0].toJSON();
     assert.equal(buttonJson.label, 'Create Link');
     assert.equal(buttonJson.custom_id, `inv_cmp:generate:${campaign.campaignId}`);
+    const embedJson = panelPayload.embeds[0].toJSON();
+    const prizeField = embedJson.fields.find((field) => field.name === '🏆 Prize Distribution');
+    assert.equal(prizeField.value, '1st Place — ₹100\n2nd Place — ₹50\n3rd Place — ₹30\n4th Place — ₹10\n5th Place — ₹5');
 
     // Click "Create Link" first time -> creates 1 Discord invite
     let reply1 = null;
@@ -469,7 +479,7 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
       { position: 3, amount: 10 },
     ]);
 
-    // Start campaign -> editing rewards or threshold after start must be rejected
+    // Start campaign -> thresholds stay fixed, while prize distribution remains editable
     await handleInviteCommand(env.guild, admin, env.inviteChannel, ['start'], async () => { }, env.client);
     let postStartEditReply = '';
     await handleInviteCommand(
@@ -482,7 +492,10 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
       },
       env.client
     );
-    assert.match(postStartEditReply, /only be modified while the campaign is/i);
+    assert.match(postStartEditReply, /Reward configuration updated/i);
+    assert.deepEqual((await getInviteCampaignById(campaign.campaignId)).rewards, [
+      { position: 1, amount: 500 },
+    ]);
   });
 
   await t.test('3. Minimum Invite Threshold Visibility (Below Threshold Hidden, Reaching Threshold Visible, Dropping Below Disappears)', async () => {

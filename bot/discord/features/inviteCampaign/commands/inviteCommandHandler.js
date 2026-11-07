@@ -210,16 +210,17 @@ export async function handleInviteCommand(guild, member, channel, args, replyFn,
       return replyFn('❌ No Draft or Scheduled campaign found. Create a campaign first with `.invite create`.');
     }
 
+    const prop = (args[1] || '').toLowerCase();
     if (
       campaign.status !== CAMPAIGN_STATUS.DRAFT &&
-      campaign.status !== CAMPAIGN_STATUS.SCHEDULED
+      campaign.status !== CAMPAIGN_STATUS.SCHEDULED &&
+      !(campaign.status === CAMPAIGN_STATUS.ACTIVE && (prop === 'rewards' || prop === 'reward'))
     ) {
       return replyFn(
         `❌ Campaign settings can only be modified while the campaign is **Draft** or **Scheduled** (current status: **${campaign.status}**).`
       );
     }
 
-    const prop = (args[1] || '').toLowerCase();
     const rawVal = args[2];
 
     if (prop === 'stay') {
@@ -286,6 +287,9 @@ export async function handleInviteCommand(guild, member, channel, args, replyFn,
       const updated = await updateInviteCampaign(campaign.campaignId, {
         rewards: parsed.rewards,
       });
+      if (effectiveClient) {
+        await ensureOrUpdateCampaignPanel(effectiveClient, updated, { allowCreateIfMissing: false });
+      }
       if (effectiveClient && updated.leaderboardMessageId) {
         await ensureOrUpdateLeaderboardMessage(effectiveClient, updated, {
           allowCreateIfMissing: false,
@@ -310,7 +314,8 @@ export async function handleInviteCommand(guild, member, channel, args, replyFn,
 
     const canEdit =
       campaign.status === CAMPAIGN_STATUS.DRAFT ||
-      campaign.status === CAMPAIGN_STATUS.SCHEDULED;
+      campaign.status === CAMPAIGN_STATUS.SCHEDULED ||
+      campaign.status === CAMPAIGN_STATUS.ACTIVE;
 
     const components = [];
     if (canEdit) {
