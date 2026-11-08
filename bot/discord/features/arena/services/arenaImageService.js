@@ -1,4 +1,7 @@
 import zlib from 'node:zlib';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Resvg } from '@resvg/resvg-js';
 import {
   AttachmentBuilder,
@@ -457,14 +460,95 @@ function getAvatarDataUri(val) {
   return null;
 }
 
-export function renderSvgToPng(svgString) {
-  const resvg = new Resvg(svgString, {
-    font: {
-      loadSystemFonts: true,
-      defaultFontFamily: 'Nirmala UI',
-    },
-  });
-  return resvg.render().asPng();
+const FONT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../assets/fonts');
+const REQUIRED_FONT_FILES = [
+  'NotoSans-Regular.ttf',
+  'NotoSans-Bold.ttf',
+  'NotoSansDevanagari-Regular.ttf',
+  'NotoSansDevanagari-Bold.ttf',
+];
+
+let resolvedFontFiles = null;
+
+export function getArenaFontFiles() {
+  if (resolvedFontFiles) return resolvedFontFiles;
+  const files = [];
+  const missing = [];
+  for (const name of REQUIRED_FONT_FILES) {
+    const full = path.join(FONT_DIR, name);
+    if (fs.existsSync(full) && fs.statSync(full).size > 10000) files.push(full);
+    else missing.push(name);
+  }
+  if (missing.length > 0) {
+    // Never silently render blank text: fail loudly so a broken deploy is visible.
+    throw new Error(`[ArenaImage] Missing bundled font files in ${FONT_DIR}: ${missing.join(', ')}`);
+  }
+  resolvedFontFiles = files;
+  return files;
+}
+
+function countVisibleTextPixels(pixels, bgSample) {
+  // Counts pixels clearly brighter than the dark card background.
+  let lit = 0;
+  for (let i = 0; i < pixels.length; i += 4) {
+    if (pixels[i] > 150 || pixels[i + 1] > 150 || pixels[i + 2] > 150) lit++;
+  }
+  return lit;
+}
+
+/**
+ * Renders SVG to PNG using ONLY bundled fonts (no dependence on host system fonts, so
+ * Linux/Docker production hosts render text identically to a developer machine).
+ * @param {string} svgString
+ * @param {{ expectedTexts?: string[], label?: string }} [opts] expected strings must appear in the SVG
+ */
+export function renderSvgToPng(svgString, { expectedTexts = [], label = 'card' } = {}) {
+  // Validation 1: expected text must really be present in the SVG sent to the renderer.
+  const decoded = String(svgString);
+  const missingText = expectedTexts.filter((t) => t && !decoded.includes(String(t)));
+  if (missingText.length > 0) {
+    console.error(`[ArenaImage] ❌ ${label}: expected text missing from SVG: ${JSON.stringify(missingText)}`);
+    throw new Error(`Arena image SVG missing expected text: ${missingText.join(', ')}`);
+  }
+
+  let rendered;
+  try {
+    const resvg = new Resvg(svgString, {
+      font: {
+        loadSystemFonts: false,
+        fontFiles: getArenaFontFiles(),
+        defaultFontFamily: 'Noto Sans',
+        sansSerifFamily: 'Noto Sans',
+        serifFamily: 'Noto Sans',
+      },
+    });
+    rendered = resvg.render();
+  } catch (err) {
+    console.error(`[ArenaImage] ❌ ${label}: render failed: ${err.message}`);
+    throw err;
+  }
+
+  const png = rendered.asPng();
+
+  // Validation 2: valid PNG with the expected size.
+  const sig = png.subarray(0, 8).toString('hex');
+  if (sig !== '89504e470d0a1a0a') {
+    throw new Error(`[ArenaImage] ${label}: output is not a valid PNG`);
+  }
+
+  // Validation 3: text pixels exist (guards against a silent blank render).
+  if (expectedTexts.length > 0) {
+    const lit = countVisibleTextPixels(rendered.pixels);
+    if (lit < 500) {
+      console.error(`[ArenaImage] ❌ ${label}: rendered image has no visible text (brightPixels=${lit}). Font loading failed.`);
+      throw new Error('Arena image rendered without visible text');
+    }
+    if (process.env.ARENA_IMAGE_DIAGNOSTICS) {
+      console.info(`[ArenaImage] ${label}: ok bytes=${png.length} brightPixels=${lit}`);
+    }
+  }
+
+  return png;
 }
 
 // ============================================================================
@@ -498,7 +582,7 @@ export function generateMatchCardPng(match, { volunteerDisplayName = null, avata
        <image href="${avatarUriA}" x="56" y="139" width="72" height="72" clip-path="url(#avatar-clip-a)" preserveAspectRatio="xMidYMid slice" />
        <circle cx="92" cy="175" r="36" fill="none" stroke="#F97316" stroke-width="2" />`
     : `<circle cx="92" cy="175" r="36" fill="#1E293B" stroke="#F97316" stroke-width="2" />
-       <text x="92" y="184" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="22" font-weight="bold" fill="#F97316">${initialA}</text>`;
+       <text x="92" y="184" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="22" font-weight="bold" fill="#F97316">${initialA}</text>`;
 
   const avatarSvgB = avatarUriB
     ? `<defs><clipPath id="avatar-clip-b"><circle cx="517" cy="175" r="36" /></clipPath></defs>
@@ -506,7 +590,7 @@ export function generateMatchCardPng(match, { volunteerDisplayName = null, avata
        <image href="${avatarUriB}" x="481" y="139" width="72" height="72" clip-path="url(#avatar-clip-b)" preserveAspectRatio="xMidYMid slice" />
        <circle cx="517" cy="175" r="36" fill="none" stroke="#F97316" stroke-width="2" />`
     : `<circle cx="517" cy="175" r="36" fill="#1E293B" stroke="#F97316" stroke-width="2" />
-       <text x="517" y="184" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="22" font-weight="bold" fill="#F97316">${initialB}</text>`;
+       <text x="517" y="184" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="22" font-weight="bold" fill="#F97316">${initialB}</text>`;
 
   // Status Styling & Label Formatting
   const statusRaw = String(match?.status || ARENA_STATUS.WAITING_FOR_VOLUNTEER);
@@ -573,61 +657,64 @@ export function generateMatchCardPng(match, { volunteerDisplayName = null, avata
   <rect x="0" y="0" width="800" height="420" fill="none" stroke="#1F2937" stroke-width="1"/>
 
   <!-- Header -->
-  <text x="35" y="42" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="20" font-weight="bold" fill="#F97316" letter-spacing="1">MATCH DISTRICT</text>
-  <text x="35" y="62" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="600" fill="#94A3B8" letter-spacing="1">MATCH DETAILS</text>
+  <text x="35" y="42" font-family="Noto Sans, Noto Sans Devanagari" font-size="20" font-weight="bold" fill="#F97316" letter-spacing="1">MATCH DISTRICT</text>
+  <text x="35" y="62" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="600" fill="#94A3B8" letter-spacing="1">MATCH DETAILS</text>
 
   <!-- Match ID Badge -->
   <rect x="615" y="24" width="150" height="34" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
-  <text x="690" y="47" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="15" font-weight="bold" fill="#FFFFFF">${matchIdStr}</text>
+  <text x="690" y="47" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="15" font-weight="bold" fill="#FFFFFF">${matchIdStr}</text>
   <line x1="35" y1="78" x2="765" y2="78" stroke="#1F2937" stroke-width="1"/>
 
   <!-- Center VS Indicator -->
   <rect x="355" y="145" width="90" height="120" rx="10" fill="#1E293B" stroke="#F97316" stroke-width="2"/>
-  <text x="400" y="200" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="34" font-weight="900" fill="#F97316">VS</text>
-  <text x="400" y="228" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="bold" fill="#FFFFFF">BGMI</text>
-  <text x="400" y="248" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="11" font-weight="600" fill="#94A3B8">TDM 1V1</text>
+  <text x="400" y="200" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="34" font-weight="900" fill="#F97316">VS</text>
+  <text x="400" y="228" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#FFFFFF">BGMI</text>
+  <text x="400" y="248" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="11" font-weight="600" fill="#94A3B8">TDM 1V1</text>
 
   <!-- Player A Panel (Left) -->
   <rect x="35" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
   <rect x="35" y="95" width="5" height="235" rx="2" fill="#F97316"/>
-  <text x="52" y="122" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">PLAYER A • CHALLENGER</text>
+  <text x="52" y="122" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">PLAYER A • CHALLENGER</text>
 
   ${avatarSvgA}
 
-  <text x="142" y="152" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="18" font-weight="bold" fill="#FFFFFF">${nameA}</text>
-  <text x="142" y="178" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${ignA}</tspan></text>
-  <text x="142" y="202" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${uidA}</tspan></text>
+  <text x="142" y="152" font-family="Noto Sans, Noto Sans Devanagari" font-size="18" font-weight="bold" fill="#FFFFFF">${nameA}</text>
+  <text x="142" y="178" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${ignA}</tspan></text>
+  <text x="142" y="202" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${uidA}</tspan></text>
 
   <rect x="50" y="280" width="275" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
-  <text x="187" y="301" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8">CHALLENGER</text>
+  <text x="187" y="301" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8">CHALLENGER</text>
 
   <!-- Player B Panel (Right) -->
   <rect x="460" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
   <rect x="760" y="95" width="5" height="235" rx="2" fill="#F97316"/>
-  <text x="477" y="122" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">PLAYER B • OPPONENT</text>
+  <text x="477" y="122" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">PLAYER B • OPPONENT</text>
 
   ${avatarSvgB}
 
-  <text x="567" y="152" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="18" font-weight="bold" fill="#FFFFFF">${nameB}</text>
-  <text x="567" y="178" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${ignB}</tspan></text>
-  <text x="567" y="202" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${uidB}</tspan></text>
+  <text x="567" y="152" font-family="Noto Sans, Noto Sans Devanagari" font-size="18" font-weight="bold" fill="#FFFFFF">${nameB}</text>
+  <text x="567" y="178" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${ignB}</tspan></text>
+  <text x="567" y="202" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${uidB}</tspan></text>
 
   <rect x="475" y="280" width="275" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
-  <text x="612" y="301" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8">OPPONENT</text>
+  <text x="612" y="301" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8">OPPONENT</text>
 
   <!-- Footer Bar -->
   <rect x="0" y="350" width="800" height="70" fill="#0D1322"/>
   <line x1="0" y1="350" x2="800" y2="350" stroke="#1F2937" stroke-width="1"/>
 
-  <text x="35" y="391" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="bold" fill="#64748B">STATUS</text>
+  <text x="35" y="391" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#64748B">STATUS</text>
   <rect x="95" y="372" width="${badgeWidth}" height="28" rx="6" fill="${statusBg}" stroke="${statusBorder}" stroke-width="1"/>
-  <text x="${95 + badgeWidth / 2}" y="391" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="${statusColor}">${statusText}</text>
+  <text x="${95 + badgeWidth / 2}" y="391" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="${statusColor}">${statusText}</text>
 
-  <text x="765" y="391" text-anchor="end" font-family="'Nirmala UI', 'Mangal', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="bold" fill="#94A3B8">OFFICIAL: <tspan fill="${volColor}">${escapeXml(truncate(volLabel, 22))}</tspan></text>
+  <text x="765" y="391" text-anchor="end" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#94A3B8">OFFICIAL: <tspan fill="${volColor}">${escapeXml(truncate(volLabel, 22))}</tspan></text>
 </svg>
 `;
 
-  return renderSvgToPng(svg);
+  return renderSvgToPng(svg, {
+    label: `match-card ${matchIdStr}`,
+    expectedTexts: ['MATCH DISTRICT', matchIdStr, nameA, ignA, uidA, nameB, ignB, uidB, 'VS', 'BGMI', statusText],
+  });
 }
 
 // ============================================================================
@@ -653,7 +740,7 @@ export function generateChallengeCardPng(
        <image href="${cAvUri}" x="56" y="139" width="72" height="72" clip-path="url(#avatar-clip-c)" preserveAspectRatio="xMidYMid slice" />
        <circle cx="92" cy="175" r="36" fill="none" stroke="#F97316" stroke-width="2" />`
     : `<circle cx="92" cy="175" r="36" fill="#1E293B" stroke="#F97316" stroke-width="2" />
-       <text x="92" y="184" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="22" font-weight="bold" fill="#F97316">${cInitial}</text>`;
+       <text x="92" y="184" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="22" font-weight="bold" fill="#F97316">${cInitial}</text>`;
 
   // Right Panel: Opponent or Open Slot
   let rightPanelSvg = '';
@@ -670,33 +757,33 @@ export function generateChallengeCardPng(
          <image href="${opAvUri}" x="481" y="139" width="72" height="72" clip-path="url(#avatar-clip-op)" preserveAspectRatio="xMidYMid slice" />
          <circle cx="517" cy="175" r="36" fill="none" stroke="#F97316" stroke-width="2" />`
       : `<circle cx="517" cy="175" r="36" fill="#1E293B" stroke="#F97316" stroke-width="2" />
-         <text x="517" y="184" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="22" font-weight="bold" fill="#F97316">${opInitial}</text>`;
+         <text x="517" y="184" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="22" font-weight="bold" fill="#F97316">${opInitial}</text>`;
 
     rightPanelSvg = `
       <rect x="460" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
       <rect x="760" y="95" width="5" height="235" rx="2" fill="#F97316"/>
-      <text x="477" y="122" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">OPPONENT</text>
+      <text x="477" y="122" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">OPPONENT</text>
 
       ${opAvatarSvg}
 
-      <text x="567" y="152" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="18" font-weight="bold" fill="#FFFFFF">${opName}</text>
-      <text x="567" y="178" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${opIgn}</tspan></text>
-      ${opUid ? `<text x="567" y="202" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${opUid}</tspan></text>` : ''}
+      <text x="567" y="152" font-family="Noto Sans, Noto Sans Devanagari" font-size="18" font-weight="bold" fill="#FFFFFF">${opName}</text>
+      <text x="567" y="178" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${opIgn}</tspan></text>
+      ${opUid ? `<text x="567" y="202" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${opUid}</tspan></text>` : ''}
 
       <rect x="475" y="280" width="275" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
-      <text x="612" y="301" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8">CHALLENGE ACCEPTED</text>
+      <text x="612" y="301" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8">CHALLENGE ACCEPTED</text>
     `;
   } else {
     rightPanelSvg = `
       <rect x="460" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
-      <text x="477" y="122" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#64748B" letter-spacing="1">SLOT OPEN</text>
+      <text x="477" y="122" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#64748B" letter-spacing="1">SLOT OPEN</text>
 
       <rect x="480" y="140" width="265" height="115" rx="8" fill="none" stroke="#334155" stroke-width="1.5" stroke-dasharray="6 4"/>
-      <text x="612" y="190" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="14" font-weight="bold" fill="#94A3B8">AWAITING OPPONENT</text>
-      <text x="612" y="215" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#F97316">CLICK ACCEPT BELOW</text>
+      <text x="612" y="190" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="14" font-weight="bold" fill="#94A3B8">AWAITING OPPONENT</text>
+      <text x="612" y="215" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#F97316">CLICK ACCEPT BELOW</text>
 
       <rect x="475" y="280" width="275" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
-      <text x="612" y="301" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8">FREE TDM 1V1 MATCH</text>
+      <text x="612" y="301" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8">FREE TDM 1V1 MATCH</text>
     `;
   }
 
@@ -734,33 +821,33 @@ export function generateChallengeCardPng(
   <rect x="0" y="0" width="800" height="420" fill="none" stroke="#1F2937" stroke-width="1"/>
 
   <!-- Header -->
-  <text x="35" y="42" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="20" font-weight="bold" fill="#F97316" letter-spacing="1">MATCH DISTRICT</text>
-  <text x="35" y="62" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="600" fill="#94A3B8" letter-spacing="1">OPEN 1V1 CHALLENGE</text>
+  <text x="35" y="42" font-family="Noto Sans, Noto Sans Devanagari" font-size="20" font-weight="bold" fill="#F97316" letter-spacing="1">MATCH DISTRICT</text>
+  <text x="35" y="62" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="600" fill="#94A3B8" letter-spacing="1">OPEN 1V1 CHALLENGE</text>
 
   <!-- Challenge ID Badge -->
   <rect x="615" y="24" width="150" height="34" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
-  <text x="690" y="47" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="15" font-weight="bold" fill="#FFFFFF">${cId}</text>
+  <text x="690" y="47" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="15" font-weight="bold" fill="#FFFFFF">${cId}</text>
   <line x1="35" y1="78" x2="765" y2="78" stroke="#1F2937" stroke-width="1"/>
 
   <!-- Center VS Indicator -->
   <rect x="355" y="145" width="90" height="120" rx="10" fill="#1E293B" stroke="#F97316" stroke-width="2"/>
-  <text x="400" y="200" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="34" font-weight="900" fill="#F97316">VS</text>
-  <text x="400" y="228" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="bold" fill="#FFFFFF">BGMI</text>
-  <text x="400" y="248" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="11" font-weight="600" fill="#94A3B8">TDM 1V1</text>
+  <text x="400" y="200" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="34" font-weight="900" fill="#F97316">VS</text>
+  <text x="400" y="228" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#FFFFFF">BGMI</text>
+  <text x="400" y="248" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="11" font-weight="600" fill="#94A3B8">TDM 1V1</text>
 
   <!-- Challenger Panel (Left) -->
   <rect x="35" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
   <rect x="35" y="95" width="5" height="235" rx="2" fill="#F97316"/>
-  <text x="52" y="122" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">CHALLENGER</text>
+  <text x="52" y="122" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">CHALLENGER</text>
 
   ${cAvatarSvg}
 
-  <text x="142" y="152" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="18" font-weight="bold" fill="#FFFFFF">${cName}</text>
-  <text x="142" y="178" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${cIgnStr}</tspan></text>
-  ${cUidStr ? `<text x="142" y="202" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${cUidStr}</tspan></text>` : ''}
+  <text x="142" y="152" font-family="Noto Sans, Noto Sans Devanagari" font-size="18" font-weight="bold" fill="#FFFFFF">${cName}</text>
+  <text x="142" y="178" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${cIgnStr}</tspan></text>
+  ${cUidStr ? `<text x="142" y="202" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${cUidStr}</tspan></text>` : ''}
 
   <rect x="50" y="280" width="275" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
-  <text x="187" y="301" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8">READY TO FIGHT</text>
+  <text x="187" y="301" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8">READY TO FIGHT</text>
 
   <!-- Right Panel -->
   ${rightPanelSvg}
@@ -769,15 +856,18 @@ export function generateChallengeCardPng(
   <rect x="0" y="350" width="800" height="70" fill="#0D1322"/>
   <line x1="0" y1="350" x2="800" y2="350" stroke="#1F2937" stroke-width="1"/>
 
-  <text x="35" y="391" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="bold" fill="#64748B">STATUS</text>
+  <text x="35" y="391" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#64748B">STATUS</text>
   <rect x="95" y="372" width="${badgeWidth}" height="28" rx="6" fill="${statusBg}" stroke="${statusBorder}" stroke-width="1"/>
-  <text x="${95 + badgeWidth / 2}" y="391" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="${statusCol}">${statusText}</text>
+  <text x="${95 + badgeWidth / 2}" y="391" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="${statusCol}">${statusText}</text>
 
-  <text x="765" y="391" text-anchor="end" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="bold" fill="#94A3B8">${escapeXml(expiryInfo)}</text>
+  <text x="765" y="391" text-anchor="end" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#94A3B8">${escapeXml(expiryInfo)}</text>
 </svg>
 `;
 
-  return renderSvgToPng(svg);
+  return renderSvgToPng(svg, {
+    label: `challenge-card ${cId}`,
+    expectedTexts: ['MATCH DISTRICT', cId, cName, cIgnStr, 'VS', 'BGMI', statusText],
+  });
 }
 
 // ============================================================================

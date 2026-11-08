@@ -3,9 +3,19 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  AttachmentBuilder,
 } from 'discord.js';
-import { ARENA_CONSTANTS, ARENA_STATUS, getArenaConfig, updateArenaChallenge, updateArenaMatch } from '../models/arenaModels.js';
 import {
+  ARENA_CONSTANTS,
+  ARENA_STATUS,
+  ARENA_FINAL_STATUSES,
+  getArenaConfig,
+  updateArenaMatch,
+  updateArenaChallenge,
+} from '../models/arenaModels.js';
+import {
+  generateMatchCardPng,
+  generateChallengeCardPng,
   buildMatchCardPayload,
   buildChallengeCardPayload,
 } from './arenaImageService.js';
@@ -17,8 +27,8 @@ export function buildCreateChallengePanel() {
     .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
     .setDescription(
       'Instant 1v1 BGMI TDM challenges officiated by verified volunteers.\n\n' +
-        '• Click **Create Challenge** to post an open challenge.\n' +
-        '• Click **Update BGMI Details** to manage your registered IGN and UID.'
+      '• Click **Create Challenge** to post an open challenge.\n' +
+      '• Click **Update BGMI Details** to manage your registered IGN and UID.'
     )
     .setFooter({ text: 'Match District Arena' });
 
@@ -36,6 +46,8 @@ export function buildCreateChallengePanel() {
   return { embeds: [embed], components: [row] };
 }
 
+// All builders hydrate live Discord + MongoDB data (display names, avatars, IGN/UID,
+// volunteer name) and render through the single bundled-font renderer in arenaImageService.
 export async function buildChallengeEmbed(challenge, creatorDisplayName = null, options = {}) {
   return buildChallengeCardPayload(challenge, creatorDisplayName, options);
 }
@@ -48,86 +60,110 @@ export async function buildMatchChannelEmbed(match, volunteerDisplayName = null,
   return buildMatchCardPayload(match, volunteerDisplayName, { ...options, surface: 'matchChannel' });
 }
 
-async function updateStoredCard(channel, messageId, payload, allowCreateIfMissing) {
-  if (!channel) return null;
-  let message = messageId ? channel.messages?.cache?.get?.(messageId) || null : null;
-  if (!message && messageId && typeof channel.messages?.fetch === 'function') {
-    message = await channel.messages.fetch(messageId).catch(() => null);
-  }
-  if (message) {
-    await queueMessageEdit(message, payload);
-    return message.id;
-  }
-  if (!allowCreateIfMissing) return null;
-  const sent = await queueChannelSend(channel, payload);
-  return sent?.id || null;
+async function resolveChannel(guild, channelId) {
+  if (!guild || !channelId) return null;
+  return guild.channels?.cache?.get(channelId) || (await guild.channels?.fetch?.(channelId).catch(() => null));
 }
 
-export async function refreshArenaChallengeCard(guild, challenge, { client = guild?.client, allowCreateIfMissing = false } = {}) {
-  if (!guild || !challenge?.discordChannelId) return null;
-  const channel = guild.channels?.cache?.get?.(challenge.discordChannelId) || await guild.channels?.fetch?.(challenge.discordChannelId).catch(() => null);
-  if (!channel) return null;
-  const payload = await buildChallengeEmbed(challenge, null, { guild, client });
-  let messageId = null;
-  try {
-    messageId = await updateStoredCard(channel, challenge.discordMessageId, payload, allowCreateIfMissing);
-  } catch (err) {
-    console.warn(`[Arena] Failed to update challenge card ${challenge.challengeId}:`, err.message);
-    return null;
-  }
-  if (messageId && messageId !== challenge.discordMessageId) {
-    await updateArenaChallenge(challenge.challengeId, { discordMessageId: messageId, discordChannelId: channel.id });
-    challenge.discordMessageId = messageId;
-  }
-  return messageId;
+async function resolveMessage(channel, messageId) {
+  if (!channel || !messageId) return null;
+  return channel.messages?.cache?.get(messageId) || (await channel.messages?.fetch?.(messageId).catch(() => null));
 }
 
-export async function refreshArenaMatchCards(guild, match, {
-  client = guild?.client,
-  volunteerDisplayName = null,
-  updatePrivate = true,
-  updateVolunteerPanel = true,
-  allowCreateIfMissing = false,
-} = {}) {
-  if (!guild || !match?.matchId) return null;
-  const updates = {};
-  if (updatePrivate && match.matchChannelId) {
-    const channel = guild.channels?.cache?.get?.(match.matchChannelId) || await guild.channels?.fetch?.(match.matchChannelId).catch(() => null);
+/**
+ * Re-renders the match image card and EDITS the existing managed messages in place
+ * (private match channel + #volunteer-panel). Buttons are rebuilt from current status.
+ * With allowCreateIfMissing, a deleted managed message is re-created and its id persisted.
+ */
+export async function refreshArenaMatchCards(guild, match, options = {}) {
+  if (!guild || !match) return { matchChannel: false, volunteerPanel: false };
+  const client = options.client || guild.client;
+  const renderOptions = { guild, client, avatars: options.avatars };
+  const volunteerDisplayName = options.volunteerDisplayName || null;
+  const result = { matchChannel: false, volunteerPanel: false };
+  const idUpdates = {};
+
+  // 1. Private match channel card
+  if (match.matchChannelId) {
+    const channel = await resolveChannel(guild, match.matchChannelId);
     if (channel) {
-      try {
-        const payload = await buildMatchChannelEmbed(match, volunteerDisplayName, { guild, client });
-        const messageId = await updateStoredCard(channel, match.matchEmbedMessageId, payload, allowCreateIfMissing);
-        if (messageId && messageId !== match.matchEmbedMessageId) {
-          updates.matchEmbedMessageId = messageId;
-          match.matchEmbedMessageId = messageId;
+      const payload = await buildMatchChannelEmbed(match, volunteerDisplayName, renderOptions);
+      const msg = await resolveMessage(channel, match.matchEmbedMessageId);
+      if (msg) {
+        await queueMessageEdit(msg, payload);
+        result.matchChannel = true;
+      } else if (options.allowCreateIfMissing) {
+        const sent = await queueChannelSend(channel, payload);
+        if (sent?.id) {
+          idUpdates.matchEmbedMessageId = sent.id;
+          result.matchChannel = true;
         }
-      } catch (err) {
-        console.warn(`[Arena] Failed to update private match card ${match.matchId}:`, err.message);
       }
     }
   }
-  if (updateVolunteerPanel && (match.panelMessageId || allowCreateIfMissing)) {
-    const config = await getArenaConfig(guild.id);
-    const channel = config?.volunteerPanelId
-      ? guild.channels?.cache?.get?.(config.volunteerPanelId) || await guild.channels?.fetch?.(config.volunteerPanelId).catch(() => null)
-      : null;
-    if (channel) {
-      const payload = await buildVolunteerPanelEmbed(match, volunteerDisplayName, { guild, client });
-      let messageId = null;
-      try {
-        messageId = await updateStoredCard(channel, match.panelMessageId, payload, allowCreateIfMissing);
-      } catch (err) {
-        console.warn(`[Arena] Failed to update volunteer card ${match.matchId}:`, err.message);
-      }
-      if (messageId && messageId !== match.panelMessageId) {
-        updates.panelMessageId = messageId;
-        match.panelMessageId = messageId;
+
+  // 2. #volunteer-panel card
+  const config = await getArenaConfig(guild.id);
+  if (config?.volunteerPanelId) {
+    const panel = await resolveChannel(guild, config.volunteerPanelId);
+    if (panel) {
+      const payload = await buildVolunteerPanelEmbed(match, volunteerDisplayName, renderOptions);
+      const msg = await resolveMessage(panel, match.panelMessageId);
+      if (msg) {
+        await queueMessageEdit(msg, payload);
+        result.volunteerPanel = true;
+      } else if (options.allowCreateIfMissing && !ARENA_FINAL_STATUSES.includes(match.status)) {
+        const sent = await queueChannelSend(panel, payload);
+        if (sent?.id) {
+          idUpdates.panelMessageId = sent.id;
+          result.volunteerPanel = true;
+        }
       }
     }
   }
-  if (Object.keys(updates).length) await updateArenaMatch(match.matchId, updates);
-  return updates;
+
+  if (Object.keys(idUpdates).length > 0) {
+    await updateArenaMatch(match.matchId, idUpdates).catch((err) =>
+      console.warn('[Arena] ⚠️ Failed to persist refreshed message ids:', err.message)
+    );
+  }
+  return result;
 }
+
+/**
+ * Re-renders an #available-challenges card and edits the existing managed message in place.
+ * With allowCreateIfMissing, an OPEN challenge whose message was deleted gets a fresh card.
+ */
+export async function refreshArenaChallengeCard(guild, challenge, options = {}) {
+  if (!guild || !challenge) return false;
+  const client = options.client || guild.client;
+  const channel = await resolveChannel(guild, challenge.discordChannelId);
+  if (!channel) return false;
+
+  const payload = await buildChallengeEmbed(challenge, options.creatorDisplayName || null, {
+    guild,
+    client,
+    avatars: options.avatars,
+    acceptedOpponent: options.acceptedOpponent || null,
+  });
+  const msg = await resolveMessage(channel, challenge.discordMessageId);
+  if (msg) {
+    await queueMessageEdit(msg, payload);
+    return true;
+  }
+  if (options.allowCreateIfMissing && challenge.status === ARENA_STATUS.OPEN) {
+    const sent = await queueChannelSend(channel, payload);
+    if (sent?.id) {
+      await updateArenaChallenge(challenge.challengeId, {
+        discordMessageId: sent.id,
+        discordChannelId: channel.id,
+      }).catch((err) => console.warn('[Arena] ⚠️ Failed to persist refreshed challenge message id:', err.message));
+      return true;
+    }
+  }
+  return false;
+}
+
 export function buildResultVerificationPayload(match, winnerPlayer, evidenceUrl = null) {
   const embed = new EmbedBuilder()
     .setTitle(`Result Submitted: ${match.matchId}`)

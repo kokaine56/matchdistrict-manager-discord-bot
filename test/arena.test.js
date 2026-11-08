@@ -1347,4 +1347,51 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.ok(newConfig && newConfig.categoryId);
     assert.ok(env.guild.channels.cache.has(newConfig.categoryId));
   });
+
+  test('20. Text rendering diagnostic: bundled fonts render every string (incl. Devanagari) with zero system fonts', async () => {
+    const { renderSvgToPng, getArenaFontFiles, generateMatchCardPng } = await import('../bot/discord/features/arena/services/arenaImageService.js');
+    const { Resvg } = await import('@resvg/resvg-js');
+
+    assert.equal(getArenaFontFiles().length, 4, 'All bundled font files must exist');
+
+    const strings = ['MATCH DISTRICT', 'MD-10001', 'KOKAINE', 'ताजKOKAINE', '51306576278', 'VS', 'BGMI TDM 1V1', 'WAITING FOR VOLUNTEER'];
+    const lines = strings
+      .map((t, i) => `<text x="20" y="${40 + i * 34}" font-family="Noto Sans, Noto Sans Devanagari" font-size="${16 + (i % 4) * 4}" font-weight="${i % 2 ? 'normal' : 'bold'}" fill="${i % 2 ? '#FFFFFF' : '#F97316'}">${t}</text>`)
+      .join('');
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="700" height="330"><rect width="700" height="330" fill="#0B0F19"/>${lines}</svg>`;
+
+    const png = renderSvgToPng(svg, { label: 'diagnostic', expectedTexts: strings });
+    assert.equal(png.subarray(0, 4).toString('hex'), '89504e47');
+
+    // Each string must light up pixels inside its own row band (i.e. it is visibly drawn).
+    const px = new Resvg(svg, { font: { loadSystemFonts: false, fontFiles: getArenaFontFiles(), defaultFontFamily: 'Noto Sans' } }).render().pixels;
+    for (let i = 0; i < strings.length; i++) {
+      const y0 = 40 + i * 34 - 28;
+      const y1 = 40 + i * 34 + 6;
+      let lit = 0;
+      for (let y = y0; y < y1; y++) for (let x = 0; x < 700; x++) {
+        const o = (y * 700 + x) * 4;
+        if (px[o] > 150 || px[o + 1] > 150 || px[o + 2] > 150) lit++;
+      }
+      assert.ok(lit > 40, `String "${strings[i]}" not visibly rendered (lit=${lit})`);
+    }
+
+    // Without fonts the same SVG is blank -> proves the root cause the validator now guards against.
+    const blank = new Resvg(svg, { font: { loadSystemFonts: false } }).render().pixels;
+    let blankLit = 0;
+    for (let i = 0; i < blank.length; i += 4) if (blank[i] > 150) blankLit++;
+    assert.equal(blankLit, 0, 'No fonts => no text; renderer must never rely on host fonts');
+
+    // Validator rejects SVGs that lack expected text instead of sending a blank card.
+    assert.throws(() => renderSvgToPng(svg, { label: 'bad', expectedTexts: ['NOT-IN-SVG'] }), /missing expected text/);
+
+    // Full match card renders with Hindi IGN, UIDs and volunteer, without throwing.
+    const card = generateMatchCardPng({
+      matchId: 'MD-10001', status: ARENA_STATUS.WAITING_FOR_VOLUNTEER,
+      playerA: { discordId: 'a', displayName: 'KOKAINE', bgmiIgn: 'ताजKOKAINE', bgmiUid: '51306576278' },
+      playerB: { discordId: 'b', displayName: 'IGxShanaya', bgmiIgn: 'ताजJESPERR', bgmiUid: '51306576265' },
+    });
+    assert.equal(card.readUInt32BE(16), 800);
+    assert.equal(card.readUInt32BE(20), 420);
+  });
 });
