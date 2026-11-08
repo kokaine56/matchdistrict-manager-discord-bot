@@ -39,8 +39,7 @@ import {
   transitionArenaStatus,
 } from '../services/arenaMatchService.js';
 import {
-  buildVolunteerPanelEmbed,
-  buildMatchChannelEmbed,
+  refreshArenaMatchCards,
 } from '../services/arenaNotificationService.js';
 import { queueMessageEdit, queueChannelSend } from '../../../../../discordQueue.js';
 import { extractUserId } from '../../../../../moderationService.js';
@@ -270,6 +269,8 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
       volunteerId: targetUserId,
       assignedAt: new Date(),
     });
+
+    await refreshArenaMatchCards(guild, updatedMatch, { volunteerDisplayName: newVolMember.displayName });
 
     // Add new volunteer to channel
     if (match.matchChannelId) {

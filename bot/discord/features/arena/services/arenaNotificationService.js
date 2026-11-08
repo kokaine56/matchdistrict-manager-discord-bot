@@ -3,14 +3,13 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  AttachmentBuilder,
 } from 'discord.js';
-import { ARENA_CONSTANTS, ARENA_STATUS } from '../models/arenaModels.js';
+import { ARENA_CONSTANTS, ARENA_STATUS, getArenaConfig, updateArenaChallenge, updateArenaMatch } from '../models/arenaModels.js';
 import {
-  generateMatchCardPng,
-  generateChallengeCardPng,
+  buildMatchCardPayload,
+  buildChallengeCardPayload,
 } from './arenaImageService.js';
-import { queueDirectMessage, queueChannelSend } from '../../../../../discordQueue.js';
+import { queueDirectMessage, queueChannelSend, queueMessageEdit } from '../../../../../discordQueue.js';
 
 export function buildCreateChallengePanel() {
   const embed = new EmbedBuilder()
@@ -37,131 +36,98 @@ export function buildCreateChallengePanel() {
   return { embeds: [embed], components: [row] };
 }
 
-export function buildChallengeEmbed(challenge, creatorDisplayName = null, options = {}) {
-  const pngBuffer = generateChallengeCardPng(challenge, {
-    creatorDisplayName,
-    creatorIgn: options.creatorIgn || null,
-    avatars: options.avatars || new Map(),
-    acceptedOpponent: options.acceptedOpponent || null,
-  });
-
-  const filename = `challenge-${String(challenge.challengeId).toLowerCase()}.png`;
-  const attachment = new AttachmentBuilder(pngBuffer, { name: filename });
-  const embed = new EmbedBuilder()
-    .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
-    .setImage(`attachment://${filename}`);
-
-  const components = [];
-  if (challenge.status === ARENA_STATUS.OPEN) {
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`arena:accept_challenge:${challenge.challengeId}`)
-        .setLabel('Accept Challenge')
-        .setStyle(ButtonStyle.Success),
-      new ButtonBuilder()
-        .setCustomId(`arena:cancel_challenge:${challenge.challengeId}`)
-        .setLabel('Cancel')
-        .setStyle(ButtonStyle.Danger)
-    );
-    components.push(row);
-  }
-
-  return { embeds: [embed], files: [attachment], components };
+export async function buildChallengeEmbed(challenge, creatorDisplayName = null, options = {}) {
+  return buildChallengeCardPayload(challenge, creatorDisplayName, options);
 }
 
-export function buildVolunteerPanelEmbed(match, volunteerDisplayName = null) {
-  const isAssigned = Boolean(match.volunteerId);
-  const statusLabel = isAssigned ? 'VOLUNTEER ASSIGNED' : 'WAITING FOR VOLUNTEER';
+export async function buildVolunteerPanelEmbed(match, volunteerDisplayName = null, options = {}) {
+  return buildMatchCardPayload(match, volunteerDisplayName, { ...options, surface: 'volunteerPanel' });
+}
 
-  const embed = new EmbedBuilder()
-    .setTitle(`Match Request ${match.matchId}`)
-    .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
-    .addFields(
-      { name: 'Game', value: 'BGMI', inline: true },
-      { name: 'Match Type', value: 'TDM 1v1', inline: true },
-      { name: 'Status', value: `\`${statusLabel}\``, inline: true },
-      { name: 'Player A', value: match.playerA.displayName, inline: true },
-      { name: 'Player B', value: match.playerB.displayName, inline: true },
-      {
-        name: 'Volunteer',
-        value: isAssigned ? volunteerDisplayName || `<@${match.volunteerId}>` : '*Available for any member*',
-        inline: true,
+export async function buildMatchChannelEmbed(match, volunteerDisplayName = null, options = {}) {
+  return buildMatchCardPayload(match, volunteerDisplayName, { ...options, surface: 'matchChannel' });
+}
+
+async function updateStoredCard(channel, messageId, payload, allowCreateIfMissing) {
+  if (!channel) return null;
+  let message = messageId ? channel.messages?.cache?.get?.(messageId) || null : null;
+  if (!message && messageId && typeof channel.messages?.fetch === 'function') {
+    message = await channel.messages.fetch(messageId).catch(() => null);
+  }
+  if (message) {
+    await queueMessageEdit(message, payload);
+    return message.id;
+  }
+  if (!allowCreateIfMissing) return null;
+  const sent = await queueChannelSend(channel, payload);
+  return sent?.id || null;
+}
+
+export async function refreshArenaChallengeCard(guild, challenge, { client = guild?.client, allowCreateIfMissing = false } = {}) {
+  if (!guild || !challenge?.discordChannelId) return null;
+  const channel = guild.channels?.cache?.get?.(challenge.discordChannelId) || await guild.channels?.fetch?.(challenge.discordChannelId).catch(() => null);
+  if (!channel) return null;
+  const payload = await buildChallengeEmbed(challenge, null, { guild, client });
+  let messageId = null;
+  try {
+    messageId = await updateStoredCard(channel, challenge.discordMessageId, payload, allowCreateIfMissing);
+  } catch (err) {
+    console.warn(`[Arena] Failed to update challenge card ${challenge.challengeId}:`, err.message);
+    return null;
+  }
+  if (messageId && messageId !== challenge.discordMessageId) {
+    await updateArenaChallenge(challenge.challengeId, { discordMessageId: messageId, discordChannelId: channel.id });
+    challenge.discordMessageId = messageId;
+  }
+  return messageId;
+}
+
+export async function refreshArenaMatchCards(guild, match, {
+  client = guild?.client,
+  volunteerDisplayName = null,
+  updatePrivate = true,
+  updateVolunteerPanel = true,
+  allowCreateIfMissing = false,
+} = {}) {
+  if (!guild || !match?.matchId) return null;
+  const updates = {};
+  if (updatePrivate && match.matchChannelId) {
+    const channel = guild.channels?.cache?.get?.(match.matchChannelId) || await guild.channels?.fetch?.(match.matchChannelId).catch(() => null);
+    if (channel) {
+      try {
+        const payload = await buildMatchChannelEmbed(match, volunteerDisplayName, { guild, client });
+        const messageId = await updateStoredCard(channel, match.matchEmbedMessageId, payload, allowCreateIfMissing);
+        if (messageId && messageId !== match.matchEmbedMessageId) {
+          updates.matchEmbedMessageId = messageId;
+          match.matchEmbedMessageId = messageId;
+        }
+      } catch (err) {
+        console.warn(`[Arena] Failed to update private match card ${match.matchId}:`, err.message);
       }
-    )
-    .setFooter({ text: 'Match District Arena • Volunteer Queue' });
-
-  if (isAssigned || match.status !== ARENA_STATUS.WAITING_FOR_VOLUNTEER) {
-    return { embeds: [embed], components: [] };
+    }
   }
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`arena:claim_match:${match.matchId}`)
-      .setLabel('Accept Match')
-      .setStyle(ButtonStyle.Primary)
-  );
-
-  return { embeds: [embed], components: [row] };
+  if (updateVolunteerPanel && (match.panelMessageId || allowCreateIfMissing)) {
+    const config = await getArenaConfig(guild.id);
+    const channel = config?.volunteerPanelId
+      ? guild.channels?.cache?.get?.(config.volunteerPanelId) || await guild.channels?.fetch?.(config.volunteerPanelId).catch(() => null)
+      : null;
+    if (channel) {
+      const payload = await buildVolunteerPanelEmbed(match, volunteerDisplayName, { guild, client });
+      let messageId = null;
+      try {
+        messageId = await updateStoredCard(channel, match.panelMessageId, payload, allowCreateIfMissing);
+      } catch (err) {
+        console.warn(`[Arena] Failed to update volunteer card ${match.matchId}:`, err.message);
+      }
+      if (messageId && messageId !== match.panelMessageId) {
+        updates.panelMessageId = messageId;
+        match.panelMessageId = messageId;
+      }
+    }
+  }
+  if (Object.keys(updates).length) await updateArenaMatch(match.matchId, updates);
+  return updates;
 }
-
-export function buildMatchChannelEmbed(match, volunteerDisplayName = null, options = {}) {
-  const pngBuffer = generateMatchCardPng(match, {
-    volunteerDisplayName,
-    avatars: options.avatars || new Map(),
-  });
-
-  const filename = `match-${String(match.matchId).toLowerCase()}.png`;
-  const attachment = new AttachmentBuilder(pngBuffer, { name: filename });
-  const embed = new EmbedBuilder()
-    .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
-    .setImage(`attachment://${filename}`);
-
-  // Volunteer Controls
-  const buttons = [];
-  if (match.status === ARENA_STATUS.VOLUNTEER_ASSIGNED || match.status === ARENA_STATUS.ROOM_READY) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId(`arena:submit_room:${match.matchId}`)
-        .setLabel(match.roomId ? 'Edit Room Details' : 'Submit Room Details')
-        .setStyle(ButtonStyle.Primary)
-    );
-  }
-
-  if (match.status === ARENA_STATUS.ROOM_READY) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId(`arena:start_match:${match.matchId}`)
-        .setLabel('Start Match')
-        .setStyle(ButtonStyle.Success)
-    );
-  }
-
-  if (match.status === ARENA_STATUS.LIVE) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId(`arena:submit_winner:${match.matchId}`)
-        .setLabel('Submit Winner')
-        .setStyle(ButtonStyle.Primary)
-    );
-  }
-
-  // Release Match allowed until match is LIVE
-  if (
-    match.status === ARENA_STATUS.VOLUNTEER_ASSIGNED ||
-    match.status === ARENA_STATUS.ROOM_READY
-  ) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId(`arena:release_match:${match.matchId}`)
-        .setLabel('Release Match')
-        .setStyle(ButtonStyle.Secondary)
-    );
-  }
-
-  const components = buttons.length ? [new ActionRowBuilder().addComponents(buttons)] : [];
-  return { embeds: [embed], files: [attachment], components };
-}
-
 export function buildResultVerificationPayload(match, winnerPlayer, evidenceUrl = null) {
   const embed = new EmbedBuilder()
     .setTitle(`Result Submitted: ${match.matchId}`)

@@ -10,8 +10,9 @@ import {
   logArenaAction,
 } from '../models/arenaModels.js';
 import {
-  buildChallengeEmbed,
   buildVolunteerPanelEmbed,
+  refreshArenaChallengeCard,
+  refreshArenaMatchCards,
 } from './arenaNotificationService.js';
 import {
   deleteMatchChannel,
@@ -114,20 +115,7 @@ async function expireChallenge(client, challenge) {
   });
 
   const guild = client.guilds?.cache?.get(challenge.guildId);
-  if (guild && challenge.discordChannelId && challenge.discordMessageId) {
-    const ch =
-      guild.channels.cache.get(challenge.discordChannelId) ||
-      (await guild.channels.fetch(challenge.discordChannelId).catch(() => null));
-    if (ch) {
-      const msg =
-        ch.messages?.cache?.get(challenge.discordMessageId) ||
-        (await ch.messages?.fetch?.(challenge.discordMessageId).catch(() => null));
-      if (msg) {
-        const payload = buildChallengeEmbed(updated);
-        await queueMessageEdit(msg, payload).catch(() => {});
-      }
-    }
-  }
+  if (guild) await refreshArenaChallengeCard(guild, updated, { client });
 
   await logArenaAction({
     action: 'CHALLENGE_EXPIRED',
@@ -194,7 +182,7 @@ async function expireWaitingMatch(client, match) {
           volPanel.messages?.cache?.get(match.panelMessageId) ||
           (await volPanel.messages?.fetch?.(match.panelMessageId).catch(() => null));
         if (msg) {
-          const payload = buildVolunteerPanelEmbed({ ...match, status: ARENA_STATUS.EXPIRED });
+          const payload = await buildVolunteerPanelEmbed({ ...match, status: ARENA_STATUS.EXPIRED }, null, { guild, client });
           await queueMessageEdit(msg, payload).catch(() => {});
         }
       }
@@ -255,6 +243,17 @@ export async function recoverArenaOnStartup(client) {
         });
       }
 
+      // Rebuild open challenge cards in place from current MongoDB player profiles.
+      for (const challenge of await getActiveChallenges(guild.id)) {
+        if (!challenge.discordChannelId && config.availableChannelId) {
+          challenge.discordChannelId = config.availableChannelId;
+          await updateArenaChallenge(challenge.challengeId, { discordChannelId: config.availableChannelId });
+        }
+        if (challenge.discordChannelId) {
+          await refreshArenaChallengeCard(guild, challenge, { client, allowCreateIfMissing: true });
+        }
+      }
+
       // 2. Reconcile active matches with Discord
       const activeMatches = [
         ...(await getArenaMatchesByStatus(ARENA_STATUS.WAITING_FOR_VOLUNTEER, guild.id)),
@@ -271,6 +270,8 @@ export async function recoverArenaOnStartup(client) {
           const recreated = await createMatchChannel(guild, m, config).catch(() => null);
           if (recreated) {
             await updateArenaMatch(m.matchId, { matchChannelId: recreated.id });
+            m.matchChannelId = recreated.id;
+            m.matchEmbedMessageId = null;
           }
         } else {
           // Verify channel still exists
@@ -281,9 +282,12 @@ export async function recoverArenaOnStartup(client) {
             const recreated = await createMatchChannel(guild, m, config).catch(() => null);
             if (recreated) {
               await updateArenaMatch(m.matchId, { matchChannelId: recreated.id });
+              m.matchChannelId = recreated.id;
+              m.matchEmbedMessageId = null;
             }
           }
         }
+        await refreshArenaMatchCards(guild, m, { client, allowCreateIfMissing: true });
       }
     } catch (guildErr) {
       console.warn(`[Arena] ⚠️ Error reconciling guild ${guild.id}:`, guildErr.message);

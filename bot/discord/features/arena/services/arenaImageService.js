@@ -7,7 +7,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
 } from 'discord.js';
-import { ARENA_STATUS, ARENA_CONSTANTS } from '../models/arenaModels.js';
+import { ARENA_STATUS, ARENA_CONSTANTS, getArenaPlayer } from '../models/arenaModels.js';
 
 // ============================================================================
 // Bitmap Font (5x7) & Drawing Helpers
@@ -332,22 +332,34 @@ export async function fetchDiscordAvatarBytes(client, userId) {
     if (!user && typeof client?.users?.fetch === 'function') {
       user = await client.users.fetch(userId).catch(() => null);
     }
-    if (!user) return null;
-
-    const avatarUrl =
-      typeof user.displayAvatarURL === 'function'
+    let avatarUrl =
+      typeof user?.displayAvatarURL === 'function'
         ? user.displayAvatarURL({ extension: 'png', size: 128, forceStatic: true })
-        : user.avatarURL;
+        : user?.avatarURL || null;
+    let defaultAvatarUrl = null;
+    try {
+      defaultAvatarUrl = `https://cdn.discordapp.com/embed/avatars/${Number((BigInt(userId) >> 22n) % 6n)}.png`;
+    } catch {
+      // IDs from unit fixtures may not be Discord snowflakes.
+    }
+    const avatarUrls = [...new Set([avatarUrl, defaultAvatarUrl].filter(Boolean))];
+    if (typeof fetch !== 'function') return null;
 
-    if (!avatarUrl || typeof fetch !== 'function') return null;
-
-    const res = await fetch(avatarUrl, { signal: AbortSignal.timeout(3000) });
-    if (!res.ok) return null;
-
-    const buffer = Buffer.from(await res.arrayBuffer());
-    if (buffer.length > 0 && buffer.length <= 1024 * 1024) {
-      avatarCache.set(userId, { buffer, ts: Date.now() });
-      return buffer;
+    for (const url of avatarUrls) {
+      if (process.env.ARENA_IMAGE_DIAGNOSTICS === '1') {
+        console.info(`[ArenaImage] avatar ${userId}: ${url}`);
+      }
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+        if (!res.ok) continue;
+        const buffer = Buffer.from(await res.arrayBuffer());
+        if (buffer.length > 0 && buffer.length <= 1024 * 1024) {
+          avatarCache.set(userId, { buffer, ts: Date.now() });
+          return buffer;
+        }
+      } catch {
+        // Try the deterministic Discord default avatar next.
+      }
     }
   } catch {
     // Graceful fallback to procedural avatar
@@ -422,9 +434,9 @@ function escapeXml(unsafe) {
 
 function truncate(str, max = 16) {
   if (!str) return '';
-  const s = String(str).trim();
-  if (s.length <= max) return s;
-  return s.slice(0, max - 1) + '…';
+  const chars = Array.from(String(str).trim());
+  if (chars.length <= max) return chars.join('');
+  return chars.slice(0, max - 1).join('') + '…';
 }
 
 function getAvatarDataUri(val) {
@@ -562,7 +574,7 @@ export function generateMatchCardPng(match, { volunteerDisplayName = null, avata
 
   <!-- Header -->
   <text x="35" y="42" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="20" font-weight="bold" fill="#F97316" letter-spacing="1">MATCH DISTRICT</text>
-  <text x="35" y="62" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="600" fill="#94A3B8" letter-spacing="1">1V1 CHALLENGE ARENA</text>
+  <text x="35" y="62" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="600" fill="#94A3B8" letter-spacing="1">MATCH DETAILS</text>
 
   <!-- Match ID Badge -->
   <rect x="615" y="24" width="150" height="34" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
@@ -706,9 +718,13 @@ export function generateChallengeCardPng(
   const statusText = statusStr === ARENA_STATUS.WAITING_FOR_VOLUNTEER ? 'ACCEPTED' : statusStr;
   const badgeWidth = Math.max(90, statusText.length * 9 + 24);
 
-  const expiryInfo = challenge?.expiresAt
-    ? `EXPIRES: ${new Date(challenge.expiresAt).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })}`
-    : 'NO TIMEOUT';
+  const expiresAtMs = challenge?.expiresAt ? new Date(challenge.expiresAt).getTime() : NaN;
+  const remainingSeconds = Number.isFinite(expiresAtMs) ? Math.max(0, Math.floor((expiresAtMs - Date.now()) / 1000)) : null;
+  const expiryInfo = statusStr === ARENA_STATUS.OPEN && remainingSeconds !== null
+    ? `EXPIRES IN ${Math.floor(remainingSeconds / 60)}M ${remainingSeconds % 60}S`
+    : remainingSeconds !== null
+      ? `EXPIRES ${new Date(challenge.expiresAt).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })}`
+      : 'NO TIMEOUT';
 
   const svg = `
 <svg xmlns="http://www.w3.org/2000/svg" width="800" height="420" viewBox="0 0 800 420">
@@ -769,25 +785,38 @@ export function generateChallengeCardPng(
 // ============================================================================
 
 export async function buildMatchCardPayload(match, volunteerDisplayName = null, options = {}) {
-  const avatars = new Map();
   const client = options.client || options.guild?.client;
+  const guild = options.guild || client?.guilds?.cache?.get?.(match.guildId) || null;
+  const avatars = options.avatars || await fetchMatchAvatars(client, match);
+  const playerData = await Promise.all(['playerA', 'playerB'].map(async (key) => {
+    const saved = match[key] || {};
+    const discordId = String(saved.discordId || '');
+    const [profile, member] = await Promise.all([
+      discordId ? getArenaPlayer(discordId).catch(() => null) : null,
+      discordId ? (guild?.members?.cache?.get?.(discordId) || guild?.members?.fetch?.(discordId).catch(() => null)) : null,
+    ]);
+    let user = member?.user || null;
+    if (!user && discordId) user = client?.users?.cache?.get?.(discordId) || await client?.users?.fetch?.(discordId).catch(() => null);
+    return [key, {
+      ...saved,
+      displayName: member?.displayName || user?.globalName || user?.username || profile?.displayName || saved.displayName || `Player ${key === 'playerA' ? 'A' : 'B'}`,
+      bgmiIgn: profile?.bgmiIgn || saved.bgmiIgn || '',
+      bgmiUid: profile?.bgmiUid || saved.bgmiUid || '',
+    }];
+  }));
+  const renderMatch = { ...match, playerA: Object.fromEntries(playerData).playerA, playerB: Object.fromEntries(playerData).playerB };
 
-  if (client) {
-    if (match.playerA?.discordId) {
-      const bufA = await fetchDiscordAvatarBytes(client, match.playerA.discordId);
-      if (bufA) avatars.set(match.playerA.discordId, bufA);
-    }
-    if (match.playerB?.discordId) {
-      const bufB = await fetchDiscordAvatarBytes(client, match.playerB.discordId);
-      if (bufB) avatars.set(match.playerB.discordId, bufB);
-    }
+  if (!volunteerDisplayName && match.volunteerId) {
+    const volunteer = guild?.members?.cache?.get?.(String(match.volunteerId)) || await guild?.members?.fetch?.(String(match.volunteerId)).catch(() => null);
+    volunteerDisplayName = volunteer?.displayName || volunteer?.user?.globalName || volunteer?.user?.username || null;
   }
 
-  const pngBuffer = generateMatchCardPng(match, {
+  const pngBuffer = generateMatchCardPng(renderMatch, {
     volunteerDisplayName,
     avatars,
   });
 
+  logArenaImageDiagnostics('match', renderMatch, volunteerDisplayName, avatars, pngBuffer);
   const filename = `match-${String(match.matchId).toLowerCase()}.png`;
   const attachment = new AttachmentBuilder(pngBuffer, { name: filename });
 
@@ -838,29 +867,62 @@ export async function buildMatchCardPayload(match, volunteerDisplayName = null, 
 
   const components = buttons.length > 0 ? [new ActionRowBuilder().addComponents(buttons)] : [];
 
+  if (options.surface === 'volunteerPanel') {
+    const publicComponents = match.status === ARENA_STATUS.WAITING_FOR_VOLUNTEER && !match.volunteerId
+      ? [new ActionRowBuilder().addComponents(new ButtonBuilder()
+          .setCustomId(`arena:claim_match:${match.matchId}`)
+          .setLabel('Accept Match')
+          .setStyle(ButtonStyle.Primary))]
+      : [];
+    return { embeds: [embed], files: [attachment], attachments: [], components: publicComponents };
+  }
+
   return {
     embeds: [embed],
     files: [attachment],
+    attachments: [],
     components,
   };
 }
 
 export async function buildChallengeCardPayload(challenge, creatorDisplayName = null, options = {}) {
-  const avatars = new Map();
   const client = options.client || options.guild?.client;
-
-  if (client && challenge.creatorId) {
-    const buf = await fetchDiscordAvatarBytes(client, challenge.creatorId);
-    if (buf) avatars.set(challenge.creatorId, buf);
+  const guild = options.guild || client?.guilds?.cache?.get?.(challenge.guildId) || null;
+  const creator = await getArenaPlayer(challenge.creatorId).catch(() => null);
+  const creatorMember = guild?.members?.cache?.get?.(String(challenge.creatorId)) || await guild?.members?.fetch?.(String(challenge.creatorId)).catch(() => null);
+  const creatorUser = creatorMember?.user || client?.users?.cache?.get?.(String(challenge.creatorId)) || await client?.users?.fetch?.(String(challenge.creatorId)).catch(() => null);
+  const displayName = creatorMember?.displayName || creatorUser?.globalName || creatorUser?.username || creatorDisplayName || creator?.displayName || null;
+  let acceptedOpponent = options.acceptedOpponent || null;
+  if (!acceptedOpponent && challenge.opponentId) acceptedOpponent = { discordId: challenge.opponentId };
+  if (acceptedOpponent?.discordId) {
+    const [opponentProfile, opponentMember] = await Promise.all([
+      getArenaPlayer(acceptedOpponent.discordId).catch(() => null),
+      guild?.members?.cache?.get?.(String(acceptedOpponent.discordId)) || guild?.members?.fetch?.(String(acceptedOpponent.discordId)).catch(() => null),
+    ]);
+    acceptedOpponent = {
+      ...acceptedOpponent,
+      displayName: opponentMember?.displayName || opponentMember?.user?.globalName || opponentMember?.user?.username || opponentProfile?.displayName || acceptedOpponent.displayName,
+      bgmiIgn: opponentProfile?.bgmiIgn || acceptedOpponent.bgmiIgn,
+      bgmiUid: opponentProfile?.bgmiUid || acceptedOpponent.bgmiUid,
+    };
   }
+  const renderChallenge = {
+    ...challenge,
+    creatorDisplayName: displayName,
+    creatorIgn: creator?.bgmiIgn || options.creatorIgn,
+    creatorUid: creator?.bgmiUid || options.creatorUid,
+  };
+  const avatars = options.avatars || await fetchChallengeAvatars(client, renderChallenge, acceptedOpponent);
 
   const pngBuffer = generateChallengeCardPng(challenge, {
-    creatorDisplayName,
-    creatorIgn: options.creatorIgn || null,
+    creatorDisplayName: displayName,
+    creatorIgn: renderChallenge.creatorIgn || null,
+    creatorUid: renderChallenge.creatorUid || null,
     avatars,
-    acceptedOpponent: options.acceptedOpponent || null,
+    acceptedOpponent,
   });
 
+  logArenaImageDiagnostics('challenge', renderChallenge, null, avatars, pngBuffer);
   const filename = `challenge-${String(challenge.challengeId).toLowerCase()}.png`;
   const attachment = new AttachmentBuilder(pngBuffer, { name: filename });
 
@@ -886,7 +948,29 @@ export async function buildChallengeCardPayload(challenge, creatorDisplayName = 
   return {
     embeds: [embed],
     files: [attachment],
+    attachments: [],
     components,
   };
+}
+
+function logArenaImageDiagnostics(type, item, volunteerDisplayName, avatars, pngBuffer) {
+  if (process.env.ARENA_IMAGE_DIAGNOSTICS !== '1') return;
+  const player = (p) => p ? ({ discordId: p.discordId, displayName: p.displayName, bgmiIgn: p.bgmiIgn, bgmiUid: p.bgmiUid }) : null;
+  console.info('[ArenaImage] render', JSON.stringify({
+    type,
+    id: item.matchId || item.challengeId,
+    playerA: player(item.playerA) || { discordId: item.creatorId, displayName: item.creatorDisplayName, bgmiIgn: item.creatorIgn, bgmiUid: item.creatorUid },
+    playerB: player(item.playerB) || (item.opponentId ? { discordId: item.opponentId } : null),
+    volunteer: item.volunteerId ? { discordId: item.volunteerId, displayName: volunteerDisplayName || null } : null,
+    avatarUserIds: [...avatars.keys()],
+    rendererInput: {
+      status: item.status,
+      matchId: item.matchId || item.challengeId,
+      playerA: player(item.playerA) || { discordId: item.creatorId, displayName: item.creatorDisplayName, bgmiIgn: item.creatorIgn, bgmiUid: item.creatorUid },
+      playerB: player(item.playerB),
+      volunteerDisplayName: volunteerDisplayName || null,
+    },
+    output: { width: pngBuffer.readUInt32BE(16), height: pngBuffer.readUInt32BE(20), bytes: pngBuffer.length, png: pngBuffer.subarray(0, 8).toString('hex') },
+  }));
 }
 

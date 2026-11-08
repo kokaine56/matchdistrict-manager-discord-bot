@@ -12,7 +12,7 @@ import {
   logArenaAction,
 } from '../models/arenaModels.js';
 import { transitionArenaStatus } from './arenaMatchService.js';
-import { buildCompletedMatchResultEmbed } from './arenaNotificationService.js';
+import { buildCompletedMatchResultEmbed, refreshArenaMatchCards } from './arenaNotificationService.js';
 import { queueChannelSend, queueMessageEdit } from '../../../../../discordQueue.js';
 
 export async function handlePlayerConfirmation(guild, member, matchId) {
@@ -89,6 +89,8 @@ export async function completeArenaMatch(
 
   if (!transition.ok) return transition;
   const completedMatch = transition.match;
+
+  await refreshArenaMatchCards(guild, completedMatch);
 
   // 1. Update winner & loser stats in arena_players
   const winnerPlayer = await getArenaPlayer(effectiveWinnerId);

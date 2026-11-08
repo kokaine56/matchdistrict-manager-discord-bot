@@ -18,6 +18,7 @@ import {
   buildVolunteerPanelEmbed,
   buildMatchChannelEmbed,
 } from './arenaNotificationService.js';
+import { fetchMatchAvatars } from './arenaImageService.js';
 import { queueMessageEdit, queueChannelSend } from '../../../../../discordQueue.js';
 
 export async function handleClaimMatch(guild, member, matchId) {
@@ -110,6 +111,8 @@ export async function handleClaimMatch(guild, member, matchId) {
     const matchChannel =
       guild.channels.cache.get(match.matchChannelId) ||
       (await guild.channels.fetch(match.matchChannelId).catch(() => null));
+    const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
+
     if (matchChannel) {
       await addVolunteerToMatchChannel(matchChannel, member.id);
 
@@ -119,7 +122,7 @@ export async function handleClaimMatch(guild, member, matchId) {
           matchChannel.messages?.cache?.get(match.matchEmbedMessageId) ||
           (await matchChannel.messages?.fetch?.(match.matchEmbedMessageId).catch(() => null));
         if (embedMsg) {
-          const payload = buildMatchChannelEmbed(updatedMatch, volunteerName);
+          const payload = await buildMatchChannelEmbed(updatedMatch, volunteerName, { avatars, guild, client: guild.client });
           await queueMessageEdit(embedMsg, payload).catch(() => {});
         }
       }
@@ -140,7 +143,8 @@ export async function handleClaimMatch(guild, member, matchId) {
         volPanel.messages?.cache?.get(match.panelMessageId) ||
         (await volPanel.messages?.fetch?.(match.panelMessageId).catch(() => null));
       if (volMsg) {
-        const payload = buildVolunteerPanelEmbed(updatedMatch, volunteerName);
+        const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
+        const payload = await buildVolunteerPanelEmbed(updatedMatch, volunteerName, { avatars, guild, client: guild.client });
         await queueMessageEdit(volMsg, payload).catch(() => {});
       }
     }
@@ -202,6 +206,8 @@ export async function handleReleaseMatch(guild, member, matchId, isAdminAction =
 
   const config = await getArenaConfig(guild.id);
 
+  const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
+
   // 1. Remove volunteer permissions from match channel
   if (match.matchChannelId) {
     const matchChannel =
@@ -217,7 +223,7 @@ export async function handleReleaseMatch(guild, member, matchId, isAdminAction =
           matchChannel.messages?.cache?.get(match.matchEmbedMessageId) ||
           (await matchChannel.messages?.fetch?.(match.matchEmbedMessageId).catch(() => null));
         if (embedMsg) {
-          const payload = buildMatchChannelEmbed(updatedMatch);
+          const payload = await buildMatchChannelEmbed(updatedMatch, null, { avatars, guild, client: guild.client });
           await queueMessageEdit(embedMsg, payload).catch(() => {});
         }
       }
@@ -238,7 +244,7 @@ export async function handleReleaseMatch(guild, member, matchId, isAdminAction =
         volPanel.messages?.cache?.get(match.panelMessageId) ||
         (await volPanel.messages?.fetch?.(match.panelMessageId).catch(() => null));
       if (volMsg) {
-        const payload = buildVolunteerPanelEmbed(updatedMatch);
+        const payload = await buildVolunteerPanelEmbed(updatedMatch, null, { avatars, guild, client: guild.client });
         await queueMessageEdit(volMsg, payload).catch(() => {});
       }
     }

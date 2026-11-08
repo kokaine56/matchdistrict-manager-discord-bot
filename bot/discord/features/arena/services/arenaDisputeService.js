@@ -11,7 +11,7 @@ import {
 } from '../models/arenaModels.js';
 import { transitionArenaStatus } from './arenaMatchService.js';
 import { completeArenaMatch } from './arenaResultService.js';
-import { buildDisputeEvidenceEmbed } from './arenaNotificationService.js';
+import { buildDisputeEvidenceEmbed, refreshArenaMatchCards } from './arenaNotificationService.js';
 import { queueChannelSend } from '../../../../../discordQueue.js';
 
 export async function handleFileDispute(guild, member, matchId, reason = 'Result disputed by player') {
@@ -38,6 +38,8 @@ export async function handleFileDispute(guild, member, matchId, reason = 'Result
   });
   if (!transition.ok) return transition;
   const updatedMatch = transition.match;
+
+  await refreshArenaMatchCards(guild, updatedMatch);
 
   // Create dispute record
   const dispute = await createArenaDispute({

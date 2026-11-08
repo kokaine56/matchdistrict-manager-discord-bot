@@ -10,7 +10,9 @@ import {
   getArenaPlayer,
   upsertArenaPlayer,
   getArenaChallenge,
+  createArenaChallenge,
   getArenaMatch,
+  createArenaMatch,
   getArenaVolunteer,
   upsertArenaVolunteer,
   getArenaConfig,
@@ -173,6 +175,7 @@ function createMockArenaEnvironment(guildId = 'guild-arena-100') {
       },
     },
   };
+  guild.client = client;
 
   const addMember = (id, displayName, { isAdmin = false, isVolunteer = false } = {}) => {
     const memberRoles = new Map();
@@ -1043,7 +1046,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(matchPng.readUInt32BE(20), 420, 'Match card height should be 420');
 
     // 2. Build Match Channel Payload
-    const matchPayload = buildMatchChannelEmbed(sampleMatch, 'OfficialVol');
+    const matchPayload = await buildMatchChannelEmbed(sampleMatch, 'OfficialVol');
     assert.ok(matchPayload.files && matchPayload.files.length === 1, 'Match payload must include the generated image card as a file attachment');
     assert.equal(matchPayload.files[0].name, 'match-md-10001.png');
     assert.ok(matchPayload.embeds && matchPayload.embeds.length === 1);
@@ -1063,7 +1066,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
       createdAt: new Date(),
       expiresAt: new Date(Date.now() + 600000),
     };
-    const challengeOpenPayload = buildChallengeEmbed(sampleChallenge, 'AlphaPro', { creatorIgn: 'AlphaKing' });
+    const challengeOpenPayload = await buildChallengeEmbed(sampleChallenge, 'AlphaPro', { creatorIgn: 'AlphaKing' });
     assert.ok(challengeOpenPayload.files && challengeOpenPayload.files.length === 1);
     assert.equal(challengeOpenPayload.files[0].name, 'challenge-md-10001.png');
     assert.equal(challengeOpenPayload.components.length, 1, 'OPEN challenge must have action buttons');
@@ -1073,7 +1076,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
 
     // 4. Challenge Card PNG (ACCEPTED) -> updates image and removes buttons
     const acceptedChallenge = { ...sampleChallenge, status: ARENA_STATUS.WAITING_FOR_VOLUNTEER };
-    const acceptedPayload = buildChallengeEmbed(acceptedChallenge, 'AlphaPro', {
+    const acceptedPayload = await buildChallengeEmbed(acceptedChallenge, 'AlphaPro', {
       creatorIgn: 'AlphaKing',
       acceptedOpponent: { discordId: 'pB', displayName: 'BravoElite', bgmiIgn: 'BravoGod' },
     });
@@ -1082,7 +1085,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
 
     // 5. Challenge Card PNG (CANCELLED / EXPIRED) -> removes buttons
     const cancelledChallenge = { ...sampleChallenge, status: ARENA_STATUS.CANCELLED };
-    const cancelledPayload = buildChallengeEmbed(cancelledChallenge, 'AlphaPro');
+    const cancelledPayload = await buildChallengeEmbed(cancelledChallenge, 'AlphaPro');
     assert.equal(cancelledPayload.components.length, 0, 'CANCELLED challenge must not have buttons');
 
     // 6. Test with a custom 32x32 PNG avatar to verify circular avatar blending
@@ -1092,5 +1095,182 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     const matchWithAvatarPng = generateMatchCardPng(sampleMatch, { avatars: avatarsMap });
     assert.ok(Buffer.isBuffer(matchWithAvatarPng));
     assert.equal(matchWithAvatarPng[0], 0x89);
+  });
+
+  test('17. Hindi BGMI IGN, UID Display, Discord Avatar Integration & Volunteer Panel Image Cards', async () => {
+    const {
+      generateMatchCardPng,
+      generateChallengeCardPng,
+      fetchMatchAvatars,
+      fetchChallengeAvatars,
+    } = await import('../bot/discord/features/arena/services/arenaImageService.js');
+    const {
+      buildVolunteerPanelEmbed,
+      buildMatchChannelEmbed,
+    } = await import('../bot/discord/features/arena/services/arenaNotificationService.js');
+
+    // 1. Match with Hindi / Devanagari characters and UIDs
+    const hindiMatch = {
+      matchId: 'MD-20002',
+      status: ARENA_STATUS.WAITING_FOR_VOLUNTEER,
+      playerA: {
+        discordId: 'kokaine-id',
+        displayName: 'KOKAINE',
+        bgmiIgn: 'ताजKOKAINE',
+        bgmiUid: '51306576278',
+      },
+      playerB: {
+        discordId: 'shanaya-id',
+        displayName: 'IGxShanaya',
+        bgmiIgn: 'ताजJESPERR',
+        bgmiUid: '51306576265',
+      },
+      volunteerId: null,
+    };
+
+    // 2. Generate PNG with Hindi characters & verify standard PNG headers
+    const hindiCardPng = generateMatchCardPng(hindiMatch);
+    assert.ok(Buffer.isBuffer(hindiCardPng));
+    assert.equal(hindiCardPng[0], 0x89);
+    assert.equal(hindiCardPng.readUInt32BE(16), 800);
+    assert.equal(hindiCardPng.readUInt32BE(20), 420);
+
+    // 3. Test with mock Discord avatars (Buffer & base64)
+    // 2x2 red pixel PNG
+    const mockAvatarBuffer = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFElEQVQIW2P8z8Dwn4GBgYGBgQEABYIBAB3k6jUAAAAASUVORK5CYII=', 'base64');
+    const avatarsMap = new Map([
+      ['kokaine-id', mockAvatarBuffer],
+      ['shanaya-id', mockAvatarBuffer],
+    ]);
+
+    const cardWithAvatarsPng = generateMatchCardPng(hindiMatch, { avatars: avatarsMap });
+    assert.ok(Buffer.isBuffer(cardWithAvatarsPng));
+    assert.equal(cardWithAvatarsPng[0], 0x89);
+
+    // 4. Verify #volunteer-panel message payload structure
+    const volPayloadWaiting = await buildVolunteerPanelEmbed(hindiMatch, null, { avatars: avatarsMap });
+    assert.ok(volPayloadWaiting.files && volPayloadWaiting.files.length === 1, 'Volunteer panel must include image file attachment');
+    assert.equal(volPayloadWaiting.files[0].name, 'match-md-20002.png');
+    assert.ok(volPayloadWaiting.embeds && volPayloadWaiting.embeds.length === 1, 'Volunteer panel must include embed');
+    assert.equal(volPayloadWaiting.embeds[0].data.image.url, 'attachment://match-md-20002.png');
+    assert.equal(volPayloadWaiting.components.length, 1, 'Waiting match must have Accept Match button');
+    assert.equal(volPayloadWaiting.components[0].components[0].data.custom_id, 'arena:claim_match:MD-20002');
+    assert.equal(volPayloadWaiting.components[0].components[0].data.label, 'Accept Match');
+
+    // 5. When claimed, button is removed while visual layout is preserved
+    const claimedMatch = {
+      ...hindiMatch,
+      status: ARENA_STATUS.VOLUNTEER_ASSIGNED,
+      volunteerId: 'vol-user-123',
+    };
+    const volPayloadClaimed = await buildVolunteerPanelEmbed(claimedMatch, 'OfficialVol', { avatars: avatarsMap });
+    assert.ok(volPayloadClaimed.files && volPayloadClaimed.files.length === 1);
+    assert.equal(volPayloadClaimed.files[0].name, 'match-md-20002.png');
+    assert.equal(volPayloadClaimed.embeds[0].data.image.url, 'attachment://match-md-20002.png');
+    assert.equal(volPayloadClaimed.components.length, 0, 'Claimed match must not have Accept Match button');
+
+    // 6. Test all status variations for footer layout integrity
+    const statuses = [
+      ARENA_STATUS.WAITING_FOR_VOLUNTEER,
+      ARENA_STATUS.VOLUNTEER_ASSIGNED,
+      ARENA_STATUS.ROOM_READY,
+      ARENA_STATUS.LIVE,
+      ARENA_STATUS.RESULT_PENDING,
+      ARENA_STATUS.CONFIRMED,
+      ARENA_STATUS.COMPLETED,
+      ARENA_STATUS.UNDER_REVIEW,
+      ARENA_STATUS.CANCELLED,
+      ARENA_STATUS.EXPIRED,
+    ];
+
+    for (const status of statuses) {
+      const testMatch = { ...hindiMatch, status, volunteerId: 'vol-user-123' };
+      const png = generateMatchCardPng(testMatch, { volunteerDisplayName: 'VeryLongVolunteerDisplayNameOfficial', avatars: avatarsMap });
+      assert.ok(Buffer.isBuffer(png));
+      assert.equal(png[0], 0x89);
+    }
+
+    // 7. Test fetchMatchAvatars & fetchChallengeAvatars with mocked Discord client
+    const mockClient = {
+      users: {
+        cache: new Map(),
+        fetch: async (id) => ({
+          id,
+          displayAvatarURL: () => null,
+        }),
+      },
+    };
+    const fetchedMatchAvatars = await fetchMatchAvatars(mockClient, hindiMatch);
+    assert.ok(fetchedMatchAvatars instanceof Map);
+
+    const fetchedChallengeAvatars = await fetchChallengeAvatars(mockClient, { creatorId: 'kokaine-id' });
+    assert.ok(fetchedChallengeAvatars instanceof Map);
+  });
+
+  test('18. Mongo-shaped Arena records hydrate complete challenge and match image cards before sending', async () => {
+    const env = createMockArenaEnvironment();
+    const { buildMatchChannelEmbed, buildChallengeEmbed } = await import('../bot/discord/features/arena/services/arenaNotificationService.js');
+    const { encodePngRgba } = await import('../bot/discord/features/arena/services/arenaImageService.js');
+    const playerA = env.addMember('111111111111111111', 'Discord Alpha');
+    const playerB = env.addMember('222222222222222222', 'Discord Bravo');
+    const volunteer = env.addMember('333333333333333333', 'Arena Official');
+    const avatarRgba = Buffer.alloc(4 * 4 * 4, 255);
+    const avatarUrl = `data:image/png;base64,${encodePngRgba(4, 4, avatarRgba).toString('base64')}`;
+    for (const user of [playerA.user, playerB.user, volunteer.user]) {
+      user.displayAvatarURL = () => avatarUrl;
+      env.client.users.cache.set(user.id, user);
+    }
+
+    await upsertArenaPlayer(playerA.id, { displayName: 'Discord Alpha', bgmiIgn: 'ताजAlpha', bgmiUid: '51306576278' });
+    await upsertArenaPlayer(playerB.id, { displayName: 'Discord Bravo', bgmiIgn: 'ताजBravo', bgmiUid: '51306576265' });
+    const match = await createArenaMatch({
+      matchId: 'MD-30001', guildId: env.guild.id, status: ARENA_STATUS.VOLUNTEER_ASSIGNED,
+      volunteerId: volunteer.id, matchChannelId: 'private-match', panelMessageId: 'vol-panel',
+      playerA: { discordId: playerA.id, displayName: playerA.displayName, bgmiIgn: 'ताजAlpha', bgmiUid: '51306576278' },
+      playerB: { discordId: playerB.id, displayName: playerB.displayName, bgmiIgn: 'ताजBravo', bgmiUid: '51306576265' },
+    });
+
+    const previousDiagnostics = process.env.ARENA_IMAGE_DIAGNOSTICS;
+    const originalInfo = console.info;
+    const diagnosticLines = [];
+    process.env.ARENA_IMAGE_DIAGNOSTICS = '1';
+    console.info = (...args) => diagnosticLines.push(args.join(' '));
+    try {
+      const matchPayload = await buildMatchChannelEmbed(match, null, { guild: env.guild, client: env.client });
+      assert.equal(matchPayload.embeds[0].data.image.url, 'attachment://match-md-30001.png');
+      assert.equal(matchPayload.files[0].name, 'match-md-30001.png');
+      const matchPng = matchPayload.files[0].attachment;
+      assert.ok(Buffer.isBuffer(matchPng));
+      assert.equal(matchPng.readUInt32BE(16), 800);
+      assert.equal(matchPng.readUInt32BE(20), 420);
+      assert.ok(matchPng.length > 1000, 'Rendered card contains more than an empty background');
+      assert.ok(matchPayload.components[0].components.some((button) => button.data.custom_id === 'arena:submit_room:MD-30001'));
+
+      const challenge = await createArenaChallenge({
+        challengeId: 'MD-30002', guildId: env.guild.id, creatorId: playerA.id,
+        status: ARENA_STATUS.OPEN, discordChannelId: 'available',
+        expiresAt: new Date(Date.now() + 20 * 60 * 1000),
+      });
+      const challengePayload = await buildChallengeEmbed(challenge, null, { guild: env.guild, client: env.client });
+      assert.equal(challengePayload.embeds[0].data.image.url, 'attachment://challenge-md-30002.png');
+      assert.ok(Buffer.isBuffer(challengePayload.files[0].attachment));
+      assert.equal(challengePayload.components[0].components.length, 2);
+
+      const allDiagnostics = diagnosticLines.join('\n');
+      assert.match(allDiagnostics, /MD-30001/);
+      assert.match(allDiagnostics, /Discord Alpha/);
+      assert.match(allDiagnostics, /Discord Bravo/);
+      assert.match(allDiagnostics, /ताजAlpha/);
+      assert.match(allDiagnostics, /ताजBravo/);
+      assert.match(allDiagnostics, /51306576278/);
+      assert.match(allDiagnostics, /51306576265/);
+      assert.match(allDiagnostics, /Arena Official/);
+      assert.match(allDiagnostics, /avatar/);
+      assert.doesNotMatch(allDiagnostics, /SECRET_PASSWORD|roomPassword/);
+    } finally {
+      console.info = originalInfo;
+      if (previousDiagnostics === undefined) delete process.env.ARENA_IMAGE_DIAGNOSTICS;
+      else process.env.ARENA_IMAGE_DIAGNOSTICS = previousDiagnostics;
+    }
   });
 });
