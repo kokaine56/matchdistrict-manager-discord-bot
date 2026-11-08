@@ -18,7 +18,7 @@ import {
   createMatchChannel,
   setupArenaChannels,
 } from './arenaChannelService.js';
-import { transitionArenaStatus } from './arenaMatchService.js';
+import { transitionArenaStatus, handleScreenshotTimeout } from './arenaMatchService.js';
 import { handleFileDispute } from './arenaDisputeService.js';
 import { queueMessageEdit, queueChannelSend } from '../../../../../discordQueue.js';
 
@@ -92,6 +92,18 @@ export async function checkArenaLifecycles(client) {
   for (const m of cleanupCandidates) {
     if (m.deleteChannelAt && now >= new Date(m.deleteChannelAt) && m.matchChannelId) {
       await cleanupMatchChannel(client, m);
+    }
+  }
+
+  // 5. Check Screenshot Upload Timeouts (5m in LIVE with pendingWinnerId)
+  const liveMatches = await getArenaMatchesByStatus(ARENA_STATUS.LIVE);
+  for (const m of liveMatches) {
+    if (m.screenshotRequestedAt && m.pendingWinnerId && m.volunteerId) {
+      const elapsedMs = now.getTime() - new Date(m.screenshotRequestedAt).getTime();
+      if (elapsedMs >= 5 * 60 * 1000) {
+        const guild = client.guilds?.cache?.get(m.guildId);
+        await handleScreenshotTimeout(guild, m.matchId, m.volunteerId);
+      }
     }
   }
 }

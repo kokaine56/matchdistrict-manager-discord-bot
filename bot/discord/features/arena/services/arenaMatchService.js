@@ -15,6 +15,48 @@ import {
   queueChannelSend,
   queueMessageEdit,
 } from '../../../../../discordQueue.js';
+import {
+  grantVolunteerScreenshotPermission,
+  revokeVolunteerScreenshotPermission,
+} from './arenaChannelService.js';
+
+const activeScreenshotTimers = new Map();
+
+export function cancelScreenshotTimer(matchId) {
+  if (activeScreenshotTimers.has(matchId)) {
+    clearTimeout(activeScreenshotTimers.get(matchId));
+    activeScreenshotTimers.delete(matchId);
+  }
+}
+
+export async function handleScreenshotTimeout(guild, matchId, volunteerId) {
+  cancelScreenshotTimer(matchId);
+
+  const match = await getArenaMatch(matchId);
+  if (!match || match.status !== ARENA_STATUS.LIVE || !match.pendingWinnerId) {
+    return;
+  }
+
+  // Revoke temporary permissions
+  if (match.matchChannelId && guild) {
+    const channel =
+      guild.channels.cache.get(match.matchChannelId) ||
+      (await guild.channels.fetch(match.matchChannelId).catch(() => null));
+    if (channel) {
+      await revokeVolunteerScreenshotPermission(channel, volunteerId);
+      await queueChannelSend(channel, {
+        content: `⏳ <@${volunteerId}>, your **5-minute screenshot upload window** has expired. Temporary message permissions have been revoked. Please click **Submit Winner** again when you are ready to upload the scoreboard screenshot.`,
+      });
+    }
+  }
+
+  // Clear pending winner fields so volunteer can retry
+  await updateArenaMatch(matchId, {
+    pendingWinnerId: null,
+    pendingLoserId: null,
+    screenshotRequestedAt: null,
+  });
+}
 
 /**
  * Authoritative single status transition engine.
@@ -215,18 +257,34 @@ export async function initiateWinnerSubmission(guild, member, matchId, winnerSid
     screenshotRequestedAt: new Date(),
   });
 
-  // Prompt the volunteer in the match channel to upload the scoreboard screenshot
+  // Prompt the volunteer in the match channel to upload the scoreboard screenshot and temporarily grant permissions
   if (match.matchChannelId) {
     const channel =
       guild.channels.cache.get(match.matchChannelId) ||
       (await guild.channels.fetch(match.matchChannelId).catch(() => null));
     if (channel) {
+      // Temporarily grant Send Messages and Attach Files to the assigned volunteer
+      await grantVolunteerScreenshotPermission(channel, member.id);
+
       await queueChannelSend(channel, {
         content:
           `📸 **Scoreboard Screenshot Required:**\n` +
           `<@${member.id}>, please upload the end-game scoreboard / match result screenshot in this channel within **5 minutes**.\n` +
-          `*The match result verification will begin immediately after the screenshot is attached.*`,
+          `*You have been temporarily granted \`Send Messages\` and \`Attach Files\` permissions for this upload.*`,
       });
+
+      // Start 5-minute timeout timer
+      cancelScreenshotTimer(matchId);
+      const timer = setTimeout(async () => {
+        try {
+          await handleScreenshotTimeout(guild, matchId, member.id);
+        } catch (err) {
+          console.warn(`[Arena] ⚠️ Error in screenshot timeout handler for ${matchId}:`, err.message);
+        }
+      }, 5 * 60 * 1000);
+
+      if (typeof timer.unref === 'function') timer.unref();
+      activeScreenshotTimers.set(matchId, timer);
     }
   }
 
@@ -235,6 +293,19 @@ export async function initiateWinnerSubmission(guild, member, matchId, winnerSid
 
 export async function processWinnerScreenshot(guild, match, volunteerMember, attachmentUrl) {
   if (!guild || !match || !attachmentUrl) throw new Error('Missing arguments');
+
+  // Cancel any active timeout timer
+  cancelScreenshotTimer(match.matchId);
+
+  // Immediately revoke temporary permissions from volunteer in match channel
+  if (match.matchChannelId && volunteerMember?.id) {
+    const channel =
+      guild.channels.cache.get(match.matchChannelId) ||
+      (await guild.channels.fetch(match.matchChannelId).catch(() => null));
+    if (channel) {
+      await revokeVolunteerScreenshotPermission(channel, volunteerMember.id);
+    }
+  }
 
   const config = await getArenaConfig(guild.id);
   let evidenceLink = attachmentUrl;

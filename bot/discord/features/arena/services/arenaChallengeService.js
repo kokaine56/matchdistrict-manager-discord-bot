@@ -121,7 +121,7 @@ export async function handleCreateChallenge(guild, member) {
   });
 
   // Post embed in #available-challenges
-  const payload = buildChallengeEmbed(challenge, player.displayName);
+  const payload = buildChallengeEmbed(challenge, player.displayName, { creatorIgn: player.bgmiIgn });
   const sentMsg = await queueChannelSend(availableChannel, payload);
 
   if (sentMsg?.id) {
@@ -318,7 +318,10 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
     if (ch) {
       const msg = ch.messages?.cache?.get(challenge.discordMessageId) || (await ch.messages?.fetch?.(challenge.discordMessageId).catch(() => null));
       if (msg) {
-        const payload = buildChallengeEmbed(updatedChallenge, creator.displayName);
+        const payload = buildChallengeEmbed(updatedChallenge, creator.displayName, {
+          creatorIgn: creator.bgmiIgn,
+          acceptedOpponent: accepter,
+        });
         await queueMessageEdit(msg, payload).catch(() => {});
       }
     }

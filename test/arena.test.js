@@ -135,7 +135,13 @@ function createMockArenaEnvironment(guildId = 'guild-arena-100') {
       fetch: async (id) => channels.get(id) || null,
       create: async (opts) => {
         const chId = `ch-${opts.name.toLowerCase().replace(/[^a-z0-9_-]/g, '-')}-${channels.size + 1}`;
-        return createMockChannel(chId, opts.name, opts.type || ChannelType.GuildText, opts.parent || null);
+        const ch = createMockChannel(chId, opts.name, opts.type || ChannelType.GuildText, opts.parent || null);
+        if (Array.isArray(opts.permissionOverwrites)) {
+          for (const ow of opts.permissionOverwrites) {
+            ch.permissionOverwrites.cache.set(ow.id, ow);
+          }
+        }
+        return ch;
       },
     },
     roles: {
@@ -906,5 +912,185 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     const resUpdated = await upsertArenaVolunteer('test-op-1', { displayName: 'ChangedName' });
     assert.equal(resUpdated.displayName, 'ChangedName');
     assert.equal(resUpdated.status, 'AVAILABLE');
+  });
+
+  test('15. Private Match Channel Permissions: Default read-only, temporary volunteer screenshot upload & 5m timeout', async () => {
+    const env = createMockArenaEnvironment();
+    const admin = env.addMember('admin-1', 'AdminUser', { isAdmin: true });
+    await handleArenaCommand(env.guild, admin, null, ['setup'], () => {});
+
+    const pA = env.addMember('pA', 'PlayerAlpha');
+    const pB = env.addMember('pB', 'PlayerBravo');
+    const vol = env.addMember('vol-perm', 'VolunteerPerm');
+
+    await upsertArenaPlayer('pA', { displayName: 'PlayerAlpha', bgmiIgn: 'AlphaIgn', bgmiUid: '9101' });
+    await upsertArenaPlayer('pB', { displayName: 'PlayerBravo', bgmiIgn: 'BravoIgn', bgmiUid: '9102' });
+
+    // 1. Create Challenge & Accept
+    const cRes = await handleCreateChallenge(env.guild, pA);
+    const mRes = await handleAcceptChallenge(env.guild, pB, cRes.challenge.challengeId, env.client);
+    const matchId = mRes.match.matchId;
+    const matchChannel = mRes.matchChannel;
+
+    // Check Player A & B default permissions: CANNOT send messages or attach files
+    const pAOverwrites = matchChannel.permissionOverwrites.cache.get('pA');
+    assert.ok(pAOverwrites);
+    assert.ok(pAOverwrites.deny.includes(PermissionFlagsBits.SendMessages));
+    assert.ok(pAOverwrites.deny.includes(PermissionFlagsBits.AttachFiles));
+    assert.ok(pAOverwrites.allow.includes(PermissionFlagsBits.ViewChannel));
+
+    const pBOverwrites = matchChannel.permissionOverwrites.cache.get('pB');
+    assert.ok(pBOverwrites);
+    assert.ok(pBOverwrites.deny.includes(PermissionFlagsBits.SendMessages));
+    assert.ok(pBOverwrites.deny.includes(PermissionFlagsBits.AttachFiles));
+    assert.ok(pBOverwrites.allow.includes(PermissionFlagsBits.ViewChannel));
+
+    // 2. Volunteer claims match -> default permissions CANNOT send messages
+    await handleClaimMatch(env.guild, vol, matchId);
+    const volDefaultOverwrites = matchChannel.permissionOverwrites.cache.get('vol-perm');
+    assert.ok(volDefaultOverwrites);
+    assert.equal(volDefaultOverwrites.SendMessages, false);
+    assert.equal(volDefaultOverwrites.AttachFiles, false);
+    assert.equal(volDefaultOverwrites.ViewChannel, true);
+
+    // 3. Move match to LIVE
+    await submitRoomDetails(env.guild, vol, matchId, 'ROOM99', 'PASS99');
+    await startMatch(env.guild, vol, matchId);
+
+    // 4. Volunteer initiates winner submission -> gets TEMPORARY SendMessages & AttachFiles
+    const initRes = await initiateWinnerSubmission(env.guild, vol, matchId, 'A');
+    assert.equal(initRes.ok, true);
+
+    const volTempOverwrites = matchChannel.permissionOverwrites.cache.get('vol-perm');
+    assert.equal(volTempOverwrites.SendMessages, true, 'Volunteer should be granted SendMessages temporarily');
+    assert.equal(volTempOverwrites.AttachFiles, true, 'Volunteer should be granted AttachFiles temporarily');
+
+    // 5. Volunteer uploads screenshot -> permissions IMMEDIATELY revoked & evidence copied
+    const { processWinnerScreenshot } = await import('../bot/discord/features/arena/services/arenaMatchService.js');
+    const liveMatch = await getArenaMatch(matchId);
+    await processWinnerScreenshot(env.guild, liveMatch, vol, 'https://cdn.discordapp.com/arena-proof.png');
+
+    const volRevokedOverwrites = matchChannel.permissionOverwrites.cache.get('vol-perm');
+    assert.equal(volRevokedOverwrites.SendMessages, false, 'Volunteer SendMessages should be revoked immediately after upload');
+    assert.equal(volRevokedOverwrites.AttachFiles, false, 'Volunteer AttachFiles should be revoked immediately after upload');
+
+    const config = await getArenaConfig(env.guild.id);
+    const evidenceChannel = env.channels.get(config.evidenceChannelId);
+    assert.ok(evidenceChannel.messages.cache.size > 0, 'Evidence screenshot must be copied to #arena-evidence');
+
+    // 6. Test 5-minute timeout flow on a second match with another volunteer
+    const pC = env.addMember('pC', 'PlayerCharlie');
+    const pD = env.addMember('pD', 'PlayerDelta');
+    const vol2 = env.addMember('vol-2', 'VolunteerTwo');
+    await upsertArenaPlayer('pC', { displayName: 'PlayerCharlie', bgmiIgn: 'CharlieIgn', bgmiUid: '9103' });
+    await upsertArenaPlayer('pD', { displayName: 'PlayerDelta', bgmiIgn: 'DeltaIgn', bgmiUid: '9104' });
+
+    const c2 = await handleCreateChallenge(env.guild, pC);
+    const m2 = await handleAcceptChallenge(env.guild, pD, c2.challenge.challengeId, env.client);
+    const mId2 = m2.match.matchId;
+    const ch2 = m2.matchChannel;
+
+    const claim2 = await handleClaimMatch(env.guild, vol2, mId2);
+    assert.equal(claim2.ok, true);
+    await submitRoomDetails(env.guild, vol2, mId2, 'R2', 'P2');
+    await startMatch(env.guild, vol2, mId2);
+
+    await initiateWinnerSubmission(env.guild, vol2, mId2, 'B');
+    assert.equal(ch2.permissionOverwrites.cache.get('vol-2').SendMessages, true);
+
+    // Fast forward / trigger timeout
+    const { handleScreenshotTimeout } = await import('../bot/discord/features/arena/services/arenaMatchService.js');
+    await handleScreenshotTimeout(env.guild, mId2, 'vol-2');
+
+    assert.equal(ch2.permissionOverwrites.cache.get('vol-2').SendMessages, false, 'Timeout must revoke SendMessages');
+    assert.equal(ch2.permissionOverwrites.cache.get('vol-2').AttachFiles, false, 'Timeout must revoke AttachFiles');
+
+    const timedOutMatch = await getArenaMatch(mId2);
+    assert.equal(timedOutMatch.pendingWinnerId, null, 'Timeout should clear pendingWinnerId to allow retry');
+  });
+
+  test('16. Dynamic Image-Based Match Cards & Challenge Cards: PNG generation, visual layout & button integration', async () => {
+    const {
+      generateMatchCardPng,
+      generateChallengeCardPng,
+      encodePngRgba,
+    } = await import('../bot/discord/features/arena/services/arenaImageService.js');
+    const {
+      buildMatchChannelEmbed,
+      buildChallengeEmbed,
+    } = await import('../bot/discord/features/arena/services/arenaNotificationService.js');
+
+    const sampleMatch = {
+      matchId: 'MD-10001',
+      status: ARENA_STATUS.LIVE,
+      playerA: { discordId: 'pA', displayName: 'AlphaPro', bgmiIgn: 'AlphaKing', bgmiUid: '1111' },
+      playerB: { discordId: 'pB', displayName: 'BravoElite', bgmiIgn: 'BravoGod', bgmiUid: '2222' },
+      volunteerId: 'vol-1',
+      roomId: 'SECRET_ROOM_ID',
+      roomPassword: 'SECRET_PASSWORD',
+    };
+
+    // 1. Generate Match Card PNG
+    const matchPng = generateMatchCardPng(sampleMatch, { volunteerDisplayName: 'OfficialVol' });
+    assert.ok(Buffer.isBuffer(matchPng));
+    // Verify standard PNG signature
+    assert.equal(matchPng[0], 0x89);
+    assert.equal(matchPng[1], 0x50); // P
+    assert.equal(matchPng[2], 0x4e); // N
+    assert.equal(matchPng[3], 0x47); // G
+    // Verify width 800, height 420 in IHDR chunk
+    assert.equal(matchPng.readUInt32BE(16), 800, 'Match card width should be 800');
+    assert.equal(matchPng.readUInt32BE(20), 420, 'Match card height should be 420');
+
+    // 2. Build Match Channel Payload
+    const matchPayload = buildMatchChannelEmbed(sampleMatch, 'OfficialVol');
+    assert.ok(matchPayload.files && matchPayload.files.length === 1, 'Match payload must include the generated image card as a file attachment');
+    assert.equal(matchPayload.files[0].name, 'match-md-10001.png');
+    assert.ok(matchPayload.embeds && matchPayload.embeds.length === 1);
+    assert.equal(matchPayload.embeds[0].data.image.url, 'attachment://match-md-10001.png');
+
+    // Verify live buttons (Submit Winner)
+    assert.ok(matchPayload.components.length > 0);
+    const buttonRow = matchPayload.components[0];
+    const customIds = buttonRow.components.map((c) => c.data.custom_id);
+    assert.ok(customIds.includes('arena:submit_winner:MD-10001'));
+
+    // 3. Challenge Card PNG (OPEN)
+    const sampleChallenge = {
+      challengeId: 'MD-10001',
+      creatorId: 'pA',
+      status: ARENA_STATUS.OPEN,
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + 600000),
+    };
+    const challengeOpenPayload = buildChallengeEmbed(sampleChallenge, 'AlphaPro', { creatorIgn: 'AlphaKing' });
+    assert.ok(challengeOpenPayload.files && challengeOpenPayload.files.length === 1);
+    assert.equal(challengeOpenPayload.files[0].name, 'challenge-md-10001.png');
+    assert.equal(challengeOpenPayload.components.length, 1, 'OPEN challenge must have action buttons');
+    const challengeBtnIds = challengeOpenPayload.components[0].components.map((c) => c.data.custom_id);
+    assert.ok(challengeBtnIds.includes('arena:accept_challenge:MD-10001'));
+    assert.ok(challengeBtnIds.includes('arena:cancel_challenge:MD-10001'));
+
+    // 4. Challenge Card PNG (ACCEPTED) -> updates image and removes buttons
+    const acceptedChallenge = { ...sampleChallenge, status: ARENA_STATUS.WAITING_FOR_VOLUNTEER };
+    const acceptedPayload = buildChallengeEmbed(acceptedChallenge, 'AlphaPro', {
+      creatorIgn: 'AlphaKing',
+      acceptedOpponent: { discordId: 'pB', displayName: 'BravoElite', bgmiIgn: 'BravoGod' },
+    });
+    assert.ok(acceptedPayload.files && acceptedPayload.files.length === 1);
+    assert.equal(acceptedPayload.components.length, 0, 'ACCEPTED challenge must not have action buttons');
+
+    // 5. Challenge Card PNG (CANCELLED / EXPIRED) -> removes buttons
+    const cancelledChallenge = { ...sampleChallenge, status: ARENA_STATUS.CANCELLED };
+    const cancelledPayload = buildChallengeEmbed(cancelledChallenge, 'AlphaPro');
+    assert.equal(cancelledPayload.components.length, 0, 'CANCELLED challenge must not have buttons');
+
+    // 6. Test with a custom 32x32 PNG avatar to verify circular avatar blending
+    const dummyAvatarRgba = Buffer.alloc(32 * 32 * 4, 180);
+    const dummyAvatarPng = encodePngRgba(32, 32, dummyAvatarRgba);
+    const avatarsMap = new Map([['pA', dummyAvatarPng]]);
+    const matchWithAvatarPng = generateMatchCardPng(sampleMatch, { avatars: avatarsMap });
+    assert.ok(Buffer.isBuffer(matchWithAvatarPng));
+    assert.equal(matchWithAvatarPng[0], 0x89);
   });
 });

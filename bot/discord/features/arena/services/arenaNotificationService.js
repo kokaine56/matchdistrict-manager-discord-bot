@@ -3,8 +3,13 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  AttachmentBuilder,
 } from 'discord.js';
 import { ARENA_CONSTANTS, ARENA_STATUS } from '../models/arenaModels.js';
+import {
+  generateMatchCardPng,
+  generateChallengeCardPng,
+} from './arenaImageService.js';
 import { queueDirectMessage, queueChannelSend } from '../../../../../discordQueue.js';
 
 export function buildCreateChallengePanel() {
@@ -32,48 +37,36 @@ export function buildCreateChallengePanel() {
   return { embeds: [embed], components: [row] };
 }
 
-export function buildChallengeEmbed(challenge, creatorDisplayName) {
-  const isExpired = challenge.status === ARENA_STATUS.EXPIRED;
-  const isCancelled = challenge.status === ARENA_STATUS.CANCELLED;
-  const isAccepted = challenge.status !== ARENA_STATUS.OPEN && !isExpired && !isCancelled;
+export function buildChallengeEmbed(challenge, creatorDisplayName = null, options = {}) {
+  const pngBuffer = generateChallengeCardPng(challenge, {
+    creatorDisplayName,
+    creatorIgn: options.creatorIgn || null,
+    avatars: options.avatars || new Map(),
+    acceptedOpponent: options.acceptedOpponent || null,
+  });
 
-  const statusLabel = isExpired
-    ? 'EXPIRED'
-    : isCancelled
-      ? 'CANCELLED'
-      : isAccepted
-        ? 'ACCEPTED'
-        : 'OPEN';
-
+  const filename = `challenge-${String(challenge.challengeId).toLowerCase()}.png`;
+  const attachment = new AttachmentBuilder(pngBuffer, { name: filename });
   const embed = new EmbedBuilder()
-    .setTitle(`Challenge ${challenge.challengeId}`)
     .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
-    .addFields(
-      { name: 'Challenger', value: creatorDisplayName || `<@${challenge.creatorId}>`, inline: true },
-      { name: 'Game', value: challenge.game || 'BGMI', inline: true },
-      { name: 'Match', value: challenge.matchType || 'TDM 1v1', inline: true },
-      { name: 'Status', value: `\`${statusLabel}\``, inline: true },
-      { name: 'Created', value: `<t:${Math.floor(new Date(challenge.createdAt).getTime() / 1000)}:R>`, inline: true },
-      { name: 'Expires', value: `<t:${Math.floor(new Date(challenge.expiresAt).getTime() / 1000)}:R>`, inline: true }
-    )
-    .setFooter({ text: 'Match District Arena' });
+    .setImage(`attachment://${filename}`);
 
-  if (challenge.status !== ARENA_STATUS.OPEN) {
-    return { embeds: [embed], components: [] };
+  const components = [];
+  if (challenge.status === ARENA_STATUS.OPEN) {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`arena:accept_challenge:${challenge.challengeId}`)
+        .setLabel('Accept Challenge')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`arena:cancel_challenge:${challenge.challengeId}`)
+        .setLabel('Cancel')
+        .setStyle(ButtonStyle.Danger)
+    );
+    components.push(row);
   }
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`arena:accept_challenge:${challenge.challengeId}`)
-      .setLabel('Accept Challenge')
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(`arena:cancel_challenge:${challenge.challengeId}`)
-      .setLabel('Cancel')
-      .setStyle(ButtonStyle.Danger)
-  );
-
-  return { embeds: [embed], components: [row] };
+  return { embeds: [embed], files: [attachment], components };
 }
 
 export function buildVolunteerPanelEmbed(match, volunteerDisplayName = null) {
@@ -111,36 +104,17 @@ export function buildVolunteerPanelEmbed(match, volunteerDisplayName = null) {
   return { embeds: [embed], components: [row] };
 }
 
-export function buildMatchChannelEmbed(match, volunteerDisplayName = null) {
+export function buildMatchChannelEmbed(match, volunteerDisplayName = null, options = {}) {
+  const pngBuffer = generateMatchCardPng(match, {
+    volunteerDisplayName,
+    avatars: options.avatars || new Map(),
+  });
+
+  const filename = `match-${String(match.matchId).toLowerCase()}.png`;
+  const attachment = new AttachmentBuilder(pngBuffer, { name: filename });
   const embed = new EmbedBuilder()
-    .setTitle(`1v1 Match: ${match.matchId}`)
     .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
-    .setDescription(
-      `**Status:** \`${match.status}\`\n` +
-      `**Volunteer:** ${match.volunteerId ? volunteerDisplayName || `<@${match.volunteerId}>` : '*Waiting for volunteer...*'}`
-    )
-    .addFields(
-      {
-        name: `Player A: ${match.playerA.displayName}`,
-        value: `• **IGN:** ${match.playerA.bgmiIgn}\n• **UID:** \`${match.playerA.bgmiUid}\`\n• **Mention:** <@${match.playerA.discordId}>`,
-        inline: true,
-      },
-      {
-        name: `Player B: ${match.playerB.displayName}`,
-        value: `• **IGN:** ${match.playerB.bgmiIgn}\n• **UID:** \`${match.playerB.bgmiUid}\`\n• **Mention:** <@${match.playerB.discordId}>`,
-        inline: true,
-      }
-    );
-
-  if (match.roomId && match.roomPassword) {
-    embed.addFields({
-      name: 'Room Credentials',
-      value: `• **Room ID:** \`${match.roomId}\`\n• **Password:** \`${match.roomPassword}\``,
-      inline: false,
-    });
-  }
-
-  embed.setFooter({ text: 'Use buttons below to officiate this match' });
+    .setImage(`attachment://${filename}`);
 
   // Volunteer Controls
   const buttons = [];
@@ -185,7 +159,7 @@ export function buildMatchChannelEmbed(match, volunteerDisplayName = null) {
   }
 
   const components = buttons.length ? [new ActionRowBuilder().addComponents(buttons)] : [];
-  return { embeds: [embed], components };
+  return { embeds: [embed], files: [attachment], components };
 }
 
 export function buildResultVerificationPayload(match, winnerPlayer, evidenceUrl = null) {

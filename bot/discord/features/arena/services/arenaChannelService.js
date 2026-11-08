@@ -299,32 +299,37 @@ export async function createMatchChannel(guild, match, config) {
       id: match.playerA.discordId,
       allow: [
         PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ReadMessageHistory,
+      ],
+      deny: [
         PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.AttachFiles,
-        PermissionFlagsBits.ReadMessageHistory,
       ],
     },
     {
       id: match.playerB.discordId,
       allow: [
         PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ReadMessageHistory,
+      ],
+      deny: [
         PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.AttachFiles,
-        PermissionFlagsBits.ReadMessageHistory,
       ],
     },
   ];
 
-  // If volunteer is already assigned (e.g. during recovery), add permissions
+  // If volunteer is already assigned (e.g. during recovery), add permissions (read-only by default)
   if (match.volunteerId) {
     permissionOverwrites.push({
       id: match.volunteerId,
       allow: [
         PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ReadMessageHistory,
+      ],
+      deny: [
         PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.AttachFiles,
-        PermissionFlagsBits.ManageMessages,
-        PermissionFlagsBits.ReadMessageHistory,
       ],
     });
   }
@@ -344,12 +349,39 @@ export async function addVolunteerToMatchChannel(channel, volunteerId) {
   if (typeof channel.permissionOverwrites?.edit === 'function') {
     await channel.permissionOverwrites.edit(volunteerId, {
       ViewChannel: true,
-      SendMessages: true,
-      AttachFiles: true,
-      ManageMessages: true,
       ReadMessageHistory: true,
+      SendMessages: false,
+      AttachFiles: false,
     }).catch((err) => {
       console.warn(`[Arena] ⚠️ Failed to add volunteer ${volunteerId} to channel ${channel.id}:`, err.message);
+    });
+  }
+}
+
+export async function grantVolunteerScreenshotPermission(channel, volunteerId) {
+  if (!channel || !volunteerId) return;
+  if (typeof channel.permissionOverwrites?.edit === 'function') {
+    await channel.permissionOverwrites.edit(volunteerId, {
+      ViewChannel: true,
+      ReadMessageHistory: true,
+      SendMessages: true,
+      AttachFiles: true,
+    }).catch((err) => {
+      console.warn(`[Arena] ⚠️ Failed to grant screenshot permission to volunteer ${volunteerId}:`, err.message);
+    });
+  }
+}
+
+export async function revokeVolunteerScreenshotPermission(channel, volunteerId) {
+  if (!channel || !volunteerId) return;
+  if (typeof channel.permissionOverwrites?.edit === 'function') {
+    await channel.permissionOverwrites.edit(volunteerId, {
+      ViewChannel: true,
+      ReadMessageHistory: true,
+      SendMessages: false,
+      AttachFiles: false,
+    }).catch((err) => {
+      console.warn(`[Arena] ⚠️ Failed to revoke screenshot permission from volunteer ${volunteerId}:`, err.message);
     });
   }
 }
