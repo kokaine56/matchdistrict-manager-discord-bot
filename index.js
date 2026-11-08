@@ -208,6 +208,10 @@ import {
   processWinnerScreenshot,
   handleArenaScreenshotUpload,
 } from './bot/discord/features/arena/index.js';
+import {
+  handleRemoveThreadsCommand,
+  isThreadAdmin,
+} from './threadManagementService.js';
 
 
 export {
@@ -331,6 +335,8 @@ export {
   logMessageEdited,
   logMessageDeleted,
   logTournamentAction,
+  handleRemoveThreadsCommand,
+  isThreadAdmin,
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1195,7 +1201,8 @@ export function getHelpResponse(prefix = PREFIX) {
     `• \`${prefix}unmute <@user|id>\` — *(Mod Only)* Remove timeout from a user\n` +
     `• \`${prefix}unban <@user|id>\` — *(Mod Only)* Unban a user from the server\n` +
     `• \`${prefix}ticket setup\` / \`${prefix}ticket delete\` — *(Admin Only)* Manage the support ticket service\n` +
-    `• \`${prefix}annc setup\` — *(Admin Only)* Setup private announcement DM dispatch channel\n\n` +
+    `• \`${prefix}annc setup\` — *(Admin Only)* Setup private announcement DM dispatch channel\n` +
+    `• \`${prefix}remove threads\` — *(Admin Only)* Disable thread creation permissions in this channel\n\n` +
     `**🏆 Tournament & Organiser Management:**\n` +
     `• \`${prefix}organiser\` — *(Admin Only)* Connect this Discord server to your MatchDistrict organiser account\n` +
     `• \`${prefix}organiser unlink\` — *(Admin Only)* Disconnect this Discord server from the organiser account\n` +
@@ -3244,6 +3251,22 @@ client.on(Events.MessageCreate, async (message) => {
           client,
           message
         );
+        return;
+      } else if (cmd === 'remove' || cmd === 'removethreads') {
+        const sub = (args[0] || '').toLowerCase();
+        if (cmd === 'removethreads' || sub === 'threads' || sub === 'thread') {
+          await handleRemoveThreadsCommand(
+            message.guild,
+            message.member,
+            message.channel,
+            args,
+            (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+            client,
+            message
+          );
+          return;
+        }
+        await message.reply(`ℹ️ **Usage:** \`${PREFIX}remove threads\` — Disable thread creation permissions in this channel.`);
         return;
       }
     }
