@@ -12,7 +12,11 @@ import {
   logArenaAction,
 } from '../models/arenaModels.js';
 import { transitionArenaStatus } from './arenaMatchService.js';
-import { buildCompletedMatchResultEmbed, refreshArenaMatchCards } from './arenaNotificationService.js';
+import {
+  buildCompletedMatchResultEmbed,
+  buildCompletedMatchResultPayload,
+  refreshArenaMatchCards,
+} from './arenaNotificationService.js';
 import { queueChannelSend, queueMessageEdit } from '../../../../../discordQueue.js';
 
 export async function handlePlayerConfirmation(guild, member, matchId) {
@@ -137,24 +141,39 @@ export async function completeArenaMatch(
   const loserObj =
     match.playerA.discordId === effectiveWinnerId ? match.playerB : match.playerA;
 
-  // 4. Post verified announcement in #match-results
+  // 4. Post verified announcement in #match-results (Image Card + Embed)
   const config = await getArenaConfig(guild.id);
   if (config?.matchResultsId) {
     const resultsChannel =
       guild.channels.cache.get(config.matchResultsId) ||
       (await guild.channels.fetch(config.matchResultsId).catch(() => null));
     if (resultsChannel) {
-      const resultEmbed = buildCompletedMatchResultEmbed(
-        completedMatch,
-        winnerObj,
-        loserObj,
-        volunteerName
-      );
-      await queueChannelSend(resultsChannel, { embeds: [resultEmbed] });
+      try {
+        const resultPayload = await buildCompletedMatchResultPayload(
+          completedMatch,
+          winnerObj,
+          loserObj,
+          volunteerName,
+          { guild, client: guild.client }
+        );
+        await queueChannelSend(resultsChannel, resultPayload);
+      } catch (err) {
+        console.warn('[Arena] ⚠️ Failed to send image result card, falling back to embed:', err.message);
+        const resultEmbed = buildCompletedMatchResultEmbed(
+          completedMatch,
+          winnerObj,
+          loserObj,
+          volunteerName
+        );
+        await queueChannelSend(resultsChannel, { embeds: [resultEmbed] });
+      }
     }
   }
 
   // 5. Post in match channel that match is completed and channel will be deleted in 60m
+  const winnerIgn = winnerObj.bgmiIgn || winnerObj.displayName;
+  const loserIgn = loserObj.bgmiIgn || loserObj.displayName;
+
   if (match.matchChannelId) {
     const channel =
       guild.channels.cache.get(match.matchChannelId) ||
@@ -163,9 +182,20 @@ export async function completeArenaMatch(
       await queueChannelSend(channel, {
         content:
           `🏁 **MATCH COMPLETED & VERIFIED!**\n` +
-          `• **Winner:** <@${effectiveWinnerId}> (${winnerObj.displayName})\n` +
-          `• **Opponent:** <@${effectiveLoserId}> (${loserObj.displayName})\n\n` +
-          `*Both players have been released to create or accept new challenges. This channel will automatically be deleted in 60 minutes.*`,
+          `• **Winner:** **${winnerIgn}** (<@${effectiveWinnerId}>)\n` +
+          `• **Defeated:** **${loserIgn}** (<@${effectiveLoserId}>)\n\n` +
+          `*Both players have been released to create or accept new challenges. Match channels will automatically be deleted in 60 minutes.*`,
+      });
+    }
+  }
+
+  if (match.roomChannelId) {
+    const rChannel =
+      guild.channels.cache.get(match.roomChannelId) ||
+      (await guild.channels.fetch(match.roomChannelId).catch(() => null));
+    if (rChannel) {
+      await queueChannelSend(rChannel, {
+        content: `🏁 **Match Completed!** Result verified: Winner is **${winnerIgn}**. This channel will be deleted shortly.`,
       });
     }
   }

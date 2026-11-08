@@ -3,12 +3,15 @@ import {
   TextInputBuilder,
   TextInputStyle,
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } from 'discord.js';
 import {
   getArenaPlayer,
   getArenaPlayerByUid,
   upsertArenaPlayer,
   getArenaMatch,
+  ARENA_STATUS,
 } from '../models/arenaModels.js';
 import {
   handleCreateChallenge,
@@ -18,12 +21,14 @@ import {
 } from '../services/arenaChallengeService.js';
 import {
   handleClaimMatch,
+  handleLeaveMatch,
   handleReleaseMatch,
 } from '../services/arenaVolunteerService.js';
 import {
   submitRoomDetails,
   startMatch,
   initiateWinnerSubmission,
+  handleReportRoomCredentials,
 } from '../services/arenaMatchService.js';
 import {
   handlePlayerConfirmation,
@@ -176,16 +181,139 @@ export async function handleArenaInteraction(interaction) {
       });
     }
 
-    // 7. Button: Volunteer Release Match
+    // 7. Button: Room Maker Leave Match (with Confirmation)
+    if (interaction.isButton() && customId.startsWith('arena:leave_match:')) {
+      const matchId = customId.split(':')[2];
+      const match = await getArenaMatch(matchId);
+      if (!match) return interaction.reply({ content: '❌ Match not found.', ephemeral: true });
+      if (match.volunteerId !== interaction.user.id) {
+        return interaction.reply({ content: '❌ You are not the assigned Room Maker for this match.', ephemeral: true });
+      }
+      if (match.status === ARENA_STATUS.LIVE) {
+        return interaction.reply({
+          content: '❌ Cannot leave a match that is already LIVE. Contact an administrator to reassign live matches.',
+          ephemeral: true,
+        });
+      }
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`arena:confirm_leave:${matchId}`)
+          .setLabel('Confirm Leave Match')
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId(`arena:cancel_leave:${matchId}`)
+          .setLabel('Cancel')
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+      return interaction.reply({
+        content:
+          `⚠️ **Leave Match Confirmation:** Are you sure you want to leave match **${matchId}**?\n` +
+          `• Your channel access will be revoked.\n` +
+          `• Any submitted room credentials will be cleared.\n` +
+          `• The match will be returned to the Room Maker queue.`,
+        components: [row],
+        ephemeral: true,
+      });
+    }
+
+    if (interaction.isButton() && customId.startsWith('arena:confirm_leave:')) {
+      const matchId = customId.split(':')[2];
+      await interaction.deferReply({ ephemeral: true });
+      const res = await handleLeaveMatch(interaction.guild, interaction.member, matchId);
+      if (!res.ok) {
+        return interaction.editReply({ content: res.error || '❌ Could not leave match.' });
+      }
+      return interaction.editReply({
+        content: `✅ **Match Left:** You have left match **${matchId}**. It has been returned to the Room Maker queue.`,
+      });
+    }
+
+    if (interaction.isButton() && customId.startsWith('arena:cancel_leave:')) {
+      return interaction.update({
+        content: 'Action cancelled. You remain the assigned Room Maker.',
+        components: [],
+      });
+    }
+
+    // Legacy Button: Volunteer Release Match
     if (interaction.isButton() && customId.startsWith('arena:release_match:')) {
       const matchId = customId.split(':')[2];
       await interaction.deferReply({ ephemeral: true });
-      const res = await handleReleaseMatch(interaction.guild, interaction.member, matchId);
+      const res = await handleLeaveMatch(interaction.guild, interaction.member, matchId);
       if (!res.ok) {
         return interaction.editReply({ content: res.error || '❌ Could not release match.' });
       }
       return interaction.editReply({
-        content: `ℹ️ **Match Released:** Match **${matchId}** has been returned to the volunteer queue.`,
+        content: `ℹ️ **Match Left:** Match **${matchId}** has been returned to the Room Maker queue.`,
+      });
+    }
+
+    // 7b. Button: Report Incorrect Room ID/Password
+    if (interaction.isButton() && customId.startsWith('arena:report_room_issue:')) {
+      const matchId = customId.split(':')[2];
+      const match = await getArenaMatch(matchId);
+      if (!match) return interaction.reply({ content: '❌ Match not found.', ephemeral: true });
+
+      const isPlayerA = match.playerA.discordId === interaction.user.id;
+      const isPlayerB = match.playerB.discordId === interaction.user.id;
+      if (!isPlayerA && !isPlayerB) {
+        return interaction.reply({
+          content: '❌ Only Player A or Player B can report incorrect room credentials.',
+          ephemeral: true,
+        });
+      }
+
+      if (match.status === ARENA_STATUS.LIVE) {
+        return interaction.reply({
+          content: '❌ Match is already LIVE. Cannot report credentials after start.',
+          ephemeral: true,
+        });
+      }
+
+      const modal = new ModalBuilder()
+        .setCustomId(`arena:modal_report_room:${matchId}`)
+        .setTitle(`Report Room Credentials Issue`);
+
+      const issueInput = new TextInputBuilder()
+        .setCustomId('issue_type')
+        .setLabel("Issue: 'ROOM_ID', 'PASSWORD', or 'BOTH'")
+        .setStyle(TextInputStyle.Short)
+        .setValue('BOTH')
+        .setMaxLength(20)
+        .setRequired(true);
+
+      const notesInput = new TextInputBuilder()
+        .setCustomId('issue_notes')
+        .setLabel('Problem Details (Optional)')
+        .setStyle(TextInputStyle.Paragraph)
+        .setPlaceholder('Describe what happened when attempting to join with these credentials...')
+        .setRequired(false);
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(issueInput),
+        new ActionRowBuilder().addComponents(notesInput)
+      );
+
+      return interaction.showModal(modal);
+    }
+
+    // 7c. Modal Submit: Report Room Issue
+    if (interaction.isModalSubmit() && customId.startsWith('arena:modal_report_room:')) {
+      const matchId = customId.split(':')[2];
+      const rawType = (interaction.fields.getTextInputValue('issue_type') || '').trim().toUpperCase();
+      let issueType = 'BOTH';
+      if (rawType.includes('ID') || rawType === 'ROOM_ID') issueType = 'ROOM_ID';
+      else if (rawType.includes('PASS') || rawType === 'PASSWORD') issueType = 'PASSWORD';
+
+      await interaction.deferReply({ ephemeral: true });
+      const res = await handleReportRoomCredentials(interaction.guild, interaction.member, matchId, issueType);
+      if (!res.ok) {
+        return interaction.editReply({ content: res.error || '❌ Could not report credential issue.' });
+      }
+      return interaction.editReply({
+        content: `⚠️ **Report Submitted:** You reported that the **${issueType}** is incorrect. The Room Maker has been notified to provide corrected credentials.`,
       });
     }
 

@@ -132,14 +132,14 @@ async function sendVolunteerWarning(client, match) {
 
   const config = await getArenaConfig(guild.id);
 
-  // Announce in public #volunteer-panel
+  // Announce in public #volunteer-panel (Room Maker Panel)
   if (config?.volunteerPanelId) {
     const volPanel =
       guild.channels.cache.get(config.volunteerPanelId) ||
       (await guild.channels.fetch(config.volunteerPanelId).catch(() => null));
     if (volPanel) {
       await queueChannelSend(volPanel, {
-        content: `⚠️ **Match ${match.matchId}** has been waiting for a volunteer for **15 minutes**! Any member can click **Accept Match** to officiate.`,
+        content: `⚠️ **Match ${match.matchId}** has been waiting for a Room Maker for **15 minutes**! Any member can click **Accept Match** to officiate.`,
       });
     }
   }
@@ -151,7 +151,7 @@ async function sendVolunteerWarning(client, match) {
       (await guild.channels.fetch(match.matchChannelId).catch(() => null));
     if (channel) {
       await queueChannelSend(channel, {
-        content: `⏳ A reminder has been posted in the volunteer panel. Thank you for your patience while a member claims your match.`,
+        content: `⏳ A reminder has been posted in the Room Maker panel. Thank you for your patience while a member claims your match.`,
       });
     }
   }
@@ -161,7 +161,7 @@ async function expireWaitingMatch(client, match) {
   // Transition status to EXPIRED
   await transitionArenaStatus(match.matchId, ARENA_STATUS.EXPIRED, {
     performedBy: 'arena_scheduler',
-    metadata: { reason: 'Volunteer claim timeout (45 minutes)' },
+    metadata: { reason: 'Room Maker claim timeout (45 minutes)' },
   });
 
   // Free both players
@@ -172,7 +172,7 @@ async function expireWaitingMatch(client, match) {
   if (guild) {
     const config = await getArenaConfig(guild.id);
 
-    // Update volunteer panel message (remove button)
+    // Update Room Maker panel message (remove button)
     if (config?.volunteerPanelId && match.panelMessageId) {
       const volPanel =
         guild.channels.cache.get(config.volunteerPanelId) ||
@@ -188,9 +188,12 @@ async function expireWaitingMatch(client, match) {
       }
     }
 
-    // Delete match channel
+    // Delete match channel and room channel
     if (match.matchChannelId) {
       await deleteMatchChannel(guild, match.matchChannelId);
+    }
+    if (match.roomChannelId) {
+      await deleteMatchChannel(guild, match.roomChannelId);
     }
   }
 
@@ -215,10 +218,16 @@ async function handleResultTimeout(client, match) {
 
 async function cleanupMatchChannel(client, match) {
   const guild = client.guilds?.cache?.get(match.guildId);
-  if (guild && match.matchChannelId) {
-    await deleteMatchChannel(guild, match.matchChannelId);
+  if (guild) {
+    if (match.matchChannelId) {
+      await deleteMatchChannel(guild, match.matchChannelId);
+    }
+    if (match.roomChannelId) {
+      await deleteMatchChannel(guild, match.roomChannelId);
+    }
     await updateArenaMatch(match.matchId, {
       matchChannelId: null,
+      roomChannelId: null,
       deleteChannelAt: null,
     });
   }

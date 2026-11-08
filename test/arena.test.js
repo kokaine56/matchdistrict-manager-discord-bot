@@ -1394,4 +1394,260 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(card.readUInt32BE(16), 800);
     assert.equal(card.readUInt32BE(20), 420);
   });
+
+  test('21. Room Maker can leave match after submitting room details (ROOM_READY & ROOM_ISSUE), atomic & safe against double clicks', async () => {
+    const env = createMockArenaEnvironment();
+    const admin = env.addMember('admin-rm-leave', 'AdminRm', { permissions: ['Administrator'] });
+    await setupArenaChannels(env.guild, admin);
+
+    const rm = env.addMember('rm-leave-user', 'RoomMakerLeave');
+    const pA = env.addMember('rm-pa', 'PlayerA');
+    const pB = env.addMember('rm-pb', 'PlayerB');
+
+    await upsertArenaPlayer(pA.id, { displayName: 'PlayerA', bgmiIgn: 'ताजKOKAINE', bgmiUid: '7770001111' });
+    await upsertArenaPlayer(pB.id, { displayName: 'PlayerB', bgmiIgn: 'ताजJESP', bgmiUid: '7770002222' });
+
+    const { handleCreateChallenge, handleAcceptChallenge } = await import('../bot/discord/features/arena/services/arenaChallengeService.js');
+    const { handleClaimMatch, handleLeaveMatch, handleReleaseMatch } = await import('../bot/discord/features/arena/services/arenaVolunteerService.js');
+    const { submitRoomDetails, startMatch } = await import('../bot/discord/features/arena/services/arenaMatchService.js');
+
+    const cRes = await handleCreateChallenge(env.guild, pA);
+    const mRes = await handleAcceptChallenge(env.guild, pB, cRes.challenge.challengeId, env.client);
+    const matchId = mRes.match.matchId;
+
+    // 1. Claim match as Room Maker
+    const claimRes = await handleClaimMatch(env.guild, rm, matchId);
+    assert.ok(claimRes.ok);
+
+    const rmProfileAfterClaim = await getArenaVolunteer(rm.id);
+    assert.equal(rmProfileAfterClaim.activeMatches, 1);
+
+    // 2. Submit Room details -> moves to ROOM_READY
+    const roomRes = await submitRoomDetails(env.guild, rm, matchId, '987654321', 'roompass123');
+    assert.ok(roomRes.ok);
+    assert.equal(roomRes.match.status, ARENA_STATUS.ROOM_READY);
+    assert.equal(roomRes.match.roomId, '987654321');
+
+    // 3. Room Maker leaves match after submitting credentials
+    const leaveRes = await handleLeaveMatch(env.guild, rm, matchId);
+    assert.ok(leaveRes.ok, 'Room Maker must be able to leave after submitting room details');
+    assert.equal(leaveRes.match.status, ARENA_STATUS.WAITING_FOR_VOLUNTEER);
+    assert.equal(leaveRes.match.volunteerId, null);
+    assert.equal(leaveRes.match.roomId, null, 'Credentials must be cleared when Room Maker leaves');
+    assert.equal(leaveRes.match.roomPassword, null, 'Credentials must be cleared when Room Maker leaves');
+
+    // 4. Active matches decremented
+    const rmProfileAfterLeave = await getArenaVolunteer(rm.id);
+    assert.equal(rmProfileAfterLeave.activeMatches, 0);
+
+    // 5. Concurrent / second leave call is rejected (protected against double clicks)
+    const doubleLeaveRes = await handleLeaveMatch(env.guild, rm, matchId);
+    assert.equal(doubleLeaveRes.ok, false);
+
+    // 6. Another Room Maker can now claim the match
+    const rm2 = env.addMember('rm2-user', 'RoomMaker2');
+    const claim2 = await handleClaimMatch(env.guild, rm2, matchId);
+    assert.ok(claim2.ok);
+
+    // 7. Submit room details, start match to LIVE -> Room Maker cannot leave a LIVE match
+    await submitRoomDetails(env.guild, rm2, matchId, '111222333', 'pass456');
+    const startRes = await startMatch(env.guild, rm2, matchId);
+    assert.ok(startRes.ok);
+    assert.equal(startRes.match.status, ARENA_STATUS.LIVE);
+
+    const liveLeaveRes = await handleLeaveMatch(env.guild, rm2, matchId);
+    assert.equal(liveLeaveRes.ok, false, 'Cannot leave a LIVE match');
+  });
+
+  test('22. Dedicated private room credentials channel created for every match, with read-only for players and send for Room Maker', async () => {
+    const env = createMockArenaEnvironment();
+    const admin = env.addMember('admin-rc', 'AdminRc', { permissions: ['Administrator'] });
+    await setupArenaChannels(env.guild, admin);
+
+    const rm = env.addMember('rm-chan-user', 'RoomMakerChan');
+    const pA = env.addMember('rc-pa', 'PlayerA');
+    const pB = env.addMember('rc-pb', 'PlayerB');
+
+    await upsertArenaPlayer(pA.id, { displayName: 'PlayerA', bgmiIgn: 'IgnA', bgmiUid: '8880001111' });
+    await upsertArenaPlayer(pB.id, { displayName: 'PlayerB', bgmiIgn: 'IgnB', bgmiUid: '8880002222' });
+
+    const { handleCreateChallenge, handleAcceptChallenge } = await import('../bot/discord/features/arena/services/arenaChallengeService.js');
+    const { handleClaimMatch } = await import('../bot/discord/features/arena/services/arenaVolunteerService.js');
+    const { submitRoomDetails } = await import('../bot/discord/features/arena/services/arenaMatchService.js');
+
+    const cRes = await handleCreateChallenge(env.guild, pA);
+    const mRes = await handleAcceptChallenge(env.guild, pB, cRes.challenge.challengeId, env.client);
+
+    // Dedicated room channel must exist
+    assert.ok(mRes.roomChannel, 'Dedicated room channel must be created');
+    assert.ok(mRes.roomChannel.name.startsWith('room-'));
+
+    // Check player permissions in room channel: read-only (Deny SendMessages)
+    const pAOverwrites = mRes.roomChannel.permissionOverwrites.cache.get(pA.id);
+    assert.ok(pAOverwrites);
+    assert.ok(pAOverwrites.deny.includes(PermissionFlagsBits.SendMessages));
+
+    const pBOverwrites = mRes.roomChannel.permissionOverwrites.cache.get(pB.id);
+    assert.ok(pBOverwrites);
+    assert.ok(pBOverwrites.deny.includes(PermissionFlagsBits.SendMessages));
+
+    // Claim match as Room Maker -> Room Maker granted send permissions in room channel
+    await handleClaimMatch(env.guild, rm, mRes.match.matchId);
+    const rmOverwrites = mRes.roomChannel.permissionOverwrites.cache.get(rm.id);
+    assert.ok(rmOverwrites);
+    assert.equal(rmOverwrites.SendMessages, true);
+
+    // Submit room details
+    await submitRoomDetails(env.guild, rm, mRes.match.matchId, 'ROOM999', 'PASS999');
+
+    // Verify room credentials are in roomChannel and not in matchChannel
+    const roomChannelMessages = Array.from(mRes.roomChannel.messages.cache.values());
+    const hasCredsInRoomChannel = roomChannelMessages.some((msg) => msg.content.includes('ROOM999') && msg.content.includes('PASS999'));
+    assert.ok(hasCredsInRoomChannel, 'Room credentials must appear in the dedicated room channel');
+
+    const matchChannelMessages = Array.from(mRes.matchChannel.messages.cache.values());
+    const hasCredsInMatchChannel = matchChannelMessages.some((msg) => msg.content.includes('PASS999'));
+    assert.equal(hasCredsInMatchChannel, false, 'Room password must NEVER be exposed in the main match channel');
+
+    // Editing credentials updates in place (does not create duplicates)
+    const initialCount = mRes.roomChannel.messages.cache.size;
+    await submitRoomDetails(env.guild, rm, mRes.match.matchId, 'ROOM999-NEW', 'PASS999-NEW');
+    assert.equal(mRes.roomChannel.messages.cache.size, initialCount, 'Editing credentials must edit in place');
+  });
+
+  test('23. Players can report incorrect room credentials (ROOM_ISSUE), blocks match start until corrected', async () => {
+    const env = createMockArenaEnvironment();
+    const admin = env.addMember('admin-report', 'AdminReport', { permissions: ['Administrator'] });
+    await setupArenaChannels(env.guild, admin);
+
+    const rm = env.addMember('rm-report-user', 'RoomMakerReport');
+    const pA = env.addMember('rep-pa', 'PlayerA');
+    const pB = env.addMember('rep-pb', 'PlayerB');
+    const outsider = env.addMember('rep-outsider', 'Outsider');
+
+    await upsertArenaPlayer(pA.id, { displayName: 'PlayerA', bgmiIgn: 'IgnA', bgmiUid: '6660001111' });
+    await upsertArenaPlayer(pB.id, { displayName: 'PlayerB', bgmiIgn: 'IgnB', bgmiUid: '6660002222' });
+
+    const { handleCreateChallenge, handleAcceptChallenge } = await import('../bot/discord/features/arena/services/arenaChallengeService.js');
+    const { handleClaimMatch } = await import('../bot/discord/features/arena/services/arenaVolunteerService.js');
+    const { submitRoomDetails, startMatch, handleReportRoomCredentials } = await import('../bot/discord/features/arena/services/arenaMatchService.js');
+
+    const cRes = await handleCreateChallenge(env.guild, pA);
+    const mRes = await handleAcceptChallenge(env.guild, pB, cRes.challenge.challengeId, env.client);
+    const matchId = mRes.match.matchId;
+
+    await handleClaimMatch(env.guild, rm, matchId);
+    await submitRoomDetails(env.guild, rm, matchId, 'BAD_ROOM', 'BAD_PASS');
+
+    // 1. Outsider cannot report
+    const outsiderRep = await handleReportRoomCredentials(env.guild, outsider, matchId, 'PASSWORD');
+    assert.equal(outsiderRep.ok, false);
+
+    // 2. Player A reports incorrect password
+    const repRes = await handleReportRoomCredentials(env.guild, pA, matchId, 'PASSWORD');
+    assert.ok(repRes.ok);
+    assert.equal(repRes.match.status, ARENA_STATUS.ROOM_ISSUE);
+
+    // 3. Duplicate report by Player A is rejected
+    const dupRep = await handleReportRoomCredentials(env.guild, pA, matchId, 'PASSWORD');
+    assert.equal(dupRep.ok, false);
+
+    // 4. Starting the match is blocked while in ROOM_ISSUE
+    const startBlocked = await startMatch(env.guild, rm, matchId);
+    assert.equal(startBlocked.ok, false, 'Match cannot start while room credentials issue is pending');
+    assert.match(startBlocked.error, /incorrect room credentials/);
+
+    // 5. Room Maker submits corrected details -> moves back to ROOM_READY
+    const fixRes = await submitRoomDetails(env.guild, rm, matchId, 'FIXED_ROOM', 'FIXED_PASS');
+    assert.ok(fixRes.ok);
+    assert.equal(fixRes.match.status, ARENA_STATUS.ROOM_READY);
+
+    // 6. Now match can be started cleanly
+    const startSuccess = await startMatch(env.guild, rm, matchId);
+    assert.ok(startSuccess.ok);
+    assert.equal(startSuccess.match.status, ARENA_STATUS.LIVE);
+  });
+
+  test('24. Redesign #match-results with image-based result cards and BGMI IGNs (Devanagari supported)', async () => {
+    const { generateResultCardPng, buildMatchResultPayload } = await import('../bot/discord/features/arena/services/arenaImageService.js');
+    const { buildCompletedMatchResultPayload } = await import('../bot/discord/features/arena/services/arenaNotificationService.js');
+
+    const sampleMatch = {
+      matchId: 'MD-77777',
+      guildId: 'guild-res',
+      volunteerId: 'rm-777',
+      status: ARENA_STATUS.COMPLETED,
+      completedAt: new Date(),
+    };
+
+    const winnerObj = {
+      discordId: 'win-id',
+      displayName: 'KOKAINE',
+      bgmiIgn: 'ताजKOKAINE',
+      bgmiUid: '51306576278',
+    };
+
+    const loserObj = {
+      discordId: 'lose-id',
+      displayName: 'IGxShanaya',
+      bgmiIgn: 'ताजJESP',
+      bgmiUid: '51306576265',
+    };
+
+    // 1. Generate Result Card PNG
+    const pngBuffer = generateResultCardPng(sampleMatch, winnerObj, loserObj, {
+      roomMakerDisplayName: 'OfficialRM',
+    });
+
+    assert.ok(Buffer.isBuffer(pngBuffer));
+    assert.equal(pngBuffer.subarray(0, 4).toString('hex'), '89504e47');
+    assert.equal(pngBuffer.readUInt32BE(16), 800, 'Result image card must be 800px wide');
+    assert.equal(pngBuffer.readUInt32BE(20), 420, 'Result image card must be 420px high');
+
+    // 2. Build result payload for #match-results
+    const payload = await buildCompletedMatchResultPayload(sampleMatch, winnerObj, loserObj, 'OfficialRM');
+    assert.ok(payload.files && payload.files.length === 1);
+    assert.equal(payload.files[0].name, 'result-md-77777.png');
+    assert.equal(payload.embeds[0].data.image.url, 'attachment://result-md-77777.png');
+
+    // 3. Verify BGMI IGNs are present in payload
+    assert.ok(payload.embeds[0].data.fields.some((f) => f.name === 'Winner' && f.value.includes('ताजKOKAINE')));
+    assert.ok(payload.embeds[0].data.fields.some((f) => f.name === 'Defeated' && f.value.includes('ताजJESP')));
+  });
+
+  test('25. Terminology & Dot Commands: .roommaker profile, .roommaker status, .leave and backwards compatibility', async () => {
+    const env = createMockArenaEnvironment();
+    const admin = env.addMember('admin-term', 'AdminTerm', { permissions: ['Administrator'] });
+    await setupArenaChannels(env.guild, admin);
+
+    const user = env.addMember('user-term', 'TermUser');
+    const { handleRoomMakerCommand, handleVolunteerCommand, handleLeaveCommand, handleReleaseCommand } = await import('../bot/discord/features/arena/commands/arenaCommandHandler.js');
+
+    // 1. .roommaker profile
+    let profileReply = null;
+    await handleRoomMakerCommand(env.guild, user, null, ['profile'], (msg) => { profileReply = msg; });
+    assert.ok(profileReply && profileReply.embeds && profileReply.embeds.length === 1);
+    assert.match(profileReply.embeds[0].data.title, /Room Maker Profile/);
+
+    // 2. .volunteer profile (alias)
+    let volProfileReply = null;
+    await handleVolunteerCommand(env.guild, user, null, ['profile'], (msg) => { volProfileReply = msg; });
+    assert.ok(volProfileReply && volProfileReply.embeds);
+    assert.match(volProfileReply.embeds[0].data.title, /Room Maker Profile/);
+
+    // 3. .roommaker status
+    let statusReply = null;
+    await handleRoomMakerCommand(env.guild, user, null, ['status'], (msg) => { statusReply = msg; });
+    assert.match(statusReply, /Room Maker availability status is now/);
+
+    // 4. .leave without matchId gives helpful usage
+    let leaveUsage = null;
+    await handleLeaveCommand(env.guild, user, null, [], (msg) => { leaveUsage = msg; });
+    assert.match(leaveUsage, /\.leave <matchId>/);
+
+    // 5. .release alias without matchId gives helpful usage
+    let releaseUsage = null;
+    await handleReleaseCommand(env.guild, user, null, [], (msg) => { releaseUsage = msg; });
+    assert.match(releaseUsage, /\.leave <matchId>/);
+  });
 });

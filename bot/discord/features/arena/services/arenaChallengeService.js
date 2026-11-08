@@ -22,6 +22,7 @@ import {
 } from './arenaNotificationService.js';
 import {
   createMatchChannel,
+  createRoomChannel,
 } from './arenaChannelService.js';
 import { queueChannelSend, queueMessageEdit } from '../../../../../discordQueue.js';
 
@@ -272,8 +273,9 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
     status: ARENA_STATUS.WAITING_FOR_VOLUNTEER,
   });
 
-  // 1. Create Private Match Channel
+  // 1. Create Private Match Channel & Dedicated Room Credentials Channel
   let matchChannel = null;
+  let roomChannel = null;
   try {
     matchChannel = await createMatchChannel(guild, match, config);
     if (matchChannel) {
@@ -290,7 +292,26 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
     console.warn(`[Arena] ⚠️ Error creating match channel for ${challengeId}:`, err.message);
   }
 
-  // 2. Post in #volunteer-panel
+  try {
+    roomChannel = await createRoomChannel(guild, match, config);
+    if (roomChannel) {
+      match.roomChannelId = roomChannel.id;
+      const initialRoomMsg = await queueChannelSend(roomChannel, {
+        content:
+          `🔐 **BGMI Room Credentials Channel — Match ${match.matchId}**\n` +
+          `• Only Player A (<@${match.playerA.discordId}>), Player B (<@${match.playerB.discordId}>), the assigned Room Maker, and staff can see this channel.\n` +
+          `• The Room Maker will publish the custom BGMI Room ID and Password here once assigned.\n` +
+          `*Players: Please keep notifications on so you can join promptly once the room is ready.*`,
+      });
+      if (initialRoomMsg?.id) {
+        match.roomMessageId = initialRoomMsg.id;
+      }
+    }
+  } catch (err) {
+    console.warn(`[Arena] ⚠️ Error creating room channel for ${challengeId}:`, err.message);
+  }
+
+  // 2. Post in #volunteer-panel (Room Maker Panel)
   if (config?.volunteerPanelId) {
     const volPanel =
       guild.channels.cache.get(config.volunteerPanelId) ||
@@ -304,11 +325,13 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
     }
   }
 
-  // Update match record with channel and panel message IDs
+  // Update match record with channel, room channel and panel message IDs
   const { updateArenaMatch } = await import('../models/arenaModels.js');
   await updateArenaMatch(match.matchId, {
     matchChannelId: match.matchChannelId,
     matchEmbedMessageId: match.matchEmbedMessageId,
+    roomChannelId: match.roomChannelId,
+    roomMessageId: match.roomMessageId,
     panelMessageId: match.panelMessageId,
   });
 
@@ -353,6 +376,6 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
     },
   });
 
-  return { ok: true, match, matchChannel };
+  return { ok: true, match, matchChannel, roomChannel };
 }
 

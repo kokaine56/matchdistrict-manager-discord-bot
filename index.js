@@ -3207,7 +3207,7 @@ client.on(Events.MessageCreate, async (message) => {
           message
         );
         return;
-      } else if (cmd === 'volunteer') {
+      } else if (cmd === 'volunteer' || cmd === 'roommaker') {
         await handleVolunteerCommand(
           message.guild,
           message.member,
@@ -3229,7 +3229,7 @@ client.on(Events.MessageCreate, async (message) => {
           message
         );
         return;
-      } else if (cmd === 'release') {
+      } else if (cmd === 'release' || cmd === 'leave') {
         await handleReleaseCommand(
           message.guild,
           message.member,

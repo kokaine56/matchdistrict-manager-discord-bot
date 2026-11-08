@@ -16,6 +16,7 @@ export const ARENA_STATUS = {
   WAITING_FOR_VOLUNTEER: 'WAITING_FOR_VOLUNTEER',
   VOLUNTEER_ASSIGNED: 'VOLUNTEER_ASSIGNED',
   ROOM_READY: 'ROOM_READY',
+  ROOM_ISSUE: 'ROOM_ISSUE',
   LIVE: 'LIVE',
   RESULT_PENDING: 'RESULT_PENDING',
   UNDER_REVIEW: 'UNDER_REVIEW',
@@ -48,6 +49,15 @@ export const ALLOWED_TRANSITIONS = {
   ],
   [ARENA_STATUS.ROOM_READY]: [
     ARENA_STATUS.LIVE,
+    ARENA_STATUS.ROOM_ISSUE,
+    ARENA_STATUS.WAITING_FOR_VOLUNTEER,
+    ARENA_STATUS.CANCELLED,
+  ],
+  // A player reported incorrect Room ID/Password: match cannot start until the Room Maker
+  // submits corrected credentials (-> ROOM_READY) or leaves (-> WAITING_FOR_VOLUNTEER).
+  [ARENA_STATUS.ROOM_ISSUE]: [
+    ARENA_STATUS.ROOM_READY,
+    ARENA_STATUS.WAITING_FOR_VOLUNTEER,
     ARENA_STATUS.CANCELLED,
   ],
   [ARENA_STATUS.LIVE]: [
@@ -495,6 +505,9 @@ export async function createArenaMatch(data) {
     matchEmbedMessageId: data.matchEmbedMessageId ? String(data.matchEmbedMessageId) : null,
     roomId: data.roomId ? String(data.roomId) : null,
     roomPassword: data.roomPassword ? String(data.roomPassword) : null,
+    roomChannelId: data.roomChannelId ? String(data.roomChannelId) : null,
+    roomMessageId: data.roomMessageId ? String(data.roomMessageId) : null,
+    roomReports: Array.isArray(data.roomReports) ? data.roomReports : [],
     status: data.status || ARENA_STATUS.WAITING_FOR_VOLUNTEER,
     winnerId: null,
     loserId: null,
@@ -767,6 +780,131 @@ export async function atomicClaimArenaMatch(matchId, volunteerId, limit = 1) {
   memVolunteers.set(String(volunteerId), vol);
 
   return { ok: true, match: { ...match }, volunteer: { ...vol } };
+}
+
+export const ARENA_LEAVABLE_STATUSES = [
+  ARENA_STATUS.VOLUNTEER_ASSIGNED,
+  ARENA_STATUS.ROOM_READY,
+  ARENA_STATUS.ROOM_ISSUE,
+];
+
+/**
+ * Atomically removes the assigned Room Maker from a match that has not started yet and returns
+ * it to WAITING_FOR_VOLUNTEER. A single conditional update (status + assigned user) makes
+ * double-clicks safe: only the first call wins, later calls get { ok: false }.
+ * Clears room credentials and credential reports, and decrements the Room Maker's activeMatches.
+ * `roomMakerId` null = administrator action (any current assignee).
+ */
+export async function atomicLeaveArenaMatch(matchId, roomMakerId = null) {
+  if (!matchId) return { ok: false, error: 'Match ID is required.' };
+  const now = new Date();
+  const resetFields = {
+    status: ARENA_STATUS.WAITING_FOR_VOLUNTEER,
+    volunteerId: null,
+    assignedAt: null,
+    roomId: null,
+    roomPassword: null,
+    roomReports: [],
+    volunteerWarningSent: false,
+    volunteerWarningDueAt: new Date(now.getTime() + ARENA_CONSTANTS.VOLUNTEER_WARNING_MS),
+    volunteerTimeoutDueAt: new Date(now.getTime() + ARENA_CONSTANTS.VOLUNTEER_TIMEOUT_MS),
+    updatedAt: now,
+  };
+
+  if (isMongoConnected()) {
+    const db = getMongoDb();
+    const filter = {
+      matchId: String(matchId),
+      status: { $in: ARENA_LEAVABLE_STATUSES },
+      volunteerId: roomMakerId ? String(roomMakerId) : { $ne: null },
+    };
+    const res = await db.collection(ARENA_COLLECTIONS.MATCHES).findOneAndUpdate(
+      filter,
+      { $set: resetFields },
+      { returnDocument: 'before' }
+    );
+    const previous = res?.value !== undefined ? res.value : res;
+    if (!previous) {
+      return { ok: false, error: 'This match can no longer be left (already left, started or reassigned).' };
+    }
+    await db.collection(ARENA_COLLECTIONS.VOLUNTEERS).updateOne(
+      { discordId: String(previous.volunteerId), activeMatches: { $gt: 0 } },
+      { $inc: { activeMatches: -1 }, $set: { updatedAt: now } }
+    );
+    const match = await db.collection(ARENA_COLLECTIONS.MATCHES).findOne({ matchId: String(matchId) });
+    return { ok: true, previous, match, previousRoomMakerId: String(previous.volunteerId) };
+  }
+
+  const existing = memMatches.get(String(matchId));
+  if (
+    !existing ||
+    !ARENA_LEAVABLE_STATUSES.includes(existing.status) ||
+    !existing.volunteerId ||
+    (roomMakerId && existing.volunteerId !== String(roomMakerId))
+  ) {
+    return { ok: false, error: 'This match can no longer be left (already left, started or reassigned).' };
+  }
+  const previous = { ...existing };
+  memMatches.set(String(matchId), { ...existing, ...resetFields });
+  const vol = memVolunteers.get(String(previous.volunteerId));
+  if (vol && vol.activeMatches > 0) {
+    vol.activeMatches -= 1;
+    vol.updatedAt = now;
+  }
+  return {
+    ok: true,
+    previous,
+    match: { ...memMatches.get(String(matchId)) },
+    previousRoomMakerId: String(previous.volunteerId),
+  };
+}
+
+export const ROOM_ISSUE_TYPES = {
+  ROOM_ID: 'ROOM_ID',
+  PASSWORD: 'PASSWORD',
+  BOTH: 'BOTH',
+};
+
+/**
+ * Atomically records an incorrect-credentials report from one player and moves the match to
+ * ROOM_ISSUE. The conditional filter rejects (a) matches that are not ROOM_READY/ROOM_ISSUE
+ * (e.g. already LIVE) and (b) a second report from the same player for the same credentials.
+ */
+export async function atomicReportRoomIssue(matchId, playerId, issueType) {
+  if (!matchId || !playerId) return { ok: false, error: 'Match ID and player ID are required.' };
+  const now = new Date();
+  const report = { playerId: String(playerId), issueType: String(issueType), reportedAt: now };
+
+  if (isMongoConnected()) {
+    const db = getMongoDb();
+    const res = await db.collection(ARENA_COLLECTIONS.MATCHES).findOneAndUpdate(
+      {
+        matchId: String(matchId),
+        status: { $in: [ARENA_STATUS.ROOM_READY, ARENA_STATUS.ROOM_ISSUE] },
+        'roomReports.playerId': { $ne: String(playerId) },
+      },
+      {
+        $set: { status: ARENA_STATUS.ROOM_ISSUE, updatedAt: now },
+        $push: { roomReports: report },
+      },
+      { returnDocument: 'after' }
+    );
+    const match = res?.value !== undefined ? res.value : res;
+    return match ? { ok: true, match } : { ok: false };
+  }
+
+  const existing = memMatches.get(String(matchId));
+  if (
+    !existing ||
+    ![ARENA_STATUS.ROOM_READY, ARENA_STATUS.ROOM_ISSUE].includes(existing.status) ||
+    (existing.roomReports || []).some((r) => r.playerId === String(playerId))
+  ) {
+    return { ok: false };
+  }
+  existing.status = ARENA_STATUS.ROOM_ISSUE;
+  existing.roomReports = [...(existing.roomReports || []), report];
+  existing.updatedAt = now;
+  return { ok: true, match: { ...existing } };
 }
 
 export async function updateArenaVolunteer(discordId, updates) {

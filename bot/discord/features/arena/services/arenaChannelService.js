@@ -117,7 +117,7 @@ export async function setupArenaChannels(guild, adminUser) {
       ViewChannel: true,
       ReadMessageHistory: true,
       SendMessages: false,
-    }).catch(() => {});
+    }).catch(() => { });
   }
 
   // #match-results (read only for @everyone)
@@ -157,7 +157,7 @@ export async function setupArenaChannels(guild, adminUser) {
           'Need help with a match, dispute, or rule question? Mention a volunteer or an administrator here.',
       });
       if (pinMsg && typeof pinMsg.pin === 'function') {
-        await pinMsg.pin().catch(() => {});
+        await pinMsg.pin().catch(() => { });
       }
     }
   } catch (err) {
@@ -211,7 +211,7 @@ export async function setupArenaChannels(guild, adminUser) {
       existingMsg = await createChannel.messages.fetch(panelMessageId).catch(() => null);
     }
     if (existingMsg) {
-      await queueMessageEdit(existingMsg, panelPayload).catch(() => {});
+      await queueMessageEdit(existingMsg, panelPayload).catch(() => { });
     } else {
       const newMsg = await queueChannelSend(createChannel, panelPayload);
       panelMessageId = newMsg?.id || null;
@@ -344,6 +344,66 @@ export async function createMatchChannel(guild, match, config) {
   return channel;
 }
 
+export async function createRoomChannel(guild, match, config) {
+  if (!guild || !match) return null;
+
+  const category = await getOrCreateMatchCategory(guild, config);
+  const channelName = `room-${match.matchId.toLowerCase()}`;
+
+  const permissionOverwrites = [
+    {
+      id: guild.id, // @everyone
+      deny: [PermissionFlagsBits.ViewChannel],
+    },
+    {
+      id: match.playerA.discordId,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ReadMessageHistory,
+      ],
+      deny: [
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.AttachFiles,
+      ],
+    },
+    {
+      id: match.playerB.discordId,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ReadMessageHistory,
+      ],
+      deny: [
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.AttachFiles,
+      ],
+    },
+  ];
+
+  // Assigned Room Maker can view, read history, and send messages in room channel
+  if (match.volunteerId) {
+    permissionOverwrites.push({
+      id: match.volunteerId,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.SendMessages,
+      ],
+      deny: [
+        PermissionFlagsBits.AttachFiles,
+      ],
+    });
+  }
+
+  const channel = await queueChannelCreate(guild, {
+    name: channelName,
+    type: ChannelType.GuildText,
+    parent: category?.id || null,
+    permissionOverwrites,
+  });
+
+  return channel;
+}
+
 export async function addVolunteerToMatchChannel(channel, volunteerId) {
   if (!channel || !volunteerId) return;
   if (typeof channel.permissionOverwrites?.edit === 'function') {
@@ -355,6 +415,33 @@ export async function addVolunteerToMatchChannel(channel, volunteerId) {
     }).catch((err) => {
       console.warn(`[Arena] ⚠️ Failed to add volunteer ${volunteerId} to channel ${channel.id}:`, err.message);
     });
+  }
+}
+
+export async function addRoomMakerToRoomChannel(channel, roomMakerId) {
+  if (!channel || !roomMakerId) return;
+  if (typeof channel.permissionOverwrites?.edit === 'function') {
+    await channel.permissionOverwrites.edit(roomMakerId, {
+      ViewChannel: true,
+      ReadMessageHistory: true,
+      SendMessages: true,
+      AttachFiles: false,
+    }).catch((err) => {
+      console.warn(`[Arena] ⚠️ Failed to add Room Maker ${roomMakerId} to room channel ${channel.id}:`, err.message);
+    });
+  }
+}
+
+export async function removeRoomMakerFromRoomChannel(channel, roomMakerId) {
+  if (!channel || !roomMakerId) return;
+  if (typeof channel.permissionOverwrites?.delete === 'function') {
+    await channel.permissionOverwrites.delete(roomMakerId).catch((err) => {
+      console.warn(`[Arena] ⚠️ Failed to delete Room Maker permissions in room channel ${channel.id}:`, err.message);
+    });
+  } else if (typeof channel.permissionOverwrites?.edit === 'function') {
+    await channel.permissionOverwrites.edit(roomMakerId, {
+      ViewChannel: false,
+    }).catch(() => { });
   }
 }
 
@@ -395,7 +482,7 @@ export async function removeVolunteerFromMatchChannel(channel, volunteerId) {
   } else if (typeof channel.permissionOverwrites?.edit === 'function') {
     await channel.permissionOverwrites.edit(volunteerId, {
       ViewChannel: false,
-    }).catch(() => {});
+    }).catch(() => { });
   }
 }
 
@@ -467,7 +554,8 @@ export async function deleteArenaChannels(guild, config = null) {
           nameLower === 'match-results' ||
           nameLower === 'challenge-support' ||
           nameLower === 'arena-evidence' ||
-          nameLower.startsWith('match-md-')
+          nameLower.startsWith('match-md-') ||
+          nameLower.startsWith('room-md-')
         ) {
           channelsToDelete.set(String(c.id), c);
         }

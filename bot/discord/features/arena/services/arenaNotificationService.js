@@ -18,6 +18,7 @@ import {
   generateChallengeCardPng,
   buildMatchCardPayload,
   buildChallengeCardPayload,
+  buildMatchResultPayload,
 } from './arenaImageService.js';
 import { queueDirectMessage, queueChannelSend, queueMessageEdit } from '../../../../../discordQueue.js';
 
@@ -164,18 +165,48 @@ export async function refreshArenaChallengeCard(guild, challenge, options = {}) 
   return false;
 }
 
+export async function repositionPanelMessage(channel, storedMessageId, newPayload, onNewId = null) {
+  if (!channel || !newPayload) return null;
+
+  let existing = null;
+  if (storedMessageId) {
+    existing = channel.messages?.cache?.get(storedMessageId) || (await channel.messages?.fetch?.(storedMessageId).catch(() => null));
+  }
+
+  // Check if channel's last message is this message
+  const lastMessageId = channel.lastMessageId || channel.lastMessage?.id || null;
+  const isAtBottom = existing && lastMessageId && (lastMessageId === existing.id);
+
+  if (existing && isAtBottom) {
+    await queueMessageEdit(existing, newPayload).catch(() => {});
+    return existing.id;
+  }
+
+  // Otherwise delete old managed message and recreate cleanly at the bottom
+  if (existing) {
+    await existing.delete().catch(() => {});
+  }
+
+  const sent = await queueChannelSend(channel, newPayload);
+  if (sent?.id && typeof onNewId === 'function') {
+    await onNewId(sent.id);
+  }
+  return sent?.id || null;
+}
+
 export function buildResultVerificationPayload(match, winnerPlayer, evidenceUrl = null) {
+  const winnerIgn = winnerPlayer.bgmiIgn || winnerPlayer.displayName;
   const embed = new EmbedBuilder()
     .setTitle(`Result Submitted: ${match.matchId}`)
     .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
     .setDescription(
-      `The assigned volunteer has reported **${winnerPlayer.displayName}** (<@${winnerPlayer.discordId}>) as the winner.\n\n` +
+      `The assigned Room Maker has reported **${winnerIgn}** (<@${winnerPlayer.discordId}>) as the winner.\n\n` +
       `Both players must confirm the result below. If you believe this is incorrect, click **Dispute**.\n` +
       `*Auto-review triggers if not confirmed within 15 minutes.*`
     )
     .addFields(
-      { name: 'Reported Winner', value: `${winnerPlayer.displayName} (\`${winnerPlayer.bgmiIgn}\`)`, inline: true },
-      { name: 'Evidence', value: evidenceUrl ? `[View Screenshot](${evidenceUrl})` : '*Attached by staff*', inline: true }
+      { name: 'Reported Winner', value: `🏆 **${winnerIgn}** (<@${winnerPlayer.discordId}>)`, inline: true },
+      { name: 'Evidence', value: evidenceUrl ? `[View Screenshot](${evidenceUrl})` : '*Attached by Room Maker*', inline: true }
     )
     .setFooter({ text: 'Match District Arena Verification' });
 
@@ -193,13 +224,22 @@ export function buildResultVerificationPayload(match, winnerPlayer, evidenceUrl 
   return { embeds: [embed], components: [row] };
 }
 
+export async function buildCompletedMatchResultPayload(match, winnerPlayer, opponentPlayer, volunteerDisplayName, options = {}) {
+  return buildMatchResultPayload(match, winnerPlayer, opponentPlayer, {
+    ...options,
+    roomMakerDisplayName: volunteerDisplayName,
+  });
+}
+
 export function buildCompletedMatchResultEmbed(match, winnerPlayer, opponentPlayer, volunteerDisplayName) {
+  const winnerIgn = winnerPlayer.bgmiIgn || winnerPlayer.displayName;
+  const oppIgn = opponentPlayer.bgmiIgn || opponentPlayer.displayName;
   return new EmbedBuilder()
     .setTitle(`Match Result: ${match.matchId}`)
     .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
     .addFields(
-      { name: 'Winner', value: `🏆 **${winnerPlayer.displayName}** (<@${winnerPlayer.discordId}>)`, inline: true },
-      { name: 'Opponent', value: `${opponentPlayer.displayName} (<@${opponentPlayer.discordId}>)`, inline: true },
+      { name: 'Winner', value: `🏆 **${winnerIgn}** (<@${winnerPlayer.discordId}>)`, inline: true },
+      { name: 'Opponent', value: `**${oppIgn}** (<@${opponentPlayer.discordId}>)`, inline: true },
       { name: 'Officiated By', value: volunteerDisplayName || `<@${match.volunteerId}>`, inline: true },
       { name: 'Status', value: '`Result: VERIFIED`', inline: true },
       { name: 'Completed', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }

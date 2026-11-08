@@ -33,6 +33,7 @@ import {
 } from '../services/arenaChannelService.js';
 import {
   handleReleaseMatch,
+  handleLeaveMatch,
 } from '../services/arenaVolunteerService.js';
 import {
   handleAdminResolveDispute,
@@ -81,11 +82,11 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
         '• `.arena active` — View open challenges and active matches.\n' +
         '• `.arena matches [status]` — List matches filtered by status.\n' +
         '• `.arena cancel <id> <reason>` — Cancel a match or challenge and free players.\n' +
-        '• `.arena reassign <id> @volunteer` — Reassign an active match to another volunteer.\n' +
+        '• `.arena reassign <id> @roommaker` — Reassign an active match to another Room Maker.\n' +
         '• `.arena dispute` — List open disputes and evidence.\n' +
         '• `.arena result <id> <A|B> <reason>` — Finalize a disputed match.\n' +
-        '• `.arena volunteer add|remove @user` — Register or deactivate an arena volunteer profile.\n' +
-        '• `.arena volunteer limit <n>` — Set the active match limit per volunteer (default 1).\n' +
+        '• `.arena roommaker add|remove @user` — Register or deactivate an arena Room Maker profile.\n' +
+        '• `.arena roommaker limit <n>` — Set the active match limit per Room Maker (default 1).\n' +
         '• `.arena suspend|unsuspend @player` — Suspend or restore player access.\n' +
         '• `.arena resetuid @player` — Clear player BGMI details for re-registration.\n' +
         '• `.arena stats` — View overall arena statistics.\n' +
@@ -375,26 +376,26 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
     if (!res.ok) return replyFn(res.error || '❌ Could not resolve dispute.');
 
     return replyFn(
-      `✅ **Dispute Finalized for Match ${matchId}!**\nWinner awarded to **${res.winner.displayName}** (<@${res.winner.discordId}>).\nResult announced in #match-results.`
+      `✅ **Dispute Finalized for Match ${matchId}!**\nWinner awarded to **${res.winner.bgmiIgn || res.winner.displayName}** (<@${res.winner.discordId}>).\nResult announced in #match-results.`
     );
   }
 
-  // 8. .arena volunteer add|remove|limit
-  if (subCmd === 'volunteer') {
+  // 8. .arena roommaker / .arena volunteer add|remove|limit
+  if (subCmd === 'volunteer' || subCmd === 'roommaker') {
     const volSub = (args[1] || '').toLowerCase();
 
     if (volSub === 'limit') {
       const rawLimit = Number(args[2]);
       if (!Number.isInteger(rawLimit) || rawLimit < 1) {
-        return replyFn('❌ Please provide a positive whole number for the volunteer match limit (e.g. `.arena volunteer limit 2`).');
+        return replyFn('❌ Please provide a positive whole number for the Room Maker match limit (e.g. `.arena roommaker limit 2`).');
       }
       await saveArenaConfig(guild.id, { volunteerMatchLimit: rawLimit });
-      return replyFn(`✅ Volunteer active match limit set to **${rawLimit}**.`);
+      return replyFn(`✅ Room Maker active match limit set to **${rawLimit}**.`);
     }
 
     const targetUserId = extractUserId(args[2]);
     if (!targetUserId) {
-      return replyFn('❌ Usage: `.arena volunteer add|remove @user` or `.arena volunteer limit <n>`');
+      return replyFn('❌ Usage: `.arena roommaker add|remove @user` or `.arena roommaker limit <n>`');
     }
 
     const targetMember =
@@ -402,7 +403,7 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
       (await guild.members.fetch(targetUserId).catch(() => null));
     if (!targetMember) return replyFn('❌ Member not found in this server.');
 
-    const targetDisplayName = targetMember.displayName || targetMember.user?.username || 'Volunteer';
+    const targetDisplayName = targetMember.displayName || targetMember.user?.username || 'Room Maker';
 
     if (volSub === 'add') {
       await upsertArenaVolunteer(targetUserId, {
@@ -410,12 +411,12 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
         status: 'AVAILABLE',
         suspended: false,
       });
-      return replyFn(`✅ <@${targetUserId}> has been registered as an active arena volunteer.`);
+      return replyFn(`✅ <@${targetUserId}> has been registered as an active arena Room Maker.`);
     }
 
     if (volSub === 'remove') {
       await updateArenaVolunteer(targetUserId, { status: 'UNAVAILABLE' });
-      return replyFn(`✅ Volunteer status set to \`UNAVAILABLE\` for <@${targetUserId}>.`);
+      return replyFn(`✅ Room Maker status set to \`UNAVAILABLE\` for <@${targetUserId}>.`);
     }
 
     return replyFn('❌ Invalid action. Use `add`, `remove`, or `limit`.');
@@ -494,19 +495,19 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
   return replyFn('❌ Unknown arena subcommand. Use `.arena help` for a list of commands.');
 }
 
-export async function handleVolunteerCommand(guild, member, channel, args, replyFn, client = null, message = null) {
+export async function handleRoomMakerCommand(guild, member, channel, args, replyFn, client = null, message = null) {
   if (!guild) return replyFn('❌ This command can only be used inside a Discord server.');
 
   const subCmd = (args[0] || 'profile').toLowerCase();
 
-  // .volunteer profile
+  // .roommaker profile / .volunteer profile
   if (subCmd === 'profile' || subCmd === 'stats') {
     const vol = await upsertArenaVolunteer(member.id, {
-      displayName: member.displayName || member.user?.username || 'Volunteer',
+      displayName: member.displayName || member.user?.username || 'Room Maker',
     });
 
     const embed = new EmbedBuilder()
-      .setTitle(`Volunteer Profile: ${member.displayName || member.user?.username || 'Volunteer'}`)
+      .setTitle(`Room Maker Profile: ${member.displayName || member.user?.username || 'Room Maker'}`)
       .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
       .addFields(
         { name: 'Status', value: vol.status === 'AVAILABLE' ? '🟢 `AVAILABLE`' : '🔴 `UNAVAILABLE`', inline: true },
@@ -518,20 +519,22 @@ export async function handleVolunteerCommand(guild, member, channel, args, reply
     return replyFn({ embeds: [embed] });
   }
 
-  // .volunteer status
+  // .roommaker status / .volunteer status
   if (subCmd === 'status') {
     const vol = await upsertArenaVolunteer(member.id, {
-      displayName: member.displayName || member.user?.username || 'Volunteer',
+      displayName: member.displayName || member.user?.username || 'Room Maker',
     });
 
     const newStatus = vol.status === 'AVAILABLE' ? 'UNAVAILABLE' : 'AVAILABLE';
     await updateArenaVolunteer(member.id, { status: newStatus });
 
-    return replyFn(`✅ Your volunteer availability status is now **\`${newStatus}\`**.`);
+    return replyFn(`✅ Your Room Maker availability status is now **\`${newStatus}\`**.`);
   }
 
-  return replyFn('❌ Usage: `.volunteer profile` or `.volunteer status`');
+  return replyFn('❌ Usage: `.roommaker profile` or `.roommaker status` (alias: `.volunteer`)');
 }
+
+export const handleVolunteerCommand = handleRoomMakerCommand;
 
 export async function handleMyMatchesCommand(guild, member, channel, args, replyFn, client = null, message = null) {
   if (!guild) return replyFn('❌ This command can only be used inside a Discord server.');
@@ -557,14 +560,16 @@ export async function handleMyMatchesCommand(guild, member, channel, args, reply
   return replyFn({ embeds: [embed] });
 }
 
-export async function handleReleaseCommand(guild, member, channel, args, replyFn, client = null, message = null) {
+export async function handleLeaveCommand(guild, member, channel, args, replyFn, client = null, message = null) {
   if (!guild) return replyFn('❌ This command can only be used inside a Discord server.');
 
   const matchId = args[0]?.toUpperCase();
-  if (!matchId) return replyFn('❌ Usage: `.release <matchId>`');
+  if (!matchId) return replyFn('❌ Usage: `.leave <matchId>` (alias: `.release <matchId>`)');
 
-  const res = await handleReleaseMatch(guild, member, matchId);
-  if (!res.ok) return replyFn(res.error || '❌ Could not release match.');
+  const res = await handleLeaveMatch(guild, member, matchId);
+  if (!res.ok) return replyFn(res.error || '❌ Could not leave match.');
 
-  return replyFn(`✅ You have successfully released match **${matchId}**.`);
+  return replyFn(`✅ You have successfully left match **${matchId}**.`);
 }
+
+export const handleReleaseCommand = handleLeaveCommand;
