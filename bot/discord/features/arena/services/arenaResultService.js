@@ -184,18 +184,7 @@ export async function completeArenaMatch(
           `🏁 **MATCH COMPLETED & VERIFIED!**\n` +
           `• **Winner:** **${winnerIgn}** (<@${effectiveWinnerId}>)\n` +
           `• **Defeated:** **${loserIgn}** (<@${effectiveLoserId}>)\n\n` +
-          `*Both players have been released to create or accept new challenges. Match channels will automatically be deleted in 60 minutes.*`,
-      });
-    }
-  }
-
-  if (match.roomChannelId) {
-    const rChannel =
-      guild.channels.cache.get(match.roomChannelId) ||
-      (await guild.channels.fetch(match.roomChannelId).catch(() => null));
-    if (rChannel) {
-      await queueChannelSend(rChannel, {
-        content: `🏁 **Match Completed!** Result verified: Winner is **${winnerIgn}**. This channel will be deleted shortly.`,
+          `*Both players have been released to create or accept new challenges. Match channel will automatically be deleted in 60 minutes.*`,
       });
     }
   }

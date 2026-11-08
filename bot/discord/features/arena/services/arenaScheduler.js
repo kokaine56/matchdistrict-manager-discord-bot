@@ -188,12 +188,9 @@ async function expireWaitingMatch(client, match) {
       }
     }
 
-    // Delete match channel and room channel
+    // Delete match channel
     if (match.matchChannelId) {
       await deleteMatchChannel(guild, match.matchChannelId);
-    }
-    if (match.roomChannelId) {
-      await deleteMatchChannel(guild, match.roomChannelId);
     }
   }
 
@@ -222,12 +219,8 @@ async function cleanupMatchChannel(client, match) {
     if (match.matchChannelId) {
       await deleteMatchChannel(guild, match.matchChannelId);
     }
-    if (match.roomChannelId) {
-      await deleteMatchChannel(guild, match.roomChannelId);
-    }
     await updateArenaMatch(match.matchId, {
       matchChannelId: null,
-      roomChannelId: null,
       deleteChannelAt: null,
     });
   }

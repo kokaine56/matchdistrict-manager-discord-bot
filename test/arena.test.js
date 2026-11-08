@@ -237,9 +237,10 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.ok(!config.volunteerRoleId, 'No Volunteer role should be created or stored');
     assert.ok(config.panelMessageId);
 
-    // Verify volunteer panel is public for @everyone
+    // Verify Room Maker panel is public for @everyone and named room-maker-panel
     const volPanel = env.channels.get(config.volunteerPanelId);
     assert.ok(volPanel);
+    assert.equal(volPanel.name, 'room-maker-panel');
     const everyonePerms = volPanel.permissionOverwrites.cache.get(env.guild.id);
     assert.ok(everyonePerms);
     assert.equal(everyonePerms.ViewChannel, true);
@@ -397,9 +398,9 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(pADoc.activeMatchId, challengeId);
     assert.equal(pBDoc.activeMatchId, challengeId);
 
-    // Verify private match channel exists
+    // Verify private match channel exists with 4-digit sequential name
     assert.ok(acceptRes.matchChannel);
-    assert.equal(acceptRes.matchChannel.name, `match-${challengeId.toLowerCase()}`);
+    assert.equal(acceptRes.matchChannel.name, 'match-0001');
   });
 
   test('6. Volunteer claiming, self-claim prevention, active limit & release flow with concurrency safety', async () => {
@@ -1459,7 +1460,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(liveLeaveRes.ok, false, 'Cannot leave a LIVE match');
   });
 
-  test('22. Dedicated private room credentials channel created for every match, with read-only for players and send for Room Maker', async () => {
+  test('22. Only ONE private channel per match (match-0001), room details displayed in place inside it, and panels stay at bottom', async () => {
     const env = createMockArenaEnvironment();
     const admin = env.addMember('admin-rc', 'AdminRc', { permissions: ['Administrator'] });
     await setupArenaChannels(env.guild, admin);
@@ -1474,45 +1475,75 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     const { handleCreateChallenge, handleAcceptChallenge } = await import('../bot/discord/features/arena/services/arenaChallengeService.js');
     const { handleClaimMatch } = await import('../bot/discord/features/arena/services/arenaVolunteerService.js');
     const { submitRoomDetails } = await import('../bot/discord/features/arena/services/arenaMatchService.js');
+    const { repositionPanelMessage, refreshArenaMatchCards, refreshArenaChallengeCard } = await import('../bot/discord/features/arena/services/arenaNotificationService.js');
 
     const cRes = await handleCreateChallenge(env.guild, pA);
     const mRes = await handleAcceptChallenge(env.guild, pB, cRes.challenge.challengeId, env.client);
 
-    // Dedicated room channel must exist
-    assert.ok(mRes.roomChannel, 'Dedicated room channel must be created');
-    assert.ok(mRes.roomChannel.name.startsWith('room-'));
+    // 1. Only ONE private match channel created with sequential 4-digit format: match-0001
+    assert.ok(mRes.matchChannel, 'Private match channel must be created');
+    assert.equal(mRes.matchChannel.name, 'match-0001');
+    assert.equal(mRes.roomChannel, undefined, 'No separate room channel should be created');
 
-    // Check player permissions in room channel: read-only (Deny SendMessages)
-    const pAOverwrites = mRes.roomChannel.permissionOverwrites.cache.get(pA.id);
+    // 2. Check player permissions: read-only by default (Deny SendMessages)
+    const pAOverwrites = mRes.matchChannel.permissionOverwrites.cache.get(pA.id);
     assert.ok(pAOverwrites);
     assert.ok(pAOverwrites.deny.includes(PermissionFlagsBits.SendMessages));
 
-    const pBOverwrites = mRes.roomChannel.permissionOverwrites.cache.get(pB.id);
+    const pBOverwrites = mRes.matchChannel.permissionOverwrites.cache.get(pB.id);
     assert.ok(pBOverwrites);
     assert.ok(pBOverwrites.deny.includes(PermissionFlagsBits.SendMessages));
 
-    // Claim match as Room Maker -> Room Maker granted send permissions in room channel
+    // 3. Claim match as Room Maker
     await handleClaimMatch(env.guild, rm, mRes.match.matchId);
-    const rmOverwrites = mRes.roomChannel.permissionOverwrites.cache.get(rm.id);
-    assert.ok(rmOverwrites);
-    assert.equal(rmOverwrites.SendMessages, true);
 
-    // Submit room details
+    // 4. Submit room details - posted directly inside the single match-0001 channel
     await submitRoomDetails(env.guild, rm, mRes.match.matchId, 'ROOM999', 'PASS999');
 
-    // Verify room credentials are in roomChannel and not in matchChannel
-    const roomChannelMessages = Array.from(mRes.roomChannel.messages.cache.values());
-    const hasCredsInRoomChannel = roomChannelMessages.some((msg) => msg.content.includes('ROOM999') && msg.content.includes('PASS999'));
-    assert.ok(hasCredsInRoomChannel, 'Room credentials must appear in the dedicated room channel');
-
     const matchChannelMessages = Array.from(mRes.matchChannel.messages.cache.values());
-    const hasCredsInMatchChannel = matchChannelMessages.some((msg) => msg.content.includes('PASS999'));
-    assert.equal(hasCredsInMatchChannel, false, 'Room password must NEVER be exposed in the main match channel');
+    const hasCredsInMatchChannel = matchChannelMessages.some((msg) => msg.content.includes('ROOM999') && msg.content.includes('PASS999'));
+    assert.ok(hasCredsInMatchChannel, 'Room credentials must appear inside the single match channel');
 
-    // Editing credentials updates in place (does not create duplicates)
-    const initialCount = mRes.roomChannel.messages.cache.size;
+    // 5. Editing credentials updates in place (does not create duplicates)
+    const countBeforeEdit = mRes.matchChannel.messages.cache.size;
     await submitRoomDetails(env.guild, rm, mRes.match.matchId, 'ROOM999-NEW', 'PASS999-NEW');
-    assert.equal(mRes.roomChannel.messages.cache.size, initialCount, 'Editing credentials must edit in place');
+    assert.equal(mRes.matchChannel.messages.cache.size, countBeforeEdit, 'Editing credentials must edit in place without duplicate messages');
+
+    // 6. Test dashboard repositioning to bottom:
+    // In #room-maker-panel (or #available-challenges), when new messages arrive above the dashboard,
+    // repositioning sends replacement at the bottom and cleans up the previous message.
+    const config = await getArenaConfig(env.guild.id);
+    const rmPanel = env.channels.get(config.volunteerPanelId);
+    assert.ok(rmPanel);
+
+    // Post an initial dashboard message
+    const initialMsg = await rmPanel.send({ content: 'Persistent Dashboard' });
+    let currentStoredId = initialMsg.id;
+
+    // Simulate another message sent to the channel (e.g. reminder/log above dashboard)
+    await rmPanel.send({ content: 'Reminder: New match claimed!' });
+
+    // Reposition panel message
+    const newStoredId = await repositionPanelMessage(
+      rmPanel,
+      currentStoredId,
+      { content: 'Persistent Dashboard - Updated' },
+      async (newId) => { currentStoredId = newId; }
+    );
+
+    assert.notEqual(newStoredId, initialMsg.id, 'Dashboard must have been moved to bottom with a new message ID');
+    assert.equal(rmPanel.messages.cache.has(initialMsg.id), false, 'Old dashboard message must be deleted');
+    const lastMsg = rmPanel.messages.cache.last ? rmPanel.messages.cache.last() : Array.from(rmPanel.messages.cache.values()).pop();
+    assert.equal(lastMsg.id, newStoredId, 'Dashboard must now be at the bottom of the channel');
+
+    // When already at the bottom, reposition edits in place
+    const sameId = await repositionPanelMessage(
+      rmPanel,
+      currentStoredId,
+      { content: 'Persistent Dashboard - Edited In Place' },
+      async (newId) => { currentStoredId = newId; }
+    );
+    assert.equal(sameId, newStoredId, 'If already at bottom, message must be edited in place without recreation');
   });
 
   test('23. Players can report incorrect room credentials (ROOM_ISSUE), blocks match start until corrected', async () => {

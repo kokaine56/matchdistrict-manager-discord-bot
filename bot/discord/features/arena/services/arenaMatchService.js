@@ -167,53 +167,46 @@ export async function submitRoomDetails(guild, member, matchId, roomId, roomPass
     updatedMatch = transition.match;
   }
 
-  // 1. Post/Edit room credentials in the dedicated Room Channel
-  const roomCredsPayload = {
-    content:
-      `🔐 **BGMI Custom Room Credentials:**\n` +
-      `• **Room ID:** \`${cleanRoomId}\`\n` +
-      `• **Password:** \`${cleanPassword}\`\n\n` +
-      `*Both players (<@${match.playerA.discordId}> & <@${match.playerB.discordId}>), please join the BGMI custom room now. If the credentials do not work, click **Report Incorrect ID/Password** below.*`,
-    components: [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`arena:report_room_issue:${match.matchId}`)
-          .setLabel('Report Incorrect ID/Password')
-          .setStyle(ButtonStyle.Danger)
-      ),
-    ],
-  };
+  // Post or edit room credentials message directly inside this private match channel
+  if (match.matchChannelId) {
+    const channel =
+      guild.channels.cache.get(match.matchChannelId) ||
+      (await guild.channels.fetch(match.matchChannelId).catch(() => null));
+    if (channel) {
+      const roomCredsPayload = {
+        content:
+          `🔐 **BGMI Custom Room Credentials:**\n` +
+          `• **Room ID:** \`${cleanRoomId}\`\n` +
+          `• **Password:** \`${cleanPassword}\`\n\n` +
+          `*Both players (<@${match.playerA.discordId}> & <@${match.playerB.discordId}>), please join the BGMI custom room now. If the credentials do not work, click **Report Incorrect ID/Password** below.*`,
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`arena:report_room_issue:${match.matchId}`)
+              .setLabel('Report Incorrect ID/Password')
+              .setStyle(ButtonStyle.Danger)
+          ),
+        ],
+      };
 
-  if (match.roomChannelId) {
-    const rChannel =
-      guild.channels.cache.get(match.roomChannelId) ||
-      (await guild.channels.fetch(match.roomChannelId).catch(() => null));
-    if (rChannel) {
       let edited = false;
       if (match.roomMessageId) {
         const existingRoomMsg =
-          rChannel.messages?.cache?.get(match.roomMessageId) ||
-          (await rChannel.messages?.fetch?.(match.roomMessageId).catch(() => null));
+          channel.messages?.cache?.get(match.roomMessageId) ||
+          (await channel.messages?.fetch?.(match.roomMessageId).catch(() => null));
         if (existingRoomMsg) {
           await queueMessageEdit(existingRoomMsg, roomCredsPayload).catch(() => {});
           edited = true;
         }
       }
       if (!edited) {
-        const newMsg = await queueChannelSend(rChannel, roomCredsPayload);
+        const newMsg = await queueChannelSend(channel, roomCredsPayload);
         if (newMsg?.id) {
           await updateArenaMatch(matchId, { roomMessageId: newMsg.id });
         }
       }
-    }
-  }
 
-  // 2. Update match channel image embed & announce room details without leaking credentials
-  if (match.matchChannelId) {
-    const channel =
-      guild.channels.cache.get(match.matchChannelId) ||
-      (await guild.channels.fetch(match.matchChannelId).catch(() => null));
-    if (channel) {
+      // Update match image card in this same channel to show ROOM READY
       if (match.matchEmbedMessageId) {
         const msg =
           channel.messages?.cache?.get(match.matchEmbedMessageId) ||
@@ -221,17 +214,9 @@ export async function submitRoomDetails(guild, member, matchId, roomId, roomPass
         if (msg) {
           const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
           const payload = await buildMatchChannelEmbed(updatedMatch, member.displayName, { avatars, guild, client: guild.client });
-          await queueMessageEdit(msg, payload).catch(() => { });
+          await queueMessageEdit(msg, payload).catch(() => {});
         }
       }
-
-      // Link to the dedicated room channel
-      const roomChannelMention = match.roomChannelId ? `<#${match.roomChannelId}>` : 'the room channel';
-      await queueChannelSend(channel, {
-        content:
-          `🔐 **Room Credentials Published:** Room ID & Password have been published in ${roomChannelMention}.\n` +
-          `*Players, please join the custom room. The Room Maker will click **Start Match** once both players are in the room.*`,
-      });
     }
   }
 
@@ -348,18 +333,6 @@ export async function handleReportRoomCredentials(guild, member, matchId, issueT
           `⚠️ **Incorrect Room Credentials Reported!**\n` +
           `<@${member.id}> reported: **${issueType}** is incorrect.\n` +
           `<@${match.volunteerId}>, please review the custom room and submit corrected credentials using **Edit Room Details**. The match cannot start until resolved.`,
-      });
-    }
-  }
-
-  // Also notify in roomChannel
-  if (match.roomChannelId) {
-    const rChannel =
-      guild.channels.cache.get(match.roomChannelId) ||
-      (await guild.channels.fetch(match.roomChannelId).catch(() => null));
-    if (rChannel) {
-      await queueChannelSend(rChannel, {
-        content: `⚠️ <@${member.id}> reported that the room details are incorrect (${issueType}). Waiting for Room Maker <@${match.volunteerId}> to submit corrected credentials.`,
       });
     }
   }

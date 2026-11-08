@@ -14,8 +14,6 @@ import {
 import {
   addVolunteerToMatchChannel,
   removeVolunteerFromMatchChannel,
-  addRoomMakerToRoomChannel,
-  removeRoomMakerFromRoomChannel,
 } from './arenaChannelService.js';
 import {
   buildVolunteerPanelEmbed,
@@ -136,17 +134,7 @@ export async function handleClaimMatch(guild, member, matchId) {
     }
   }
 
-  // Also grant Room Maker access to room channel if it exists
-  if (match.roomChannelId) {
-    const roomChannel =
-      guild.channels.cache.get(match.roomChannelId) ||
-      (await guild.channels.fetch(match.roomChannelId).catch(() => null));
-    if (roomChannel) {
-      await addRoomMakerToRoomChannel(roomChannel, member.id);
-    }
-  }
-
-  // 2. Update #volunteer-panel message (assigned, no button)
+  // 2. Update #room-maker-panel message (assigned, no button)
   if (config?.volunteerPanelId && match.panelMessageId) {
     const volPanel =
       guild.channels.cache.get(config.volunteerPanelId) ||
@@ -196,7 +184,7 @@ export async function handleLeaveMatch(guild, member, matchId, isAdminAction = f
   const config = await getArenaConfig(guild.id);
   const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
 
-  // 1. Remove Room Maker permissions from match channel
+  // 1. Remove Room Maker permissions from match channel & clear room credentials message
   if (match.matchChannelId) {
     const matchChannel =
       guild.channels.cache.get(match.matchChannelId) ||
@@ -204,6 +192,15 @@ export async function handleLeaveMatch(guild, member, matchId, isAdminAction = f
     if (matchChannel) {
       if (prevVolunteerId) {
         await removeVolunteerFromMatchChannel(matchChannel, prevVolunteerId);
+      }
+
+      if (match.roomMessageId) {
+        const roomMsg =
+          matchChannel.messages?.cache?.get(match.roomMessageId) ||
+          (await matchChannel.messages?.fetch?.(match.roomMessageId).catch(() => null));
+        if (roomMsg) {
+          await roomMsg.delete().catch(() => {});
+        }
       }
 
       if (match.matchEmbedMessageId) {
@@ -217,35 +214,12 @@ export async function handleLeaveMatch(guild, member, matchId, isAdminAction = f
       }
 
       await queueChannelSend(matchChannel, {
-        content: `⚠️ The assigned Room Maker has left this match. Waiting for a new Room Maker to claim...`,
+        content: `⚠️ The assigned Room Maker has left this match. Credentials have been cleared. Waiting for a new Room Maker to claim...`,
       });
     }
   }
 
-  // 2. Remove Room Maker permissions from room channel & clear room message
-  if (match.roomChannelId) {
-    const roomChannel =
-      guild.channels.cache.get(match.roomChannelId) ||
-      (await guild.channels.fetch(match.roomChannelId).catch(() => null));
-    if (roomChannel) {
-      if (prevVolunteerId) {
-        await removeRoomMakerFromRoomChannel(roomChannel, prevVolunteerId);
-      }
-      if (match.roomMessageId) {
-        const roomMsg =
-          roomChannel.messages?.cache?.get(match.roomMessageId) ||
-          (await roomChannel.messages?.fetch?.(match.roomMessageId).catch(() => null));
-        if (roomMsg) {
-          await queueMessageEdit(roomMsg, {
-            content: `⚠️ The previous Room Maker has left the match. Room credentials have been cleared. Waiting for a new Room Maker to claim and submit credentials.`,
-            components: [],
-          }).catch(() => {});
-        }
-      }
-    }
-  }
-
-  // 3. Re-enable #volunteer-panel message with Accept Match button
+  // 2. Re-enable #room-maker-panel message with Accept Match button
   if (config?.volunteerPanelId && match.panelMessageId) {
     const volPanel =
       guild.channels.cache.get(config.volunteerPanelId) ||

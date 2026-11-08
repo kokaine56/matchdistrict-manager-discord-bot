@@ -103,22 +103,22 @@ export async function refreshArenaMatchCards(guild, match, options = {}) {
     }
   }
 
-  // 2. #volunteer-panel card
+  // 2. #room-maker-panel card (Dashboard must always remain at the bottom)
   const config = await getArenaConfig(guild.id);
   if (config?.volunteerPanelId) {
     const panel = await resolveChannel(guild, config.volunteerPanelId);
     if (panel) {
       const payload = await buildVolunteerPanelEmbed(match, volunteerDisplayName, renderOptions);
-      const msg = await resolveMessage(panel, match.panelMessageId);
-      if (msg) {
-        await queueMessageEdit(msg, payload);
-        result.volunteerPanel = true;
-      } else if (options.allowCreateIfMissing && !ARENA_FINAL_STATUSES.includes(match.status)) {
-        const sent = await queueChannelSend(panel, payload);
-        if (sent?.id) {
-          idUpdates.panelMessageId = sent.id;
-          result.volunteerPanel = true;
-        }
+      if (match.panelMessageId || (options.allowCreateIfMissing && !ARENA_FINAL_STATUSES.includes(match.status))) {
+        const finalId = await repositionPanelMessage(
+          panel,
+          match.panelMessageId,
+          payload,
+          (newId) => {
+            idUpdates.panelMessageId = newId;
+          }
+        );
+        if (finalId) result.volunteerPanel = true;
       }
     }
   }
@@ -132,8 +132,8 @@ export async function refreshArenaMatchCards(guild, match, options = {}) {
 }
 
 /**
- * Re-renders an #available-challenges card and edits the existing managed message in place.
- * With allowCreateIfMissing, an OPEN challenge whose message was deleted gets a fresh card.
+ * Re-renders an #available-challenges card and ensures the dashboard remains at the bottom of the channel.
+ * Moves existing dashboard to the bottom when new messages appear above it, editing in place otherwise.
  */
 export async function refreshArenaChallengeCard(guild, challenge, options = {}) {
   if (!guild || !challenge) return false;
@@ -147,20 +147,20 @@ export async function refreshArenaChallengeCard(guild, challenge, options = {}) 
     avatars: options.avatars,
     acceptedOpponent: options.acceptedOpponent || null,
   });
-  const msg = await resolveMessage(channel, challenge.discordMessageId);
-  if (msg) {
-    await queueMessageEdit(msg, payload);
-    return true;
-  }
-  if (options.allowCreateIfMissing && challenge.status === ARENA_STATUS.OPEN) {
-    const sent = await queueChannelSend(channel, payload);
-    if (sent?.id) {
-      await updateArenaChallenge(challenge.challengeId, {
-        discordMessageId: sent.id,
-        discordChannelId: channel.id,
-      }).catch((err) => console.warn('[Arena] ⚠️ Failed to persist refreshed challenge message id:', err.message));
-      return true;
-    }
+
+  if (challenge.discordMessageId || (options.allowCreateIfMissing && challenge.status === ARENA_STATUS.OPEN)) {
+    const finalId = await repositionPanelMessage(
+      channel,
+      challenge.discordMessageId,
+      payload,
+      async (newId) => {
+        await updateArenaChallenge(challenge.challengeId, {
+          discordMessageId: newId,
+          discordChannelId: channel.id,
+        }).catch((err) => console.warn('[Arena] ⚠️ Failed to persist refreshed challenge message id:', err.message));
+      }
+    );
+    return Boolean(finalId);
   }
   return false;
 }
@@ -170,28 +170,44 @@ export async function repositionPanelMessage(channel, storedMessageId, newPayloa
 
   let existing = null;
   if (storedMessageId) {
-    existing = channel.messages?.cache?.get(storedMessageId) || (await channel.messages?.fetch?.(storedMessageId).catch(() => null));
+    existing =
+      channel.messages?.cache?.get(storedMessageId) ||
+      (await channel.messages?.fetch?.(storedMessageId).catch(() => null));
   }
 
-  // Check if channel's last message is this message
-  const lastMessageId = channel.lastMessageId || channel.lastMessage?.id || null;
-  const isAtBottom = existing && lastMessageId && (lastMessageId === existing.id);
+  // Determine the ID of the last message in the channel
+  let lastId = channel.lastMessageId || channel.lastMessage?.id || null;
+  if (!lastId && channel.messages?.cache) {
+    if (typeof channel.messages.cache.last === 'function') {
+      lastId = channel.messages.cache.last()?.id || null;
+    } else {
+      const arr = Array.from(channel.messages.cache.values?.() || []);
+      lastId = arr.length > 0 ? arr[arr.length - 1]?.id : null;
+    }
+  }
+
+  const isAtBottom = existing && lastId && (lastId === existing.id);
 
   if (existing && isAtBottom) {
+    // Already the latest message: edit in place without recreation
     await queueMessageEdit(existing, newPayload).catch(() => {});
     return existing.id;
   }
 
-  // Otherwise delete old managed message and recreate cleanly at the bottom
-  if (existing) {
-    await existing.delete().catch(() => {});
+  // Not at bottom or missing: create replacement at bottom first
+  const sent = await queueChannelSend(channel, newPayload);
+  if (sent?.id) {
+    // Delete previous dashboard message only after replacement is successfully created
+    if (existing) {
+      await existing.delete().catch(() => {});
+    }
+    if (typeof onNewId === 'function') {
+      await onNewId(sent.id);
+    }
+    return sent.id;
   }
 
-  const sent = await queueChannelSend(channel, newPayload);
-  if (sent?.id && typeof onNewId === 'function') {
-    await onNewId(sent.id);
-  }
-  return sent?.id || null;
+  return existing?.id || null;
 }
 
 export function buildResultVerificationPayload(match, winnerPlayer, evidenceUrl = null) {
