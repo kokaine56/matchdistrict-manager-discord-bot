@@ -219,6 +219,17 @@ import {
   handleRemoveThreadsCommand,
   isThreadAdmin,
 } from './threadManagementService.js';
+import {
+  handleRoleCommand,
+  handleRolePrefixInteraction,
+  handleRolePrefixMemberUpdate,
+  initRolePrefixCache,
+} from './bot/discord/features/rolePrefix/index.js';
+import {
+  handleHelpCommand,
+  handleHelpInteraction,
+  getHelpResponse,
+} from './helpService.js';
 
 
 export {
@@ -344,6 +355,13 @@ export {
   logTournamentAction,
   handleRemoveThreadsCommand,
   isThreadAdmin,
+  handleRoleCommand,
+  handleRolePrefixInteraction,
+  handleRolePrefixMemberUpdate,
+  initRolePrefixCache,
+  getHelpResponse,
+  handleHelpCommand,
+  handleHelpInteraction,
   buildDynamicWelcomeMessage,
   resolveDynamicWelcomeMessage,
   resolveActiveInviteEvents,
@@ -1191,43 +1209,6 @@ export function buildBotPreviewMessage(guild, welcomeEnabled, channelMap) {
  */
 export function getPingResponse(roundtripLatency, wsLatency) {
   return `🏓 **Pong!**\n• Latency: **${roundtripLatency}ms**\n• WebSocket API: **${wsLatency >= 0 ? wsLatency : 0}ms**`;
-}
-
-export function getHelpResponse(prefix = PREFIX) {
-  return (
-    `🎮 **MatchDistrict Bot Commands**\n` +
-    `Prefix: \`${prefix}\`\n\n` +
-    `**🛡️ Administrator & Moderation:**\n` +
-    `• \`${prefix}setup\` — *(Admin Only)* Create/configure management and member-log channels\n` +
-    `• \`${prefix}member count <text>\` — *(Admin Only)* Set the member-count channel prefix\n` +
-    `• \`${prefix}setup remove\` — *(Admin Only)* Safely remove and delete management channels (requires confirmation)\n` +
-    `• \`${prefix}dm welcome on\` — *(Admin Only)* Enable welcome DMs for new members\n` +
-    `• \`${prefix}dm welcome off\` — *(Admin Only)* Disable welcome DMs for new members\n` +
-    `• \`${prefix}ban @user [reason]\` — *(Mod Only)* Ban a user with audit logging\n` +
-    `• \`${prefix}clear <1-100>\` — *(Mod Only)* Bulk delete recent messages\n` +
-    `• \`${prefix}mute <@user|id> <minutes>\` — *(Mod Only)* Timeout a user for a number of minutes\n` +
-    `• \`${prefix}unmute <@user|id>\` — *(Mod Only)* Remove timeout from a user\n` +
-    `• \`${prefix}unban <@user|id>\` — *(Mod Only)* Unban a user from the server\n` +
-    `• \`${prefix}ticket setup\` / \`${prefix}ticket delete\` — *(Admin Only)* Manage the support ticket service\n` +
-    `• \`${prefix}annc setup\` — *(Admin Only)* Setup private announcement DM dispatch channel\n` +
-    `• \`${prefix}remove threads\` — *(Admin Only)* Disable thread creation permissions in this channel\n\n` +
-    `**🏆 Tournament & Organiser Management:**\n` +
-    `• \`${prefix}organiser\` — *(Admin Only)* Connect this Discord server to your MatchDistrict organiser account\n` +
-    `• \`${prefix}organiser unlink\` — *(Admin Only)* Disconnect this Discord server from the organiser account\n` +
-    `• \`${prefix}list tournament [all]\` — *(Admin Only)* List tournaments & open control panel via selection\n` +
-    `• \`${prefix}select tournament <id>\` — *(Admin Only)* Open or refresh control panel in #bot-commands\n` +
-    `• \`${prefix}dash\` — *(Admin Only)* Restore/resynchronize the tournament control panel in #bot-commands\n` +
-    `• \`${prefix}delete tournament <id>\` — *(Admin Only)* Permanently delete tournament, channels, roles, and database records\n` +
-    `• \`${prefix}fetch teams [id]\` — *(Admin Only)* Provision tournament channels & sync live registered squad\n` +
-    `• \`${prefix}cred <room_id> <password>\` — *(Admin Only)* Publish match credentials inside a private group channel\n\n` +
-    `**ℹ️ General Information:**\n` +
-    `• \`${prefix}status\` — Check server configuration & welcome status\n` +
-    `• \`${prefix}website\` — Get the official MatchDistrict platform link\n` +
-    `• \`${prefix}ping\` — Check bot response time & WebSocket latency\n` +
-    `• \`${prefix}help\` — Show this list of commands\n\n` +
-    `🌐 Visit our platform: https://matchdistrict.in\n` +
-    `— Team MatchDistrict`
-  );
 }
 
 export function getWebsiteResponse() {
@@ -2876,6 +2857,11 @@ client.once(Events.ClientReady, async (readyClient) => {
   });
   startArenaScheduler(readyClient);
 
+  // Initialize role prefix cache from MongoDB
+  await initRolePrefixCache().catch((rpErr) => {
+    console.warn('[RolePrefix] ⚠️ Startup cache init warning:', rpErr.message);
+  });
+
   // Restore each persisted dashboard in place and clean its command channel after every restart.
   for (const guild of readyClient.guilds.cache.values()) {
     const tournaments = guildSettingsCache[guild.id]?.tournaments || {};
@@ -2913,7 +2899,7 @@ client.on(Events.MessageCreate, async (message) => {
           ? commandText.slice(PREFIX.length).trim()
           : commandText.replace(new RegExp(`^<@!?${client.user?.id}>\\s*`), '');
         const dashboardCommand = (commandText.startsWith(PREFIX) || withoutPrefix !== commandText) &&
-          ['dash', 'dashboard', 'setup', 'member', 'mute', 'unmute'].includes(withoutPrefix.split(/\s+/)[0]?.toLowerCase());
+          ['dash', 'dashboard', 'setup', 'member', 'mute', 'unmute', 'help', 'commands'].includes(withoutPrefix.split(/\s+/)[0]?.toLowerCase());
         if (dashboardCommand) {
           // Let .dash run; its handler deletes the invocation after access checks.
         } else {
@@ -3199,8 +3185,16 @@ client.on(Events.MessageCreate, async (message) => {
         const wsLatency = Math.round(message.client.ws.ping);
         await sent.edit(getPingResponse(roundtripLatency, wsLatency));
         return;
-      } else if (cmd === 'help') {
-        await message.reply(getHelpResponse(PREFIX));
+      } else if (cmd === 'help' || cmd === 'commands') {
+        await handleHelpCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          args,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+          PREFIX,
+          message
+        );
         return;
       } else if (cmd === 'website' || cmd === 'site') {
         await message.reply(getWebsiteResponse());
@@ -3251,6 +3245,17 @@ client.on(Events.MessageCreate, async (message) => {
         return;
       } else if (cmd === 'release' || cmd === 'leave') {
         await handleReleaseCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          args,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+          client,
+          message
+        );
+        return;
+      } else if (cmd === 'role') {
+        await handleRoleCommand(
           message.guild,
           message.member,
           message.channel,
@@ -3345,6 +3350,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // Handle 1v1 Challenge Arena interactions (buttons, modals, challenge & match lifecycle)
   if (interaction.customId?.startsWith('arena:')) {
     const handled = await handleArenaInteraction(interaction);
+    if (handled) return;
+  }
+
+  // Handle Role Prefix wizard interactions (select menus & buttons)
+  if (interaction.customId?.startsWith('role_pre:')) {
+    const handled = await handleRolePrefixInteraction(interaction);
+    if (handled) return;
+  }
+
+  // Handle command directory help interactions (pagination & category select)
+  if (interaction.customId?.startsWith('help:')) {
+    const handled = await handleHelpInteraction(interaction, PREFIX);
     if (handled) return;
   }
 
@@ -3584,7 +3601,12 @@ client.on(Events.ChannelUpdate, async (oldChannel, newChannel) => {
 
 client.on(Events.GuildMemberAdd, updateGuildMemberCache);
 client.on(Events.GuildMemberRemove, removeGuildMemberFromCache);
-client.on(Events.GuildMemberUpdate, (_oldMember, newMember) => updateGuildMemberCache(newMember));
+client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
+  updateGuildMemberCache(newMember);
+  await handleRolePrefixMemberUpdate(oldMember, newMember).catch((err) => {
+    console.warn(`[RolePrefix] ⚠️ Error handling member update for ${newMember?.id}:`, err?.message || err);
+  });
+});
 client.on(Events.GuildMemberAdd, (member) => scheduleMemberCountChannelRefresh(member.guild));
 client.on(Events.GuildMemberRemove, (member) => scheduleMemberCountChannelRefresh(member.guild));
 

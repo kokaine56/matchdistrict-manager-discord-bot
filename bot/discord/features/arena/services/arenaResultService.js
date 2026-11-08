@@ -16,6 +16,7 @@ import {
   buildCompletedMatchResultEmbed,
   buildCompletedMatchResultPayload,
   refreshArenaMatchCards,
+  deleteMatchNotifications,
 } from './arenaNotificationService.js';
 import { queueChannelSend, queueMessageEdit } from '../../../../../discordQueue.js';
 
@@ -95,6 +96,7 @@ export async function completeArenaMatch(
   const completedMatch = transition.match;
 
   await refreshArenaMatchCards(guild, completedMatch);
+  await deleteMatchNotifications(guild, completedMatch);
 
   // 1. Update winner & loser stats in arena_players
   const winnerPlayer = await getArenaPlayer(effectiveWinnerId);

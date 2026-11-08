@@ -209,6 +209,13 @@ export async function queueRoleRemove(member, roleId, reason) {
   return enqueueDiscordAction(() => member.roles.remove(roleId, reason), 'role');
 }
 
+export async function queueMemberNickname(member, nickname, reason = 'Role prefix update') {
+  if (!member || typeof member.setNickname !== 'function') {
+    return null;
+  }
+  return enqueueDiscordAction(() => member.setNickname(nickname, reason), 'action');
+}
+
 export async function queueDirectMessage(userOrMember, payload) {
   if (!userOrMember || typeof userOrMember.send !== 'function') return null;
   return enqueueDiscordAction(() => userOrMember.send(payload), 'dm');

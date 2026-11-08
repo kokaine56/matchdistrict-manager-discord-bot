@@ -22,6 +22,7 @@ import {
   safeDirectMessage,
   sendChallengeCreationNotification,
   sendRoomMakerNeededNotification,
+  deleteChallengeNotification,
 } from './arenaNotificationService.js';
 import {
   createMatchChannel,
@@ -192,6 +193,9 @@ export async function handleCancelChallenge(guild, member, challengeId) {
     }
   }
 
+  // Delete @here notification from #available-matches
+  await deleteChallengeNotification(guild, challenge);
+
   await logArenaAction({
     action: 'CHALLENGE_CANCELLED',
     challengeId,
@@ -280,6 +284,8 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
       bgmiUid: accepter.bgmiUid,
     },
     status: ARENA_STATUS.WAITING_FOR_VOLUNTEER,
+    challengeNotificationMessageId: challenge.notificationMessageId || null,
+    challengeNotificationChannelId: challenge.notificationChannelId || null,
   });
 
   // 1. Create Private Match Channel (Challengers: match-0001)
@@ -361,6 +367,9 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
       }
     }
   }
+
+  // Delete @here notification from #available-matches
+  await deleteChallengeNotification(guild, challenge);
 
   // 4. DM both players (best effort)
   const channelLink = matchChannel ? `<#${matchChannel.id}>` : `channel match-${match.matchId.toLowerCase()}`;

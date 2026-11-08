@@ -36,6 +36,10 @@ import {
   handleLeaveMatch,
 } from '../services/arenaVolunteerService.js';
 import {
+  deleteChallengeNotification,
+  deleteMatchNotifications,
+} from '../services/arenaNotificationService.js';
+import {
   handleAdminResolveDispute,
 } from '../services/arenaDisputeService.js';
 import {
@@ -224,6 +228,7 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
     const challenge = await getArenaChallenge(targetId);
     if (challenge && challenge.status === ARENA_STATUS.OPEN) {
       await updateArenaChallenge(targetId, { status: ARENA_STATUS.CANCELLED });
+      await deleteChallengeNotification(guild, challenge);
       return replyFn(`✅ Open challenge **${targetId}** has been cancelled.`);
     }
 
@@ -244,6 +249,8 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
         roomPassword: null,
       },
     });
+
+    await deleteMatchNotifications(guild, match);
 
     // Free both players
     await atomicReleasePlayerMatch(match.playerA.discordId, match.matchId);

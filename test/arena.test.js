@@ -2126,14 +2126,15 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.ok(notifMsg, 'A notification containing @here must be sent');
     assert.equal(
       notifMsg.content,
-      `@here A new BGMI TDM 1V1 challenge is available! Head over to <#${config.availableChannelId}> and accept the challenge.`
+      '@here A new BGMI TDM 1V1 challenge is available! Accept the challenge now!'
     );
     assert.deepEqual(notifMsg.allowedMentions, { parse: ['everyone'] });
 
-    // Verify challenge document in MongoDB tracked creationNotified = true
+    // Verify challenge document in MongoDB tracked creationNotified = true and notificationMessageId
     const challengeDoc = await getArenaChallenge(challengeId);
     assert.equal(challengeDoc.creationNotified, true);
     assert.ok(challengeDoc.creationNotifiedAt);
+    assert.equal(challengeDoc.notificationMessageId, notifMsg.id);
 
     // 2. Re-refreshing challenge card does NOT send duplicate @here
     const { refreshArenaChallengeCard } = await import('../bot/discord/features/arena/services/arenaNotificationService.js');
@@ -2144,7 +2145,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(hereCount, 1, 'Only one @here notification must ever be sent per challenge');
   });
 
-  test('32. Notify online members with @here when match needs Room Maker, re-notifies on leave, no duplicates on refresh', async () => {
+  test('32. Notify online members with @here when match needs Room Maker, re-notifies on leave, cleans up on claim', async () => {
     const env = createMockArenaEnvironment('guild-notif-2');
     const admin = env.addMember('admin-notif-2', 'NotifAdmin2', { isAdmin: true });
     await setupArenaChannels(env.guild, admin);
@@ -2174,12 +2175,13 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.ok(notifMsg1, '@here notification must be sent when match enters WAITING_FOR_VOLUNTEER');
     assert.equal(
       notifMsg1.content,
-      `@here A BGMI TDM 1V1 match needs a Room Maker! Visit <#${config.volunteerPanelId}> and claim an available match.`
+      '@here A BGMI TDM 1V1 match needs a Room Maker! Claim an available match now!'
     );
     assert.deepEqual(notifMsg1.allowedMentions, { parse: ['everyone'] });
 
-    // 2. Room Maker claims match
+    // 2. Room Maker claims match -> availability notification is cleaned up!
     await handleClaimMatch(env.guild, rm, matchId);
+    assert.equal(rmPanel.messages.cache.has(notifMsg1.id), false, 'Notification must be deleted when match is claimed');
 
     // Refreshing panel / match cards does NOT send another @here
     const { refreshArenaMatchCards } = await import('../bot/discord/features/arena/services/arenaNotificationService.js');
@@ -2189,7 +2191,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     const hereCountWhileClaimed = Array.from(rmPanel.messages.cache.values()).filter(
       (m) => typeof m.content === 'string' && m.content.includes('@here')
     ).length;
-    assert.equal(hereCountWhileClaimed, 1, 'No additional notification while claimed');
+    assert.equal(hereCountWhileClaimed, 0, 'No notification while claimed');
 
     // 3. Room Maker leaves match -> match re-enters WAITING_FOR_VOLUNTEER -> sends @here once more
     const { handleLeaveMatch } = await import('../bot/discord/features/arena/services/arenaVolunteerService.js');
@@ -2197,18 +2199,20 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(leaveRes.ok, true);
 
     const rmPanelMsgsAfterLeave = Array.from(rmPanel.messages.cache.values());
-    const hereCountAfterLeave = rmPanelMsgsAfterLeave.filter(
-      (m) => typeof m.content === 'string' && m.content.includes('@here')
-    ).length;
-    assert.equal(hereCountAfterLeave, 2, 'A new @here notification must be sent when Room Maker leaves and match returns to waiting');
+    const notifMsg2 = rmPanelMsgsAfterLeave.find((m) => typeof m.content === 'string' && m.content.includes('@here'));
+    assert.ok(notifMsg2, 'A new @here notification must be sent when Room Maker leaves and match returns to waiting');
+    assert.equal(
+      notifMsg2.content,
+      '@here A BGMI TDM 1V1 match needs a Room Maker! Claim an available match now!'
+    );
 
-    // Re-refreshing after leave does not send a third notification
+    // Re-refreshing after leave does not send a duplicate notification
     const mDocAfterLeave = await getArenaMatch(matchId);
     await refreshArenaMatchCards(env.guild, mDocAfterLeave, { client: env.client });
     const hereCountAfterSecondRefresh = Array.from(rmPanel.messages.cache.values()).filter(
       (m) => typeof m.content === 'string' && m.content.includes('@here')
     ).length;
-    assert.equal(hereCountAfterSecondRefresh, 2);
+    assert.equal(hereCountAfterSecondRefresh, 1);
   });
 
   test('33. Challenge cleanup: expired, cancelled, and accepted challenges delete their message from #available-matches', async () => {
@@ -2227,37 +2231,47 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     await upsertArenaPlayer('p-clean-b', { displayName: 'PlayerCleanB', bgmiIgn: 'CleanB', bgmiUid: '999222' });
     await upsertArenaPlayer('p-clean-c', { displayName: 'PlayerCleanC', bgmiIgn: 'CleanC', bgmiUid: '999333' });
 
-    // --- Scenario A: Cancelled challenge deletes message ---
+    // --- Scenario A: Cancelled challenge deletes message & notification ---
     const c1Res = await handleCreateChallenge(env.guild, pA);
     const c1Id = c1Res.challenge.challengeId;
     const c1MsgId = c1Res.challenge.discordMessageId;
+    const c1NotifId = c1Res.challenge.notificationMessageId;
     assert.ok(c1MsgId);
+    assert.ok(c1NotifId);
     assert.ok(availMatches.messages.cache.has(c1MsgId), 'Card should exist before cancellation');
+    assert.ok(availMatches.messages.cache.has(c1NotifId), 'Notification should exist before cancellation');
 
     await handleCancelChallenge(env.guild, pA, c1Id);
     assert.equal(availMatches.messages.cache.has(c1MsgId), false, 'Challenge card must be deleted on cancellation');
+    assert.equal(availMatches.messages.cache.has(c1NotifId), false, 'Challenge notification must be deleted on cancellation');
     const c1Doc = await getArenaChallenge(c1Id);
     assert.equal(c1Doc.status, ARENA_STATUS.CANCELLED);
 
-    // --- Scenario B: Accepted challenge deletes open challenge message ---
+    // --- Scenario B: Accepted challenge deletes open challenge message & notification ---
     await upsertArenaPlayer(pA.id, { lastChallengeCreatedAt: null });
     const c2Res = await handleCreateChallenge(env.guild, pA);
     assert.equal(c2Res.ok, true);
     const c2Id = c2Res.challenge.challengeId;
     const c2MsgId = c2Res.challenge.discordMessageId;
+    const c2NotifId = c2Res.challenge.notificationMessageId;
     assert.ok(c2MsgId);
+    assert.ok(c2NotifId);
     assert.ok(availMatches.messages.cache.has(c2MsgId), 'Card should exist before acceptance');
+    assert.ok(availMatches.messages.cache.has(c2NotifId), 'Notification should exist before acceptance');
 
     await handleAcceptChallenge(env.guild, pB, c2Id, env.client);
     assert.equal(availMatches.messages.cache.has(c2MsgId), false, 'Open challenge card must be deleted on acceptance');
+    assert.equal(availMatches.messages.cache.has(c2NotifId), false, 'Challenge notification must be deleted on acceptance');
 
-    // --- Scenario C: Expired challenge deletes message via scheduler ---
+    // --- Scenario C: Expired challenge deletes message & notification via scheduler ---
     await upsertArenaPlayer(pC.id, { lastChallengeCreatedAt: null });
     const c3Res = await handleCreateChallenge(env.guild, pC);
     assert.equal(c3Res.ok, true);
     const c3Id = c3Res.challenge.challengeId;
     const c3MsgId = c3Res.challenge.discordMessageId;
+    const c3NotifId = c3Res.challenge.notificationMessageId;
     assert.ok(availMatches.messages.cache.has(c3MsgId), 'Card should exist before expiry');
+    assert.ok(availMatches.messages.cache.has(c3NotifId), 'Notification should exist before expiry');
 
     // Fast-forward expiry in past
     await updateArenaChallenge(c3Id, {
@@ -2268,6 +2282,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     await checkArenaLifecycles(env.client);
 
     assert.equal(availMatches.messages.cache.has(c3MsgId), false, 'Expired challenge card must be deleted from channel');
+    assert.equal(availMatches.messages.cache.has(c3NotifId), false, 'Expired challenge notification must be deleted from channel');
     const c3Doc = await getArenaChallenge(c3Id);
     assert.equal(c3Doc.status, ARENA_STATUS.EXPIRED, 'Status must be updated to EXPIRED in MongoDB');
 
@@ -2353,5 +2368,46 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(chInfo.name, '1v1-tdm-info');
     assert.equal(chCreate.name, '1v1-tdm-create');
     assert.equal(env.channels.size, initialTotalChannels);
+  });
+
+  test('35. Notification cleanup on match completion and cancellation', async () => {
+    const env = createMockArenaEnvironment('guild-notif-clean-35');
+    const admin = env.addMember('admin-35', 'Admin35', { isAdmin: true });
+    await setupArenaChannels(env.guild, admin);
+
+    const config = await getArenaConfig(env.guild.id);
+    const rmPanel = env.channels.get(config.volunteerPanelId);
+    const availMatches = env.channels.get(config.availableChannelId);
+
+    const pA = env.addMember('p-35-a', 'Player35A');
+    const pB = env.addMember('p-35-b', 'Player35B');
+
+    await upsertArenaPlayer('p-35-a', { displayName: 'Player35A', bgmiIgn: 'IGN35A', bgmiUid: '888001' });
+    await upsertArenaPlayer('p-35-b', { displayName: 'Player35B', bgmiIgn: 'IGN35B', bgmiUid: '888002' });
+
+    // 1. Create and accept challenge
+    const cRes = await handleCreateChallenge(env.guild, pA);
+    const challengeId = cRes.challenge.challengeId;
+    assert.equal(availMatches.messages.cache.has(cRes.challenge.notificationMessageId), true);
+
+    const mRes = await handleAcceptChallenge(env.guild, pB, challengeId, env.client);
+    assert.equal(mRes.ok, true);
+    // Challenge notification deleted upon acceptance
+    assert.equal(availMatches.messages.cache.has(cRes.challenge.notificationMessageId), false);
+
+    // Room Maker notification was sent in #room-maker-panel
+    const matchId = mRes.match.matchId;
+    const matchDoc = await getArenaMatch(matchId);
+    const rmNotifId = matchDoc.roomMakerNotificationMessageId;
+    assert.ok(rmNotifId);
+    assert.equal(rmPanel.messages.cache.has(rmNotifId), true);
+
+    // 2. Admin cancels match while in WAITING_FOR_VOLUNTEER -> Room Maker notification must be deleted
+    await handleArenaCommand(env.guild, admin, null, ['cancel', matchId, 'Test cancellation'], () => {});
+    assert.equal(rmPanel.messages.cache.has(rmNotifId), false, 'Room Maker notification must be deleted on match cancellation');
+
+    const cancelledDoc = await getArenaMatch(matchId);
+    assert.equal(cancelledDoc.status, ARENA_STATUS.CANCELLED);
+    assert.equal(cancelledDoc.roomMakerNotificationMessageId, null);
   });
 });

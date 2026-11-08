@@ -415,6 +415,8 @@ export async function createArenaChallenge(data) {
     status: data.status || ARENA_STATUS.OPEN,
     discordMessageId: data.discordMessageId ? String(data.discordMessageId) : null,
     discordChannelId: data.discordChannelId ? String(data.discordChannelId) : null,
+    notificationMessageId: data.notificationMessageId ? String(data.notificationMessageId) : null,
+    notificationChannelId: data.notificationChannelId ? String(data.notificationChannelId) : null,
     createdAt: data.createdAt ? new Date(data.createdAt) : now,
     acceptedAt: data.acceptedAt ? new Date(data.acceptedAt) : null,
     expiresAt: data.expiresAt ? new Date(data.expiresAt) : new Date(now.getTime() + ARENA_CONSTANTS.CHALLENGE_EXPIRY_MS),
@@ -590,6 +592,10 @@ export async function createArenaMatch(data) {
     roomMakerNotifiedForWaiting: false,
     roomMakerNotifiedAt: null,
     roomMakerNotificationCount: 0,
+    roomMakerNotificationMessageId: data.roomMakerNotificationMessageId ? String(data.roomMakerNotificationMessageId) : null,
+    roomMakerNotificationChannelId: data.roomMakerNotificationChannelId ? String(data.roomMakerNotificationChannelId) : null,
+    challengeNotificationMessageId: data.challengeNotificationMessageId ? String(data.challengeNotificationMessageId) : null,
+    challengeNotificationChannelId: data.challengeNotificationChannelId ? String(data.challengeNotificationChannelId) : null,
     status: data.status || ARENA_STATUS.WAITING_FOR_VOLUNTEER,
     winnerId: null,
     loserId: null,
@@ -916,6 +922,8 @@ export async function atomicLeaveArenaMatch(matchId, roomMakerId = null) {
     volunteerWarningDueAt: new Date(now.getTime() + ARENA_CONSTANTS.VOLUNTEER_WARNING_MS),
     volunteerTimeoutDueAt: new Date(now.getTime() + ARENA_CONSTANTS.VOLUNTEER_TIMEOUT_MS),
     roomMakerNotifiedForWaiting: false,
+    roomMakerNotificationMessageId: null,
+    roomMakerNotificationChannelId: null,
     updatedAt: now,
   };
 

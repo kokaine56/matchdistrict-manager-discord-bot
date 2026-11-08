@@ -23,6 +23,7 @@ import {
   buildArenaStatusEmbed,
   purgeStandaloneRoomMakerMessages,
   sendRoomMakerNeededNotification,
+  deleteRoomMakerNotification,
 } from './arenaNotificationService.js';
 import { fetchMatchAvatars } from './arenaImageService.js';
 import { queueMessageEdit, queueChannelSend } from '../../../../../discordQueue.js';
@@ -184,6 +185,9 @@ export async function handleClaimMatch(guild, member, matchId) {
     }
   }
 
+  // Delete Room Maker availability notification once claimed
+  await deleteRoomMakerNotification(guild, match);
+
   await logArenaAction({
     action: 'MATCH_CLAIMED',
     matchId,
@@ -224,6 +228,9 @@ export async function handleLeaveMatch(guild, member, matchId, isAdminAction = f
   const prevVolunteerId = leaveRes.previousRoomMakerId;
   const config = await getArenaConfig(guild.id);
   const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
+
+  // Delete previous Room Maker availability notification before sending a fresh one
+  await deleteRoomMakerNotification(guild, match);
 
   // 1. Remove Room Maker access from their private channel (roommaker-0001)
   const rmChannelId = match.roomMakerChannelId || match.roomChannelId;

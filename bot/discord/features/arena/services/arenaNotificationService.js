@@ -10,6 +10,8 @@ import {
   ARENA_STATUS,
   ARENA_FINAL_STATUSES,
   getArenaConfig,
+  getArenaChallenge,
+  getArenaMatch,
   updateArenaMatch,
   updateArenaChallenge,
   formatMatchId,
@@ -23,7 +25,7 @@ import {
   buildChallengeCardPayload,
   buildMatchResultPayload,
 } from './arenaImageService.js';
-import { queueDirectMessage, queueChannelSend, queueMessageEdit } from '../../../../../discordQueue.js';
+import { queueDirectMessage, queueChannelSend, queueMessageEdit, queueMessageDelete } from '../../../../../discordQueue.js';
 
 export function buildCreateChallengePanel() {
   const embed = new EmbedBuilder()
@@ -88,9 +90,12 @@ export function buildArenaInfoPanel(channelIds = {}) {
   return { embeds: [embed] };
 }
 
+export const CHALLENGE_CREATION_NOTIF_TEXT = '@here A new BGMI TDM 1V1 challenge is available! Accept the challenge now!';
+export const ROOM_MAKER_NEEDED_NOTIF_TEXT = '@here A BGMI TDM 1V1 match needs a Room Maker! Claim an available match now!';
+
 /**
  * Notifies online members via @here when a new challenge is created in #available-matches.
- * Guarantees exactly-once send via atomic DB claim.
+ * Guarantees exactly-once send via atomic DB claim, and records the Discord message ID.
  */
 export async function sendChallengeCreationNotification(guild, challenge, availableChannel) {
   if (!guild || !challenge || !availableChannel) return false;
@@ -100,12 +105,22 @@ export async function sendChallengeCreationNotification(guild, challenge, availa
     return false;
   }
 
-  const content = `@here A new BGMI TDM 1V1 challenge is available! Head over to <#${availableChannel.id}> and accept the challenge.`;
+  const content = CHALLENGE_CREATION_NOTIF_TEXT;
   try {
-    await queueChannelSend(availableChannel, {
+    const sentMsg = await queueChannelSend(availableChannel, {
       content,
       allowedMentions: { parse: ['everyone'] },
     });
+    if (sentMsg?.id) {
+      const msgIdStr = String(sentMsg.id);
+      const chIdStr = String(availableChannel.id);
+      await updateArenaChallenge(challenge.challengeId, {
+        notificationMessageId: msgIdStr,
+        notificationChannelId: chIdStr,
+      });
+      challenge.notificationMessageId = msgIdStr;
+      challenge.notificationChannelId = chIdStr;
+    }
     return true;
   } catch (err) {
     console.warn(`[Arena] ⚠️ Failed to send challenge creation @here notification in ${availableChannel.id}:`, err?.message || err);
@@ -115,7 +130,8 @@ export async function sendChallengeCreationNotification(guild, challenge, availa
 
 /**
  * Notifies online members via @here when a match enters WAITING_FOR_VOLUNTEER in #room-maker-panel.
- * Guarantees exactly-once send per WAITING_FOR_VOLUNTEER transition via atomic DB claim.
+ * Guarantees exactly-once send per WAITING_FOR_VOLUNTEER transition via atomic DB claim,
+ * and records the Discord message ID.
  */
 export async function sendRoomMakerNeededNotification(guild, match, volunteerPanel) {
   if (!guild || !match || !volunteerPanel) return false;
@@ -125,16 +141,149 @@ export async function sendRoomMakerNeededNotification(guild, match, volunteerPan
     return false;
   }
 
-  const content = `@here A BGMI TDM 1V1 match needs a Room Maker! Visit <#${volunteerPanel.id}> and claim an available match.`;
+  const content = ROOM_MAKER_NEEDED_NOTIF_TEXT;
   try {
-    await queueChannelSend(volunteerPanel, {
+    const sentMsg = await queueChannelSend(volunteerPanel, {
       content,
       allowedMentions: { parse: ['everyone'] },
     });
+    if (sentMsg?.id) {
+      const msgIdStr = String(sentMsg.id);
+      const chIdStr = String(volunteerPanel.id);
+      await updateArenaMatch(match.matchId, {
+        roomMakerNotificationMessageId: msgIdStr,
+        roomMakerNotificationChannelId: chIdStr,
+      });
+      match.roomMakerNotificationMessageId = msgIdStr;
+      match.roomMakerNotificationChannelId = chIdStr;
+    }
     return true;
   } catch (err) {
     console.warn(`[Arena] ⚠️ Failed to send Room Maker needed @here notification in ${volunteerPanel.id}:`, err?.message || err);
     return false;
+  }
+}
+
+/**
+ * Deletes a specific notification message from a Discord channel.
+ * Handles already-deleted messages gracefully and retries temporary Discord API failures via queueMessageDelete.
+ */
+export async function deleteArenaNotificationMessage(guild, channelId, messageId) {
+  if (!guild || !channelId || !messageId) return false;
+  try {
+    const channel =
+      guild.channels?.cache?.get(String(channelId)) ||
+      (typeof guild.channels?.fetch === 'function'
+        ? await guild.channels.fetch(String(channelId)).catch(() => null)
+        : null);
+    if (!channel) return false;
+
+    const msg =
+      channel.messages?.cache?.get(String(messageId)) ||
+      (typeof channel.messages?.fetch === 'function'
+        ? await channel.messages.fetch(String(messageId)).catch(() => null)
+        : null);
+
+    if (msg) {
+      if (typeof msg.delete === 'function') {
+        await queueMessageDelete(msg).catch((err) => {
+          if (err?.code !== 10008) {
+            console.warn(`[Arena] ⚠️ Temporary error deleting notification message ${messageId}:`, err?.message || err);
+          }
+        });
+      }
+      return true;
+    }
+    return false;
+  } catch (err) {
+    if (err?.code !== 10008) {
+      console.warn(`[Arena] ⚠️ Error finding notification message ${messageId}:`, err?.message || err);
+    }
+    return false;
+  }
+}
+
+/**
+ * Deletes the @here notification message associated with a challenge.
+ * Clears notificationMessageId and notificationChannelId in MongoDB/memory.
+ */
+export async function deleteChallengeNotification(guild, challengeOrId) {
+  if (!challengeOrId) return false;
+  let challenge = challengeOrId;
+  if (typeof challengeOrId === 'string') {
+    challenge = await getArenaChallenge(challengeOrId);
+  }
+  if (!challenge) return false;
+
+  const msgId = challenge.notificationMessageId;
+  const chId = challenge.notificationChannelId;
+
+  if (msgId && chId && guild) {
+    await deleteArenaNotificationMessage(guild, chId, msgId);
+  }
+
+  if (msgId || chId) {
+    challenge.notificationMessageId = null;
+    challenge.notificationChannelId = null;
+    await updateArenaChallenge(challenge.challengeId, {
+      notificationMessageId: null,
+      notificationChannelId: null,
+    }).catch(() => {});
+  }
+  return true;
+}
+
+/**
+ * Deletes the Room Maker @here notification message associated with a match.
+ * Clears roomMakerNotificationMessageId and roomMakerNotificationChannelId in MongoDB/memory.
+ */
+export async function deleteRoomMakerNotification(guild, matchOrId) {
+  if (!matchOrId) return false;
+  let match = matchOrId;
+  if (typeof matchOrId === 'string') {
+    match = await getArenaMatch(matchOrId);
+  }
+  if (!match) return false;
+
+  const msgId = match.roomMakerNotificationMessageId;
+  const chId = match.roomMakerNotificationChannelId;
+
+  if (msgId && chId && guild) {
+    await deleteArenaNotificationMessage(guild, chId, msgId);
+  }
+
+  if (msgId || chId) {
+    match.roomMakerNotificationMessageId = null;
+    match.roomMakerNotificationChannelId = null;
+    await updateArenaMatch(match.matchId, {
+      roomMakerNotificationMessageId: null,
+      roomMakerNotificationChannelId: null,
+    }).catch(() => {});
+  }
+  return true;
+}
+
+/**
+ * Cleans up all remaining notifications associated with a match (Room Maker and Challenge).
+ */
+export async function deleteMatchNotifications(guild, match) {
+  if (!match) return;
+  await deleteRoomMakerNotification(guild, match);
+  if (match.challengeNotificationMessageId && match.challengeNotificationChannelId) {
+    await deleteArenaNotificationMessage(
+      guild,
+      match.challengeNotificationChannelId,
+      match.challengeNotificationMessageId
+    );
+    match.challengeNotificationMessageId = null;
+    match.challengeNotificationChannelId = null;
+    await updateArenaMatch(match.matchId, {
+      challengeNotificationMessageId: null,
+      challengeNotificationChannelId: null,
+    }).catch(() => {});
+  }
+  if (match.challengeId) {
+    await deleteChallengeNotification(guild, match.challengeId);
   }
 }
 

@@ -14,6 +14,8 @@ import {
   buildVolunteerPanelEmbed,
   refreshArenaChallengeCard,
   refreshArenaMatchCards,
+  deleteChallengeNotification,
+  deleteMatchNotifications,
 } from './arenaNotificationService.js';
 import {
   deleteMatchChannel,
@@ -133,6 +135,10 @@ async function expireChallenge(client, challenge) {
     }
   }
 
+  if (guild) {
+    await deleteChallengeNotification(guild, challenge);
+  }
+
   await logArenaAction({
     action: 'CHALLENGE_EXPIRED',
     challengeId: challenge.challengeId,
@@ -212,6 +218,9 @@ async function expireWaitingMatch(client, match) {
     if (rmChanId) {
       await deleteMatchChannel(guild, rmChanId);
     }
+
+    // Clean up all related @here notifications
+    await deleteMatchNotifications(guild, match);
   }
 
   await logArenaAction({
@@ -297,6 +306,7 @@ export async function recoverArenaOnStartup(client) {
           }
           await updateArenaChallenge(lc.challengeId, { discordMessageId: null });
         }
+        await deleteChallengeNotification(guild, lc);
       }
 
       // 1d. Rebuild surviving open challenge cards in place from current MongoDB player profiles.
@@ -390,6 +400,7 @@ export async function recoverArenaOnStartup(client) {
               }
               await updateArenaMatch(fm.matchId, { panelMessageId: null });
             }
+            await deleteMatchNotifications(guild, fm);
           }
         }
       }
