@@ -501,11 +501,13 @@ export async function createArenaMatch(data) {
     },
     volunteerId: data.volunteerId ? String(data.volunteerId) : null,
     matchChannelId: data.matchChannelId ? String(data.matchChannelId) : null,
+    roomMakerChannelId: data.roomMakerChannelId ? String(data.roomMakerChannelId) : (data.roomChannelId ? String(data.roomChannelId) : null),
+    roomMakerMessageId: data.roomMakerMessageId ? String(data.roomMakerMessageId) : null,
     panelMessageId: data.panelMessageId ? String(data.panelMessageId) : null,
     matchEmbedMessageId: data.matchEmbedMessageId ? String(data.matchEmbedMessageId) : null,
     roomId: data.roomId ? String(data.roomId) : null,
     roomPassword: data.roomPassword ? String(data.roomPassword) : null,
-    roomChannelId: data.roomChannelId ? String(data.roomChannelId) : null,
+    roomChannelId: data.roomMakerChannelId ? String(data.roomMakerChannelId) : (data.roomChannelId ? String(data.roomChannelId) : null),
     roomMessageId: data.roomMessageId ? String(data.roomMessageId) : null,
     roomReports: Array.isArray(data.roomReports) ? data.roomReports : [],
     status: data.status || ARENA_STATUS.WAITING_FOR_VOLUNTEER,
@@ -545,6 +547,29 @@ export async function getArenaMatch(matchId) {
   }
   const doc = memMatches.get(String(matchId));
   return doc ? { ...doc } : null;
+}
+
+export async function getArenaMatchByChannelId(channelId) {
+  if (!channelId) return null;
+  const cId = String(channelId);
+  if (isMongoConnected()) {
+    const db = getMongoDb();
+    return db.collection(ARENA_COLLECTIONS.MATCHES).findOne({
+      $or: [
+        { roomMakerChannelId: cId },
+        { matchChannelId: cId },
+        { roomChannelId: cId },
+      ],
+    });
+  }
+  return (
+    [...memMatches.values()].find(
+      (m) =>
+        m.roomMakerChannelId === cId ||
+        m.matchChannelId === cId ||
+        m.roomChannelId === cId
+    ) || null
+  );
 }
 
 export async function getArenaMatchesByStatus(status, guildId = null) {

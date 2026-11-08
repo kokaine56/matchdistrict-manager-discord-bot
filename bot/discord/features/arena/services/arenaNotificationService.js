@@ -47,6 +47,44 @@ export function buildCreateChallengePanel() {
   return { embeds: [embed], components: [row] };
 }
 
+export function buildArenaInfoPanel(channelIds = {}) {
+  const createMention = channelIds.createChannelId ? `<#${channelIds.createChannelId}>` : '#create-challenge';
+  const availableMention = channelIds.availableChannelId ? `<#${channelIds.availableChannelId}>` : '#available-challenges';
+  const resultsMention = channelIds.matchResultsId ? `<#${channelIds.matchResultsId}>` : '#match-results';
+
+  const embed = new EmbedBuilder()
+    .setTitle('MATCH DISTRICT – 1V1 ARENA')
+    .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
+    .setDescription(
+      'Welcome to the Match District 1V1 Challenge Arena!\n' +
+      'Challenge other players to a BGMI TDM 1v1 match. Follow these simple steps to get started.\n\n' +
+      `**1. Create a Challenge**\n` +
+      `Go to ${createMention} and click **Create Challenge**. Enter your BGMI IGN and UID if this is your first time.\n\n` +
+      `**2. Accept a Challenge**\n` +
+      `Visit ${availableMention} and accept an available challenge. Two players are required for every match.\n\n` +
+      `**3. Wait for a Room Maker**\n` +
+      `Once another player accepts, wait for a Room Maker to claim your match and prepare the custom room.\n\n` +
+      `**4. Join the Match**\n` +
+      `The bot will share the Room ID and Password in your private match channel. Join the room and play fairly.\n\n` +
+      `**5. Report Incorrect Credentials**\n` +
+      `If the Room ID or Password does not work, use the **Report Incorrect ID/Password** button in your match channel.\n\n` +
+      `**6. Verify the Result**\n` +
+      `After the match, the Room Maker submits the winner and screenshot proof. Check the evidence and select **Confirm Result** or **Dispute Result**.\n\n` +
+      `**7. Check Match Results**\n` +
+      `Completed matches will appear in ${resultsMention}.\n\n` +
+      `**Important Rules**\n` +
+      `• Only participate in your own assigned match.\n` +
+      `• Never share private room credentials outside your match.\n` +
+      `• Do not submit fake results or evidence.\n` +
+      `• Report incorrect credentials immediately.\n` +
+      `• Respect other players and Room Makers.\n` +
+      `• Follow administrator instructions during disputes.`
+    )
+    .setFooter({ text: 'Match District Arena • Fair Play & Sportsmanship' });
+
+  return { embeds: [embed] };
+}
+
 // All builders hydrate live Discord + MongoDB data (display names, avatars, IGN/UID,
 // volunteer name) and render through the single bundled-font renderer in arenaImageService.
 export async function buildChallengeEmbed(challenge, creatorDisplayName = null, options = {}) {
@@ -103,7 +141,27 @@ export async function refreshArenaMatchCards(guild, match, options = {}) {
     }
   }
 
-  // 2. #room-maker-panel card (Dashboard must always remain at the bottom)
+  // 2. Room Maker's private channel card
+  const rmChannelId = match.roomMakerChannelId || match.roomChannelId;
+  if (rmChannelId) {
+    const rmChannel = await resolveChannel(guild, rmChannelId);
+    if (rmChannel) {
+      const payload = await buildMatchChannelEmbed(match, volunteerDisplayName, { ...renderOptions, surface: 'roomMakerChannel' });
+      const msg = await resolveMessage(rmChannel, match.roomMakerMessageId);
+      if (msg) {
+        await queueMessageEdit(msg, payload);
+        result.roomMakerChannel = true;
+      } else if (options.allowCreateIfMissing) {
+        const sent = await queueChannelSend(rmChannel, payload);
+        if (sent?.id) {
+          idUpdates.roomMakerMessageId = sent.id;
+          result.roomMakerChannel = true;
+        }
+      }
+    }
+  }
+
+  // 3. #room-maker-panel card (Dashboard must always remain at the bottom)
   const config = await getArenaConfig(guild.id);
   if (config?.volunteerPanelId) {
     const panel = await resolveChannel(guild, config.volunteerPanelId);
@@ -210,21 +268,41 @@ export async function repositionPanelMessage(channel, storedMessageId, newPayloa
   return existing?.id || null;
 }
 
+export function buildArenaStatusEmbed({
+  title,
+  description,
+  fields = [],
+  color = ARENA_CONSTANTS.ORANGE_COLOR,
+  footer = 'MatchDistrict 1v1 Arena',
+}) {
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setColor(color)
+    .setFooter({ text: footer });
+  if (description) embed.setDescription(description);
+  if (fields && fields.length > 0) embed.addFields(fields);
+  return embed;
+}
+
 export function buildResultVerificationPayload(match, winnerPlayer, evidenceUrl = null) {
   const winnerIgn = winnerPlayer.bgmiIgn || winnerPlayer.displayName;
   const embed = new EmbedBuilder()
-    .setTitle(`Result Submitted: ${match.matchId}`)
+    .setTitle(`Match Result Submitted: ${match.matchId}`)
     .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
     .setDescription(
-      `The assigned Room Maker has reported **${winnerIgn}** (<@${winnerPlayer.discordId}>) as the winner.\n\n` +
-      `Both players must confirm the result below. If you believe this is incorrect, click **Dispute**.\n` +
-      `*Auto-review triggers if not confirmed within 15 minutes.*`
+      `The assigned Room Maker has reported **${winnerIgn}** as the winner.\n\n` +
+      `Both players must confirm the result below. If you believe this result is incorrect, click **Dispute Result**.\n` +
+      `*Automatic staff review triggers if not confirmed within 15 minutes.*`
     )
     .addFields(
       { name: 'Reported Winner', value: `🏆 **${winnerIgn}** (<@${winnerPlayer.discordId}>)`, inline: true },
-      { name: 'Evidence', value: evidenceUrl ? `[View Screenshot](${evidenceUrl})` : '*Attached by Room Maker*', inline: true }
+      { name: 'Proof Screenshot', value: evidenceUrl ? `[View Evidence Attachment](${evidenceUrl})` : '*Uploaded by Room Maker*', inline: true }
     )
-    .setFooter({ text: 'Match District Arena Verification' });
+    .setFooter({ text: 'MatchDistrict 1v1 Arena Verification' });
+
+  if (evidenceUrl && (evidenceUrl.startsWith('http://') || evidenceUrl.startsWith('https://'))) {
+    embed.setImage(evidenceUrl);
+  }
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -233,7 +311,7 @@ export function buildResultVerificationPayload(match, winnerPlayer, evidenceUrl 
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId(`arena:dispute_result:${match.matchId}`)
-      .setLabel('Dispute')
+      .setLabel('Dispute Result')
       .setStyle(ButtonStyle.Danger)
   );
 

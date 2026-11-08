@@ -18,6 +18,8 @@ import {
   deleteMatchChannel,
   createMatchChannel,
   setupArenaChannels,
+  formatMatchChannelName,
+  formatRoomMakerChannelName,
 } from './arenaChannelService.js';
 import { transitionArenaStatus, handleScreenshotTimeout } from './arenaMatchService.js';
 import { handleFileDispute } from './arenaDisputeService.js';
@@ -188,9 +190,13 @@ async function expireWaitingMatch(client, match) {
       }
     }
 
-    // Delete match channel
+    // Delete match channel and room maker channel
     if (match.matchChannelId) {
       await deleteMatchChannel(guild, match.matchChannelId);
+    }
+    const rmChanId = match.roomMakerChannelId || match.roomChannelId;
+    if (rmChanId) {
+      await deleteMatchChannel(guild, rmChanId);
     }
   }
 
@@ -219,8 +225,14 @@ async function cleanupMatchChannel(client, match) {
     if (match.matchChannelId) {
       await deleteMatchChannel(guild, match.matchChannelId);
     }
+    const rmChanId = match.roomMakerChannelId || match.roomChannelId;
+    if (rmChanId) {
+      await deleteMatchChannel(guild, rmChanId);
+    }
     await updateArenaMatch(match.matchId, {
       matchChannelId: null,
+      roomMakerChannelId: null,
+      roomChannelId: null,
       deleteChannelAt: null,
     });
   }
@@ -286,6 +298,26 @@ export async function recoverArenaOnStartup(client) {
               await updateArenaMatch(m.matchId, { matchChannelId: recreated.id });
               m.matchChannelId = recreated.id;
               m.matchEmbedMessageId = null;
+            }
+          } else {
+            const expectedName = formatMatchChannelName(m.matchId);
+            if (existingCh.name !== expectedName && typeof existingCh.setName === 'function') {
+              await existingCh.setName(expectedName).catch(() => {});
+              existingCh.name = expectedName;
+            }
+          }
+        }
+
+        const rmChId = m.roomMakerChannelId || m.roomChannelId;
+        if (rmChId) {
+          const rmCh =
+            guild.channels.cache.get(rmChId) ||
+            (await guild.channels.fetch(rmChId).catch(() => null));
+          if (rmCh) {
+            const expectedRmName = formatRoomMakerChannelName(m.matchId);
+            if (rmCh.name !== expectedRmName && typeof rmCh.setName === 'function') {
+              await rmCh.setName(expectedRmName).catch(() => {});
+              rmCh.name = expectedRmName;
             }
           }
         }

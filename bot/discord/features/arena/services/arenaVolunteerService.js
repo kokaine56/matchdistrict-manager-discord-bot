@@ -14,10 +14,13 @@ import {
 import {
   addVolunteerToMatchChannel,
   removeVolunteerFromMatchChannel,
+  addRoomMakerToRoomMakerChannel,
+  removeRoomMakerFromRoomMakerChannel,
 } from './arenaChannelService.js';
 import {
   buildVolunteerPanelEmbed,
   buildMatchChannelEmbed,
+  buildArenaStatusEmbed,
 } from './arenaNotificationService.js';
 import { fetchMatchAvatars } from './arenaImageService.js';
 import { queueMessageEdit, queueChannelSend } from '../../../../../discordQueue.js';
@@ -107,34 +110,70 @@ export async function handleClaimMatch(guild, member, matchId) {
   const updatedMatch = claimRes.match;
   const volunteerName = member.displayName || member.user?.username || 'Volunteer';
 
-  // 1. Grant volunteer access to private match channel
+  const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
+
+  // 1. Grant Room Maker access to their private Room Maker channel (roommaker-0001)
+  const rmChannelId = match.roomMakerChannelId || match.roomChannelId;
+  if (rmChannelId) {
+    const rmChannel =
+      guild.channels.cache.get(rmChannelId) ||
+      (await guild.channels.fetch(rmChannelId).catch(() => null));
+    if (rmChannel) {
+      await addRoomMakerToRoomMakerChannel(rmChannel, member.id);
+
+      // Post Room Maker match card with management controls
+      const rmPayload = await buildMatchChannelEmbed(updatedMatch, volunteerName, {
+        avatars,
+        guild,
+        client: guild.client,
+        surface: 'roomMakerChannel',
+      });
+      const rmMsg = await queueChannelSend(rmChannel, rmPayload);
+      if (rmMsg?.id) {
+        await updateArenaMatch(matchId, { roomMakerMessageId: rmMsg.id });
+      }
+
+      // Clean embed instruction for Room Maker
+      const claimEmbed = buildArenaStatusEmbed({
+        title: '📋 Match Claimed',
+        description:
+          `You are now officiating Match **${match.matchId}**.\n\n` +
+          `Please create a BGMI custom room and click **Submit Room Details** below to send the Room ID and Password to the players.`,
+      });
+      await queueChannelSend(rmChannel, { embeds: [claimEmbed] });
+    }
+  }
+
+  // 2. Update challengers' match channel (match-0001) - Room Maker identity STRICTLY hidden
   if (match.matchChannelId) {
     const matchChannel =
       guild.channels.cache.get(match.matchChannelId) ||
       (await guild.channels.fetch(match.matchChannelId).catch(() => null));
-    const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
 
     if (matchChannel) {
-      await addVolunteerToMatchChannel(matchChannel, member.id);
-
-      // Edit main match embed in channel
+      // Edit main match embed in channel (shows ROOM MAKER ASSIGNED, no Room Maker name)
       if (match.matchEmbedMessageId) {
         const embedMsg =
           matchChannel.messages?.cache?.get(match.matchEmbedMessageId) ||
           (await matchChannel.messages?.fetch?.(match.matchEmbedMessageId).catch(() => null));
         if (embedMsg) {
-          const payload = await buildMatchChannelEmbed(updatedMatch, volunteerName, { avatars, guild, client: guild.client });
+          const payload = await buildMatchChannelEmbed(updatedMatch, null, { avatars, guild, client: guild.client });
           await queueMessageEdit(embedMsg, payload).catch(() => {});
         }
       }
 
-      await queueChannelSend(matchChannel, {
-        content: `📋 <@${member.id}> has volunteered as Room Maker to officiate this match.\nPlease submit the room credentials when ready using **Submit Room Details**.`,
+      // Clean embed notice for challengers - Bot speaks on behalf of the Room Maker
+      const assignedNotice = buildArenaStatusEmbed({
+        title: '📋 Room Maker Assigned',
+        description:
+          'A Room Maker has been assigned to your match.\n' +
+          'They are currently preparing the BGMI custom room credentials. Room details will appear here as soon as they are ready.',
       });
+      await queueChannelSend(matchChannel, { embeds: [assignedNotice] });
     }
   }
 
-  // 2. Update #room-maker-panel message (assigned, no button)
+  // 3. Update #room-maker-panel message (assigned, no button)
   if (config?.volunteerPanelId && match.panelMessageId) {
     const volPanel =
       guild.channels.cache.get(config.volunteerPanelId) ||
@@ -184,7 +223,33 @@ export async function handleLeaveMatch(guild, member, matchId, isAdminAction = f
   const config = await getArenaConfig(guild.id);
   const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
 
-  // 1. Remove Room Maker permissions from match channel & clear room credentials message
+  // 1. Remove Room Maker access from their private channel (roommaker-0001)
+  const rmChannelId = match.roomMakerChannelId || match.roomChannelId;
+  if (rmChannelId) {
+    const rmChannel =
+      guild.channels.cache.get(rmChannelId) ||
+      (await guild.channels.fetch(rmChannelId).catch(() => null));
+    if (rmChannel) {
+      if (prevVolunteerId) {
+        await removeRoomMakerFromRoomMakerChannel(rmChannel, prevVolunteerId);
+      }
+      if (match.roomMakerMessageId) {
+        const rmMsg =
+          rmChannel.messages?.cache?.get(match.roomMakerMessageId) ||
+          (await rmChannel.messages?.fetch?.(match.roomMakerMessageId).catch(() => null));
+        if (rmMsg) {
+          await rmMsg.delete().catch(() => {});
+        }
+      }
+      const leaveNotice = buildArenaStatusEmbed({
+        title: '⚠️ Room Maker Left',
+        description: `The Room Maker has left Match **${match.matchId}**. Awaiting new Room Maker assignment.`,
+      });
+      await queueChannelSend(rmChannel, { embeds: [leaveNotice] });
+    }
+  }
+
+  // 2. Clear credentials from challengers channel & update match card
   if (match.matchChannelId) {
     const matchChannel =
       guild.channels.cache.get(match.matchChannelId) ||
@@ -213,13 +278,17 @@ export async function handleLeaveMatch(guild, member, matchId, isAdminAction = f
         }
       }
 
-      await queueChannelSend(matchChannel, {
-        content: `⚠️ The assigned Room Maker has left this match. Credentials have been cleared. Waiting for a new Room Maker to claim...`,
+      const pNotice = buildArenaStatusEmbed({
+        title: '⚠️ Room Maker Left',
+        description:
+          'The assigned Room Maker has left this match. Credentials have been cleared.\n' +
+          'Waiting for a new Room Maker to claim this match from #room-maker-panel...',
       });
+      await queueChannelSend(matchChannel, { embeds: [pNotice] });
     }
   }
 
-  // 2. Re-enable #room-maker-panel message with Accept Match button
+  // 3. Re-enable #room-maker-panel message with Accept Match button
   if (config?.volunteerPanelId && match.panelMessageId) {
     const volPanel =
       guild.channels.cache.get(config.volunteerPanelId) ||

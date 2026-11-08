@@ -206,6 +206,7 @@ import {
   startArenaScheduler,
   getArenaMatch,
   processWinnerScreenshot,
+  handleArenaScreenshotUpload,
 } from './bot/discord/features/arena/index.js';
 
 
@@ -2925,6 +2926,10 @@ client.on(Events.MessageCreate, async (message) => {
     const handledScreenshot = await handleSubmissionScreenshotUpload(message);
     if (handledScreenshot) return;
 
+    // Check if message is a 1v1 Arena match proof screenshot upload from the Room Maker
+    const handledArenaScreenshot = await handleArenaScreenshotUpload(message);
+    if (handledArenaScreenshot) return;
+
     // Check if message is a registration schedule image upload from an organiser
     const handledScheduleUpload = await handleScheduleImageUploadMessage(message);
     if (handledScheduleUpload) return;
@@ -3240,28 +3245,6 @@ client.on(Events.MessageCreate, async (message) => {
           message
         );
         return;
-      }
-    }
-
-    // Check if this is an arena match channel screenshot submission from the assigned volunteer
-    if (message.guild && message.channel?.name?.startsWith('match-md-')) {
-      const matchId = message.channel.name.slice('match-'.length).toUpperCase();
-      const match = await getArenaMatch(matchId);
-      if (
-        match &&
-        match.status === 'LIVE' &&
-        match.pendingWinnerId &&
-        match.volunteerId === message.author?.id
-      ) {
-        const attachment =
-          message.attachments instanceof Map
-            ? Array.from(message.attachments.values())[0]
-            : message.attachments?.first?.() ||
-              (Array.isArray(message.attachments) ? message.attachments[0] : null);
-        if (attachment?.url) {
-          await processWinnerScreenshot(message.guild, match, message.member, attachment.url);
-          return;
-        }
       }
     }
 

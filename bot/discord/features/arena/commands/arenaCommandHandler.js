@@ -103,6 +103,7 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
       return replyFn(
         `✅ **1v1 Challenge Arena Setup Complete!**\n` +
         `• Category: **${res.mainCategory.name}**\n` +
+        `• Information: <#${res.infoChannel.id}>\n` +
         `• Create Panel: <#${res.createChannel.id}>\n` +
         `• Available Challenges: <#${res.availableChannel.id}>\n` +
         `• Volunteer Queue: <#${res.volunteerPanel.id}>\n` +

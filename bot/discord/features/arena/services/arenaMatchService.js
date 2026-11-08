@@ -2,6 +2,7 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  EmbedBuilder,
 } from 'discord.js';
 import {
   ARENA_STATUS,
@@ -9,6 +10,7 @@ import {
   ARENA_CONSTANTS,
   ARENA_FINAL_STATUSES,
   getArenaMatch,
+  getArenaMatchByChannelId,
   updateArenaMatch,
   getArenaConfig,
   atomicReportRoomIssue,
@@ -17,6 +19,7 @@ import {
 import {
   buildMatchChannelEmbed,
   buildResultVerificationPayload,
+  buildArenaStatusEmbed,
 } from './arenaNotificationService.js';
 import { fetchMatchAvatars } from './arenaImageService.js';
 import {
@@ -52,20 +55,35 @@ export async function handleScreenshotTimeout(guild, matchId, volunteerId) {
     return;
   }
 
-  // Revoke temporary permissions
+  // Revoke temporary permissions if previously granted in match channel
   if (match.matchChannelId && guild) {
     const channel =
       guild.channels.cache.get(match.matchChannelId) ||
       (await guild.channels.fetch(match.matchChannelId).catch(() => null));
     if (channel) {
       await revokeVolunteerScreenshotPermission(channel, volunteerId);
-      await queueChannelSend(channel, {
-        content: `⏳ <@${volunteerId}>, your **5-minute screenshot upload window** has expired. Temporary message permissions have been revoked. Please click **Submit Winner** again when you are ready to upload the scoreboard screenshot.`,
-      });
     }
   }
 
-  // Clear pending winner fields so volunteer can retry
+  // Notify Room Maker in their private channel
+  const rmChannelId = match.roomMakerChannelId || match.roomChannelId || match.matchChannelId;
+  if (rmChannelId && guild) {
+    const rmChannel =
+      guild.channels.cache.get(rmChannelId) ||
+      (await guild.channels.fetch(rmChannelId).catch(() => null));
+    if (rmChannel) {
+      const timeoutEmbed = buildArenaStatusEmbed({
+        title: '⏳ Screenshot Window Expired',
+        description:
+          `Your **5-minute screenshot upload window** has expired.\n\n` +
+          `Please click **Submit Winner** again when you are ready to select the winner and upload the end-game screenshot.`,
+        color: 0xEAB308,
+      });
+      await queueChannelSend(rmChannel, { embeds: [timeoutEmbed] });
+    }
+  }
+
+  // Clear pending winner fields so Room Maker can retry
   await updateArenaMatch(matchId, {
     pendingWinnerId: null,
     pendingLoserId: null,
@@ -167,18 +185,29 @@ export async function submitRoomDetails(guild, member, matchId, roomId, roomPass
     updatedMatch = transition.match;
   }
 
-  // Post or edit room credentials message directly inside this private match channel
+  // 1. Post or edit room credentials message directly inside the challengers' match channel
   if (match.matchChannelId) {
     const channel =
       guild.channels.cache.get(match.matchChannelId) ||
       (await guild.channels.fetch(match.matchChannelId).catch(() => null));
     if (channel) {
+      const roomCredsEmbed = new EmbedBuilder()
+        .setTitle('🔐 BGMI ROOM DETAILS')
+        .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
+        .setDescription(
+          `Both players (<@${match.playerA.discordId}> & <@${match.playerB.discordId}>), please join the BGMI custom room now.\n\n` +
+          `If the Room ID or Password does not work, click **Report Incorrect ID/Password** below.`
+        )
+        .addFields(
+          { name: 'Match ID', value: `\`${match.matchId}\``, inline: true },
+          { name: 'Room ID', value: `\`${cleanRoomId}\``, inline: true },
+          { name: 'Password', value: `\`${cleanPassword}\``, inline: true }
+        )
+        .setFooter({ text: 'MatchDistrict 1v1 Arena' });
+
       const roomCredsPayload = {
-        content:
-          `🔐 **BGMI Custom Room Credentials:**\n` +
-          `• **Room ID:** \`${cleanRoomId}\`\n` +
-          `• **Password:** \`${cleanPassword}\`\n\n` +
-          `*Both players (<@${match.playerA.discordId}> & <@${match.playerB.discordId}>), please join the BGMI custom room now. If the credentials do not work, click **Report Incorrect ID/Password** below.*`,
+        content: `🔐 **BGMI Room Credentials:** Room ID: \`${cleanRoomId}\` • Password: \`${cleanPassword}\` (<@${match.playerA.discordId}> <@${match.playerB.discordId}>)`,
+        embeds: [roomCredsEmbed],
         components: [
           new ActionRowBuilder().addComponents(
             new ButtonBuilder()
@@ -213,10 +242,46 @@ export async function submitRoomDetails(guild, member, matchId, roomId, roomPass
           (await channel.messages?.fetch?.(match.matchEmbedMessageId).catch(() => null));
         if (msg) {
           const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
-          const payload = await buildMatchChannelEmbed(updatedMatch, member.displayName, { avatars, guild, client: guild.client });
+          const payload = await buildMatchChannelEmbed(updatedMatch, null, { avatars, guild, client: guild.client });
           await queueMessageEdit(msg, payload).catch(() => {});
         }
       }
+    }
+  }
+
+  // 2. Update Room Maker's private channel (roommaker-0001)
+  const rmChannelId = match.roomMakerChannelId || match.roomChannelId;
+  if (rmChannelId) {
+    const rmChannel =
+      guild.channels.cache.get(rmChannelId) ||
+      (await guild.channels.fetch(rmChannelId).catch(() => null));
+    if (rmChannel) {
+      const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
+      if (match.roomMakerMessageId) {
+        const rmMsg =
+          rmChannel.messages?.cache?.get(match.roomMakerMessageId) ||
+          (await rmChannel.messages?.fetch?.(match.roomMakerMessageId).catch(() => null));
+        if (rmMsg) {
+          const rmPayload = await buildMatchChannelEmbed(updatedMatch, member.displayName, {
+            avatars,
+            guild,
+            client: guild.client,
+            surface: 'roomMakerChannel',
+          });
+          await queueMessageEdit(rmMsg, rmPayload).catch(() => {});
+        }
+      }
+
+      const rmNotice = buildArenaStatusEmbed({
+        title: '✅ Room Details Submitted',
+        description:
+          `Credentials successfully dispatched to the players.\n` +
+          `• **Room ID:** \`${cleanRoomId}\`\n` +
+          `• **Password:** \`${cleanPassword}\`\n\n` +
+          `When both players have joined the custom room, click **Start Match** below.`,
+        color: 0x22C55E,
+      });
+      await queueChannelSend(rmChannel, { embeds: [rmNotice] });
     }
   }
 
@@ -256,7 +321,7 @@ export async function startMatch(guild, member, matchId) {
   if (!transition.ok) return transition;
   const updatedMatch = transition.match;
 
-  // Update channel embed and post started announcement
+  // 1. Update challengers' match channel
   if (match.matchChannelId) {
     const channel =
       guild.channels.cache.get(match.matchChannelId) ||
@@ -268,14 +333,52 @@ export async function startMatch(guild, member, matchId) {
           (await channel.messages?.fetch?.(match.matchEmbedMessageId).catch(() => null));
         if (msg) {
           const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
-          const payload = await buildMatchChannelEmbed(updatedMatch, member.displayName, { avatars, guild, client: guild.client });
+          const payload = await buildMatchChannelEmbed(updatedMatch, null, { avatars, guild, client: guild.client });
           await queueMessageEdit(msg, payload).catch(() => { });
         }
       }
 
-      await queueChannelSend(channel, {
-        content: `⚔️ **MATCH IS NOW LIVE!**\nGood luck to both players. The Room Maker will submit the winner once the game concludes.`,
+      const liveNotice = buildArenaStatusEmbed({
+        title: '🔥 Match is LIVE!',
+        description:
+          'The 1v1 match has officially started.\n' +
+          'Play fair and respect BGMI TDM rules. Once the game ends, the Room Maker will submit the winner and upload proof screenshot for verification.',
       });
+      await queueChannelSend(channel, { embeds: [liveNotice] });
+    }
+  }
+
+  // 2. Update Room Maker's private channel
+  const rmChannelId = match.roomMakerChannelId || match.roomChannelId;
+  if (rmChannelId) {
+    const rmChannel =
+      guild.channels.cache.get(rmChannelId) ||
+      (await guild.channels.fetch(rmChannelId).catch(() => null));
+    if (rmChannel) {
+      const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
+      if (match.roomMakerMessageId) {
+        const rmMsg =
+          rmChannel.messages?.cache?.get(match.roomMakerMessageId) ||
+          (await rmChannel.messages?.fetch?.(match.roomMakerMessageId).catch(() => null));
+        if (rmMsg) {
+          const rmPayload = await buildMatchChannelEmbed(updatedMatch, member.displayName, {
+            avatars,
+            guild,
+            client: guild.client,
+            surface: 'roomMakerChannel',
+          });
+          await queueMessageEdit(rmMsg, rmPayload).catch(() => {});
+        }
+      }
+
+      const rmNotice = buildArenaStatusEmbed({
+        title: '🔥 Match is LIVE!',
+        description:
+          'The match is underway in BGMI.\n\n' +
+          'When the match finishes, click **Submit Winner** below to select the winner and upload the scoreboard screenshot.',
+        color: 0x22C55E,
+      });
+      await queueChannelSend(rmChannel, { embeds: [rmNotice] });
     }
   }
 
@@ -308,7 +411,7 @@ export async function handleReportRoomCredentials(guild, member, matchId, issueT
 
   const updatedMatch = reportRes.match;
 
-  // Refresh match card in matchChannel
+  // 1. Update challengers' match channel (clean embed, no Room Maker username exposure)
   if (match.matchChannelId) {
     const channel =
       guild.channels.cache.get(match.matchChannelId) ||
@@ -320,20 +423,55 @@ export async function handleReportRoomCredentials(guild, member, matchId, issueT
           (await channel.messages?.fetch?.(match.matchEmbedMessageId).catch(() => null));
         if (msg) {
           const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
-          const volunteerName = match.volunteerId
-            ? (guild.members?.cache?.get(match.volunteerId)?.displayName || 'Room Maker')
-            : null;
-          const payload = await buildMatchChannelEmbed(updatedMatch, volunteerName, { avatars, guild, client: guild.client });
+          const payload = await buildMatchChannelEmbed(updatedMatch, null, { avatars, guild, client: guild.client });
           await queueMessageEdit(msg, payload).catch(() => {});
         }
       }
 
-      await queueChannelSend(channel, {
-        content:
-          `⚠️ **Incorrect Room Credentials Reported!**\n` +
-          `<@${member.id}> reported: **${issueType}** is incorrect.\n` +
-          `<@${match.volunteerId}>, please review the custom room and submit corrected credentials using **Edit Room Details**. The match cannot start until resolved.`,
+      const reportEmbed = buildArenaStatusEmbed({
+        title: '⚠️ Room Credentials Issue Reported',
+        description:
+          `A report was submitted for **${issueType}**.\n\n` +
+          `The Room Maker has been notified to check and submit corrected credentials.\n` +
+          `Match start is paused until updated credentials are provided.`,
+        color: 0xEAB308,
       });
+      await queueChannelSend(channel, { embeds: [reportEmbed] });
+    }
+  }
+
+  // 2. Alert Room Maker in their private channel
+  const rmChannelId = match.roomMakerChannelId || match.roomChannelId;
+  if (rmChannelId) {
+    const rmChannel =
+      guild.channels.cache.get(rmChannelId) ||
+      (await guild.channels.fetch(rmChannelId).catch(() => null));
+    if (rmChannel) {
+      const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
+      if (match.roomMakerMessageId) {
+        const rmMsg =
+          rmChannel.messages?.cache?.get(match.roomMakerMessageId) ||
+          (await rmChannel.messages?.fetch?.(match.roomMakerMessageId).catch(() => null));
+        if (rmMsg) {
+          const rmPayload = await buildMatchChannelEmbed(updatedMatch, member.displayName, {
+            avatars,
+            guild,
+            client: guild.client,
+            surface: 'roomMakerChannel',
+          });
+          await queueMessageEdit(rmMsg, rmPayload).catch(() => {});
+        }
+      }
+
+      const rmAlert = buildArenaStatusEmbed({
+        title: '⚠️ Incorrect Room Credentials Reported',
+        description:
+          `A player reported that the **${issueType}** is incorrect.\n\n` +
+          `Please check the custom room in BGMI and submit corrected credentials using **Edit Room Details** below.\n` +
+          `Match start is locked until corrected.`,
+        color: 0xEF4444,
+      });
+      await queueChannelSend(rmChannel, { embeds: [rmAlert] });
     }
   }
 
@@ -373,21 +511,23 @@ export async function initiateWinnerSubmission(guild, member, matchId, winnerSid
     screenshotRequestedAt: new Date(),
   });
 
-  // Prompt the volunteer in the match channel to upload the scoreboard screenshot and temporarily grant permissions
-  if (match.matchChannelId) {
-    const channel =
-      guild.channels.cache.get(match.matchChannelId) ||
-      (await guild.channels.fetch(match.matchChannelId).catch(() => null));
-    if (channel) {
-      // Temporarily grant Send Messages and Attach Files to the assigned volunteer
-      await grantVolunteerScreenshotPermission(channel, member.id);
-
-      await queueChannelSend(channel, {
-        content:
-          `📸 **Scoreboard Screenshot Required:**\n` +
-          `<@${member.id}>, please upload the end-game scoreboard / match result screenshot in this channel within **5 minutes**.\n` +
-          `*You have been temporarily granted \`Send Messages\` and \`Attach Files\` permissions for this upload.*`,
+  // Prompt the Room Maker in their private channel to upload the scoreboard screenshot
+  const rmChannelId = match.roomMakerChannelId || match.roomChannelId || match.matchChannelId;
+  if (rmChannelId) {
+    const targetChannel =
+      guild.channels.cache.get(rmChannelId) ||
+      (await guild.channels.fetch(rmChannelId).catch(() => null));
+    if (targetChannel) {
+      const winnerIgn = winnerPlayer.bgmiIgn || winnerPlayer.displayName;
+      const uploadEmbed = buildArenaStatusEmbed({
+        title: '📸 Scoreboard Screenshot Required',
+        description:
+          `Winner selected: **${winnerIgn}**\n\n` +
+          `Please upload the end-game scoreboard / match result screenshot as an image attachment in this channel within **5 minutes**.\n` +
+          `The bot will automatically detect your image and forward it to the players for verification.`,
+        color: ARENA_CONSTANTS.ORANGE_COLOR,
       });
+      await queueChannelSend(targetChannel, { embeds: [uploadEmbed] });
 
       // Start 5-minute timeout timer
       cancelScreenshotTimer(matchId);
@@ -413,7 +553,7 @@ export async function processWinnerScreenshot(guild, match, volunteerMember, att
   // Cancel any active timeout timer
   cancelScreenshotTimer(match.matchId);
 
-  // Immediately revoke temporary permissions from volunteer in match channel
+  // Immediately revoke temporary permissions from volunteer in match channel if any
   if (match.matchChannelId && volunteerMember?.id) {
     const channel =
       guild.channels.cache.get(match.matchChannelId) ||
@@ -465,7 +605,25 @@ export async function processWinnerScreenshot(guild, match, volunteerMember, att
   if (!transition.ok) return transition;
   const updatedMatch = transition.match;
 
-  // 3. Post verification payload with Confirm and Dispute buttons
+  // 3. Confirm receipt in Room Maker's channel
+  const rmChannelId = match.roomMakerChannelId || match.roomChannelId;
+  if (rmChannelId) {
+    const rmChannel =
+      guild.channels.cache.get(rmChannelId) ||
+      (await guild.channels.fetch(rmChannelId).catch(() => null));
+    if (rmChannel) {
+      const confirmNotice = buildArenaStatusEmbed({
+        title: '✅ Screenshot Received',
+        description:
+          `Scoreboard proof has been recorded and forwarded to the challengers for verification.\n` +
+          `Awaiting player confirmation or dispute within 15 minutes.`,
+        color: 0x22C55E,
+      });
+      await queueChannelSend(rmChannel, { embeds: [confirmNotice] });
+    }
+  }
+
+  // 4. Post verification payload with Confirm Result and Dispute Result buttons to challengers
   if (match.matchChannelId) {
     const channel =
       guild.channels.cache.get(match.matchChannelId) ||
@@ -482,5 +640,51 @@ export async function processWinnerScreenshot(guild, match, volunteerMember, att
   }
 
   return { ok: true, match: updatedMatch };
+}
+
+/**
+ * Event-driven screenshot proof detector.
+ * Detects image attachments uploaded by the assigned Room Maker in their private channel,
+ * even when the message contains zero text.
+ */
+export async function handleArenaScreenshotUpload(message) {
+  if (!message || message.author?.bot || !message.guild) return false;
+
+  const attachments = message.attachments;
+  const attachment =
+    attachments instanceof Map
+      ? Array.from(attachments.values())[0]
+      : (attachments?.first?.() || (Array.isArray(attachments) ? attachments[0] : null));
+
+  if (!attachment?.url) return false;
+
+  // Validate supported image format
+  const isImageMime = attachment.contentType ? attachment.contentType.startsWith('image/') : false;
+  const isImageUrl =
+    /\.(png|jpe?g|webp|gif)($|\?)/i.test(attachment.url || '') ||
+    /\.(png|jpe?g|webp|gif)$/i.test(attachment.name || '');
+
+  if (!isImageMime && !isImageUrl) return false;
+
+  // Look up match by channel
+  const match = await getArenaMatchByChannelId(message.channel.id);
+  if (!match) return false;
+
+  // Validate state & assigned Room Maker
+  if (
+    match.status === ARENA_STATUS.LIVE &&
+    match.pendingWinnerId &&
+    match.volunteerId === message.author.id
+  ) {
+    await processWinnerScreenshot(
+      message.guild,
+      match,
+      message.member || message.author,
+      attachment.url
+    );
+    return true;
+  }
+
+  return false;
 }
 

@@ -435,11 +435,37 @@ function escapeXml(unsafe) {
   });
 }
 
-function truncate(str, max = 16) {
+const graphemeSegmenter = typeof Intl !== 'undefined' && Intl.Segmenter
+  ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+  : null;
+
+function getGraphemeCount(str) {
+  if (!str) return 0;
+  if (graphemeSegmenter) {
+    return Array.from(graphemeSegmenter.segment(String(str))).length;
+  }
+  return Array.from(String(str)).length;
+}
+
+function truncate(str, max = 20) {
   if (!str) return '';
-  const chars = Array.from(String(str).trim());
+  const text = String(str).trim();
+  if (graphemeSegmenter) {
+    const segments = Array.from(graphemeSegmenter.segment(text), (s) => s.segment);
+    if (segments.length <= max) return text;
+    return segments.slice(0, max - 1).join('') + '…';
+  }
+  const chars = Array.from(text);
   if (chars.length <= max) return chars.join('');
   return chars.slice(0, max - 1).join('') + '…';
+}
+
+function getDynamicIgnFontSize(str) {
+  const count = getGraphemeCount(str);
+  if (count <= 10) return 17;
+  if (count <= 14) return 15;
+  if (count <= 18) return 13;
+  return 11;
 }
 
 function getAvatarDataUri(val) {
@@ -559,17 +585,21 @@ export function generateMatchCardPng(match, { volunteerDisplayName = null, avata
   const pA = match?.playerA || {};
   const pB = match?.playerB || {};
 
-  const nameA = escapeXml(truncate(pA.displayName || 'Player A', 16));
-  const ignA = escapeXml(truncate(pA.bgmiIgn || 'Unknown', 16));
+  const nameA = escapeXml(truncate(pA.displayName || 'Player A', 18));
+  const rawIgnA = pA.bgmiIgn || 'Unknown';
+  const ignA = escapeXml(truncate(rawIgnA, 22));
   const uidA = escapeXml(truncate(pA.bgmiUid || 'N/A', 15));
+  const fontSizeA = getDynamicIgnFontSize(rawIgnA);
 
-  const nameB = escapeXml(truncate(pB.displayName || 'Player B', 16));
-  const ignB = escapeXml(truncate(pB.bgmiIgn || 'Unknown', 16));
+  const nameB = escapeXml(truncate(pB.displayName || 'Player B', 18));
+  const rawIgnB = pB.bgmiIgn || 'Unknown';
+  const ignB = escapeXml(truncate(rawIgnB, 22));
   const uidB = escapeXml(truncate(pB.bgmiUid || 'N/A', 15));
+  const fontSizeB = getDynamicIgnFontSize(rawIgnB);
 
   const matchIdStr = escapeXml(String(match?.matchId || '1V1 MATCH'));
 
-  // Avatars
+  // Avatars (larger 84px diameter frame for clear identification)
   const avatarUriA = getAvatarDataUri(avatars.get(String(pA.discordId)));
   const initialA = escapeXml((pA.displayName || 'A').trim().slice(0, 1).toUpperCase() || 'A');
 
@@ -577,20 +607,20 @@ export function generateMatchCardPng(match, { volunteerDisplayName = null, avata
   const initialB = escapeXml((pB.displayName || 'B').trim().slice(0, 1).toUpperCase() || 'B');
 
   const avatarSvgA = avatarUriA
-    ? `<defs><clipPath id="avatar-clip-a"><circle cx="92" cy="175" r="36" /></clipPath></defs>
-       <circle cx="92" cy="175" r="36" fill="#1E293B" />
-       <image href="${avatarUriA}" x="56" y="139" width="72" height="72" clip-path="url(#avatar-clip-a)" preserveAspectRatio="xMidYMid slice" />
-       <circle cx="92" cy="175" r="36" fill="none" stroke="#F97316" stroke-width="2" />`
-    : `<circle cx="92" cy="175" r="36" fill="#1E293B" stroke="#F97316" stroke-width="2" />
-       <text x="92" y="184" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="22" font-weight="bold" fill="#F97316">${initialA}</text>`;
+    ? `<defs><clipPath id="avatar-clip-a"><circle cx="90" cy="175" r="42" /></clipPath></defs>
+       <circle cx="90" cy="175" r="42" fill="#1E293B" />
+       <image href="${avatarUriA}" x="48" y="133" width="84" height="84" clip-path="url(#avatar-clip-a)" preserveAspectRatio="xMidYMid slice" />
+       <circle cx="90" cy="175" r="42" fill="none" stroke="#F97316" stroke-width="2.5" />`
+    : `<circle cx="90" cy="175" r="42" fill="#1E293B" stroke="#F97316" stroke-width="2.5" />
+       <text x="90" y="184" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="24" font-weight="bold" fill="#F97316">${initialA}</text>`;
 
   const avatarSvgB = avatarUriB
-    ? `<defs><clipPath id="avatar-clip-b"><circle cx="517" cy="175" r="36" /></clipPath></defs>
-       <circle cx="517" cy="175" r="36" fill="#1E293B" />
-       <image href="${avatarUriB}" x="481" y="139" width="72" height="72" clip-path="url(#avatar-clip-b)" preserveAspectRatio="xMidYMid slice" />
-       <circle cx="517" cy="175" r="36" fill="none" stroke="#F97316" stroke-width="2" />`
-    : `<circle cx="517" cy="175" r="36" fill="#1E293B" stroke="#F97316" stroke-width="2" />
-       <text x="517" y="184" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="22" font-weight="bold" fill="#F97316">${initialB}</text>`;
+    ? `<defs><clipPath id="avatar-clip-b"><circle cx="515" cy="175" r="42" /></clipPath></defs>
+       <circle cx="515" cy="175" r="42" fill="#1E293B" />
+       <image href="${avatarUriB}" x="473" y="133" width="84" height="84" clip-path="url(#avatar-clip-b)" preserveAspectRatio="xMidYMid slice" />
+       <circle cx="515" cy="175" r="42" fill="none" stroke="#F97316" stroke-width="2.5" />`
+    : `<circle cx="515" cy="175" r="42" fill="#1E293B" stroke="#F97316" stroke-width="2.5" />
+       <text x="515" y="184" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="24" font-weight="bold" fill="#F97316">${initialB}</text>`;
 
   // Status Styling & Label Formatting
   const statusRaw = String(match?.status || ARENA_STATUS.WAITING_FOR_VOLUNTEER);
@@ -648,12 +678,6 @@ export function generateMatchCardPng(match, { volunteerDisplayName = null, avata
 
   const badgeWidth = Math.max(100, Math.min(260, statusText.length * 8.5 + 24));
 
-  // Room Maker Info
-  const volLabel = match?.volunteerId
-    ? volunteerDisplayName || `ROOM MAKER ASSIGNED`
-    : 'AWAITING ROOM MAKER';
-  const volColor = match?.volunteerId ? '#FFFFFF' : '#F59E0B';
-
   const svg = `
 <svg xmlns="http://www.w3.org/2000/svg" width="800" height="420" viewBox="0 0 800 420">
   <!-- Base Background -->
@@ -670,41 +694,44 @@ export function generateMatchCardPng(match, { volunteerDisplayName = null, avata
   <text x="690" y="47" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="15" font-weight="bold" fill="#FFFFFF">${matchIdStr}</text>
   <line x1="35" y1="78" x2="765" y2="78" stroke="#1F2937" stroke-width="1"/>
 
-  <!-- Center VS Indicator -->
-  <rect x="355" y="145" width="90" height="120" rx="10" fill="#1E293B" stroke="#F97316" stroke-width="2"/>
-  <text x="400" y="200" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="34" font-weight="900" fill="#F97316">VS</text>
-  <text x="400" y="228" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#FFFFFF">BGMI</text>
-  <text x="400" y="248" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="11" font-weight="600" fill="#94A3B8">TDM 1V1</text>
+  <!-- Center VS Indicator: Significantly Larger & Prominent -->
+  <rect x="348" y="132" width="104" height="146" rx="12" fill="#1E293B" stroke="#F97316" stroke-width="2.5"/>
+  <rect x="348" y="132" width="104" height="6" rx="3" fill="#F97316"/>
+  <text x="400" y="196" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="44" font-weight="900" fill="#F97316">VS</text>
+  <text x="400" y="226" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="14" font-weight="bold" fill="#FFFFFF">BGMI</text>
+  <text x="400" y="248" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="11" font-weight="700" fill="#F97316">TDM 1V1</text>
 
   <!-- Player A Panel (Left) -->
-  <rect x="35" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
+  <rect x="35" y="95" width="300" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
   <rect x="35" y="95" width="5" height="235" rx="2" fill="#F97316"/>
   <text x="52" y="122" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">PLAYER A • CHALLENGER</text>
 
   ${avatarSvgA}
 
-  <text x="142" y="152" font-family="Noto Sans, Noto Sans Devanagari" font-size="18" font-weight="bold" fill="#FFFFFF">${nameA}</text>
-  <text x="142" y="178" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${ignA}</tspan></text>
-  <text x="142" y="202" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${uidA}</tspan></text>
+  <text x="146" y="150" font-family="Noto Sans, Noto Sans Devanagari" font-size="20" font-weight="bold" fill="#FFFFFF">${nameA}</text>
+  <text x="146" y="172" font-family="Noto Sans, Noto Sans Devanagari" font-size="11" font-weight="bold" fill="#94A3B8">BGMI IGN</text>
+  <text x="146" y="194" font-family="Noto Sans, Noto Sans Devanagari" font-size="${fontSizeA}" font-weight="bold" fill="#F97316">${ignA}</text>
+  <text x="146" y="218" font-family="Noto Sans, Noto Sans Devanagari" font-size="11" font-weight="600" fill="#64748B">UID: <tspan fill="#E2E8F0" font-weight="bold" font-size="12">${uidA}</tspan></text>
 
-  <rect x="50" y="280" width="275" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
-  <text x="187" y="301" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8">CHALLENGER</text>
+  <rect x="50" y="280" width="270" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
+  <text x="185" y="301" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8">CHALLENGER</text>
 
   <!-- Player B Panel (Right) -->
-  <rect x="460" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
+  <rect x="465" y="95" width="300" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
   <rect x="760" y="95" width="5" height="235" rx="2" fill="#F97316"/>
-  <text x="477" y="122" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">PLAYER B • OPPONENT</text>
+  <text x="482" y="122" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">PLAYER B • OPPONENT</text>
 
   ${avatarSvgB}
 
-  <text x="567" y="152" font-family="Noto Sans, Noto Sans Devanagari" font-size="18" font-weight="bold" fill="#FFFFFF">${nameB}</text>
-  <text x="567" y="178" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${ignB}</tspan></text>
-  <text x="567" y="202" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${uidB}</tspan></text>
+  <text x="571" y="150" font-family="Noto Sans, Noto Sans Devanagari" font-size="20" font-weight="bold" fill="#FFFFFF">${nameB}</text>
+  <text x="571" y="172" font-family="Noto Sans, Noto Sans Devanagari" font-size="11" font-weight="bold" fill="#94A3B8">BGMI IGN</text>
+  <text x="571" y="194" font-family="Noto Sans, Noto Sans Devanagari" font-size="${fontSizeB}" font-weight="bold" fill="#F97316">${ignB}</text>
+  <text x="571" y="218" font-family="Noto Sans, Noto Sans Devanagari" font-size="11" font-weight="600" fill="#64748B">UID: <tspan fill="#E2E8F0" font-weight="bold" font-size="12">${uidB}</tspan></text>
 
-  <rect x="475" y="280" width="275" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
-  <text x="612" y="301" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8">OPPONENT</text>
+  <rect x="480" y="280" width="270" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
+  <text x="615" y="301" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#94A3B8">OPPONENT</text>
 
-  <!-- Footer Bar -->
+  <!-- Footer Bar: Room Maker identity strictly hidden from players -->
   <rect x="0" y="350" width="800" height="70" fill="#0D1322"/>
   <line x1="0" y1="350" x2="800" y2="350" stroke="#1F2937" stroke-width="1"/>
 
@@ -712,7 +739,7 @@ export function generateMatchCardPng(match, { volunteerDisplayName = null, avata
   <rect x="95" y="372" width="${badgeWidth}" height="28" rx="6" fill="${statusBg}" stroke="${statusBorder}" stroke-width="1"/>
   <text x="${95 + badgeWidth / 2}" y="391" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="${statusColor}">${statusText}</text>
 
-  <text x="765" y="391" text-anchor="end" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#94A3B8">ROOM MAKER: <tspan fill="${volColor}">${escapeXml(truncate(volLabel, 22))}</tspan></text>
+  <text x="765" y="391" text-anchor="end" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#F97316">MATCH DISTRICT ARENA</text>
 </svg>
 `;
 
@@ -735,17 +762,21 @@ export function generateResultCardPng(
   const w = winnerObj || {};
   const l = loserObj || {};
 
-  const nameW = escapeXml(truncate(w.displayName || 'Winner', 16));
-  const ignW = escapeXml(truncate(w.bgmiIgn || 'Unknown', 16));
+  const nameW = escapeXml(truncate(w.displayName || 'Winner', 18));
+  const rawIgnW = w.bgmiIgn || 'Unknown';
+  const ignW = escapeXml(truncate(rawIgnW, 22));
   const uidW = escapeXml(truncate(w.bgmiUid || 'N/A', 15));
+  const fontSizeW = getDynamicIgnFontSize(rawIgnW);
 
-  const nameL = escapeXml(truncate(l.displayName || 'Defeated', 16));
-  const ignL = escapeXml(truncate(l.bgmiIgn || 'Unknown', 16));
+  const nameL = escapeXml(truncate(l.displayName || 'Defeated', 18));
+  const rawIgnL = l.bgmiIgn || 'Unknown';
+  const ignL = escapeXml(truncate(rawIgnL, 22));
   const uidL = escapeXml(truncate(l.bgmiUid || 'N/A', 15));
+  const fontSizeL = getDynamicIgnFontSize(rawIgnL);
 
   const matchIdStr = escapeXml(String(match?.matchId || '1V1 RESULT'));
 
-  // Avatars
+  // Avatars (larger 84px diameter frame for clear identification)
   const avatarUriW = getAvatarDataUri(avatars.get(String(w.discordId)));
   const initialW = escapeXml((w.displayName || 'W').trim().slice(0, 1).toUpperCase() || 'W');
 
@@ -753,20 +784,20 @@ export function generateResultCardPng(
   const initialL = escapeXml((l.displayName || 'L').trim().slice(0, 1).toUpperCase() || 'L');
 
   const avatarSvgW = avatarUriW
-    ? `<defs><clipPath id="avatar-clip-w"><circle cx="92" cy="175" r="36" /></clipPath></defs>
-       <circle cx="92" cy="175" r="36" fill="#1E293B" />
-       <image href="${avatarUriW}" x="56" y="139" width="72" height="72" clip-path="url(#avatar-clip-w)" preserveAspectRatio="xMidYMid slice" />
-       <circle cx="92" cy="175" r="36" fill="none" stroke="#22C55E" stroke-width="2" />`
-    : `<circle cx="92" cy="175" r="36" fill="#1E293B" stroke="#22C55E" stroke-width="2" />
-       <text x="92" y="184" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="22" font-weight="bold" fill="#22C55E">${initialW}</text>`;
+    ? `<defs><clipPath id="avatar-clip-w"><circle cx="90" cy="175" r="42" /></clipPath></defs>
+       <circle cx="90" cy="175" r="42" fill="#1E293B" />
+       <image href="${avatarUriW}" x="48" y="133" width="84" height="84" clip-path="url(#avatar-clip-w)" preserveAspectRatio="xMidYMid slice" />
+       <circle cx="90" cy="175" r="42" fill="none" stroke="#22C55E" stroke-width="2.5" />`
+    : `<circle cx="90" cy="175" r="42" fill="#1E293B" stroke="#22C55E" stroke-width="2.5" />
+       <text x="90" y="184" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="24" font-weight="bold" fill="#22C55E">${initialW}</text>`;
 
   const avatarSvgL = avatarUriL
-    ? `<defs><clipPath id="avatar-clip-l"><circle cx="517" cy="175" r="36" /></clipPath></defs>
-       <circle cx="517" cy="175" r="36" fill="#1E293B" />
-       <image href="${avatarUriL}" x="481" y="139" width="72" height="72" clip-path="url(#avatar-clip-l)" preserveAspectRatio="xMidYMid slice" />
-       <circle cx="517" cy="175" r="36" fill="none" stroke="#EF4444" stroke-width="2" />`
-    : `<circle cx="517" cy="175" r="36" fill="#1E293B" stroke="#EF4444" stroke-width="2" />
-       <text x="517" y="184" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="22" font-weight="bold" fill="#EF4444">${initialL}</text>`;
+    ? `<defs><clipPath id="avatar-clip-l"><circle cx="515" cy="175" r="42" /></clipPath></defs>
+       <circle cx="515" cy="175" r="42" fill="#1E293B" />
+       <image href="${avatarUriL}" x="473" y="133" width="84" height="84" clip-path="url(#avatar-clip-l)" preserveAspectRatio="xMidYMid slice" />
+       <circle cx="515" cy="175" r="42" fill="none" stroke="#EF4444" stroke-width="2.5" />`
+    : `<circle cx="515" cy="175" r="42" fill="#1E293B" stroke="#EF4444" stroke-width="2.5" />
+       <text x="515" y="184" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="24" font-weight="bold" fill="#EF4444">${initialL}</text>`;
 
   // Date formatting
   const d = completionDate instanceof Date ? completionDate : new Date(completionDate);
@@ -775,8 +806,6 @@ export function generateResultCardPng(
       ? `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')} UTC`
       : 'COMPLETED'
   );
-
-  const roomMakerName = escapeXml(truncate(roomMakerDisplayName || 'OFFICIAL', 22));
 
   const svg = `
 <svg xmlns="http://www.w3.org/2000/svg" width="800" height="420" viewBox="0 0 800 420">
@@ -794,41 +823,44 @@ export function generateResultCardPng(
   <text x="690" y="47" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="15" font-weight="bold" fill="#FFFFFF">${matchIdStr}</text>
   <line x1="35" y1="78" x2="765" y2="78" stroke="#1F2937" stroke-width="1"/>
 
-  <!-- Center VS Indicator -->
-  <rect x="355" y="145" width="90" height="120" rx="10" fill="#1E293B" stroke="#22C55E" stroke-width="2"/>
-  <text x="400" y="200" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="34" font-weight="900" fill="#22C55E">VS</text>
-  <text x="400" y="228" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#FFFFFF">BGMI</text>
+  <!-- Center VS Indicator: Significantly Larger & Prominent -->
+  <rect x="348" y="132" width="104" height="146" rx="12" fill="#1E293B" stroke="#22C55E" stroke-width="2.5"/>
+  <rect x="348" y="132" width="104" height="6" rx="3" fill="#22C55E"/>
+  <text x="400" y="196" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="44" font-weight="900" fill="#22C55E">VS</text>
+  <text x="400" y="226" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="14" font-weight="bold" fill="#FFFFFF">BGMI</text>
   <text x="400" y="248" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="11" font-weight="600" fill="#94A3B8">TDM 1V1</text>
 
   <!-- Winner Panel (Left) -->
-  <rect x="35" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#22C55E" stroke-width="1.5"/>
+  <rect x="35" y="95" width="300" height="235" rx="10" fill="#111827" stroke="#22C55E" stroke-width="1.5"/>
   <rect x="35" y="95" width="5" height="235" rx="2" fill="#22C55E"/>
   <text x="52" y="122" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#22C55E" letter-spacing="1">WINNER</text>
 
   ${avatarSvgW}
 
-  <text x="142" y="152" font-family="Noto Sans, Noto Sans Devanagari" font-size="18" font-weight="bold" fill="#FFFFFF">${nameW}</text>
-  <text x="142" y="178" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#22C55E" font-weight="bold">${ignW}</tspan></text>
-  <text x="142" y="202" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${uidW}</tspan></text>
+  <text x="146" y="150" font-family="Noto Sans, Noto Sans Devanagari" font-size="20" font-weight="bold" fill="#FFFFFF">${nameW}</text>
+  <text x="146" y="172" font-family="Noto Sans, Noto Sans Devanagari" font-size="11" font-weight="bold" fill="#94A3B8">BGMI IGN</text>
+  <text x="146" y="194" font-family="Noto Sans, Noto Sans Devanagari" font-size="${fontSizeW}" font-weight="bold" fill="#22C55E">${ignW}</text>
+  <text x="146" y="218" font-family="Noto Sans, Noto Sans Devanagari" font-size="11" font-weight="600" fill="#64748B">UID: <tspan fill="#E2E8F0" font-weight="bold" font-size="12">${uidW}</tspan></text>
 
-  <rect x="50" y="280" width="275" height="32" rx="6" fill="#052E16" stroke="#22C55E" stroke-width="1"/>
-  <text x="187" y="301" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#22C55E">🏆 WINNER</text>
+  <rect x="50" y="280" width="270" height="32" rx="6" fill="#052E16" stroke="#22C55E" stroke-width="1"/>
+  <text x="185" y="301" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#22C55E">🏆 WINNER</text>
 
   <!-- Loser Panel (Right) -->
-  <rect x="460" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#EF4444" stroke-width="1.5"/>
+  <rect x="465" y="95" width="300" height="235" rx="10" fill="#111827" stroke="#EF4444" stroke-width="1.5"/>
   <rect x="760" y="95" width="5" height="235" rx="2" fill="#EF4444"/>
-  <text x="477" y="122" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#EF4444" letter-spacing="1">DEFEATED</text>
+  <text x="482" y="122" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="#EF4444" letter-spacing="1">DEFEATED</text>
 
   ${avatarSvgL}
 
-  <text x="567" y="152" font-family="Noto Sans, Noto Sans Devanagari" font-size="18" font-weight="bold" fill="#FFFFFF">${nameL}</text>
-  <text x="567" y="178" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#EF4444" font-weight="bold">${ignL}</tspan></text>
-  <text x="567" y="202" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${uidL}</tspan></text>
+  <text x="571" y="150" font-family="Noto Sans, Noto Sans Devanagari" font-size="20" font-weight="bold" fill="#FFFFFF">${nameL}</text>
+  <text x="571" y="172" font-family="Noto Sans, Noto Sans Devanagari" font-size="11" font-weight="bold" fill="#94A3B8">BGMI IGN</text>
+  <text x="571" y="194" font-family="Noto Sans, Noto Sans Devanagari" font-size="${fontSizeL}" font-weight="bold" fill="#EF4444">${ignL}</text>
+  <text x="571" y="218" font-family="Noto Sans, Noto Sans Devanagari" font-size="11" font-weight="600" fill="#64748B">UID: <tspan fill="#E2E8F0" font-weight="bold" font-size="12">${uidL}</tspan></text>
 
-  <rect x="475" y="280" width="275" height="32" rx="6" fill="#450A0A" stroke="#EF4444" stroke-width="1"/>
-  <text x="612" y="301" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#EF4444">DEFEATED</text>
+  <rect x="480" y="280" width="270" height="32" rx="6" fill="#450A0A" stroke="#EF4444" stroke-width="1"/>
+  <text x="615" y="301" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#EF4444">DEFEATED</text>
 
-  <!-- Footer Bar -->
+  <!-- Footer Bar: Room Maker identity strictly hidden from players -->
   <rect x="0" y="350" width="800" height="70" fill="#0D1322"/>
   <line x1="0" y1="350" x2="800" y2="350" stroke="#1F2937" stroke-width="1"/>
 
@@ -837,7 +869,7 @@ export function generateResultCardPng(
 
   <text x="400" y="391" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="500" fill="#64748B">${dateStr}</text>
 
-  <text x="765" y="391" text-anchor="end" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#94A3B8">ROOM MAKER: <tspan fill="#FFFFFF">${roomMakerName}</tspan></text>
+  <text x="765" y="391" text-anchor="end" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#10B981">OFFICIAL VERIFIED</text>
 </svg>
 `;
 
@@ -1065,15 +1097,6 @@ export async function buildMatchCardPayload(match, volunteerDisplayName = null, 
         .setCustomId(`arena:start_match:${match.matchId}`)
         .setLabel('Start Match')
         .setStyle(ButtonStyle.Success)
-    );
-  }
-
-  if (match.status === ARENA_STATUS.ROOM_READY || match.status === ARENA_STATUS.ROOM_ISSUE) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId(`arena:report_room_issue:${match.matchId}`)
-        .setLabel('Report ID/PW Issue')
-        .setStyle(ButtonStyle.Danger)
     );
   }
 

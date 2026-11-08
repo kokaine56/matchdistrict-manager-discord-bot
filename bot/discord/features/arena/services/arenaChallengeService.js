@@ -18,10 +18,12 @@ import {
   buildChallengeEmbed,
   buildVolunteerPanelEmbed,
   buildMatchChannelEmbed,
+  buildArenaStatusEmbed,
   safeDirectMessage,
 } from './arenaNotificationService.js';
 import {
   createMatchChannel,
+  createRoomMakerChannel,
 } from './arenaChannelService.js';
 import { queueChannelSend, queueMessageEdit } from '../../../../../discordQueue.js';
 
@@ -272,22 +274,54 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
     status: ARENA_STATUS.WAITING_FOR_VOLUNTEER,
   });
 
-  // 1. Create Private Match Channel (Single dedicated channel per match: match-0001, etc.)
+  // 1. Create Private Match Channel (Challengers: match-0001)
   let matchChannel = null;
   try {
     matchChannel = await createMatchChannel(guild, match, config);
     if (matchChannel) {
       match.matchChannelId = matchChannel.id;
 
-      // Post initial status embed in match channel
+      // Post initial match card in challengers channel
       const channelPayload = await buildMatchChannelEmbed(match, null, { guild, client: guild?.client || client });
       const embedMsg = await queueChannelSend(matchChannel, channelPayload);
       if (embedMsg?.id) {
         match.matchEmbedMessageId = embedMsg.id;
       }
+
+      // Clean status embed for challengers
+      const initNotice = buildArenaStatusEmbed({
+        title: '🏆 1v1 Challenge Accepted',
+        description:
+          `Welcome <@${creator.discordId}> and <@${accepter.discordId}>!\n\n` +
+          `Your 1v1 match has been created. A Room Maker will be assigned shortly to create the BGMI custom room.\n` +
+          `Custom Room ID and Password will appear directly in this channel once prepared.`,
+      });
+      await queueChannelSend(matchChannel, { embeds: [initNotice] });
     }
   } catch (err) {
     console.warn(`[Arena] ⚠️ Error creating match channel for ${challengeId}:`, err.message);
+  }
+
+  // 1b. Create Room Maker's Private Channel (roommaker-0001)
+  let roomMakerChannel = null;
+  try {
+    roomMakerChannel = await createRoomMakerChannel(guild, match, config);
+    if (roomMakerChannel) {
+      match.roomMakerChannelId = roomMakerChannel.id;
+      match.roomChannelId = roomMakerChannel.id;
+
+      const rmNotice = buildArenaStatusEmbed({
+        title: '📋 Room Maker Channel',
+        description:
+          `This private channel is dedicated to officiating Match **${match.matchId}**.\n` +
+          `• **Player A:** ${creator.displayName} (IGN: \`${creator.bgmiIgn || 'Unknown'}\`)\n` +
+          `• **Player B:** ${accepter.displayName} (IGN: \`${accepter.bgmiIgn || 'Unknown'}\`)\n\n` +
+          `*Waiting for an eligible member to claim this match from #room-maker-panel.*`,
+      });
+      await queueChannelSend(roomMakerChannel, { embeds: [rmNotice] });
+    }
+  } catch (err) {
+    console.warn(`[Arena] ⚠️ Error creating room maker channel for ${challengeId}:`, err.message);
   }
 
   // 2. Post in #room-maker-panel (Room Maker Panel)
@@ -308,6 +342,8 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
   const { updateArenaMatch } = await import('../models/arenaModels.js');
   await updateArenaMatch(match.matchId, {
     matchChannelId: match.matchChannelId,
+    roomMakerChannelId: match.roomMakerChannelId,
+    roomChannelId: match.roomMakerChannelId,
     matchEmbedMessageId: match.matchEmbedMessageId,
     panelMessageId: match.panelMessageId,
   });
@@ -353,6 +389,6 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
     },
   });
 
-  return { ok: true, match, matchChannel };
+  return { ok: true, match, matchChannel, roomMakerChannel };
 }
 

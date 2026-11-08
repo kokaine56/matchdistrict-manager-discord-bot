@@ -9,10 +9,18 @@ import {
   queueMessageEdit,
 } from '../../../../../discordQueue.js';
 import {
+  ARENA_STATUS,
   getArenaConfig,
+  getArenaMatchesByStatus,
   saveArenaConfig,
 } from '../models/arenaModels.js';
-import { buildCreateChallengePanel } from './arenaNotificationService.js';
+import { buildCreateChallengePanel, buildArenaInfoPanel } from './arenaNotificationService.js';
+
+export const ARENA_CHANNEL_PREFIX = '𝟏𝐕𝟏｜';
+
+export function formatArenaChannelName(slug) {
+  return `${ARENA_CHANNEL_PREFIX}${slug}`;
+}
 
 function findInCache(cache, predicate) {
   if (!cache) return null;
@@ -48,109 +56,175 @@ export async function setupArenaChannels(guild, adminUser) {
         {
           id: guild.id, // @everyone
           allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-          deny: [PermissionFlagsBits.SendMessages],
+          deny: [
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.CreatePublicThreads,
+            PermissionFlagsBits.CreatePrivateThreads,
+            PermissionFlagsBits.SendMessagesInThreads,
+          ],
         },
       ],
     });
   }
 
-  // Helper to find or create channel in main category
-  async function ensureChannel(storedId, name, options = {}) {
+  // Helper to find, create or rename channel in main category
+  async function ensureChannel(storedId, slug, options = {}, aliases = []) {
+    const targetName = formatArenaChannelName(slug);
+    const lookupNames = new Set([
+      targetName.toLowerCase(),
+      slug.toLowerCase(),
+      ...aliases.map((a) => a.toLowerCase()),
+      ...aliases.map((a) => formatArenaChannelName(a).toLowerCase()),
+    ]);
+
     let ch = null;
     if (storedId) {
-      ch = guild.channels.cache.get(storedId) || (await guild.channels.fetch(storedId).catch(() => null));
+      ch = guild.channels.cache?.get(storedId) || (await guild.channels?.fetch?.(storedId).catch(() => null));
     }
     if (!ch) {
       ch = findInCache(
         guild.channels?.cache,
-        (c) => c.parentId === mainCategory.id && c.name.toLowerCase() === name.toLowerCase()
+        (c) => c.parentId === mainCategory.id && lookupNames.has((c.name || '').toLowerCase())
       );
     }
     if (!ch) {
       ch = await queueChannelCreate(guild, {
-        name,
+        name: targetName,
         type: ChannelType.GuildText,
         parent: mainCategory.id,
         ...options,
       });
     }
+
+    if (ch && ch.name !== targetName && typeof ch.setName === 'function') {
+      await ch.setName(targetName).catch((err) => {
+        console.warn(`[Arena] ⚠️ Failed to rename channel ${ch.id} to ${targetName}:`, err.message);
+      });
+      ch.name = targetName;
+    }
+
     return ch;
   }
 
+  const lockedChannelDeny = [
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.CreatePublicThreads,
+    PermissionFlagsBits.CreatePrivateThreads,
+    PermissionFlagsBits.SendMessagesInThreads,
+  ];
+
   // 2. Channels inside main category:
-  // #create-challenge (read only for @everyone)
+  // #arena-info (read only for @everyone, no threads)
+  const infoChannel = await ensureChannel(config.infoChannelId, 'arena-info', {
+    permissionOverwrites: [
+      {
+        id: guild.id,
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
+        deny: lockedChannelDeny,
+      },
+    ],
+  });
+  if (typeof infoChannel.permissionOverwrites?.edit === 'function') {
+    await infoChannel.permissionOverwrites.edit(guild.id, {
+      ViewChannel: true,
+      ReadMessageHistory: true,
+      SendMessages: false,
+      CreatePublicThreads: false,
+      CreatePrivateThreads: false,
+      SendMessagesInThreads: false,
+    }).catch(() => {});
+  }
+
+  // #create-challenge (read only for @everyone, no threads)
   const createChannel = await ensureChannel(config.createChannelId, 'create-challenge', {
     permissionOverwrites: [
       {
         id: guild.id,
         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-        deny: [PermissionFlagsBits.SendMessages],
+        deny: lockedChannelDeny,
       },
     ],
   });
+  if (typeof createChannel.permissionOverwrites?.edit === 'function') {
+    await createChannel.permissionOverwrites.edit(guild.id, {
+      ViewChannel: true,
+      ReadMessageHistory: true,
+      SendMessages: false,
+      CreatePublicThreads: false,
+      CreatePrivateThreads: false,
+      SendMessagesInThreads: false,
+    }).catch(() => {});
+  }
 
-  // #available-challenges (read only for @everyone)
+  // #available-challenges (read only for @everyone, no threads)
   const availableChannel = await ensureChannel(config.availableChannelId, 'available-challenges', {
     permissionOverwrites: [
       {
         id: guild.id,
         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-        deny: [PermissionFlagsBits.SendMessages],
+        deny: lockedChannelDeny,
       },
     ],
   });
+  if (typeof availableChannel.permissionOverwrites?.edit === 'function') {
+    await availableChannel.permissionOverwrites.edit(guild.id, {
+      ViewChannel: true,
+      ReadMessageHistory: true,
+      SendMessages: false,
+      CreatePublicThreads: false,
+      CreatePrivateThreads: false,
+      SendMessagesInThreads: false,
+    }).catch(() => {});
+  }
 
-  // #room-maker-panel (public visibility for all server members, read only for @everyone)
-  let volunteerPanel = null;
-  if (config.volunteerPanelId) {
-    volunteerPanel = guild.channels?.cache?.get(config.volunteerPanelId) || (await guild.channels?.fetch?.(config.volunteerPanelId).catch(() => null));
-    if (volunteerPanel && volunteerPanel.name !== 'room-maker-panel' && typeof volunteerPanel.setName === 'function') {
-      await volunteerPanel.setName('room-maker-panel').catch(() => {});
-    }
-  }
-  if (!volunteerPanel) {
-    volunteerPanel = findInCache(
-      guild.channels?.cache,
-      (c) => c.parentId === mainCategory.id && (c.name.toLowerCase() === 'room-maker-panel' || c.name.toLowerCase() === 'volunteer-panel')
-    );
-    if (volunteerPanel && volunteerPanel.name !== 'room-maker-panel' && typeof volunteerPanel.setName === 'function') {
-      await volunteerPanel.setName('room-maker-panel').catch(() => {});
-    }
-  }
-  if (!volunteerPanel) {
-    volunteerPanel = await queueChannelCreate(guild, {
-      name: 'room-maker-panel',
-      type: ChannelType.GuildText,
-      parent: mainCategory.id,
+  // #room-maker-panel (public visibility for all server members, read only for @everyone, no threads)
+  const volunteerPanel = await ensureChannel(
+    config.volunteerPanelId,
+    'room-maker-panel',
+    {
       permissionOverwrites: [
         {
           id: guild.id, // @everyone
           allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-          deny: [PermissionFlagsBits.SendMessages],
+          deny: lockedChannelDeny,
         },
       ],
-    });
-  }
+    },
+    ['volunteer-panel']
+  );
 
-  // Ensure @everyone can view if overwrites were previously configured with denial
+  // Ensure @everyone can view and thread creation is disabled idempotently
   if (typeof volunteerPanel.permissionOverwrites?.edit === 'function') {
     await volunteerPanel.permissionOverwrites.edit(guild.id, {
       ViewChannel: true,
       ReadMessageHistory: true,
       SendMessages: false,
+      CreatePublicThreads: false,
+      CreatePrivateThreads: false,
+      SendMessagesInThreads: false,
     }).catch(() => { });
   }
 
-  // #match-results (read only for @everyone)
+  // #match-results (read only for @everyone, no threads)
   const matchResults = await ensureChannel(config.matchResultsId, 'match-results', {
     permissionOverwrites: [
       {
         id: guild.id,
         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-        deny: [PermissionFlagsBits.SendMessages],
+        deny: lockedChannelDeny,
       },
     ],
   });
+  if (typeof matchResults.permissionOverwrites?.edit === 'function') {
+    await matchResults.permissionOverwrites.edit(guild.id, {
+      ViewChannel: true,
+      ReadMessageHistory: true,
+      SendMessages: false,
+      CreatePublicThreads: false,
+      CreatePrivateThreads: false,
+      SendMessagesInThreads: false,
+    }).catch(() => {});
+  }
 
   // #challenge-support (normal public text channel with short pinned note, no bot logic)
   const supportChannel = await ensureChannel(config.supportChannelId, 'challenge-support', {
@@ -185,15 +259,66 @@ export async function setupArenaChannels(guild, adminUser) {
     // Ignore pinning failure in mocks
   }
 
-  // #arena-evidence (administrators only)
+  // #arena-evidence (administrators only, no threads for @everyone)
   const evidenceChannel = await ensureChannel(config.evidenceChannelId, 'arena-evidence', {
     permissionOverwrites: [
       {
         id: guild.id, // @everyone
-        deny: [PermissionFlagsBits.ViewChannel],
+        deny: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.CreatePublicThreads,
+          PermissionFlagsBits.CreatePrivateThreads,
+          PermissionFlagsBits.SendMessagesInThreads,
+        ],
       },
     ],
   });
+  if (typeof evidenceChannel.permissionOverwrites?.edit === 'function') {
+    await evidenceChannel.permissionOverwrites.edit(guild.id, {
+      ViewChannel: false,
+      SendMessages: false,
+      CreatePublicThreads: false,
+      CreatePrivateThreads: false,
+      SendMessagesInThreads: false,
+    }).catch(() => {});
+  }
+
+  // Rename any active match channels to adhere to naming convention
+  try {
+    const activeStatuses = [
+      ARENA_STATUS.WAITING_FOR_VOLUNTEER,
+      ARENA_STATUS.VOLUNTEER_ASSIGNED,
+      ARENA_STATUS.ROOM_READY,
+      ARENA_STATUS.LIVE,
+      ARENA_STATUS.RESULT_PENDING,
+      ARENA_STATUS.UNDER_REVIEW,
+    ];
+    for (const status of activeStatuses) {
+      const matches = await getArenaMatchesByStatus(status, guild.id).catch(() => []);
+      for (const m of matches) {
+        if (m.matchChannelId) {
+          const ch = guild.channels?.cache?.get(m.matchChannelId) || (await guild.channels?.fetch?.(m.matchChannelId).catch(() => null));
+          const targetName = formatMatchChannelName(m.matchId);
+          if (ch && ch.name !== targetName && typeof ch.setName === 'function') {
+            await ch.setName(targetName).catch(() => {});
+            ch.name = targetName;
+          }
+        }
+        const rmChId = m.roomMakerChannelId || m.roomChannelId;
+        if (rmChId) {
+          const ch = guild.channels?.cache?.get(rmChId) || (await guild.channels?.fetch?.(rmChId).catch(() => null));
+          const targetName = formatRoomMakerChannelName(m.matchId);
+          if (ch && ch.name !== targetName && typeof ch.setName === 'function') {
+            await ch.setName(targetName).catch(() => {});
+            ch.name = targetName;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    // Non-fatal if active match query fails during setup
+  }
 
   // 4. Matches Category: "ARENA MATCHES"
   const matchCategories = Array.isArray(config.matchCategories) ? [...config.matchCategories] : [];
@@ -242,9 +367,49 @@ export async function setupArenaChannels(guild, adminUser) {
     panelMessageId = newMsg?.id || null;
   }
 
+  // 6. Persistent Information Embed in #arena-info
+  let infoMessageId = config.infoMessageId || null;
+  const infoPayload = buildArenaInfoPanel({
+    createChannelId: createChannel.id,
+    availableChannelId: availableChannel.id,
+    matchResultsId: matchResults.id,
+  });
+
+  if (infoMessageId) {
+    let existingInfoMsg = infoChannel.messages?.cache?.get(infoMessageId) || null;
+    if (!existingInfoMsg && typeof infoChannel.messages?.fetch === 'function') {
+      existingInfoMsg = await infoChannel.messages.fetch(infoMessageId).catch(() => null);
+    }
+    if (existingInfoMsg) {
+      await queueMessageEdit(existingInfoMsg, infoPayload).catch(() => {});
+    } else {
+      const newMsg = await queueChannelSend(infoChannel, infoPayload);
+      infoMessageId = newMsg?.id || null;
+    }
+  } else {
+    let existingInfoMsg = null;
+    try {
+      const msgs = typeof infoChannel.messages?.fetch === 'function' ? await infoChannel.messages.fetch({ limit: 5 }).catch(() => null) : null;
+      if (msgs && (msgs.size > 0 || msgs.length > 0)) {
+        const msgList = Array.isArray(msgs) ? msgs : Array.from(msgs.values ? msgs.values() : []);
+        existingInfoMsg = msgList.find((m) => m.embeds?.[0]?.title?.includes('MATCH DISTRICT – 1V1 ARENA') || m.author?.bot) || null;
+      }
+    } catch (_) {}
+
+    if (existingInfoMsg) {
+      await queueMessageEdit(existingInfoMsg, infoPayload).catch(() => {});
+      infoMessageId = existingInfoMsg.id;
+    } else {
+      const newMsg = await queueChannelSend(infoChannel, infoPayload);
+      infoMessageId = newMsg?.id || null;
+    }
+  }
+
   // Save updated config
   const savedConfig = await saveArenaConfig(guild.id, {
     categoryId: mainCategory.id,
+    infoChannelId: infoChannel.id,
+    infoMessageId,
     createChannelId: createChannel.id,
     availableChannelId: availableChannel.id,
     volunteerPanelId: volunteerPanel.id,
@@ -258,6 +423,7 @@ export async function setupArenaChannels(guild, adminUser) {
   return {
     config: savedConfig,
     mainCategory,
+    infoChannel,
     createChannel,
     availableChannel,
     volunteerPanel,
@@ -306,18 +472,33 @@ export async function getOrCreateMatchCategory(guild, config) {
 }
 
 export function formatMatchChannelName(matchId) {
-  if (!matchId) return 'match-0001';
+  if (!matchId) return `${ARENA_CHANNEL_PREFIX}match-0001`;
   const clean = String(matchId).trim().toLowerCase();
   const digits = clean.match(/\d+/)?.[0];
-  if (!digits) return `match-${clean}`;
+  if (!digits) return `${ARENA_CHANNEL_PREFIX}match-${clean}`;
   if (digits.length <= 4) {
-    return `match-${digits.padStart(4, '0')}`;
+    return `${ARENA_CHANNEL_PREFIX}match-${digits.padStart(4, '0')}`;
   }
   const num = parseInt(digits, 10);
   if (num >= 10000 && num < 20000) {
-    return `match-${String(num - 10000).padStart(4, '0')}`;
+    return `${ARENA_CHANNEL_PREFIX}match-${String(num - 10000).padStart(4, '0')}`;
   }
-  return `match-${digits.slice(-4).padStart(4, '0')}`;
+  return `${ARENA_CHANNEL_PREFIX}match-${digits.slice(-4).padStart(4, '0')}`;
+}
+
+export function formatRoomMakerChannelName(matchId) {
+  if (!matchId) return `${ARENA_CHANNEL_PREFIX}roommaker-0001`;
+  const clean = String(matchId).trim().toLowerCase();
+  const digits = clean.match(/\d+/)?.[0];
+  if (!digits) return `${ARENA_CHANNEL_PREFIX}roommaker-${clean}`;
+  if (digits.length <= 4) {
+    return `${ARENA_CHANNEL_PREFIX}roommaker-${digits.padStart(4, '0')}`;
+  }
+  const num = parseInt(digits, 10);
+  if (num >= 10000 && num < 20000) {
+    return `${ARENA_CHANNEL_PREFIX}roommaker-${String(num - 10000).padStart(4, '0')}`;
+  }
+  return `${ARENA_CHANNEL_PREFIX}roommaker-${digits.slice(-4).padStart(4, '0')}`;
 }
 
 export async function createMatchChannel(guild, match, config) {
@@ -326,6 +507,8 @@ export async function createMatchChannel(guild, match, config) {
   const category = await getOrCreateMatchCategory(guild, config);
   const channelName = formatMatchChannelName(match.matchId);
 
+  // Challengers' Match Channel: Player A, Player B, Admins, Bot.
+  // The Room Maker must NOT have access to this channel.
   const permissionOverwrites = [
     {
       id: guild.id, // @everyone
@@ -340,6 +523,8 @@ export async function createMatchChannel(guild, match, config) {
       deny: [
         PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.AttachFiles,
+        PermissionFlagsBits.CreatePublicThreads,
+        PermissionFlagsBits.CreatePrivateThreads,
       ],
     },
     {
@@ -351,19 +536,44 @@ export async function createMatchChannel(guild, match, config) {
       deny: [
         PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.AttachFiles,
+        PermissionFlagsBits.CreatePublicThreads,
+        PermissionFlagsBits.CreatePrivateThreads,
       ],
     },
   ];
 
-  // If Room Maker is already assigned (e.g. during recovery), add permissions (read-only by default)
-  if (match.volunteerId) {
+  const channel = await queueChannelCreate(guild, {
+    name: channelName,
+    type: ChannelType.GuildText,
+    parent: category?.id || null,
+    permissionOverwrites,
+  });
+
+  return channel;
+}
+
+export async function createRoomMakerChannel(guild, match, config, roomMakerId = null) {
+  if (!guild || !match) return null;
+
+  const category = await getOrCreateMatchCategory(guild, config);
+  const channelName = formatRoomMakerChannelName(match.matchId);
+
+  // Room Maker's Private Channel: Room Maker, Admins, Bot.
+  // Players must NOT have access to this channel.
+  const permissionOverwrites = [
+    {
+      id: guild.id, // @everyone
+      deny: [PermissionFlagsBits.ViewChannel],
+    },
+  ];
+
+  const assignedId = roomMakerId || match.volunteerId;
+  if (assignedId) {
     permissionOverwrites.push({
-      id: match.volunteerId,
+      id: assignedId,
       allow: [
         PermissionFlagsBits.ViewChannel,
         PermissionFlagsBits.ReadMessageHistory,
-      ],
-      deny: [
         PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.AttachFiles,
       ],
@@ -378,6 +588,33 @@ export async function createMatchChannel(guild, match, config) {
   });
 
   return channel;
+}
+
+export async function addRoomMakerToRoomMakerChannel(channel, roomMakerId) {
+  if (!channel || !roomMakerId) return;
+  if (typeof channel.permissionOverwrites?.edit === 'function') {
+    await channel.permissionOverwrites.edit(roomMakerId, {
+      ViewChannel: true,
+      ReadMessageHistory: true,
+      SendMessages: true,
+      AttachFiles: true,
+    }).catch((err) => {
+      console.warn(`[Arena] ⚠️ Failed to add Room Maker ${roomMakerId} to channel ${channel.id}:`, err.message);
+    });
+  }
+}
+
+export async function removeRoomMakerFromRoomMakerChannel(channel, roomMakerId) {
+  if (!channel || !roomMakerId) return;
+  if (typeof channel.permissionOverwrites?.delete === 'function') {
+    await channel.permissionOverwrites.delete(roomMakerId).catch((err) => {
+      console.warn(`[Arena] ⚠️ Failed to delete Room Maker permissions in channel ${channel.id}:`, err.message);
+    });
+  } else if (typeof channel.permissionOverwrites?.edit === 'function') {
+    await channel.permissionOverwrites.edit(roomMakerId, {
+      ViewChannel: false,
+    }).catch(() => {});
+  }
 }
 
 export async function addVolunteerToMatchChannel(channel, volunteerId) {
@@ -474,6 +711,7 @@ export async function deleteArenaChannels(guild, config = null) {
 
   // Known channel IDs from config
   const knownChannelIds = [
+    cfg.infoChannelId,
     cfg.createChannelId,
     cfg.availableChannelId,
     cfg.volunteerPanelId,
@@ -495,16 +733,24 @@ export async function deleteArenaChannels(guild, config = null) {
       if (c.parentId && targetCategoryIds.has(String(c.parentId))) {
         channelsToDelete.set(String(c.id), c);
       } else {
-        const nameLower = (c.name || '').toLowerCase();
+        const rawName = c.name || '';
+        const nameLower = rawName.toLowerCase();
+        const unPrefixed = rawName.startsWith(ARENA_CHANNEL_PREFIX)
+          ? rawName.slice(ARENA_CHANNEL_PREFIX.length).toLowerCase()
+          : nameLower;
         if (
-          nameLower === 'create-challenge' ||
-          nameLower === 'available-challenges' ||
-          nameLower === 'volunteer-panel' ||
-          nameLower === 'room-maker-panel' ||
-          nameLower === 'match-results' ||
-          nameLower === 'challenge-support' ||
-          nameLower === 'arena-evidence' ||
-          nameLower.startsWith('match-')
+          unPrefixed === 'arena-info' ||
+          unPrefixed === 'create-challenge' ||
+          unPrefixed === 'available-challenges' ||
+          unPrefixed === 'volunteer-panel' ||
+          unPrefixed === 'room-maker-panel' ||
+          unPrefixed === 'match-results' ||
+          unPrefixed === 'challenge-support' ||
+          unPrefixed === 'arena-evidence' ||
+          unPrefixed.startsWith('match-') ||
+          unPrefixed.startsWith('roommaker-') ||
+          unPrefixed.startsWith('room-') ||
+          nameLower.startsWith(ARENA_CHANNEL_PREFIX.toLowerCase())
         ) {
           channelsToDelete.set(String(c.id), c);
         }

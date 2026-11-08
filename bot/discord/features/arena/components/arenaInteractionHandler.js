@@ -395,7 +395,7 @@ export async function handleArenaInteraction(interaction) {
       }
       if (match.volunteerId !== interaction.user.id) {
         return interaction.reply({
-          content: '❌ Only the assigned volunteer can submit the winner.',
+          content: '❌ Only the assigned Room Maker can submit the winner.',
           ephemeral: true,
         });
       }
@@ -434,7 +434,7 @@ export async function handleArenaInteraction(interaction) {
         return interaction.editReply({ content: res.error || '❌ Failed to process winner selection.' });
       }
       return interaction.editReply({
-        content: `📸 **Winner Selection Recorded (${res.pendingWinner.displayName}).** Now upload the end-game screenshot as a message attachment in the match channel within 5 minutes.`,
+        content: `📸 **Winner Selection Recorded (${res.pendingWinner.displayName}).** Now upload the end-game scoreboard screenshot as an image attachment in your private Room Maker channel within 5 minutes.`,
       });
     }
 
