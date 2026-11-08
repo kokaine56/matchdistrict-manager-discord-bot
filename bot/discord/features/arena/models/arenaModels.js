@@ -159,6 +159,21 @@ export async function ensureArenaIndexes(dbInstance = null) {
 // Sequence / ID Generator
 // ============================================================================
 
+export function formatMatchId(rawId) {
+  if (!rawId) return 'MD-0001';
+  const str = String(rawId).trim();
+  const digits = str.match(/\d+/)?.[0];
+  if (!digits) return str.toUpperCase().startsWith('MD-') ? str.toUpperCase() : `MD-${str.toUpperCase()}`;
+  if (digits.length <= 4) {
+    return `MD-${digits.padStart(4, '0')}`;
+  }
+  const num = parseInt(digits, 10);
+  if (num >= 10000 && num < 20000) {
+    return `MD-${String(num - 10000).padStart(4, '0')}`;
+  }
+  return `MD-${digits.slice(-4).padStart(4, '0')}`;
+}
+
 export async function getNextArenaSequence(guildId = null) {
   if (isMongoConnected()) {
     const db = getMongoDb();
@@ -170,12 +185,12 @@ export async function getNextArenaSequence(guildId = null) {
       { upsert: true, returnDocument: 'after' }
     );
     const doc = res?.value !== undefined ? res.value : res;
-    const count = doc?.counter || 10001;
-    return `MD-${count}`;
+    const count = doc?.counter || 1;
+    return formatMatchId(count);
   }
 
   memCounter += 1;
-  return `MD-${memCounter}`;
+  return formatMatchId(memCounter);
 }
 
 // ============================================================================
@@ -840,8 +855,9 @@ export async function atomicLeaveArenaMatch(matchId, roomMakerId = null) {
     const db = getMongoDb();
     const filter = {
       matchId: String(matchId),
-      status: { $in: ARENA_LEAVABLE_STATUSES },
+      status: roomMakerId ? ARENA_STATUS.VOLUNTEER_ASSIGNED : { $in: ARENA_LEAVABLE_STATUSES },
       volunteerId: roomMakerId ? String(roomMakerId) : { $ne: null },
+      ...(roomMakerId ? { roomId: null } : {}),
     };
     const res = await db.collection(ARENA_COLLECTIONS.MATCHES).findOneAndUpdate(
       filter,
@@ -850,6 +866,13 @@ export async function atomicLeaveArenaMatch(matchId, roomMakerId = null) {
     );
     const previous = res?.value !== undefined ? res.value : res;
     if (!previous) {
+      const current = await db.collection(ARENA_COLLECTIONS.MATCHES).findOne({ matchId: String(matchId) });
+      if (current && (current.roomId || current.status !== ARENA_STATUS.VOLUNTEER_ASSIGNED) && roomMakerId) {
+        return {
+          ok: false,
+          error: '❌ You cannot leave the match after submitting room credentials. Only an administrator can reassign this match.',
+        };
+      }
       return { ok: false, error: 'This match can no longer be left (already left, started or reassigned).' };
     }
     await db.collection(ARENA_COLLECTIONS.VOLUNTEERS).updateOne(
@@ -861,8 +884,16 @@ export async function atomicLeaveArenaMatch(matchId, roomMakerId = null) {
   }
 
   const existing = memMatches.get(String(matchId));
+  if (!existing) {
+    return { ok: false, error: 'Match not found.' };
+  }
+  if (roomMakerId && (existing.roomId || existing.status !== ARENA_STATUS.VOLUNTEER_ASSIGNED)) {
+    return {
+      ok: false,
+      error: '❌ You cannot leave the match after submitting room credentials. Only an administrator can reassign this match.',
+    };
+  }
   if (
-    !existing ||
     !ARENA_LEAVABLE_STATUSES.includes(existing.status) ||
     !existing.volunteerId ||
     (roomMakerId && existing.volunteerId !== String(roomMakerId))

@@ -45,7 +45,7 @@ export async function validatePlayerForAction(member, action = 'create') {
   if (player.suspended) {
     return {
       valid: false,
-      error: '❌ **Account Suspended:** You are currently suspended from the 1v1 Challenge Arena.',
+      error: '❌ **Account Suspended:** You are currently suspended from 1v1 TDM.',
     };
   }
 
@@ -91,7 +91,7 @@ export async function handleCreateChallenge(guild, member) {
   if (!config || !config.availableChannelId) {
     return {
       valid: false,
-      error: '❌ **Arena Not Configured:** The arena channels have not been initialized. An administrator must run `.arena setup`.',
+      error: '❌ **TDM Not Configured:** The TDM channels have not been initialized. An administrator must run `.tdm setup`.',
     };
   }
 
@@ -101,7 +101,7 @@ export async function handleCreateChallenge(guild, member) {
   if (!availableChannel) {
     return {
       valid: false,
-      error: '❌ Available challenges channel not found. Please contact an administrator to run `.arena setup`.',
+      error: '❌ Available challenges channel not found. Please contact an administrator to run `.tdm setup`.',
     };
   }
 
@@ -290,7 +290,7 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
 
       // Clean status embed for challengers
       const initNotice = buildArenaStatusEmbed({
-        title: '🏆 1v1 Challenge Accepted',
+        title: '🏆 1v1 TDM Challenge Accepted',
         description:
           `Welcome <@${creator.discordId}> and <@${accepter.discordId}>!\n\n` +
           `Your 1v1 match has been created. A Room Maker will be assigned shortly to create the BGMI custom room.\n` +
@@ -309,16 +309,6 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
     if (roomMakerChannel) {
       match.roomMakerChannelId = roomMakerChannel.id;
       match.roomChannelId = roomMakerChannel.id;
-
-      const rmNotice = buildArenaStatusEmbed({
-        title: '📋 Room Maker Channel',
-        description:
-          `This private channel is dedicated to officiating Match **${match.matchId}**.\n` +
-          `• **Player A:** ${creator.displayName} (IGN: \`${creator.bgmiIgn || 'Unknown'}\`)\n` +
-          `• **Player B:** ${accepter.displayName} (IGN: \`${accepter.bgmiIgn || 'Unknown'}\`)\n\n` +
-          `*Waiting for an eligible member to claim this match from #room-maker-panel.*`,
-      });
-      await queueChannelSend(roomMakerChannel, { embeds: [rmNotice] });
     }
   } catch (err) {
     console.warn(`[Arena] ⚠️ Error creating room maker channel for ${challengeId}:`, err.message);
@@ -371,9 +361,9 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
   // 4. DM both players (best effort)
   const channelLink = matchChannel ? `<#${matchChannel.id}>` : `channel match-${match.matchId.toLowerCase()}`;
   const dmContent =
-    `⚔️ **1v1 Challenge Accepted!**\n` +
+    `⚔️ **1v1 TDM Challenge Accepted!**\n` +
     `Your match **${match.matchId}** has been created in ${channelLink}.\n` +
-    `Please proceed to the channel and wait for the volunteer to provide room credentials.`;
+    `Please proceed to the channel and wait for the Room Maker to provide room credentials.`;
   await safeDirectMessage(client, creator.discordId, dmContent);
   await safeDirectMessage(client, accepter.discordId, dmContent);
 

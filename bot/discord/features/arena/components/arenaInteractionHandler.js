@@ -12,6 +12,7 @@ import {
   upsertArenaPlayer,
   getArenaMatch,
   ARENA_STATUS,
+  formatMatchId,
 } from '../models/arenaModels.js';
 import {
   handleCreateChallenge,
@@ -189,9 +190,9 @@ export async function handleArenaInteraction(interaction) {
       if (match.volunteerId !== interaction.user.id) {
         return interaction.reply({ content: '❌ You are not the assigned Room Maker for this match.', ephemeral: true });
       }
-      if (match.status === ARENA_STATUS.LIVE) {
+      if (match.roomId || match.status !== ARENA_STATUS.VOLUNTEER_ASSIGNED) {
         return interaction.reply({
-          content: '❌ Cannot leave a match that is already LIVE. Contact an administrator to reassign live matches.',
+          content: '❌ You cannot leave the match after submitting room credentials. Only an administrator can reassign this match.',
           ephemeral: true,
         });
       }
@@ -209,9 +210,8 @@ export async function handleArenaInteraction(interaction) {
 
       return interaction.reply({
         content:
-          `⚠️ **Leave Match Confirmation:** Are you sure you want to leave match **${matchId}**?\n` +
+          `⚠️ **Leave Match Confirmation:** Are you sure you want to leave match **${formatMatchId(matchId)}**?\n` +
           `• Your channel access will be revoked.\n` +
-          `• Any submitted room credentials will be cleared.\n` +
           `• The match will be returned to the Room Maker queue.`,
         components: [row],
         ephemeral: true,
@@ -333,11 +333,11 @@ export async function handleArenaInteraction(interaction) {
 
       const modal = new ModalBuilder()
         .setCustomId(`arena:modal_room:${matchId}`)
-        .setTitle(`Room Details: ${matchId}`);
+        .setTitle(`Room Details: ${formatMatchId(matchId)}`);
 
       const roomIdInput = new TextInputBuilder()
         .setCustomId('room_id')
-        .setLabel('BGMI Room ID')
+        .setLabel('Room ID')
         .setStyle(TextInputStyle.Short)
         .setValue(match.roomId || '')
         .setRequired(true);

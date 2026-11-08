@@ -10,7 +10,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
 } from 'discord.js';
-import { ARENA_STATUS, ARENA_CONSTANTS, getArenaPlayer } from '../models/arenaModels.js';
+import { ARENA_STATUS, ARENA_CONSTANTS, getArenaPlayer, formatMatchId } from '../models/arenaModels.js';
 
 // ============================================================================
 // Bitmap Font (5x7) & Drawing Helpers
@@ -597,7 +597,7 @@ export function generateMatchCardPng(match, { volunteerDisplayName = null, avata
   const uidB = escapeXml(truncate(pB.bgmiUid || 'N/A', 15));
   const fontSizeB = getDynamicIgnFontSize(rawIgnB);
 
-  const matchIdStr = escapeXml(String(match?.matchId || '1V1 MATCH'));
+  const matchIdStr = escapeXml(formatMatchId(match?.matchId));
 
   // Avatars (larger 84px diameter frame for clear identification)
   const avatarUriA = getAvatarDataUri(avatars.get(String(pA.discordId)));
@@ -739,7 +739,7 @@ export function generateMatchCardPng(match, { volunteerDisplayName = null, avata
   <rect x="95" y="372" width="${badgeWidth}" height="28" rx="6" fill="${statusBg}" stroke="${statusBorder}" stroke-width="1"/>
   <text x="${95 + badgeWidth / 2}" y="391" text-anchor="middle" font-family="Noto Sans, Noto Sans Devanagari" font-size="12" font-weight="bold" fill="${statusColor}">${statusText}</text>
 
-  <text x="765" y="391" text-anchor="end" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#F97316">MATCH DISTRICT ARENA</text>
+  <text x="765" y="391" text-anchor="end" font-family="Noto Sans, Noto Sans Devanagari" font-size="13" font-weight="bold" fill="#F97316">MATCH DISTRICT TDM</text>
 </svg>
 `;
 
@@ -774,7 +774,7 @@ export function generateResultCardPng(
   const uidL = escapeXml(truncate(l.bgmiUid || 'N/A', 15));
   const fontSizeL = getDynamicIgnFontSize(rawIgnL);
 
-  const matchIdStr = escapeXml(String(match?.matchId || '1V1 RESULT'));
+  const matchIdStr = escapeXml(formatMatchId(match?.matchId));
 
   // Avatars (larger 84px diameter frame for clear identification)
   const avatarUriW = getAvatarDataUri(avatars.get(String(w.discordId)));
@@ -887,7 +887,7 @@ export function generateChallengeCardPng(
   challenge,
   { creatorDisplayName = null, creatorIgn = null, creatorUid = null, avatars = new Map(), acceptedOpponent = null } = {}
 ) {
-  const cId = escapeXml(String(challenge?.challengeId || 'CHALLENGE'));
+  const cId = escapeXml(formatMatchId(challenge?.challengeId));
   const cName = escapeXml(truncate(creatorDisplayName || `User#${challenge?.creatorId?.slice?.(-4) || '1'}`, 16));
   const cIgnStr = escapeXml(truncate(creatorIgn || 'BGMI PLAYER', 16));
   const cUidStr = escapeXml(truncate(creatorUid || challenge?.creatorUid || '', 15));
@@ -1078,48 +1078,53 @@ export async function buildMatchCardPayload(match, volunteerDisplayName = null, 
 
   // Build match control buttons
   const buttons = [];
-  if (
-    match.status === ARENA_STATUS.VOLUNTEER_ASSIGNED ||
-    match.status === ARENA_STATUS.ROOM_READY ||
-    match.status === ARENA_STATUS.ROOM_ISSUE
-  ) {
+  if (match.status === ARENA_STATUS.VOLUNTEER_ASSIGNED) {
+    if (!match.roomId) {
+      buttons.push(
+        new ButtonBuilder()
+          .setCustomId(`arena:submit_room:${match.matchId}`)
+          .setLabel('Submit Room Details')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(`arena:leave_match:${match.matchId}`)
+          .setLabel('Leave Match')
+          .setStyle(ButtonStyle.Secondary)
+      );
+    } else {
+      buttons.push(
+        new ButtonBuilder()
+          .setCustomId(`arena:submit_room:${match.matchId}`)
+          .setLabel('Edit Room Details')
+          .setStyle(ButtonStyle.Primary)
+      );
+    }
+  } else if (match.status === ARENA_STATUS.ROOM_READY) {
     buttons.push(
       new ButtonBuilder()
         .setCustomId(`arena:submit_room:${match.matchId}`)
-        .setLabel(match.roomId ? 'Edit Room Details' : 'Submit Room Details')
-        .setStyle(ButtonStyle.Primary)
-    );
-  }
-
-  if (match.status === ARENA_STATUS.ROOM_READY) {
-    buttons.push(
+        .setLabel('Edit Room Details')
+        .setStyle(ButtonStyle.Primary),
       new ButtonBuilder()
         .setCustomId(`arena:start_match:${match.matchId}`)
         .setLabel('Start Match')
         .setStyle(ButtonStyle.Success)
     );
-  }
-
-  if (match.status === ARENA_STATUS.LIVE) {
+  } else if (match.status === ARENA_STATUS.ROOM_ISSUE) {
     buttons.push(
       new ButtonBuilder()
-        .setCustomId(`arena:submit_winner:${match.matchId}`)
-        .setLabel('Submit Winner')
+        .setCustomId(`arena:submit_room:${match.matchId}`)
+        .setLabel('Edit Room Details')
         .setStyle(ButtonStyle.Primary)
     );
-  }
-
-  if (
-    match.status === ARENA_STATUS.VOLUNTEER_ASSIGNED ||
-    match.status === ARENA_STATUS.ROOM_READY ||
-    match.status === ARENA_STATUS.ROOM_ISSUE
-  ) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId(`arena:leave_match:${match.matchId}`)
-        .setLabel('Leave Match')
-        .setStyle(ButtonStyle.Secondary)
-    );
+  } else if (match.status === ARENA_STATUS.LIVE) {
+    if (!match.pendingWinnerId) {
+      buttons.push(
+        new ButtonBuilder()
+          .setCustomId(`arena:submit_winner:${match.matchId}`)
+          .setLabel('Submit Winner')
+          .setStyle(ButtonStyle.Primary)
+      );
+    }
   }
 
   const components = buttons.length > 0 ? [new ActionRowBuilder().addComponents(buttons)] : [];
@@ -1132,6 +1137,34 @@ export async function buildMatchCardPayload(match, volunteerDisplayName = null, 
           .setStyle(ButtonStyle.Primary))]
       : [];
     return { embeds: [embed], files: [attachment], attachments: [], components: publicComponents };
+  }
+
+  if (options.surface === 'matchChannel') {
+    return { embeds: [embed], files: [attachment], attachments: [], components: [] };
+  }
+
+  if (options.surface === 'roomMakerChannel') {
+    let statusDesc = '';
+    if (match.status === ARENA_STATUS.VOLUNTEER_ASSIGNED && !match.roomId) {
+      statusDesc = '📋 **Status: Awaiting Room Credentials**\nClick **Submit Room Details** below to create and provide the BGMI custom room credentials.';
+    } else if (match.status === ARENA_STATUS.ROOM_READY) {
+      statusDesc = '✅ **Status: Room Ready**\nRoom credentials have been dispatched to the players. When both players have entered the custom room, click **Start Match** below.';
+    } else if (match.status === ARENA_STATUS.ROOM_ISSUE) {
+      statusDesc = '⚠️ **Status: Credentials Reported Incorrect**\nA player reported that the room credentials do not work. Click **Edit Room Details** below to submit corrected credentials. Match start is locked until corrected.';
+    } else if (match.status === ARENA_STATUS.LIVE && !match.pendingWinnerId) {
+      statusDesc = '🔥 **Status: Match is LIVE**\nThe match is underway in BGMI. When the match concludes, click **Submit Winner** below.';
+    } else if (match.status === ARENA_STATUS.LIVE && match.pendingWinnerId) {
+      statusDesc = '📸 **Status: Scoreboard Proof Required**\nPlease upload the end-game scoreboard screenshot as an image attachment in this channel (within 5 minutes).';
+    } else if (match.status === ARENA_STATUS.RESULT_PENDING) {
+      statusDesc = '⏳ **Status: Awaiting Result Confirmation**\nScoreboard proof has been forwarded to the challengers for verification.';
+    } else if (match.status === ARENA_STATUS.UNDER_REVIEW) {
+      statusDesc = '⚠️ **Status: Under Review**\nA dispute has been filed. Administrators are inspecting the evidence.';
+    } else if (match.status === ARENA_STATUS.COMPLETED) {
+      statusDesc = '🏆 **Status: Match Completed**';
+    }
+    if (statusDesc) {
+      embed.setDescription(statusDesc);
+    }
   }
 
   return {
@@ -1167,7 +1200,7 @@ export async function buildMatchResultPayload(match, winnerObj, loserObj, option
       { name: 'Status', value: '`Result: VERIFIED`', inline: true },
       { name: 'Completed', value: `<t:${Math.floor((match.completedAt ? new Date(match.completedAt).getTime() : Date.now()) / 1000)}:R>`, inline: true }
     )
-    .setFooter({ text: 'Match District 1v1 Arena' });
+    .setFooter({ text: 'Match District 1v1 TDM' });
 
   return {
     embeds: [embed],

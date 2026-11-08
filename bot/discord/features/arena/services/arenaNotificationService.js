@@ -12,6 +12,7 @@ import {
   getArenaConfig,
   updateArenaMatch,
   updateArenaChallenge,
+  formatMatchId,
 } from '../models/arenaModels.js';
 import {
   generateMatchCardPng,
@@ -24,14 +25,14 @@ import { queueDirectMessage, queueChannelSend, queueMessageEdit } from '../../..
 
 export function buildCreateChallengePanel() {
   const embed = new EmbedBuilder()
-    .setTitle('1v1 BGMI Challenge Arena')
+    .setTitle('1v1 BGMI TDM Challenge')
     .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
     .setDescription(
-      'Instant 1v1 BGMI TDM challenges officiated by verified volunteers.\n\n' +
+      'Instant 1v1 BGMI TDM challenges officiated by verified Room Makers.\n\n' +
       '• Click **Create Challenge** to post an open challenge.\n' +
       '• Click **Update BGMI Details** to manage your registered IGN and UID.'
     )
-    .setFooter({ text: 'Match District Arena' });
+    .setFooter({ text: 'Match District TDM' });
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -53,10 +54,10 @@ export function buildArenaInfoPanel(channelIds = {}) {
   const resultsMention = channelIds.matchResultsId ? `<#${channelIds.matchResultsId}>` : '#match-results';
 
   const embed = new EmbedBuilder()
-    .setTitle('MATCH DISTRICT – 1V1 ARENA')
+    .setTitle('MATCH DISTRICT – 1V1 TDM')
     .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
     .setDescription(
-      'Welcome to the Match District 1V1 Challenge Arena!\n' +
+      'Welcome to Match District 1V1 TDM!\n' +
       'Challenge other players to a BGMI TDM 1v1 match. Follow these simple steps to get started.\n\n' +
       `**1. Create a Challenge**\n` +
       `Go to ${createMention} and click **Create Challenge**. Enter your BGMI IGN and UID if this is your first time.\n\n` +
@@ -80,7 +81,7 @@ export function buildArenaInfoPanel(channelIds = {}) {
       `• Respect other players and Room Makers.\n` +
       `• Follow administrator instructions during disputes.`
     )
-    .setFooter({ text: 'Match District Arena • Fair Play & Sportsmanship' });
+    .setFooter({ text: 'Match District TDM • Fair Play & Sportsmanship' });
 
   return { embeds: [embed] };
 }
@@ -96,7 +97,42 @@ export async function buildVolunteerPanelEmbed(match, volunteerDisplayName = nul
 }
 
 export async function buildMatchChannelEmbed(match, volunteerDisplayName = null, options = {}) {
-  return buildMatchCardPayload(match, volunteerDisplayName, { ...options, surface: 'matchChannel' });
+  return buildMatchCardPayload(match, volunteerDisplayName, options);
+}
+
+export function buildRoomCredentialsEmbed(match, roomId, roomPassword) {
+  const formattedMatchId = formatMatchId(match?.matchId);
+  return new EmbedBuilder()
+    .setTitle('BGMI ROOM DETAILS')
+    .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
+    .setDescription(
+      'Both players should join the BGMI custom room.\n' +
+      'If the credentials do not work, use the **Report Incorrect ID/Password** button below.'
+    )
+    .addFields(
+      { name: 'Match ID', value: formattedMatchId, inline: true },
+      { name: 'Room ID', value: String(roomId), inline: true },
+      { name: 'Room Password', value: String(roomPassword), inline: true }
+    )
+    .setFooter({ text: 'Match District TDM' });
+}
+
+export async function purgeStandaloneRoomMakerMessages(channel, dashboardMessageId) {
+  if (!channel || !channel.messages) return;
+  try {
+    const messages = typeof channel.messages.fetch === 'function'
+      ? await channel.messages.fetch({ limit: 50 }).catch(() => null)
+      : channel.messages.cache;
+    if (!messages) return;
+    const msgList = Array.isArray(messages) ? messages : Array.from(messages.values ? messages.values() : []);
+    for (const msg of msgList) {
+      if (msg && msg.author?.bot && msg.id !== dashboardMessageId) {
+        await msg.delete().catch(() => {});
+      }
+    }
+  } catch (err) {
+    // Non-fatal cleanup
+  }
 }
 
 async function resolveChannel(guild, channelId) {
@@ -126,7 +162,7 @@ export async function refreshArenaMatchCards(guild, match, options = {}) {
   if (match.matchChannelId) {
     const channel = await resolveChannel(guild, match.matchChannelId);
     if (channel) {
-      const payload = await buildMatchChannelEmbed(match, volunteerDisplayName, renderOptions);
+      const payload = await buildMatchChannelEmbed(match, volunteerDisplayName, { ...renderOptions, surface: 'matchChannel' });
       const msg = await resolveMessage(channel, match.matchEmbedMessageId);
       if (msg) {
         await queueMessageEdit(msg, payload);
@@ -148,6 +184,7 @@ export async function refreshArenaMatchCards(guild, match, options = {}) {
     if (rmChannel) {
       const payload = await buildMatchChannelEmbed(match, volunteerDisplayName, { ...renderOptions, surface: 'roomMakerChannel' });
       const msg = await resolveMessage(rmChannel, match.roomMakerMessageId);
+      let currentDashboardId = match.roomMakerMessageId;
       if (msg) {
         await queueMessageEdit(msg, payload);
         result.roomMakerChannel = true;
@@ -155,28 +192,42 @@ export async function refreshArenaMatchCards(guild, match, options = {}) {
         const sent = await queueChannelSend(rmChannel, payload);
         if (sent?.id) {
           idUpdates.roomMakerMessageId = sent.id;
+          currentDashboardId = sent.id;
           result.roomMakerChannel = true;
         }
+      }
+      if (currentDashboardId) {
+        await purgeStandaloneRoomMakerMessages(rmChannel, currentDashboardId);
       }
     }
   }
 
-  // 3. #room-maker-panel card (Dashboard must always remain at the bottom)
+  // 3. #room-maker-panel card (Completed matches removed; active matches kept at bottom)
   const config = await getArenaConfig(guild.id);
   if (config?.volunteerPanelId) {
     const panel = await resolveChannel(guild, config.volunteerPanelId);
     if (panel) {
-      const payload = await buildVolunteerPanelEmbed(match, volunteerDisplayName, renderOptions);
-      if (match.panelMessageId || (options.allowCreateIfMissing && !ARENA_FINAL_STATUSES.includes(match.status))) {
-        const finalId = await repositionPanelMessage(
-          panel,
-          match.panelMessageId,
-          payload,
-          (newId) => {
-            idUpdates.panelMessageId = newId;
+      if (ARENA_FINAL_STATUSES.includes(match.status)) {
+        if (match.panelMessageId) {
+          const msg = await resolveMessage(panel, match.panelMessageId);
+          if (msg) {
+            await msg.delete().catch(() => {});
           }
-        );
-        if (finalId) result.volunteerPanel = true;
+          idUpdates.panelMessageId = null;
+        }
+      } else {
+        const payload = await buildVolunteerPanelEmbed(match, volunteerDisplayName, renderOptions);
+        if (match.panelMessageId || (options.allowCreateIfMissing && !ARENA_FINAL_STATUSES.includes(match.status))) {
+          const finalId = await repositionPanelMessage(
+            panel,
+            match.panelMessageId,
+            payload,
+            (newId) => {
+              idUpdates.panelMessageId = newId;
+            }
+          );
+          if (finalId) result.volunteerPanel = true;
+        }
       }
     }
   }
@@ -273,7 +324,7 @@ export function buildArenaStatusEmbed({
   description,
   fields = [],
   color = ARENA_CONSTANTS.ORANGE_COLOR,
-  footer = 'MatchDistrict 1v1 Arena',
+  footer = 'MatchDistrict 1v1 TDM',
 }) {
   const embed = new EmbedBuilder()
     .setTitle(title)
@@ -298,7 +349,7 @@ export function buildResultVerificationPayload(match, winnerPlayer, evidenceUrl 
       { name: 'Reported Winner', value: `🏆 **${winnerIgn}** (<@${winnerPlayer.discordId}>)`, inline: true },
       { name: 'Proof Screenshot', value: evidenceUrl ? `[View Evidence Attachment](${evidenceUrl})` : '*Uploaded by Room Maker*', inline: true }
     )
-    .setFooter({ text: 'MatchDistrict 1v1 Arena Verification' });
+    .setFooter({ text: 'MatchDistrict 1v1 TDM Verification' });
 
   if (evidenceUrl && (evidenceUrl.startsWith('http://') || evidenceUrl.startsWith('https://'))) {
     embed.setImage(evidenceUrl);
@@ -338,7 +389,7 @@ export function buildCompletedMatchResultEmbed(match, winnerPlayer, opponentPlay
       { name: 'Status', value: '`Result: VERIFIED`', inline: true },
       { name: 'Completed', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }
     )
-    .setFooter({ text: 'Match District 1v1 Arena' });
+    .setFooter({ text: 'Match District 1v1 TDM' });
 }
 
 export function buildDisputeEvidenceEmbed(match, reportedBy, reason, evidenceUrl = null) {
@@ -353,7 +404,7 @@ export function buildDisputeEvidenceEmbed(match, reportedBy, reason, evidenceUrl
       { name: 'Player B', value: `${match.playerB.displayName} (<@${match.playerB.discordId}>)`, inline: true },
       { name: 'Reason', value: reason || '*No specific reason stated*', inline: false }
     )
-    .setFooter({ text: 'Use .arena result <id> <A|B> <reason> to resolve' });
+    .setFooter({ text: 'Use .tdm result <id> <A|B> <reason> to resolve' });
 
   if (evidenceUrl) {
     embed.addFields({ name: 'Evidence Link', value: `[View Screenshot](${evidenceUrl})`, inline: false });

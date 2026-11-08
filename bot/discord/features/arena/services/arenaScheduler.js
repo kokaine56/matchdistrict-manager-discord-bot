@@ -323,6 +323,31 @@ export async function recoverArenaOnStartup(client) {
         }
         await refreshArenaMatchCards(guild, m, { client, allowCreateIfMissing: true });
       }
+
+      // 2b. Cleanup completed / terminal matches from Room Maker panel if lingering
+      if (config.volunteerPanelId) {
+        const panel =
+          guild.channels.cache.get(config.volunteerPanelId) ||
+          (await guild.channels.fetch(config.volunteerPanelId).catch(() => null));
+        if (panel) {
+          const finalMatches = [
+            ...(await getArenaMatchesByStatus(ARENA_STATUS.COMPLETED, guild.id)),
+            ...(await getArenaMatchesByStatus(ARENA_STATUS.CANCELLED, guild.id)),
+            ...(await getArenaMatchesByStatus(ARENA_STATUS.EXPIRED, guild.id)),
+          ];
+          for (const fm of finalMatches) {
+            if (fm.panelMessageId) {
+              const msg =
+                panel.messages?.cache?.get(fm.panelMessageId) ||
+                (await panel.messages?.fetch?.(fm.panelMessageId).catch(() => null));
+              if (msg) {
+                await msg.delete().catch(() => {});
+              }
+              await updateArenaMatch(fm.matchId, { panelMessageId: null });
+            }
+          }
+        }
+      }
     } catch (guildErr) {
       console.warn(`[Arena] ⚠️ Error reconciling guild ${guild.id}:`, guildErr.message);
     }

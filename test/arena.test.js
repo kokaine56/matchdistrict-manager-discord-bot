@@ -233,7 +233,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
 
     let reply = '';
     await handleArenaCommand(env.guild, admin, null, ['setup'], (text) => { reply = typeof text === 'string' ? text : text.content; });
-    assert.match(reply, /1v1 Challenge Arena Setup Complete/);
+    assert.match(reply, /1v1 TDM Setup Complete/);
 
     const config = await getArenaConfig(env.guild.id);
     assert.ok(config.categoryId);
@@ -248,18 +248,18 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.ok(!config.volunteerRoleId, 'No Volunteer role should be created or stored');
     assert.ok(config.panelMessageId);
 
-    // Verify Arena channel names use the 𝟏𝐕𝟏｜ prefix
+    // Verify TDM channel names use the 𝟏𝐕𝟏 𝐓𝐃𝐌｜ prefix
     const infoChannel = env.channels.get(config.infoChannelId);
     assert.ok(infoChannel);
-    assert.equal(infoChannel.name, '𝟏𝐕𝟏｜arena-info');
+    assert.equal(infoChannel.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜info');
     const volPanel = env.channels.get(config.volunteerPanelId);
     assert.ok(volPanel);
-    assert.equal(volPanel.name, '𝟏𝐕𝟏｜room-maker-panel');
-    assert.equal(env.channels.get(config.createChannelId).name, '𝟏𝐕𝟏｜create-challenge');
-    assert.equal(env.channels.get(config.availableChannelId).name, '𝟏𝐕𝟏｜available-challenges');
-    assert.equal(env.channels.get(config.matchResultsId).name, '𝟏𝐕𝟏｜match-results');
-    assert.equal(env.channels.get(config.supportChannelId).name, '𝟏𝐕𝟏｜challenge-support');
-    assert.equal(env.channels.get(config.evidenceChannelId).name, '𝟏𝐕𝟏｜arena-evidence');
+    assert.equal(volPanel.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜room-maker-panel');
+    assert.equal(env.channels.get(config.createChannelId).name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜create-challenge');
+    assert.equal(env.channels.get(config.availableChannelId).name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜available-challenges');
+    assert.equal(env.channels.get(config.matchResultsId).name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-results');
+    assert.equal(env.channels.get(config.supportChannelId).name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜challenge-support');
+    assert.equal(env.channels.get(config.evidenceChannelId).name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜evidence');
     const everyonePerms = volPanel.permissionOverwrites.cache.get(env.guild.id);
     assert.ok(everyonePerms);
     assert.equal(everyonePerms.ViewChannel, true);
@@ -281,7 +281,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(env.channels.size, initialChannelCount, 'Idempotent setup should not create duplicate channels');
   });
 
-  test('2. Category overflow creates ARENA MATCHES 2 when category is full', async () => {
+  test('2. Category overflow creates 1V1 TDM 2 when category is full', async () => {
     const env = createMockArenaEnvironment();
     const admin = env.addMember('admin-1', 'AdminUser', { isAdmin: true });
     await handleArenaCommand(env.guild, admin, null, ['setup'], () => {});
@@ -295,7 +295,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     }
 
     const nextCat = await getOrCreateMatchCategory(env.guild, config);
-    assert.equal(nextCat.name, 'ARENA MATCHES 2');
+    assert.equal(nextCat.name, '1V1 TDM 2');
     const updatedConfig = await getArenaConfig(env.guild.id);
     assert.equal(updatedConfig.matchCategories.length, 2);
   });
@@ -372,7 +372,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     // Create challenge
     const res1 = await handleCreateChallenge(env.guild, player1);
     assert.equal(res1.ok, true);
-    assert.equal(res1.challenge.challengeId, 'MD-10001');
+    assert.equal(res1.challenge.challengeId, 'MD-0001');
     assert.equal(res1.challenge.status, ARENA_STATUS.OPEN);
 
     // Attempt to create second challenge during cooldown -> rejected
@@ -381,7 +381,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.match(res2.error, /Open Challenge Exists|Cooldown/);
 
     // Cancel own challenge
-    const cancelRes = await handleCancelChallenge(env.guild, player1, 'MD-10001');
+    const cancelRes = await handleCancelChallenge(env.guild, player1, 'MD-0001');
     assert.equal(cancelRes.ok, true);
     assert.equal(cancelRes.challenge.status, ARENA_STATUS.CANCELLED);
 
@@ -423,9 +423,9 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(pADoc.activeMatchId, challengeId);
     assert.equal(pBDoc.activeMatchId, challengeId);
 
-    // Verify private match channel exists with 4-digit sequential name and 𝟏𝐕𝟏｜ prefix
+    // Verify private match channel exists with 4-digit sequential name and 𝟏𝐕𝟏 𝐓𝐃𝐌｜ prefix
     assert.ok(acceptRes.matchChannel);
-    assert.equal(acceptRes.matchChannel.name, '𝟏𝐕𝟏｜match-0001');
+    assert.equal(acceptRes.matchChannel.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0001');
   });
 
   test('6. Volunteer claiming, self-claim prevention, active limit & release flow with concurrency safety', async () => {
@@ -710,7 +710,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
       editReply: async (p) => { editReplyContent = p.content; },
     });
     assert.match(editReplyContent, /open challenge|Details Saved/);
-    const challenge = await getArenaChallenge('MD-10001');
+    const challenge = await getArenaChallenge('MD-0001');
     assert.ok(challenge);
 
     // 2. Player B registers and accepts challenge via interaction button
@@ -986,21 +986,27 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     const rmOverwrites = roomMakerChannel.permissionOverwrites.cache.get('vol-perm');
     assert.ok(rmOverwrites, 'Room Maker must have overwrites in their private channel');
     assert.equal(rmOverwrites.ViewChannel, true);
-    assert.equal(rmOverwrites.SendMessages, true);
-    assert.equal(rmOverwrites.AttachFiles, true);
+    assert.equal(rmOverwrites.SendMessages, false, 'Room Maker must NOT have default message sending permissions');
+    assert.equal(rmOverwrites.AttachFiles, false, 'Room Maker must NOT have default attachment permissions');
 
     // 3. Move match to LIVE
     await submitRoomDetails(env.guild, vol, matchId, 'ROOM99', 'PASS99');
     await startMatch(env.guild, vol, matchId);
 
-    // 4. Room Maker initiates winner submission -> instruction sent to Room Maker private channel
+    // 4. Room Maker initiates winner submission -> temporary upload permissions granted
     const initRes = await initiateWinnerSubmission(env.guild, vol, matchId, 'A');
     assert.equal(initRes.ok, true);
+    const rmOverwritesDuringUpload = roomMakerChannel.permissionOverwrites.cache.get('vol-perm');
+    assert.equal(rmOverwritesDuringUpload.SendMessages, true, 'Temporary SendMessages granted for proof upload');
+    assert.equal(rmOverwritesDuringUpload.AttachFiles, true, 'Temporary AttachFiles granted for proof upload');
 
-    // 5. Room Maker uploads screenshot -> evidence saved, forwarded to #arena-evidence & sent to challengers
+    // 5. Room Maker uploads screenshot -> permissions immediately revoked, evidence saved
     const { processWinnerScreenshot } = await import('../bot/discord/features/arena/services/arenaMatchService.js');
     const liveMatch = await getArenaMatch(matchId);
     await processWinnerScreenshot(env.guild, liveMatch, vol, 'https://cdn.discordapp.com/arena-proof.png');
+    const rmOverwritesAfterUpload = roomMakerChannel.permissionOverwrites.cache.get('vol-perm');
+    assert.equal(rmOverwritesAfterUpload.SendMessages, false, 'Temporary SendMessages revoked after proof upload');
+    assert.equal(rmOverwritesAfterUpload.AttachFiles, false, 'Temporary AttachFiles revoked after proof upload');
 
     const config = await getArenaConfig(env.guild.id);
     const evidenceChannel = env.channels.get(config.evidenceChannelId);
@@ -1051,7 +1057,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     } = await import('../bot/discord/features/arena/services/arenaNotificationService.js');
 
     const sampleMatch = {
-      matchId: 'MD-10001',
+      matchId: 'MD-0001',
       status: ARENA_STATUS.LIVE,
       playerA: { discordId: 'pA', displayName: 'AlphaPro', bgmiIgn: 'AlphaKing', bgmiUid: '1111' },
       playerB: { discordId: 'pB', displayName: 'BravoElite', bgmiIgn: 'BravoGod', bgmiUid: '2222' },
@@ -1075,19 +1081,19 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     // 2. Build Match Channel Payload
     const matchPayload = await buildMatchChannelEmbed(sampleMatch, 'OfficialVol');
     assert.ok(matchPayload.files && matchPayload.files.length === 1, 'Match payload must include the generated image card as a file attachment');
-    assert.equal(matchPayload.files[0].name, 'match-md-10001.png');
+    assert.equal(matchPayload.files[0].name, 'match-md-0001.png');
     assert.ok(matchPayload.embeds && matchPayload.embeds.length === 1);
-    assert.equal(matchPayload.embeds[0].data.image.url, 'attachment://match-md-10001.png');
+    assert.equal(matchPayload.embeds[0].data.image.url, 'attachment://match-md-0001.png');
 
     // Verify live buttons (Submit Winner)
     assert.ok(matchPayload.components.length > 0);
     const buttonRow = matchPayload.components[0];
     const customIds = buttonRow.components.map((c) => c.data.custom_id);
-    assert.ok(customIds.includes('arena:submit_winner:MD-10001'));
+    assert.ok(customIds.includes('arena:submit_winner:MD-0001'));
 
     // 3. Challenge Card PNG (OPEN)
     const sampleChallenge = {
-      challengeId: 'MD-10001',
+      challengeId: 'MD-0001',
       creatorId: 'pA',
       status: ARENA_STATUS.OPEN,
       createdAt: new Date(),
@@ -1095,11 +1101,11 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     };
     const challengeOpenPayload = await buildChallengeEmbed(sampleChallenge, 'AlphaPro', { creatorIgn: 'AlphaKing' });
     assert.ok(challengeOpenPayload.files && challengeOpenPayload.files.length === 1);
-    assert.equal(challengeOpenPayload.files[0].name, 'challenge-md-10001.png');
+    assert.equal(challengeOpenPayload.files[0].name, 'challenge-md-0001.png');
     assert.equal(challengeOpenPayload.components.length, 1, 'OPEN challenge must have action buttons');
     const challengeBtnIds = challengeOpenPayload.components[0].components.map((c) => c.data.custom_id);
-    assert.ok(challengeBtnIds.includes('arena:accept_challenge:MD-10001'));
-    assert.ok(challengeBtnIds.includes('arena:cancel_challenge:MD-10001'));
+    assert.ok(challengeBtnIds.includes('arena:accept_challenge:MD-0001'));
+    assert.ok(challengeBtnIds.includes('arena:cancel_challenge:MD-0001'));
 
     // 4. Challenge Card PNG (ACCEPTED) -> updates image and removes buttons
     const acceptedChallenge = { ...sampleChallenge, status: ARENA_STATUS.WAITING_FOR_VOLUNTEER };
@@ -1346,7 +1352,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     });
 
     assert.ok(deleteReply && deleteReply.embeds && deleteReply.embeds.length === 1);
-    assert.match(deleteReply.embeds[0].data.title, /1v1 Challenge Arena Deleted/);
+    assert.match(deleteReply.embeds[0].data.title, /1v1 TDM Deleted/);
 
     // 4. Verify channels and categories are removed from Discord
     assert.equal(env.guild.channels.cache.has(config.categoryId), false, 'Main category must be deleted');
@@ -1422,7 +1428,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(card.readUInt32BE(20), 420);
   });
 
-  test('21. Room Maker can leave match after submitting room details (ROOM_READY & ROOM_ISSUE), atomic & safe against double clicks', async () => {
+  test('21. Room Maker can leave BEFORE submitting room credentials, blocked after credentials submitted, admin can reassign', async () => {
     const env = createMockArenaEnvironment();
     const admin = env.addMember('admin-rm-leave', 'AdminRm', { permissions: ['Administrator'] });
     await setupArenaChannels(env.guild, admin);
@@ -1435,8 +1441,9 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     await upsertArenaPlayer(pB.id, { displayName: 'PlayerB', bgmiIgn: 'ताजJESP', bgmiUid: '7770002222' });
 
     const { handleCreateChallenge, handleAcceptChallenge } = await import('../bot/discord/features/arena/services/arenaChallengeService.js');
-    const { handleClaimMatch, handleLeaveMatch, handleReleaseMatch } = await import('../bot/discord/features/arena/services/arenaVolunteerService.js');
+    const { handleClaimMatch, handleLeaveMatch } = await import('../bot/discord/features/arena/services/arenaVolunteerService.js');
     const { submitRoomDetails, startMatch } = await import('../bot/discord/features/arena/services/arenaMatchService.js');
+    const { buildMatchCardPayload } = await import('../bot/discord/features/arena/services/arenaImageService.js');
 
     const cRes = await handleCreateChallenge(env.guild, pA);
     const mRes = await handleAcceptChallenge(env.guild, pB, cRes.challenge.challengeId, env.client);
@@ -1449,41 +1456,47 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     const rmProfileAfterClaim = await getArenaVolunteer(rm.id);
     assert.equal(rmProfileAfterClaim.activeMatches, 1);
 
-    // 2. Submit Room details -> moves to ROOM_READY
-    const roomRes = await submitRoomDetails(env.guild, rm, matchId, '987654321', 'roompass123');
-    assert.ok(roomRes.ok);
-    assert.equal(roomRes.match.status, ARENA_STATUS.ROOM_READY);
-    assert.equal(roomRes.match.roomId, '987654321');
+    // 2. Room Maker can leave BEFORE submitting room details
+    const earlyLeave = await handleLeaveMatch(env.guild, rm, matchId);
+    assert.ok(earlyLeave.ok, 'Room Maker must be able to leave before submitting room details');
+    assert.equal(earlyLeave.match.status, ARENA_STATUS.WAITING_FOR_VOLUNTEER);
+    assert.equal(earlyLeave.match.volunteerId, null);
+    const rmProfileAfterEarlyLeave = await getArenaVolunteer(rm.id);
+    assert.equal(rmProfileAfterEarlyLeave.activeMatches, 0);
 
-    // 3. Room Maker leaves match after submitting credentials
-    const leaveRes = await handleLeaveMatch(env.guild, rm, matchId);
-    assert.ok(leaveRes.ok, 'Room Maker must be able to leave after submitting room details');
-    assert.equal(leaveRes.match.status, ARENA_STATUS.WAITING_FOR_VOLUNTEER);
-    assert.equal(leaveRes.match.volunteerId, null);
-    assert.equal(leaveRes.match.roomId, null, 'Credentials must be cleared when Room Maker leaves');
-    assert.equal(leaveRes.match.roomPassword, null, 'Credentials must be cleared when Room Maker leaves');
-
-    // 4. Active matches decremented
-    const rmProfileAfterLeave = await getArenaVolunteer(rm.id);
-    assert.equal(rmProfileAfterLeave.activeMatches, 0);
-
-    // 5. Concurrent / second leave call is rejected (protected against double clicks)
+    // 3. Concurrent leave call is rejected (protected against double clicks)
     const doubleLeaveRes = await handleLeaveMatch(env.guild, rm, matchId);
     assert.equal(doubleLeaveRes.ok, false);
 
-    // 6. Another Room Maker can now claim the match
+    // 4. Another Room Maker claims the match
     const rm2 = env.addMember('rm2-user', 'RoomMaker2');
     const claim2 = await handleClaimMatch(env.guild, rm2, matchId);
     assert.ok(claim2.ok);
 
-    // 7. Submit room details, start match to LIVE -> Room Maker cannot leave a LIVE match
-    await submitRoomDetails(env.guild, rm2, matchId, '111222333', 'pass456');
-    const startRes = await startMatch(env.guild, rm2, matchId);
-    assert.ok(startRes.ok);
-    assert.equal(startRes.match.status, ARENA_STATUS.LIVE);
+    // 5. Submit Room details -> moves to ROOM_READY
+    const roomRes = await submitRoomDetails(env.guild, rm2, matchId, '987654321', 'roompass123');
+    assert.ok(roomRes.ok);
+    assert.equal(roomRes.match.status, ARENA_STATUS.ROOM_READY);
+    assert.equal(roomRes.match.roomId, '987654321');
 
-    const liveLeaveRes = await handleLeaveMatch(env.guild, rm2, matchId);
-    assert.equal(liveLeaveRes.ok, false, 'Cannot leave a LIVE match');
+    // 6. Room Maker CANNOT leave after room details are submitted
+    const blockedLeave = await handleLeaveMatch(env.guild, rm2, matchId);
+    assert.equal(blockedLeave.ok, false, 'Room Maker must NOT be allowed to leave after credentials submitted');
+    assert.match(blockedLeave.error, /cannot leave the match after submitting room credentials/);
+
+    // 7. Verify Leave Match button is removed from dashboard in ROOM_READY
+    const dashboardPayload = await buildMatchCardPayload(roomRes.match, 'RoomMaker2', { surface: 'roomMakerChannel' });
+    const buttonLabels = dashboardPayload.components[0].components.map((b) => b.data.label);
+    assert.equal(buttonLabels.includes('Leave Match'), false, 'Leave Match button must NOT appear in ROOM_READY');
+    assert.ok(buttonLabels.includes('Edit Room Details'));
+    assert.ok(buttonLabels.includes('Start Match'));
+
+    // 8. Administrator CAN still reassign/release the match anytime
+    const adminRelease = await handleLeaveMatch(env.guild, admin, matchId, true);
+    assert.ok(adminRelease.ok, 'Administrator must be able to release/reassign');
+    assert.equal(adminRelease.match.status, ARENA_STATUS.WAITING_FOR_VOLUNTEER);
+    assert.equal(adminRelease.match.volunteerId, null);
+    assert.equal(adminRelease.match.roomId, null, 'Credentials cleared on admin release');
   });
 
   test('22. Separate Room Maker Channel (roommaker-0001) from Challengers (match-0001), privacy, screenshot detection & bottom panels', async () => {
@@ -1507,12 +1520,12 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     const mRes = await handleAcceptChallenge(env.guild, pB, cRes.challenge.challengeId, env.client);
 
     // 1. Exactly TWO separate private channels created:
-    // A. Challengers channel: 𝟏𝐕𝟏｜match-0001
-    // B. Room Maker channel: 𝟏𝐕𝟏｜roommaker-0001
+    // A. Challengers channel: 𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0001
+    // B. Room Maker channel: 𝟏𝐕𝟏 𝐓𝐃𝐌｜roommaker-0001
     assert.ok(mRes.matchChannel, 'Private match channel must be created');
-    assert.equal(mRes.matchChannel.name, '𝟏𝐕𝟏｜match-0001');
+    assert.equal(mRes.matchChannel.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0001');
     assert.ok(mRes.roomMakerChannel, 'Private room maker channel must be created');
-    assert.equal(mRes.roomMakerChannel.name, '𝟏𝐕𝟏｜roommaker-0001');
+    assert.equal(mRes.roomMakerChannel.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜roommaker-0001');
 
     // 2. Permissions separation:
     // Players have access to match-0001, but NOT to roommaker-0001
@@ -1530,12 +1543,23 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     await submitRoomDetails(env.guild, rm, mRes.match.matchId, 'ROOM999', 'PASS999');
 
     const matchChannelMessages = Array.from(mRes.matchChannel.messages.cache.values());
-    const credsMsg = matchChannelMessages.find((msg) => msg.embeds?.some((e) => e.data?.title === '🔐 BGMI ROOM DETAILS') || msg.content?.includes('ROOM999'));
+    const credsMsg = matchChannelMessages.find((msg) => msg.embeds?.some((e) => e.data?.title?.includes('BGMI ROOM DETAILS')) || msg.content?.includes('ROOM999'));
     assert.ok(credsMsg, 'Room credentials embed must appear inside the challengers match channel');
     assert.ok(credsMsg.components?.some((r) => r.components?.some((b) => b.data?.custom_id?.includes('report_room_issue'))), 'Report ID/Password button must appear in challengers channel');
 
-    // 5. Room Maker channel messages must NOT have report_room_issue button
+    // Verify standardized credential fields: Match ID, Room ID, Room Password (no backticks)
+    const credsEmbed = credsMsg.embeds[0];
+    const fieldNames = credsEmbed.data.fields.map((f) => f.name);
+    assert.ok(fieldNames.includes('Match ID'));
+    assert.ok(fieldNames.includes('Room ID'));
+    assert.ok(fieldNames.includes('Room Password'));
+    for (const f of credsEmbed.data.fields) {
+      assert.equal(f.value.includes('`'), false, `Field "${f.name}" must NOT contain inline-code backticks`);
+    }
+
+    // 5. Room Maker channel must contain ONLY 1 message (the dashboard image card) and NO report button
     const rmChannelMessages = Array.from(mRes.roomMakerChannel.messages.cache.values());
+    assert.equal(rmChannelMessages.length, 1, 'Room Maker channel must contain ONLY the dashboard image card');
     const hasReportButtonInRm = rmChannelMessages.some((msg) =>
       msg.components?.some((r) => r.components?.some((b) => b.data?.custom_id?.includes('report_room_issue')))
     );
@@ -1566,6 +1590,9 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
       m.components?.some((r) => r.components?.some((b) => b.data?.custom_id?.includes('confirm_result')))
     );
     assert.ok(proofMsg, 'Challengers must receive verification embed with Confirm Result & Dispute Result buttons');
+
+    // CRITICAL PRIVACY: Verify Room Maker was NOT granted access or overwrites on matchChannel after screenshot upload
+    assert.equal(mRes.matchChannel.permissionOverwrites.cache.get(rm.id), undefined, 'Room Maker must NEVER be added to challengers match channel after screenshot upload');
 
     // 7. Test dashboard repositioning to bottom in #room-maker-panel
     const config = await getArenaConfig(env.guild.id);
@@ -1726,23 +1753,23 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.match(releaseUsage, /\.leave <matchId>/);
   });
 
-  test('26. 1V1 Arena Channel Naming Convention: 𝟏𝐕𝟏｜ prefix on public, admin, dynamic channels & idempotency', async () => {
+  test('26. 1V1 TDM Channel Naming Convention: 𝟏𝐕𝟏 𝐓𝐃𝐌｜ prefix on public, admin, dynamic channels & idempotency', async () => {
     // 1. Verify channel format helper functions
-    assert.equal(ARENA_CHANNEL_PREFIX, '𝟏𝐕𝟏｜');
-    assert.equal(formatArenaChannelName('arena-info'), '𝟏𝐕𝟏｜arena-info');
-    assert.equal(formatArenaChannelName('create-challenge'), '𝟏𝐕𝟏｜create-challenge');
-    assert.equal(formatArenaChannelName('available-challenges'), '𝟏𝐕𝟏｜available-challenges');
-    assert.equal(formatArenaChannelName('room-maker-panel'), '𝟏𝐕𝟏｜room-maker-panel');
-    assert.equal(formatArenaChannelName('match-results'), '𝟏𝐕𝟏｜match-results');
-    assert.equal(formatArenaChannelName('challenge-support'), '𝟏𝐕𝟏｜challenge-support');
-    assert.equal(formatArenaChannelName('arena-evidence'), '𝟏𝐕𝟏｜arena-evidence');
+    assert.equal(ARENA_CHANNEL_PREFIX, '𝟏𝐕𝟏 𝐓𝐃𝐌｜');
+    assert.equal(formatArenaChannelName('info'), '𝟏𝐕𝟏 𝐓𝐃𝐌｜info');
+    assert.equal(formatArenaChannelName('create-challenge'), '𝟏𝐕𝟏 𝐓𝐃𝐌｜create-challenge');
+    assert.equal(formatArenaChannelName('available-challenges'), '𝟏𝐕𝟏 𝐓𝐃𝐌｜available-challenges');
+    assert.equal(formatArenaChannelName('room-maker-panel'), '𝟏𝐕𝟏 𝐓𝐃𝐌｜room-maker-panel');
+    assert.equal(formatArenaChannelName('match-results'), '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-results');
+    assert.equal(formatArenaChannelName('challenge-support'), '𝟏𝐕𝟏 𝐓𝐃𝐌｜challenge-support');
+    assert.equal(formatArenaChannelName('evidence'), '𝟏𝐕𝟏 𝐓𝐃𝐌｜evidence');
 
-    assert.equal(formatMatchChannelName(1), '𝟏𝐕𝟏｜match-0001');
-    assert.equal(formatMatchChannelName(2), '𝟏𝐕𝟏｜match-0002');
-    assert.equal(formatMatchChannelName('10003'), '𝟏𝐕𝟏｜match-0003');
-    assert.equal(formatRoomMakerChannelName(1), '𝟏𝐕𝟏｜roommaker-0001');
-    assert.equal(formatRoomMakerChannelName(2), '𝟏𝐕𝟏｜roommaker-0002');
-    assert.equal(formatRoomMakerChannelName('10004'), '𝟏𝐕𝟏｜roommaker-0004');
+    assert.equal(formatMatchChannelName(1), '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0001');
+    assert.equal(formatMatchChannelName(2), '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0002');
+    assert.equal(formatMatchChannelName('10003'), '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0003');
+    assert.equal(formatRoomMakerChannelName(1), '𝟏𝐕𝟏 𝐓𝐃𝐌｜roommaker-0001');
+    assert.equal(formatRoomMakerChannelName(2), '𝟏𝐕𝟏 𝐓𝐃𝐌｜roommaker-0002');
+    assert.equal(formatRoomMakerChannelName('10004'), '𝟏𝐕𝟏 𝐓𝐃𝐌｜roommaker-0004');
 
     // 2. Pre-create legacy un-prefixed channels in mock guild to test automatic renaming
     const env = createMockArenaEnvironment('guild-naming-1');
@@ -1764,13 +1791,13 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     const setupRes = await setupArenaChannels(env.guild, admin);
 
     // Verify existing channels were renamed
-    assert.equal(legacyInfo.name, '𝟏𝐕𝟏｜arena-info');
-    assert.equal(legacyCreate.name, '𝟏𝐕𝟏｜create-challenge');
-    assert.equal(legacyAvail.name, '𝟏𝐕𝟏｜available-challenges');
-    assert.equal(legacyVol.name, '𝟏𝐕𝟏｜room-maker-panel');
-    assert.equal(legacyResults.name, '𝟏𝐕𝟏｜match-results');
-    assert.equal(legacySupport.name, '𝟏𝐕𝟏｜challenge-support');
-    assert.equal(legacyEvidence.name, '𝟏𝐕𝟏｜arena-evidence');
+    assert.equal(legacyInfo.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜info');
+    assert.equal(legacyCreate.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜create-challenge');
+    assert.equal(legacyAvail.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜available-challenges');
+    assert.equal(legacyVol.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜room-maker-panel');
+    assert.equal(legacyResults.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-results');
+    assert.equal(legacySupport.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜challenge-support');
+    assert.equal(legacyEvidence.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜evidence');
 
     // Verify channel IDs match the existing ones (no duplicate channels created)
     assert.equal(setupRes.infoChannel.id, legacyInfo.id);
@@ -1781,19 +1808,18 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(setupRes.supportChannel.id, legacySupport.id);
     assert.equal(setupRes.evidenceChannel.id, legacyEvidence.id);
 
-    // Verify no new duplicate channels were added (except match category if created)
-    const matchCatCount = Array.from(env.channels.values()).filter((c) => c.name.startsWith('ARENA MATCHES')).length;
-    assert.equal(env.channels.size, totalChannelsBefore + matchCatCount, 'Setup must be idempotent and not create duplicate channels');
+    // Verify no new duplicate channels were added
+    assert.equal(env.channels.size, totalChannelsBefore, 'Setup must be idempotent and not create duplicate channels');
   });
 
-  test('27. 1V1 Arena Information Channel: 𝟏𝐕𝟏｜arena-info created with permissions, permanent embed, and dynamic mentions', async () => {
+  test('27. 1V1 TDM Information Channel: 𝟏𝐕𝟏 𝐓𝐃𝐌｜info created with permissions, permanent embed, and dynamic mentions', async () => {
     const env = createMockArenaEnvironment('guild-info-1');
     const admin = env.addMember('admin-info', 'InfoAdmin', { isAdmin: true });
 
     // 1. Run setupArenaChannels
     const res = await setupArenaChannels(env.guild, admin);
     assert.ok(res.infoChannel);
-    assert.equal(res.infoChannel.name, '𝟏𝐕𝟏｜arena-info');
+    assert.equal(res.infoChannel.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜info');
 
     // 2. Verify permissions for @everyone: view & read history true, send messages & thread creation denied
     const everyonePerms = res.infoChannel.permissionOverwrites.cache.get(env.guild.id);
@@ -1816,11 +1842,11 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(infoMsg.embeds.length, 1);
     const embedData = infoMsg.embeds[0].data;
 
-    assert.equal(embedData.title, 'MATCH DISTRICT – 1V1 ARENA');
+    assert.equal(embedData.title, 'MATCH DISTRICT – 1V1 TDM');
     assert.equal(embedData.color, ARENA_CONSTANTS.ORANGE_COLOR);
 
     // Verify instructions and dynamic channel mentions
-    assert.match(embedData.description, /Welcome to the Match District 1V1 Challenge Arena!/);
+    assert.match(embedData.description, /Welcome to Match District 1V1 TDM!/);
     assert.ok(embedData.description.includes(`<#${config.createChannelId}>`), 'Must contain create challenge channel mention');
     assert.ok(embedData.description.includes(`<#${config.availableChannelId}>`), 'Must contain available challenges channel mention');
     assert.ok(embedData.description.includes(`<#${config.matchResultsId}>`), 'Must contain match results channel mention');
@@ -1840,5 +1866,232 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     const res2 = await setupArenaChannels(env.guild, admin);
     assert.equal(res2.infoChannel.messages.cache.size, 1, 'Setup re-run must not create duplicate messages');
     assert.equal(res2.config.infoMessageId, config.infoMessageId, 'Message ID must remain unchanged upon re-edit');
+  });
+
+  test('28. Standardized MD-0001 Match ID, credential replacement deletion & dashboard-only channel across all lifecycle events', async () => {
+    const env = createMockArenaEnvironment('guild-std-1');
+    const admin = env.addMember('admin-std', 'StdAdmin', { permissions: ['Administrator'] });
+    await setupArenaChannels(env.guild, admin);
+
+    const rm = env.addMember('rm-std-user', 'StdRoomMaker');
+    const pA = env.addMember('std-pa', 'PlayerAlpha');
+    const pB = env.addMember('std-pb', 'PlayerBravo');
+
+    await upsertArenaPlayer(pA.id, { displayName: 'PlayerAlpha', bgmiIgn: 'AlphaIGN', bgmiUid: '9110001111' });
+    await upsertArenaPlayer(pB.id, { displayName: 'PlayerBravo', bgmiIgn: 'BravoIGN', bgmiUid: '9110002222' });
+
+    const { handleCreateChallenge, handleAcceptChallenge } = await import('../bot/discord/features/arena/services/arenaChallengeService.js');
+    const { handleClaimMatch } = await import('../bot/discord/features/arena/services/arenaVolunteerService.js');
+    const {
+      submitRoomDetails,
+      handleReportRoomCredentials,
+      startMatch,
+      initiateWinnerSubmission,
+      handleArenaScreenshotUpload,
+    } = await import('../bot/discord/features/arena/services/arenaMatchService.js');
+    const { formatMatchId } = await import('../bot/discord/features/arena/models/arenaModels.js');
+
+    // 1. Verify formatMatchId helper
+    assert.equal(formatMatchId('1'), 'MD-0001');
+    assert.equal(formatMatchId('0002'), 'MD-0002');
+    assert.equal(formatMatchId('MD-3'), 'MD-0003');
+    assert.equal(formatMatchId('match-0004'), 'MD-0004');
+
+    // 2. Create and accept challenge
+    const cRes = await handleCreateChallenge(env.guild, pA);
+    assert.equal(cRes.challenge.challengeId, 'MD-0001');
+    const mRes = await handleAcceptChallenge(env.guild, pB, cRes.challenge.challengeId, env.client);
+    const matchId = mRes.match.matchId;
+    assert.equal(matchId, 'MD-0001');
+
+    // 3. Room Maker claims match
+    await handleClaimMatch(env.guild, rm, matchId);
+    const rmChannel = mRes.roomMakerChannel;
+    assert.equal(rmChannel.messages.cache.size, 1, 'Room Maker channel must contain ONLY the dashboard on claim');
+
+    // 4. Room Maker submits initial credentials
+    await submitRoomDetails(env.guild, rm, matchId, '12345678', 'pass123');
+    assert.equal(rmChannel.messages.cache.size, 1, 'Room Maker channel must contain ONLY the dashboard after credentials');
+
+    const matchChannel = mRes.matchChannel;
+    const initialCredsMsg = Array.from(matchChannel.messages.cache.values()).find((m) =>
+      m.embeds?.some((e) => e.data?.title?.includes('BGMI ROOM DETAILS'))
+    );
+    assert.ok(initialCredsMsg);
+    const oldCredsMsgId = initialCredsMsg.id;
+
+    // Verify fields and lack of backticks
+    const initEmbed = initialCredsMsg.embeds[0].data;
+    assert.equal(initEmbed.fields.find((f) => f.name === 'Match ID')?.value, 'MD-0001');
+    assert.equal(initEmbed.fields.find((f) => f.name === 'Room ID')?.value, '12345678');
+    assert.equal(initEmbed.fields.find((f) => f.name === 'Room Password')?.value, 'pass123');
+    for (const field of initEmbed.fields) {
+      assert.equal(field.value.includes('`'), false, 'Credential field values must not use backticks');
+    }
+
+    // 5. Player reports incorrect credentials (ROOM_ISSUE)
+    await handleReportRoomCredentials(env.guild, pA, matchId, 'ROOM_ID');
+    assert.equal(rmChannel.messages.cache.size, 1, 'Room Maker channel must contain ONLY the dashboard after issue report');
+
+    // 6. Room Maker submits corrected credentials
+    await submitRoomDetails(env.guild, rm, matchId, '87654321', 'passCorrected');
+    assert.equal(rmChannel.messages.cache.size, 1, 'Room Maker channel must contain ONLY the dashboard after correction');
+
+    // Verify old credentials message was DELETED from challengers channel
+    assert.equal(matchChannel.messages.cache.has(oldCredsMsgId), false, 'Old credentials message must be deleted upon correction');
+
+    // Verify fresh credentials message and notification update
+    const freshCredsMsg = Array.from(matchChannel.messages.cache.values()).find((m) =>
+      m.embeds?.some((e) => e.data?.title?.includes('BGMI ROOM DETAILS'))
+    );
+    assert.ok(freshCredsMsg);
+    assert.notEqual(freshCredsMsg.id, oldCredsMsgId);
+    assert.equal(freshCredsMsg.embeds[0].data.fields.find((f) => f.name === 'Room ID')?.value, '87654321');
+
+    const updateNoticeMsg = Array.from(matchChannel.messages.cache.values()).find((m) =>
+      m.embeds?.some((e) => e.data?.title?.includes('Room Credentials Updated'))
+    );
+    assert.ok(updateNoticeMsg, 'Challengers must receive update notification');
+    assert.match(updateNoticeMsg.embeds[0].data.description, /Room credentials have been updated by the Room Maker/);
+
+    // 7. Start match
+    await startMatch(env.guild, rm, matchId);
+    assert.equal(rmChannel.messages.cache.size, 1, 'Room Maker channel must contain ONLY the dashboard when LIVE');
+
+    // 8. Initiate winner submission
+    await initiateWinnerSubmission(env.guild, rm, matchId, 'A');
+    assert.equal(rmChannel.messages.cache.size, 1, 'Room Maker channel must contain ONLY the dashboard after winner initiated');
+
+    // 9. Upload screenshot
+    const mockUploadMsg = {
+      guild: env.guild,
+      author: rm.user,
+      member: rm,
+      channel: rmChannel,
+      content: '',
+      attachments: new Map([
+        ['att-test', { url: 'https://cdn.discordapp.com/result.png', name: 'result.png', contentType: 'image/png' }],
+      ]),
+    };
+    await handleArenaScreenshotUpload(mockUploadMsg);
+    assert.equal(rmChannel.messages.cache.size, 1, 'Room Maker channel must contain ONLY the dashboard after proof received');
+  });
+
+  test('29. Room Maker Separation & Panel Cleanup: Completed match card removed from Room Maker panel, active matches preserved, zero RM access to challengers channel', async () => {
+    const { handleArenaScreenshotUpload } = await import('../bot/discord/features/arena/services/arenaMatchService.js');
+    const env = createMockArenaEnvironment('guild-cleanup-1');
+    const admin = env.addMember('admin-clean', 'CleanAdmin', { isAdmin: true });
+    await setupArenaChannels(env.guild, admin);
+
+    const config = await getArenaConfig(env.guild.id);
+    const rmPanel = env.channels.get(config.volunteerPanelId);
+    assert.ok(rmPanel);
+
+    const rm = env.addMember('rm-clean-1', 'CleanRoomMaker');
+    const p1A = env.addMember('clean-p1a', 'Player1A');
+    const p1B = env.addMember('clean-p1b', 'Player1B');
+    const p2A = env.addMember('clean-p2a', 'Player2A');
+    const p2B = env.addMember('clean-p2b', 'Player2B');
+
+    await upsertArenaPlayer(p1A.id, { displayName: 'Player1A', bgmiIgn: 'Clean1A', bgmiUid: '8001001' });
+    await upsertArenaPlayer(p1B.id, { displayName: 'Player1B', bgmiIgn: 'Clean1B', bgmiUid: '8001002' });
+    await upsertArenaPlayer(p2A.id, { displayName: 'Player2A', bgmiIgn: 'Clean2A', bgmiUid: '8002001' });
+    await upsertArenaPlayer(p2B.id, { displayName: 'Player2B', bgmiIgn: 'Clean2B', bgmiUid: '8002002' });
+
+    // Match 1
+    const c1 = await handleCreateChallenge(env.guild, p1A);
+    const m1Res = await handleAcceptChallenge(env.guild, p1B, c1.challenge.challengeId, env.client);
+    const m1Id = m1Res.match.matchId;
+
+    // Match 2 (active, stays waiting)
+    const c2 = await handleCreateChallenge(env.guild, p2A);
+    const m2Res = await handleAcceptChallenge(env.guild, p2B, c2.challenge.challengeId, env.client);
+    const m2Id = m2Res.match.matchId;
+
+    // Verify both match cards exist in #room-maker-panel
+    const m1DocBefore = await getArenaMatch(m1Id);
+    const m2DocBefore = await getArenaMatch(m2Id);
+    assert.ok(m1DocBefore.panelMessageId);
+    assert.ok(m2DocBefore.panelMessageId);
+    assert.ok(rmPanel.messages.cache.has(m1DocBefore.panelMessageId));
+    assert.ok(rmPanel.messages.cache.has(m2DocBefore.panelMessageId));
+
+    // RM claims Match 1
+    await handleClaimMatch(env.guild, rm, m1Id);
+
+    // Verify RM has NO access to Match 1 challengers channel
+    assert.equal(m1Res.matchChannel.permissionOverwrites.cache.get(rm.id), undefined, 'RM must NOT have access to challengers channel upon claim');
+
+    // Submit room details
+    await submitRoomDetails(env.guild, rm, m1Id, '998877', 'pass9988');
+
+    // Start match
+    await startMatch(env.guild, rm, m1Id);
+
+    // Winner submission
+    await initiateWinnerSubmission(env.guild, rm, m1Id, 'A');
+
+    // Upload screenshot
+    const mockUploadMsg = {
+      guild: env.guild,
+      author: rm.user,
+      member: rm,
+      channel: m1Res.roomMakerChannel,
+      content: '',
+      attachments: new Map([
+        ['att-clean', { url: 'https://cdn.discordapp.com/result_clean.png', name: 'result.png', contentType: 'image/png' }],
+      ]),
+    };
+    await handleArenaScreenshotUpload(mockUploadMsg);
+
+    // CRITICAL: Room Maker must STILL have NO access or overwrite in challengers channel after screenshot submission
+    assert.equal(m1Res.matchChannel.permissionOverwrites.cache.get(rm.id), undefined, 'RM must NEVER have access or overwrites in challengers channel after screenshot upload');
+
+    // Players confirm result -> match completed
+    await handlePlayerConfirmation(env.guild, p1A, m1Id, 'confirm');
+    await handlePlayerConfirmation(env.guild, p1B, m1Id, 'confirm');
+
+    // Check Match 1 status in database
+    const m1DocAfter = await getArenaMatch(m1Id);
+    assert.equal(m1DocAfter.status, ARENA_STATUS.COMPLETED);
+    assert.equal(m1DocAfter.panelMessageId, null, 'panelMessageId must be cleared in DB upon completion');
+
+    // Verify Match 1 card was DELETED from #room-maker-panel
+    assert.equal(rmPanel.messages.cache.has(m1DocBefore.panelMessageId), false, 'Completed match card must be removed from #room-maker-panel');
+
+    // Verify Match 2 card REMAINS in #room-maker-panel (active matches preserved!)
+    assert.ok(rmPanel.messages.cache.has(m2DocBefore.panelMessageId), 'Active match card must remain in #room-maker-panel');
+  });
+
+  test('30. Startup recovery reconciles Room Maker panel by deleting lingering completed match cards', async () => {
+    const env = createMockArenaEnvironment('guild-recovery-1');
+    const admin = env.addMember('admin-rec', 'RecoveryAdmin', { isAdmin: true });
+    await setupArenaChannels(env.guild, admin);
+
+    const config = await getArenaConfig(env.guild.id);
+    const rmPanel = env.channels.get(config.volunteerPanelId);
+
+    // Simulate an orphaned completed match that still has a panelMessageId in Discord
+    const orphanCard = await rmPanel.send({ content: 'Orphaned Completed Match Card' });
+    const orphanMatch = await createArenaMatch({
+      matchId: 'MD-7777',
+      guildId: env.guild.id,
+      status: ARENA_STATUS.COMPLETED,
+      panelMessageId: orphanCard.id,
+      playerA: { discordId: 'u1', displayName: 'U1', bgmiIgn: 'IGN1', bgmiUid: '11111' },
+      playerB: { discordId: 'u2', displayName: 'U2', bgmiIgn: 'IGN2', bgmiUid: '22222' },
+    });
+
+    assert.ok(rmPanel.messages.cache.has(orphanCard.id));
+
+    // Run startup recovery
+    await recoverArenaOnStartup(env.client);
+
+    // Verify orphaned card was deleted from #room-maker-panel
+    assert.equal(rmPanel.messages.cache.has(orphanCard.id), false, 'Startup recovery must delete completed match cards from #room-maker-panel');
+
+    // Verify database field updated
+    const updatedOrphan = await getArenaMatch('MD-7777');
+    assert.equal(updatedOrphan.panelMessageId, null);
   });
 });

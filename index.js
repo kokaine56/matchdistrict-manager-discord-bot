@@ -3201,7 +3201,7 @@ client.on(Events.MessageCreate, async (message) => {
           message
         );
         return;
-      } else if (cmd === 'arena') {
+      } else if (cmd === 'arena' || cmd === 'tdm') {
         await handleArenaCommand(
           message.guild,
           message.member,

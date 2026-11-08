@@ -21,6 +21,7 @@ import {
   buildVolunteerPanelEmbed,
   buildMatchChannelEmbed,
   buildArenaStatusEmbed,
+  purgeStandaloneRoomMakerMessages,
 } from './arenaNotificationService.js';
 import { fetchMatchAvatars } from './arenaImageService.js';
 import { queueMessageEdit, queueChannelSend } from '../../../../../discordQueue.js';
@@ -121,7 +122,7 @@ export async function handleClaimMatch(guild, member, matchId) {
     if (rmChannel) {
       await addRoomMakerToRoomMakerChannel(rmChannel, member.id);
 
-      // Post Room Maker match card with management controls
+      // Post Room Maker match card with management controls (dashboard only)
       const rmPayload = await buildMatchChannelEmbed(updatedMatch, volunteerName, {
         avatars,
         guild,
@@ -132,15 +133,7 @@ export async function handleClaimMatch(guild, member, matchId) {
       if (rmMsg?.id) {
         await updateArenaMatch(matchId, { roomMakerMessageId: rmMsg.id });
       }
-
-      // Clean embed instruction for Room Maker
-      const claimEmbed = buildArenaStatusEmbed({
-        title: '📋 Match Claimed',
-        description:
-          `You are now officiating Match **${match.matchId}**.\n\n` +
-          `Please create a BGMI custom room and click **Submit Room Details** below to send the Room ID and Password to the players.`,
-      });
-      await queueChannelSend(rmChannel, { embeds: [claimEmbed] });
+      await purgeStandaloneRoomMakerMessages(rmChannel, rmMsg?.id);
     }
   }
 
@@ -208,8 +201,16 @@ export async function handleLeaveMatch(guild, member, matchId, isAdminAction = f
     return { ok: false, error: '❌ Match not found.' };
   }
 
-  if (!isAdminAction && match.volunteerId !== member.id) {
-    return { ok: false, error: '❌ You are not the assigned Room Maker for this match.' };
+  if (!isAdminAction) {
+    if (match.volunteerId !== member.id) {
+      return { ok: false, error: '❌ You are not the assigned Room Maker for this match.' };
+    }
+    if (match.roomId || match.status !== ARENA_STATUS.VOLUNTEER_ASSIGNED) {
+      return {
+        ok: false,
+        error: '❌ You cannot leave the match after submitting room credentials. Only an administrator can reassign this match.',
+      };
+    }
   }
 
   // Atomically leave match (guaranteed concurrency & double-click protection)
@@ -241,11 +242,7 @@ export async function handleLeaveMatch(guild, member, matchId, isAdminAction = f
           await rmMsg.delete().catch(() => {});
         }
       }
-      const leaveNotice = buildArenaStatusEmbed({
-        title: '⚠️ Room Maker Left',
-        description: `The Room Maker has left Match **${match.matchId}**. Awaiting new Room Maker assignment.`,
-      });
-      await queueChannelSend(rmChannel, { embeds: [leaveNotice] });
+      await purgeStandaloneRoomMakerMessages(rmChannel, null);
     }
   }
 
