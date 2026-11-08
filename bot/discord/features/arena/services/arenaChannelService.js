@@ -17,11 +17,19 @@ import {
 } from '../models/arenaModels.js';
 import { buildCreateChallengePanel, buildArenaInfoPanel } from './arenaNotificationService.js';
 
-export const ARENA_CHANNEL_PREFIX = '1V1-TDM | ';
+export const ARENA_CHANNEL_PREFIX = '1v1-tdm-';
 export const ARENA_DYNAMIC_CHANNEL_PREFIX = '𝟏𝐕𝟏 𝐓𝐃𝐌｜';
 
 export function formatArenaChannelName(slug) {
-  return `${ARENA_CHANNEL_PREFIX}${slug}`;
+  const cleanSlug = String(slug || '')
+    .toLowerCase()
+    .trim()
+    .replace(/^1v1[-_]?tdm[-_]?/, '')
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+
+  return `${ARENA_CHANNEL_PREFIX}${cleanSlug}`;
 }
 
 function findInCache(cache, predicate) {
@@ -82,11 +90,15 @@ export async function setupArenaChannels(guild, adminUser) {
     const lookupNames = new Set([
       targetName.toLowerCase(),
       slug.toLowerCase(),
+      `1v1-tdm-${slug.toLowerCase()}`,
+      `1v1-tdm--${slug.toLowerCase()}`,
       `1v1-tdm | ${slug.toLowerCase()}`,
       `𝟏𝐯𝟏 𝐭𝐝𝐦｜${slug.toLowerCase()}`,
       `𝟏𝐯𝟏｜${slug.toLowerCase()}`,
       ...aliases.map((a) => a.toLowerCase()),
       ...aliases.map((a) => formatArenaChannelName(a).toLowerCase()),
+      ...aliases.map((a) => `1v1-tdm-${a.toLowerCase()}`),
+      ...aliases.map((a) => `1v1-tdm--${a.toLowerCase()}`),
       ...aliases.map((a) => `1v1-tdm | ${a.toLowerCase()}`),
       ...aliases.map((a) => `𝟏𝐯𝟏 𝐭𝐝𝐦｜${a.toLowerCase()}`),
       ...aliases.map((a) => `𝟏𝐯𝟏｜${a.toLowerCase()}`),
@@ -99,13 +111,17 @@ export async function setupArenaChannels(guild, adminUser) {
     if (!ch) {
       ch = findInCache(
         guild.channels?.cache,
-        (c) => c.parentId === mainCategory.id && lookupNames.has((c.name || '').toLowerCase())
+        (c) => c.parentId === mainCategory.id && (
+          lookupNames.has((c.name || '').toLowerCase()) ||
+          (c.name || '').toLowerCase().replace(/--+/g, '-') === targetName.toLowerCase()
+        )
       );
     }
     if (!ch) {
       ch = findInCache(
         guild.channels?.cache,
-        (c) => lookupNames.has((c.name || '').toLowerCase())
+        (c) => lookupNames.has((c.name || '').toLowerCase()) ||
+               (c.name || '').toLowerCase().replace(/--+/g, '-') === targetName.toLowerCase()
       );
     }
     if (!ch) {
@@ -752,11 +768,13 @@ export async function deleteArenaChannels(guild, config = null) {
       } else {
         const rawName = c.name || '';
         const nameLower = rawName.toLowerCase();
-        const unPrefixed = rawName.startsWith(ARENA_CHANNEL_PREFIX)
-          ? rawName.slice(ARENA_CHANNEL_PREFIX.length).toLowerCase()
-          : (rawName.startsWith(ARENA_DYNAMIC_CHANNEL_PREFIX)
-            ? rawName.slice(ARENA_DYNAMIC_CHANNEL_PREFIX.length).toLowerCase()
-            : (rawName.startsWith('𝟏𝐕𝟏｜') ? rawName.slice(4).toLowerCase() : nameLower));
+        const unPrefixed = (
+          rawName.startsWith(ARENA_CHANNEL_PREFIX)
+            ? rawName.slice(ARENA_CHANNEL_PREFIX.length)
+            : (rawName.startsWith(ARENA_DYNAMIC_CHANNEL_PREFIX)
+              ? rawName.slice(ARENA_DYNAMIC_CHANNEL_PREFIX.length)
+              : (rawName.startsWith('𝟏𝐕𝟏｜') ? rawName.slice(4) : nameLower))
+        ).toLowerCase().replace(/^-+/, '');
         if (
           unPrefixed === 'info' ||
           unPrefixed === 'arena-info' ||
@@ -774,9 +792,8 @@ export async function deleteArenaChannels(guild, config = null) {
           unPrefixed.startsWith('match-') ||
           unPrefixed.startsWith('roommaker-') ||
           unPrefixed.startsWith('room-') ||
-          nameLower.startsWith(ARENA_CHANNEL_PREFIX.toLowerCase()) ||
+          nameLower.startsWith('1v1-tdm') ||
           nameLower.startsWith(ARENA_DYNAMIC_CHANNEL_PREFIX.toLowerCase()) ||
-          nameLower.startsWith('1v1-tdm |') ||
           nameLower.startsWith('𝟏𝐯𝟏｜')
         ) {
           channelsToDelete.set(String(c.id), c);

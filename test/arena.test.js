@@ -250,18 +250,18 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.ok(!config.volunteerRoleId, 'No Volunteer role should be created or stored');
     assert.ok(config.panelMessageId);
 
-    // Verify TDM channel names use the 1V1-TDM | prefix
+    // Verify TDM channel names use the exact 1v1-tdm- prefix with single hyphen
     const infoChannel = env.channels.get(config.infoChannelId);
     assert.ok(infoChannel);
-    assert.equal(infoChannel.name, '1V1-TDM | info');
+    assert.equal(infoChannel.name, '1v1-tdm-info');
     const volPanel = env.channels.get(config.volunteerPanelId);
     assert.ok(volPanel);
-    assert.equal(volPanel.name, '1V1-TDM | room-maker-panel');
-    assert.equal(env.channels.get(config.createChannelId).name, '1V1-TDM | create');
-    assert.equal(env.channels.get(config.availableChannelId).name, '1V1-TDM | available-matches');
-    assert.equal(env.channels.get(config.matchResultsId).name, '1V1-TDM | match-results');
-    assert.equal(env.channels.get(config.supportChannelId).name, '1V1-TDM | match-support');
-    assert.equal(env.channels.get(config.evidenceChannelId).name, '1V1-TDM | evidence');
+    assert.equal(volPanel.name, '1v1-tdm-room-maker-panel');
+    assert.equal(env.channels.get(config.createChannelId).name, '1v1-tdm-create');
+    assert.equal(env.channels.get(config.availableChannelId).name, '1v1-tdm-available-matches');
+    assert.equal(env.channels.get(config.matchResultsId).name, '1v1-tdm-match-results');
+    assert.equal(env.channels.get(config.supportChannelId).name, '1v1-tdm-match-support');
+    assert.equal(env.channels.get(config.evidenceChannelId).name, '1v1-tdm-evidence');
     const everyonePerms = volPanel.permissionOverwrites.cache.get(env.guild.id);
     assert.ok(everyonePerms);
     assert.equal(everyonePerms.ViewChannel, true);
@@ -1755,16 +1755,16 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.match(releaseUsage, /\.leave <matchId>/);
   });
 
-  test('26. 1V1 TDM Channel Naming Convention: 1V1-TDM | prefix on public/admin channels and dynamic match channels preserved', async () => {
+  test('26. 1V1 TDM Channel Naming Convention: 1v1-tdm- single hyphen prefix on public/admin channels and dynamic match channels preserved', async () => {
     // 1. Verify channel format helper functions
-    assert.equal(ARENA_CHANNEL_PREFIX, '1V1-TDM | ');
-    assert.equal(formatArenaChannelName('info'), '1V1-TDM | info');
-    assert.equal(formatArenaChannelName('create'), '1V1-TDM | create');
-    assert.equal(formatArenaChannelName('available-matches'), '1V1-TDM | available-matches');
-    assert.equal(formatArenaChannelName('room-maker-panel'), '1V1-TDM | room-maker-panel');
-    assert.equal(formatArenaChannelName('match-results'), '1V1-TDM | match-results');
-    assert.equal(formatArenaChannelName('match-support'), '1V1-TDM | match-support');
-    assert.equal(formatArenaChannelName('evidence'), '1V1-TDM | evidence');
+    assert.equal(ARENA_CHANNEL_PREFIX, '1v1-tdm-');
+    assert.equal(formatArenaChannelName('info'), '1v1-tdm-info');
+    assert.equal(formatArenaChannelName('create'), '1v1-tdm-create');
+    assert.equal(formatArenaChannelName('available-matches'), '1v1-tdm-available-matches');
+    assert.equal(formatArenaChannelName('room-maker-panel'), '1v1-tdm-room-maker-panel');
+    assert.equal(formatArenaChannelName('match-results'), '1v1-tdm-match-results');
+    assert.equal(formatArenaChannelName('match-support'), '1v1-tdm-match-support');
+    assert.equal(formatArenaChannelName('evidence'), '1v1-tdm-evidence');
 
     assert.equal(formatMatchChannelName(1), '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0001');
     assert.equal(formatMatchChannelName(2), '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0002');
@@ -1773,33 +1773,33 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(formatRoomMakerChannelName(2), '𝟏𝐕𝟏 𝐓𝐃𝐌｜roommaker-0002');
     assert.equal(formatRoomMakerChannelName('10004'), '𝟏𝐕𝟏 𝐓𝐃𝐌｜roommaker-0004');
 
-    // 2. Pre-create legacy un-prefixed channels in mock guild to test automatic renaming
+    // 2. Pre-create legacy / double-hyphen channels in mock guild to test automatic renaming
     const env = createMockArenaEnvironment('guild-naming-1');
     const admin = env.addMember('admin-naming', 'NamingAdmin', { isAdmin: true });
 
-    // Simulate pre-existing legacy channels
+    // Simulate pre-existing legacy & double-hyphen channels
     const mainCat = await env.guild.channels.create({ name: '1V1 CHALLENGE ARENA', type: ChannelType.GuildCategory });
-    const legacyInfo = await env.guild.channels.create({ name: 'arena-info', parent: mainCat.id });
-    const legacyCreate = await env.guild.channels.create({ name: 'create-challenge', parent: mainCat.id });
-    const legacyAvail = await env.guild.channels.create({ name: 'available-challenges', parent: mainCat.id });
-    const legacyVol = await env.guild.channels.create({ name: 'volunteer-panel', parent: mainCat.id });
-    const legacyResults = await env.guild.channels.create({ name: 'match-results', parent: mainCat.id });
-    const legacySupport = await env.guild.channels.create({ name: 'challenge-support', parent: mainCat.id });
-    const legacyEvidence = await env.guild.channels.create({ name: 'arena-evidence', parent: mainCat.id });
+    const legacyInfo = await env.guild.channels.create({ name: '1v1-tdm--info', parent: mainCat.id });
+    const legacyCreate = await env.guild.channels.create({ name: '1v1-tdm--create', parent: mainCat.id });
+    const legacyAvail = await env.guild.channels.create({ name: '1v1-tdm--available-matches', parent: mainCat.id });
+    const legacyVol = await env.guild.channels.create({ name: '1v1-tdm--room-maker-panel', parent: mainCat.id });
+    const legacyResults = await env.guild.channels.create({ name: '1v1-tdm--match-results', parent: mainCat.id });
+    const legacySupport = await env.guild.channels.create({ name: '1v1-tdm--match-support', parent: mainCat.id });
+    const legacyEvidence = await env.guild.channels.create({ name: '1v1-tdm--evidence', parent: mainCat.id });
 
     const totalChannelsBefore = env.channels.size;
 
-    // Run setupArenaChannels -> should detect existing channels and rename them without creating duplicates
+    // Run setupArenaChannels -> should detect existing double-hyphen channels and rename them without creating duplicates
     const setupRes = await setupArenaChannels(env.guild, admin);
 
-    // Verify existing channels were renamed to exact screenshot specifications
-    assert.equal(legacyInfo.name, '1V1-TDM | info');
-    assert.equal(legacyCreate.name, '1V1-TDM | create');
-    assert.equal(legacyAvail.name, '1V1-TDM | available-matches');
-    assert.equal(legacyVol.name, '1V1-TDM | room-maker-panel');
-    assert.equal(legacyResults.name, '1V1-TDM | match-results');
-    assert.equal(legacySupport.name, '1V1-TDM | match-support');
-    assert.equal(legacyEvidence.name, '1V1-TDM | evidence');
+    // Verify existing channels were renamed to exact single-hyphen specifications
+    assert.equal(legacyInfo.name, '1v1-tdm-info');
+    assert.equal(legacyCreate.name, '1v1-tdm-create');
+    assert.equal(legacyAvail.name, '1v1-tdm-available-matches');
+    assert.equal(legacyVol.name, '1v1-tdm-room-maker-panel');
+    assert.equal(legacyResults.name, '1v1-tdm-match-results');
+    assert.equal(legacySupport.name, '1v1-tdm-match-support');
+    assert.equal(legacyEvidence.name, '1v1-tdm-evidence');
 
     // Verify channel IDs match the existing ones (no duplicate channels created)
     assert.equal(setupRes.infoChannel.id, legacyInfo.id);
@@ -1814,14 +1814,14 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(env.channels.size, totalChannelsBefore, 'Setup must be idempotent and not create duplicate channels');
   });
 
-  test('27. 1V1 TDM Information Channel: 1V1-TDM | info created with permissions, permanent embed, and dynamic mentions', async () => {
+  test('27. 1V1 TDM Information Channel: 1v1-tdm-info created with permissions, permanent embed, and dynamic mentions', async () => {
     const env = createMockArenaEnvironment('guild-info-1');
     const admin = env.addMember('admin-info', 'InfoAdmin', { isAdmin: true });
 
     // 1. Run setupArenaChannels
     const res = await setupArenaChannels(env.guild, admin);
     assert.ok(res.infoChannel);
-    assert.equal(res.infoChannel.name, '1V1-TDM | info');
+    assert.equal(res.infoChannel.name, '1v1-tdm-info');
 
     // 2. Verify permissions for @everyone: view & read history true, send messages & thread creation denied
     const everyonePerms = res.infoChannel.permissionOverwrites.cache.get(env.guild.id);
@@ -2290,5 +2290,68 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(availMatches.messages.cache.has(lingeringCard.id), false, 'Startup recovery must delete expired challenge message from #available-matches');
     const recoveredDoc = await getArenaChallenge('MD-9999');
     assert.equal(recoveredDoc.status, ARENA_STATUS.EXPIRED);
+  });
+
+  test('34. Channel name format & sanitization: exactly one hyphen between 1v1-tdm and channel name, renames double-hyphen channels without creating duplicates', async () => {
+    // 1. Verify channel name generation & sanitization logic at source
+    assert.equal(formatArenaChannelName('info'), '1v1-tdm-info');
+    assert.equal(formatArenaChannelName('create'), '1v1-tdm-create');
+    assert.equal(formatArenaChannelName('available-matches'), '1v1-tdm-available-matches');
+    assert.equal(formatArenaChannelName('room-maker-panel'), '1v1-tdm-room-maker-panel');
+    assert.equal(formatArenaChannelName('match-results'), '1v1-tdm-match-results');
+    assert.equal(formatArenaChannelName('match-support'), '1v1-tdm-match-support');
+    assert.equal(formatArenaChannelName('evidence'), '1v1-tdm-evidence');
+
+    // Sanitization collapses redundant hyphens and removes duplicate prefix
+    assert.equal(formatArenaChannelName('1v1-tdm--info'), '1v1-tdm-info');
+    assert.equal(formatArenaChannelName('1v1-tdm---create'), '1v1-tdm-create');
+    assert.equal(formatArenaChannelName('1V1-TDM | available-matches'), '1v1-tdm-available-matches');
+    assert.equal(formatArenaChannelName('--match-results--'), '1v1-tdm-match-results');
+
+    // 2. Pre-create double-hyphen channels to verify rename & zero duplicate channels
+    const env = createMockArenaEnvironment('guild-double-hyphen');
+    const admin = env.addMember('admin-dh', 'DoubleHyphenAdmin', { isAdmin: true });
+
+    const mainCat = await env.guild.channels.create({ name: '1V1 TDM', type: ChannelType.GuildCategory });
+    const chInfo = await env.guild.channels.create({ name: '1v1-tdm--info', parent: mainCat.id });
+    const chCreate = await env.guild.channels.create({ name: '1v1-tdm--create', parent: mainCat.id });
+    const chAvail = await env.guild.channels.create({ name: '1v1-tdm--available-matches', parent: mainCat.id });
+    const chVol = await env.guild.channels.create({ name: '1v1-tdm--room-maker-panel', parent: mainCat.id });
+    const chResults = await env.guild.channels.create({ name: '1v1-tdm--match-results', parent: mainCat.id });
+    const chSupport = await env.guild.channels.create({ name: '1v1-tdm--match-support', parent: mainCat.id });
+    const chEvidence = await env.guild.channels.create({ name: '1v1-tdm--evidence', parent: mainCat.id });
+
+    // Put a test message in the channel to verify messages are preserved
+    const testMsg = await chCreate.send({ content: 'Persistent Panel Test Message' });
+    const chInfoId = chInfo.id;
+    const chCreateId = chCreate.id;
+
+    const initialTotalChannels = env.channels.size;
+
+    // Run setup
+    const setupRes = await setupArenaChannels(env.guild, admin);
+
+    // Verify all channels were renamed to use exactly one hyphen
+    assert.equal(chInfo.name, '1v1-tdm-info');
+    assert.equal(chCreate.name, '1v1-tdm-create');
+    assert.equal(chAvail.name, '1v1-tdm-available-matches');
+    assert.equal(chVol.name, '1v1-tdm-room-maker-panel');
+    assert.equal(chResults.name, '1v1-tdm-match-results');
+    assert.equal(chSupport.name, '1v1-tdm-match-support');
+    assert.equal(chEvidence.name, '1v1-tdm-evidence');
+
+    // Verify channel IDs and messages preserved
+    assert.equal(setupRes.infoChannel.id, chInfoId);
+    assert.equal(setupRes.createChannel.id, chCreateId);
+    assert.ok(chCreate.messages.cache.has(testMsg.id), 'Messages must be preserved upon rename');
+
+    // Verify no duplicate channels created
+    assert.equal(env.channels.size, initialTotalChannels, 'Setup must be idempotent and not create duplicate channels');
+
+    // Subsequent setup run must keep channels exactly as single hyphen
+    await setupArenaChannels(env.guild, admin);
+    assert.equal(chInfo.name, '1v1-tdm-info');
+    assert.equal(chCreate.name, '1v1-tdm-create');
+    assert.equal(env.channels.size, initialTotalChannels);
   });
 });
