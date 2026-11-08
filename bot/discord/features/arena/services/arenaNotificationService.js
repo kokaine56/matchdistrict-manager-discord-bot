@@ -298,7 +298,11 @@ export async function buildVolunteerPanelEmbed(match, volunteerDisplayName = nul
 }
 
 export async function buildMatchChannelEmbed(match, volunteerDisplayName = null, options = {}) {
-  return buildMatchCardPayload(match, volunteerDisplayName, options);
+  return buildMatchCardPayload(match, volunteerDisplayName, { surface: 'matchChannel', ...options });
+}
+
+export async function buildRoomMakerChannelEmbed(match, volunteerDisplayName = null, options = {}) {
+  return buildMatchCardPayload(match, volunteerDisplayName, { surface: 'roomMakerChannel', ...options });
 }
 
 export function buildRoomCredentialsEmbed(match, roomId, roomPassword) {
@@ -536,24 +540,28 @@ export function buildArenaStatusEmbed({
   return embed;
 }
 
-export function buildResultVerificationPayload(match, winnerPlayer, evidenceUrl = null) {
+export function buildResultVerificationPayload(match, winnerPlayer, attachment = null) {
+  const formattedMatchId = formatMatchId(match?.matchId);
   const winnerIgn = winnerPlayer.bgmiIgn || winnerPlayer.displayName;
+  const fileName = `screenshot-${formattedMatchId.toLowerCase().replace(/[^a-z0-9-]/g, '')}.png`;
+
   const embed = new EmbedBuilder()
-    .setTitle(`Match Result Submitted: ${match.matchId}`)
+    .setTitle(`MATCH RESULT SUBMITTED – ${formattedMatchId}`)
     .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
     .setDescription(
-      `The assigned Room Maker has reported **${winnerIgn}** as the winner.\n\n` +
-      `Both players must confirm the result below. If you believe this result is incorrect, click **Dispute Result**.\n` +
-      `*Automatic staff review triggers if not confirmed within 15 minutes.*`
+      `The reported winner is: **${winnerIgn}**\n\n` +
+      `Please inspect the screenshot and verify the result.`
     )
     .addFields(
-      { name: 'Reported Winner', value: `🏆 **${winnerIgn}** (<@${winnerPlayer.discordId}>)`, inline: true },
-      { name: 'Proof Screenshot', value: evidenceUrl ? `[View Evidence Attachment](${evidenceUrl})` : '*Uploaded by Room Maker*', inline: true }
+      { name: 'Reported Winner', value: `🏆 **${winnerIgn}** (<@${winnerPlayer.discordId}>)`, inline: true }
     )
-    .setFooter({ text: 'MatchDistrict 1v1 TDM Verification' });
+    .setFooter({ text: 'MatchDistrict 1v1 TDM Verification' })
+    .setTimestamp();
 
-  if (evidenceUrl && (evidenceUrl.startsWith('http://') || evidenceUrl.startsWith('https://'))) {
-    embed.setImage(evidenceUrl);
+  const files = [];
+  if (attachment) {
+    files.push({ attachment, name: fileName });
+    embed.setImage(`attachment://${fileName}`);
   }
 
   const row = new ActionRowBuilder().addComponents(
@@ -567,7 +575,7 @@ export function buildResultVerificationPayload(match, winnerPlayer, evidenceUrl 
       .setStyle(ButtonStyle.Danger)
   );
 
-  return { embeds: [embed], components: [row] };
+  return { embeds: [embed], components: [row], files };
 }
 
 export async function buildCompletedMatchResultPayload(match, winnerPlayer, opponentPlayer, volunteerDisplayName, options = {}) {

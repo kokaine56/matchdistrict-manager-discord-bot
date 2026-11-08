@@ -296,7 +296,7 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
       match.matchChannelId = matchChannel.id;
 
       // Post initial match card in challengers channel
-      const channelPayload = await buildMatchChannelEmbed(match, null, { guild, client: guild?.client || client });
+      const channelPayload = await buildMatchChannelEmbed(match, null, { guild, client: guild?.client || client, surface: 'matchChannel' });
       const embedMsg = await queueChannelSend(matchChannel, channelPayload);
       if (embedMsg?.id) {
         match.matchEmbedMessageId = embedMsg.id;

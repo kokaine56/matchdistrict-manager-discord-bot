@@ -5,6 +5,7 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  PermissionFlagsBits,
 } from 'discord.js';
 import {
   getArenaPlayer,
@@ -37,6 +38,18 @@ import {
 import {
   handleFileDispute,
 } from '../services/arenaDisputeService.js';
+
+function isUserAdmin(member, guild) {
+  if (!member) return false;
+  const effectiveGuild = guild || member.guild;
+  if (effectiveGuild?.ownerId === member.id) return true;
+  if (member.permissions?.has?.(PermissionFlagsBits.Administrator)) return true;
+  if (member.permissions?.has?.(PermissionFlagsBits.ManageGuild)) return true;
+  if (typeof member.permissions?.has === 'function') {
+    if (member.permissions.has('Administrator') || member.permissions.has('ManageGuild')) return true;
+  }
+  return false;
+}
 
 export async function handleArenaInteraction(interaction) {
   if (!interaction || !interaction.customId?.startsWith('arena:')) return false;
@@ -324,9 +337,11 @@ export async function handleArenaInteraction(interaction) {
       if (!match) {
         return interaction.reply({ content: '❌ Match not found.', ephemeral: true });
       }
-      if (match.volunteerId !== interaction.user.id) {
+      const isRoomMaker = match.volunteerId === interaction.user.id;
+      const isAdmin = isUserAdmin(interaction.member, interaction.guild);
+      if (!isRoomMaker && !isAdmin) {
         return interaction.reply({
-          content: '❌ Only the assigned volunteer can submit room credentials.',
+          content: '❌ Only the assigned Room Maker can submit room credentials.',
           ephemeral: true,
         });
       }
@@ -360,6 +375,18 @@ export async function handleArenaInteraction(interaction) {
     // 9. Modal Submit: Room Details
     if (interaction.isModalSubmit() && customId.startsWith('arena:modal_room:')) {
       const matchId = customId.split(':')[2];
+      const match = await getArenaMatch(matchId);
+      if (!match) return interaction.reply({ content: '❌ Match not found.', ephemeral: true });
+
+      const isRoomMaker = match.volunteerId === interaction.user.id;
+      const isAdmin = isUserAdmin(interaction.member, interaction.guild);
+      if (!isRoomMaker && !isAdmin) {
+        return interaction.reply({
+          content: '❌ Only the assigned Room Maker can submit room credentials.',
+          ephemeral: true,
+        });
+      }
+
       const roomId = interaction.fields.getTextInputValue('room_id')?.trim();
       const roomPassword = interaction.fields.getTextInputValue('room_password')?.trim();
 
@@ -376,6 +403,18 @@ export async function handleArenaInteraction(interaction) {
     // 10. Button: Start Match
     if (interaction.isButton() && customId.startsWith('arena:start_match:')) {
       const matchId = customId.split(':')[2];
+      const match = await getArenaMatch(matchId);
+      if (!match) return interaction.reply({ content: '❌ Match not found.', ephemeral: true });
+
+      const isRoomMaker = match.volunteerId === interaction.user.id;
+      const isAdmin = isUserAdmin(interaction.member, interaction.guild);
+      if (!isRoomMaker && !isAdmin) {
+        return interaction.reply({
+          content: '❌ Only the assigned Room Maker can start this match.',
+          ephemeral: true,
+        });
+      }
+
       await interaction.deferReply({ ephemeral: true });
       const res = await startMatch(interaction.guild, interaction.member, matchId);
       if (!res.ok) {
@@ -393,7 +432,9 @@ export async function handleArenaInteraction(interaction) {
       if (!match) {
         return interaction.reply({ content: '❌ Match not found.', ephemeral: true });
       }
-      if (match.volunteerId !== interaction.user.id) {
+      const isRoomMaker = match.volunteerId === interaction.user.id;
+      const isAdmin = isUserAdmin(interaction.member, interaction.guild);
+      if (!isRoomMaker && !isAdmin) {
         return interaction.reply({
           content: '❌ Only the assigned Room Maker can submit the winner.',
           ephemeral: true,
@@ -419,6 +460,18 @@ export async function handleArenaInteraction(interaction) {
     // 12. Modal Submit: Winner Submission
     if (interaction.isModalSubmit() && customId.startsWith('arena:modal_winner:')) {
       const matchId = customId.split(':')[2];
+      const match = await getArenaMatch(matchId);
+      if (!match) return interaction.reply({ content: '❌ Match not found.', ephemeral: true });
+
+      const isRoomMaker = match.volunteerId === interaction.user.id;
+      const isAdmin = isUserAdmin(interaction.member, interaction.guild);
+      if (!isRoomMaker && !isAdmin) {
+        return interaction.reply({
+          content: '❌ Only the assigned Room Maker can submit the winner.',
+          ephemeral: true,
+        });
+      }
+
       const rawSide = interaction.fields.getTextInputValue('winner_side')?.trim().toUpperCase();
 
       if (rawSide !== 'A' && rawSide !== 'B') {

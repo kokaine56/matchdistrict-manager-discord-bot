@@ -425,9 +425,9 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(pADoc.activeMatchId, challengeId);
     assert.equal(pBDoc.activeMatchId, challengeId);
 
-    // Verify private match channel exists with 4-digit sequential name and 𝟏𝐕𝟏 𝐓𝐃𝐌｜ prefix
+    // Verify private match channel exists with 4-digit sequential name and 1v1-tdm- prefix
     assert.ok(acceptRes.matchChannel);
-    assert.equal(acceptRes.matchChannel.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0001');
+    assert.equal(acceptRes.matchChannel.name, '1v1-tdm-match-0001');
   });
 
   test('6. Volunteer claiming, self-claim prevention, active limit & release flow with concurrency safety', async () => {
@@ -1055,6 +1055,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     } = await import('../bot/discord/features/arena/services/arenaImageService.js');
     const {
       buildMatchChannelEmbed,
+      buildRoomMakerChannelEmbed,
       buildChallengeEmbed,
     } = await import('../bot/discord/features/arena/services/arenaNotificationService.js');
 
@@ -1080,16 +1081,18 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(matchPng.readUInt32BE(16), 800, 'Match card width should be 800');
     assert.equal(matchPng.readUInt32BE(20), 420, 'Match card height should be 420');
 
-    // 2. Build Match Channel Payload
+    // 2. Build Match Channel Payload (Challengers match channel NEVER has Room Maker buttons)
     const matchPayload = await buildMatchChannelEmbed(sampleMatch, 'OfficialVol');
     assert.ok(matchPayload.files && matchPayload.files.length === 1, 'Match payload must include the generated image card as a file attachment');
     assert.equal(matchPayload.files[0].name, 'match-md-0001.png');
     assert.ok(matchPayload.embeds && matchPayload.embeds.length === 1);
     assert.equal(matchPayload.embeds[0].data.image.url, 'attachment://match-md-0001.png');
+    assert.equal(matchPayload.components.length, 0, 'Challengers match channel must NEVER contain Room Maker buttons');
 
-    // Verify live buttons (Submit Winner)
-    assert.ok(matchPayload.components.length > 0);
-    const buttonRow = matchPayload.components[0];
+    // Room Maker Channel Payload: Exclusively contains Room Maker controls (Submit Winner)
+    const rmPayload = await buildRoomMakerChannelEmbed(sampleMatch, 'OfficialVol');
+    assert.ok(rmPayload.components.length > 0, 'Room Maker payload must have controls');
+    const buttonRow = rmPayload.components[0];
     const customIds = buttonRow.components.map((c) => c.data.custom_id);
     assert.ok(customIds.includes('arena:submit_winner:MD-0001'));
 
@@ -1244,7 +1247,7 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
 
   test('18. Mongo-shaped Arena records hydrate complete challenge and match image cards before sending', async () => {
     const env = createMockArenaEnvironment();
-    const { buildMatchChannelEmbed, buildChallengeEmbed } = await import('../bot/discord/features/arena/services/arenaNotificationService.js');
+    const { buildMatchChannelEmbed, buildRoomMakerChannelEmbed, buildChallengeEmbed } = await import('../bot/discord/features/arena/services/arenaNotificationService.js');
     const { encodePngRgba } = await import('../bot/discord/features/arena/services/arenaImageService.js');
     const playerA = env.addMember('111111111111111111', 'Discord Alpha');
     const playerB = env.addMember('222222222222222222', 'Discord Bravo');
@@ -1279,7 +1282,11 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
       assert.equal(matchPng.readUInt32BE(16), 800);
       assert.equal(matchPng.readUInt32BE(20), 420);
       assert.ok(matchPng.length > 1000, 'Rendered card contains more than an empty background');
-      assert.ok(matchPayload.components[0].components.some((button) => button.data.custom_id === 'arena:submit_room:MD-30001'));
+      assert.equal(matchPayload.components.length, 0, 'Challengers match payload has no Room Maker buttons');
+
+      // Room Maker channel has Submit Room Details button
+      const rmPayload = await buildRoomMakerChannelEmbed(match, null, { guild: env.guild, client: env.client });
+      assert.ok(rmPayload.components[0].components.some((button) => button.data.custom_id === 'arena:submit_room:MD-30001'));
 
       const challenge = await createArenaChallenge({
         challengeId: 'MD-30002', guildId: env.guild.id, creatorId: playerA.id,
@@ -1522,12 +1529,12 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     const mRes = await handleAcceptChallenge(env.guild, pB, cRes.challenge.challengeId, env.client);
 
     // 1. Exactly TWO separate private channels created:
-    // A. Challengers channel: 𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0001
-    // B. Room Maker channel: 𝟏𝐕𝟏 𝐓𝐃𝐌｜roommaker-0001
+    // A. Challengers channel: 1v1-tdm-match-0001
+    // B. Room Maker channel: 1v1-tdm-roommaker-0001
     assert.ok(mRes.matchChannel, 'Private match channel must be created');
-    assert.equal(mRes.matchChannel.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0001');
+    assert.equal(mRes.matchChannel.name, '1v1-tdm-match-0001');
     assert.ok(mRes.roomMakerChannel, 'Private room maker channel must be created');
-    assert.equal(mRes.roomMakerChannel.name, '𝟏𝐕𝟏 𝐓𝐃𝐌｜roommaker-0001');
+    assert.equal(mRes.roomMakerChannel.name, '1v1-tdm-roommaker-0001');
 
     // 2. Permissions separation:
     // Players have access to match-0001, but NOT to roommaker-0001
@@ -1592,6 +1599,18 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
       m.components?.some((r) => r.components?.some((b) => b.data?.custom_id?.includes('confirm_result')))
     );
     assert.ok(proofMsg, 'Challengers must receive verification embed with Confirm Result & Dispute Result buttons');
+    assert.ok(proofMsg.files?.length > 0, 'Challengers must receive screenshot attachment');
+
+    // Verify Challengers match channel NEVER contains Room Maker control buttons
+    const hasRmControlInMatch = updatedMatchMsgs.some((m) =>
+      m.components?.some((r) => r.components?.some((b) =>
+        b.data?.custom_id?.includes('submit_room') ||
+        b.data?.custom_id?.includes('start_match') ||
+        b.data?.custom_id?.includes('submit_winner') ||
+        b.data?.custom_id?.includes('leave_match')
+      ))
+    );
+    assert.equal(hasRmControlInMatch, false, 'Challengers match channel must NEVER contain Room Maker control buttons');
 
     // CRITICAL PRIVACY: Verify Room Maker was NOT granted access or overwrites on matchChannel after screenshot upload
     assert.equal(mRes.matchChannel.permissionOverwrites.cache.get(rm.id), undefined, 'Room Maker must NEVER be added to challengers match channel after screenshot upload');
@@ -1766,12 +1785,12 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
     assert.equal(formatArenaChannelName('match-support'), '1v1-tdm-match-support');
     assert.equal(formatArenaChannelName('evidence'), '1v1-tdm-evidence');
 
-    assert.equal(formatMatchChannelName(1), '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0001');
-    assert.equal(formatMatchChannelName(2), '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0002');
-    assert.equal(formatMatchChannelName('10003'), '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-0003');
-    assert.equal(formatRoomMakerChannelName(1), '𝟏𝐕𝟏 𝐓𝐃𝐌｜roommaker-0001');
-    assert.equal(formatRoomMakerChannelName(2), '𝟏𝐕𝟏 𝐓𝐃𝐌｜roommaker-0002');
-    assert.equal(formatRoomMakerChannelName('10004'), '𝟏𝐕𝟏 𝐓𝐃𝐌｜roommaker-0004');
+    assert.equal(formatMatchChannelName(1), '1v1-tdm-match-0001');
+    assert.equal(formatMatchChannelName(2), '1v1-tdm-match-0002');
+    assert.equal(formatMatchChannelName('10003'), '1v1-tdm-match-0003');
+    assert.equal(formatRoomMakerChannelName(1), '1v1-tdm-roommaker-0001');
+    assert.equal(formatRoomMakerChannelName(2), '1v1-tdm-roommaker-0002');
+    assert.equal(formatRoomMakerChannelName('10004'), '1v1-tdm-roommaker-0004');
 
     // 2. Pre-create legacy / double-hyphen channels in mock guild to test automatic renaming
     const env = createMockArenaEnvironment('guild-naming-1');

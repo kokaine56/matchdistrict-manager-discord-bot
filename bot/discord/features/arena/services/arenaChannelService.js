@@ -18,7 +18,7 @@ import {
 import { buildCreateChallengePanel, buildArenaInfoPanel } from './arenaNotificationService.js';
 
 export const ARENA_CHANNEL_PREFIX = '1v1-tdm-';
-export const ARENA_DYNAMIC_CHANNEL_PREFIX = '𝟏𝐕𝟏 𝐓𝐃𝐌｜';
+export const ARENA_DYNAMIC_CHANNEL_PREFIX = '1v1-tdm-';
 
 export function formatArenaChannelName(slug) {
   const cleanSlug = String(slug || '')
@@ -771,8 +771,8 @@ export async function deleteArenaChannels(guild, config = null) {
         const unPrefixed = (
           rawName.startsWith(ARENA_CHANNEL_PREFIX)
             ? rawName.slice(ARENA_CHANNEL_PREFIX.length)
-            : (rawName.startsWith(ARENA_DYNAMIC_CHANNEL_PREFIX)
-              ? rawName.slice(ARENA_DYNAMIC_CHANNEL_PREFIX.length)
+            : (rawName.startsWith('𝟏𝐕𝟏 𝐓𝐃𝐌｜')
+              ? rawName.slice(9)
               : (rawName.startsWith('𝟏𝐕𝟏｜') ? rawName.slice(4) : nameLower))
         ).toLowerCase().replace(/^-+/, '');
         if (
@@ -793,7 +793,7 @@ export async function deleteArenaChannels(guild, config = null) {
           unPrefixed.startsWith('roommaker-') ||
           unPrefixed.startsWith('room-') ||
           nameLower.startsWith('1v1-tdm') ||
-          nameLower.startsWith(ARENA_DYNAMIC_CHANNEL_PREFIX.toLowerCase()) ||
+          nameLower.startsWith('𝟏𝐯𝟏 𝐭𝐝𝐦｜') ||
           nameLower.startsWith('𝟏𝐯𝟏｜')
         ) {
           channelsToDelete.set(String(c.id), c);

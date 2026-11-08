@@ -20,6 +20,7 @@ import {
 import {
   buildVolunteerPanelEmbed,
   buildMatchChannelEmbed,
+  buildRoomMakerChannelEmbed,
   buildArenaStatusEmbed,
   purgeStandaloneRoomMakerMessages,
   sendRoomMakerNeededNotification,
@@ -125,11 +126,10 @@ export async function handleClaimMatch(guild, member, matchId) {
       await addRoomMakerToRoomMakerChannel(rmChannel, member.id);
 
       // Post Room Maker match card with management controls (dashboard only)
-      const rmPayload = await buildMatchChannelEmbed(updatedMatch, volunteerName, {
+      const rmPayload = await buildRoomMakerChannelEmbed(updatedMatch, volunteerName, {
         avatars,
         guild,
         client: guild.client,
-        surface: 'roomMakerChannel',
       });
       const rmMsg = await queueChannelSend(rmChannel, rmPayload);
       if (rmMsg?.id) {
@@ -152,7 +152,7 @@ export async function handleClaimMatch(guild, member, matchId) {
           matchChannel.messages?.cache?.get(match.matchEmbedMessageId) ||
           (await matchChannel.messages?.fetch?.(match.matchEmbedMessageId).catch(() => null));
         if (embedMsg) {
-          const payload = await buildMatchChannelEmbed(updatedMatch, null, { avatars, guild, client: guild.client });
+          const payload = await buildMatchChannelEmbed(updatedMatch, null, { avatars, guild, client: guild.client, surface: 'matchChannel' });
           await queueMessageEdit(embedMsg, payload).catch(() => {});
         }
       }
@@ -278,7 +278,7 @@ export async function handleLeaveMatch(guild, member, matchId, isAdminAction = f
           matchChannel.messages?.cache?.get(match.matchEmbedMessageId) ||
           (await matchChannel.messages?.fetch?.(match.matchEmbedMessageId).catch(() => null));
         if (embedMsg) {
-          const payload = await buildMatchChannelEmbed(updatedMatch, null, { avatars, guild, client: guild.client });
+          const payload = await buildMatchChannelEmbed(updatedMatch, null, { avatars, guild, client: guild.client, surface: 'matchChannel' });
           await queueMessageEdit(embedMsg, payload).catch(() => {});
         }
       }

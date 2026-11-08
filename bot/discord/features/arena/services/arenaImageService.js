@@ -1076,54 +1076,56 @@ export async function buildMatchCardPayload(match, volunteerDisplayName = null, 
     .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
     .setImage(`attachment://${filename}`);
 
-  // Build match control buttons
+  // Build match control buttons ONLY for Room Maker channel
   const buttons = [];
-  if (match.status === ARENA_STATUS.VOLUNTEER_ASSIGNED) {
-    if (!match.roomId) {
+  if (options.surface === 'roomMakerChannel') {
+    if (match.status === ARENA_STATUS.VOLUNTEER_ASSIGNED) {
+      if (!match.roomId) {
+        buttons.push(
+          new ButtonBuilder()
+            .setCustomId(`arena:submit_room:${match.matchId}`)
+            .setLabel('Submit Room Details')
+            .setStyle(ButtonStyle.Primary),
+          new ButtonBuilder()
+            .setCustomId(`arena:leave_match:${match.matchId}`)
+            .setLabel('Leave Match')
+            .setStyle(ButtonStyle.Secondary)
+        );
+      } else {
+        buttons.push(
+          new ButtonBuilder()
+            .setCustomId(`arena:submit_room:${match.matchId}`)
+            .setLabel('Edit Room Details')
+            .setStyle(ButtonStyle.Primary)
+        );
+      }
+    } else if (match.status === ARENA_STATUS.ROOM_READY) {
       buttons.push(
         new ButtonBuilder()
           .setCustomId(`arena:submit_room:${match.matchId}`)
-          .setLabel('Submit Room Details')
+          .setLabel('Edit Room Details')
           .setStyle(ButtonStyle.Primary),
         new ButtonBuilder()
-          .setCustomId(`arena:leave_match:${match.matchId}`)
-          .setLabel('Leave Match')
-          .setStyle(ButtonStyle.Secondary)
+          .setCustomId(`arena:start_match:${match.matchId}`)
+          .setLabel('Start Match')
+          .setStyle(ButtonStyle.Success)
       );
-    } else {
+    } else if (match.status === ARENA_STATUS.ROOM_ISSUE) {
       buttons.push(
         new ButtonBuilder()
           .setCustomId(`arena:submit_room:${match.matchId}`)
           .setLabel('Edit Room Details')
           .setStyle(ButtonStyle.Primary)
       );
-    }
-  } else if (match.status === ARENA_STATUS.ROOM_READY) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId(`arena:submit_room:${match.matchId}`)
-        .setLabel('Edit Room Details')
-        .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId(`arena:start_match:${match.matchId}`)
-        .setLabel('Start Match')
-        .setStyle(ButtonStyle.Success)
-    );
-  } else if (match.status === ARENA_STATUS.ROOM_ISSUE) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId(`arena:submit_room:${match.matchId}`)
-        .setLabel('Edit Room Details')
-        .setStyle(ButtonStyle.Primary)
-    );
-  } else if (match.status === ARENA_STATUS.LIVE) {
-    if (!match.pendingWinnerId) {
-      buttons.push(
-        new ButtonBuilder()
-          .setCustomId(`arena:submit_winner:${match.matchId}`)
-          .setLabel('Submit Winner')
-          .setStyle(ButtonStyle.Primary)
-      );
+    } else if (match.status === ARENA_STATUS.LIVE) {
+      if (!match.pendingWinnerId) {
+        buttons.push(
+          new ButtonBuilder()
+            .setCustomId(`arena:submit_winner:${match.matchId}`)
+            .setLabel('Submit Winner')
+            .setStyle(ButtonStyle.Primary)
+        );
+      }
     }
   }
 
@@ -1137,10 +1139,6 @@ export async function buildMatchCardPayload(match, volunteerDisplayName = null, 
           .setStyle(ButtonStyle.Primary))]
       : [];
     return { embeds: [embed], files: [attachment], attachments: [], components: publicComponents };
-  }
-
-  if (options.surface === 'matchChannel') {
-    return { embeds: [embed], files: [attachment], attachments: [], components: [] };
   }
 
   if (options.surface === 'roomMakerChannel') {
@@ -1165,13 +1163,20 @@ export async function buildMatchCardPayload(match, volunteerDisplayName = null, 
     if (statusDesc) {
       embed.setDescription(statusDesc);
     }
+    return {
+      embeds: [embed],
+      files: [attachment],
+      attachments: [],
+      components,
+    };
   }
 
+  // Challengers' match channel and any default surface NEVER contain Room Maker buttons
   return {
     embeds: [embed],
     files: [attachment],
     attachments: [],
-    components,
+    components: [],
   };
 }
 
