@@ -11,6 +11,7 @@
     "test": "node --test"
   },
   "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "discord.js": "^14.18.0",
     "dotenv": "^16.4.7",
     "mongodb": "^7.7.0"

@@ -1,4 +1,5 @@
 import zlib from 'node:zlib';
+import { Resvg } from '@resvg/resvg-js';
 import {
   AttachmentBuilder,
   EmbedBuilder,
@@ -355,291 +356,412 @@ export async function fetchDiscordAvatarBytes(client, userId) {
   return null;
 }
 
+export async function fetchMatchAvatars(client, match) {
+  const avatars = new Map();
+  if (!client || !match) return avatars;
+  const pAId = match.playerA?.discordId;
+  const pBId = match.playerB?.discordId;
+  const promises = [];
+  if (pAId) {
+    promises.push(
+      fetchDiscordAvatarBytes(client, pAId).then((buf) => {
+        if (buf) avatars.set(pAId, buf);
+      })
+    );
+  }
+  if (pBId) {
+    promises.push(
+      fetchDiscordAvatarBytes(client, pBId).then((buf) => {
+        if (buf) avatars.set(pBId, buf);
+      })
+    );
+  }
+  await Promise.all(promises);
+  return avatars;
+}
+
+export async function fetchChallengeAvatars(client, challenge, acceptedOpponent = null) {
+  const avatars = new Map();
+  if (!client || !challenge) return avatars;
+  const promises = [];
+  if (challenge.creatorId) {
+    promises.push(
+      fetchDiscordAvatarBytes(client, challenge.creatorId).then((buf) => {
+        if (buf) avatars.set(challenge.creatorId, buf);
+      })
+    );
+  }
+  if (acceptedOpponent?.discordId) {
+    promises.push(
+      fetchDiscordAvatarBytes(client, acceptedOpponent.discordId).then((buf) => {
+        if (buf) avatars.set(acceptedOpponent.discordId, buf);
+      })
+    );
+  }
+  await Promise.all(promises);
+  return avatars;
+}
+
+// ============================================================================
+// SVG Rendering Engine (Devanagari, Avatars & Layout Integrity)
+// ============================================================================
+
+function escapeXml(unsafe) {
+  if (unsafe === undefined || unsafe === null) return '';
+  return String(unsafe).replace(/[<>&"']/g, (c) => {
+    switch (c) {
+      case '<': return '&lt;';
+      case '>': return '&gt;';
+      case '&': return '&amp;';
+      case '"': return '&quot;';
+      case "'": return '&apos;';
+      default: return c;
+    }
+  });
+}
+
+function truncate(str, max = 16) {
+  if (!str) return '';
+  const s = String(str).trim();
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + '…';
+}
+
+function getAvatarDataUri(val) {
+  if (!val) return null;
+  if (typeof val === 'string') {
+    if (val.startsWith('data:image/')) return val;
+    return `data:image/png;base64,${val}`;
+  }
+  if (Buffer.isBuffer(val)) {
+    let mime = 'png';
+    if (val.length >= 3 && val[0] === 0xff && val[1] === 0xd8 && val[2] === 0xff) {
+      mime = 'jpeg';
+    } else if (val.length >= 12 && val.subarray(0, 4).toString() === 'RIFF' && val.subarray(8, 12).toString() === 'WEBP') {
+      mime = 'webp';
+    }
+    return `data:image/${mime};base64,${val.toString('base64')}`;
+  }
+  return null;
+}
+
+export function renderSvgToPng(svgString) {
+  const resvg = new Resvg(svgString, {
+    font: {
+      loadSystemFonts: true,
+      defaultFontFamily: 'Nirmala UI',
+    },
+  });
+  return resvg.render().asPng();
+}
+
 // ============================================================================
 // Match Card PNG Generator
 // ============================================================================
 
 export function generateMatchCardPng(match, { volunteerDisplayName = null, avatars = new Map() } = {}) {
-  const width = 800;
-  const height = 420;
-  const rgba = Buffer.alloc(width * height * 4);
+  const pA = match?.playerA || {};
+  const pB = match?.playerB || {};
 
-  // Palettes
-  const bgMain = [11, 15, 25, 255];        // #0B0F19 (Deep Charcoal)
-  const panelBg = [17, 24, 39, 255];       // #111827 (Card Background)
-  const panelBorder = [31, 41, 55, 255];   // #1F2937 (1px Border)
-  const accentOrange = [249, 115, 22, 255];// #F97316 (Match District Orange)
-  const whiteText = [255, 255, 255, 255];  // Primary
-  const slateText = [148, 163, 184, 255];  // Secondary
-  const mutedText = [100, 116, 139, 255];  // Tertiary
-  const badgeBg = [30, 41, 59, 255];       // #1E293B
+  const nameA = escapeXml(truncate(pA.displayName || 'Player A', 16));
+  const ignA = escapeXml(truncate(pA.bgmiIgn || 'Unknown', 16));
+  const uidA = escapeXml(truncate(pA.bgmiUid || 'N/A', 15));
 
-  // 1. Base Background
-  fillRect(rgba, width, height, 0, 0, width, height, bgMain);
+  const nameB = escapeXml(truncate(pB.displayName || 'Player B', 16));
+  const ignB = escapeXml(truncate(pB.bgmiIgn || 'Unknown', 16));
+  const uidB = escapeXml(truncate(pB.bgmiUid || 'N/A', 15));
 
-  // 2. Top Header Accent Strip
-  fillRect(rgba, width, height, 0, 0, width, 4, accentOrange);
+  const matchIdStr = escapeXml(String(match?.matchId || '1V1 MATCH'));
 
-  // Outer border
-  strokeRect(rgba, width, height, 0, 0, width, height, panelBorder, 1);
+  // Avatars
+  const avatarUriA = getAvatarDataUri(avatars.get(String(pA.discordId)));
+  const initialA = escapeXml((pA.displayName || 'A').trim().slice(0, 1).toUpperCase() || 'A');
 
-  // 3. Header Section (y: 20-75)
-  drawText(rgba, width, height, 'MATCH DISTRICT', 35, 22, 3, accentOrange, 'left');
-  drawText(rgba, width, height, '1V1 ARENA', 35, 48, 2, slateText, 'left');
+  const avatarUriB = getAvatarDataUri(avatars.get(String(pB.discordId)));
+  const initialB = escapeXml((pB.displayName || 'B').trim().slice(0, 1).toUpperCase() || 'B');
 
-  // Match ID Header Badge
-  const matchIdStr = String(match.matchId || '1V1 MATCH');
-  fillRect(rgba, width, height, width - 210, 22, 175, 34, badgeBg);
-  strokeRect(rgba, width, height, width - 210, 22, 175, 34, panelBorder, 1);
-  drawText(rgba, width, height, matchIdStr, width - 122, 30, 3, whiteText, 'center');
+  const avatarSvgA = avatarUriA
+    ? `<defs><clipPath id="avatar-clip-a"><circle cx="92" cy="175" r="36" /></clipPath></defs>
+       <circle cx="92" cy="175" r="36" fill="#1E293B" />
+       <image href="${avatarUriA}" x="56" y="139" width="72" height="72" clip-path="url(#avatar-clip-a)" preserveAspectRatio="xMidYMid slice" />
+       <circle cx="92" cy="175" r="36" fill="none" stroke="#F97316" stroke-width="2" />`
+    : `<circle cx="92" cy="175" r="36" fill="#1E293B" stroke="#F97316" stroke-width="2" />
+       <text x="92" y="184" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="22" font-weight="bold" fill="#F97316">${initialA}</text>`;
 
-  // Separator below header
-  fillRect(rgba, width, height, 35, 76, width - 70, 1, panelBorder);
+  const avatarSvgB = avatarUriB
+    ? `<defs><clipPath id="avatar-clip-b"><circle cx="517" cy="175" r="36" /></clipPath></defs>
+       <circle cx="517" cy="175" r="36" fill="#1E293B" />
+       <image href="${avatarUriB}" x="481" y="139" width="72" height="72" clip-path="url(#avatar-clip-b)" preserveAspectRatio="xMidYMid slice" />
+       <circle cx="517" cy="175" r="36" fill="none" stroke="#F97316" stroke-width="2" />`
+    : `<circle cx="517" cy="175" r="36" fill="#1E293B" stroke="#F97316" stroke-width="2" />
+       <text x="517" y="184" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="22" font-weight="bold" fill="#F97316">${initialB}</text>`;
 
-  // 4. Center VS Indicator (x: 355 to 445, y: 135 to 275)
-  const vsX = 355;
-  const vsY = 145;
-  const vsW = 90;
-  const vsH = 115;
-  fillRect(rgba, width, height, vsX, vsY, vsW, vsH, badgeBg);
-  strokeRect(rgba, width, height, vsX, vsY, vsW, vsH, accentOrange, 2);
+  // Status Styling & Label Formatting
+  const statusRaw = String(match?.status || ARENA_STATUS.WAITING_FOR_VOLUNTEER);
+  let statusText = statusRaw.replace(/_/g, ' ');
+  let statusBg = '#2E1B0F';
+  let statusBorder = '#F97316';
+  let statusColor = '#F97316';
 
-  drawText(rgba, width, height, 'VS', vsX + vsW / 2, vsY + 22, 6, accentOrange, 'center');
-  drawText(rgba, width, height, 'BGMI', vsX + vsW / 2, vsY + 72, 2, whiteText, 'center');
-  drawText(rgba, width, height, 'TDM 1V1', vsX + vsW / 2, vsY + 90, 2, slateText, 'center');
-
-  // 5. Player A Panel (Left)
-  const leftX = 35;
-  const cardY = 95;
-  const cardW = 300;
-  const cardH = 225;
-
-  fillRect(rgba, width, height, leftX, cardY, cardW, cardH, panelBg);
-  strokeRect(rgba, width, height, leftX, cardY, cardW, cardH, panelBorder, 1);
-  fillRect(rgba, width, height, leftX, cardY, 4, cardH, accentOrange); // Left accent bar
-
-  drawText(rgba, width, height, 'PLAYER A', leftX + 20, cardY + 16, 2, slateText, 'left');
-
-  // Player A Avatar
-  const avSize = 72;
-  const pAAvX = leftX + 20;
-  const pAAvY = cardY + 45;
-  const pAAvBuf = avatars.get(String(match.playerA.discordId));
-  if (pAAvBuf) {
-    drawCircularAvatar(rgba, width, height, pAAvBuf, pAAvX, pAAvY, avSize, accentOrange);
-  } else {
-    drawProceduralAvatar(rgba, width, height, match.playerA.displayName, pAAvX, pAAvY, avSize, accentOrange);
+  if (statusRaw === ARENA_STATUS.LIVE) {
+    statusText = 'MATCH LIVE';
+    statusBg = '#052E16';
+    statusBorder = '#22C55E';
+    statusColor = '#22C55E';
+  } else if (statusRaw === ARENA_STATUS.COMPLETED || statusRaw === ARENA_STATUS.CONFIRMED) {
+    statusText = statusRaw === ARENA_STATUS.CONFIRMED ? 'CONFIRMED' : 'COMPLETED';
+    statusBg = '#064E3B';
+    statusBorder = '#10B981';
+    statusColor = '#10B981';
+  } else if (statusRaw === ARENA_STATUS.UNDER_REVIEW) {
+    statusText = 'UNDER REVIEW';
+    statusBg = '#450A0A';
+    statusBorder = '#EF4444';
+    statusColor = '#EF4444';
+  } else if (statusRaw === ARENA_STATUS.RESULT_PENDING) {
+    statusText = 'RESULT PENDING';
+    statusBg = '#422006';
+    statusBorder = '#EAB308';
+    statusColor = '#EAB308';
+  } else if (statusRaw === ARENA_STATUS.ROOM_READY) {
+    statusText = 'ROOM READY';
+    statusBg = '#3B0764';
+    statusBorder = '#A855F7';
+    statusColor = '#C084FC';
+  } else if (statusRaw === ARENA_STATUS.VOLUNTEER_ASSIGNED) {
+    statusText = 'VOLUNTEER ASSIGNED';
+    statusBg = '#172554';
+    statusBorder = '#3B82F6';
+    statusColor = '#60A5FA';
+  } else if (statusRaw === ARENA_STATUS.WAITING_FOR_VOLUNTEER) {
+    statusText = 'WAITING FOR VOLUNTEER';
+    statusBg = '#2E1B0F';
+    statusBorder = '#F97316';
+    statusColor = '#F97316';
+  } else if (statusRaw === ARENA_STATUS.CANCELLED || statusRaw === ARENA_STATUS.EXPIRED) {
+    statusText = statusRaw;
+    statusBg = '#1F2937';
+    statusBorder = '#4B5563';
+    statusColor = '#9CA3AF';
   }
 
-  // Player A Names
-  const pAName = String(match.playerA.displayName || 'Player A').slice(0, 15);
-  const pAIgn = String(match.playerA.bgmiIgn || 'Unknown').slice(0, 15);
-  drawText(rgba, width, height, pAName, leftX + 105, cardY + 55, 3, whiteText, 'left');
-  drawText(rgba, width, height, 'IGN:', leftX + 105, cardY + 84, 2, mutedText, 'left');
-  drawText(rgba, width, height, pAIgn, leftX + 145, cardY + 84, 2, accentOrange, 'left');
+  const badgeWidth = Math.max(100, Math.min(260, statusText.length * 8.5 + 24));
 
-  // Sub-badge: Challenger
-  fillRect(rgba, width, height, leftX + 20, cardY + 145, cardW - 40, 32, badgeBg);
-  strokeRect(rgba, width, height, leftX + 20, cardY + 145, cardW - 40, 32, panelBorder, 1);
-  drawText(rgba, width, height, 'CHALLENGER', leftX + cardW / 2, cardY + 154, 2, slateText, 'center');
-
-  // 6. Player B Panel (Right)
-  const rightX = 465;
-  fillRect(rgba, width, height, rightX, cardY, cardW, cardH, panelBg);
-  strokeRect(rgba, width, height, rightX, cardY, cardW, cardH, panelBorder, 1);
-  fillRect(rgba, width, height, rightX + cardW - 4, cardY, 4, cardH, accentOrange); // Right accent bar
-
-  drawText(rgba, width, height, 'PLAYER B', rightX + cardW - 20, cardY + 16, 2, slateText, 'right');
-
-  // Player B Avatar
-  const pBAvX = rightX + cardW - 20 - avSize;
-  const pBAvY = cardY + 45;
-  const pBAvBuf = avatars.get(String(match.playerB.discordId));
-  if (pBAvBuf) {
-    drawCircularAvatar(rgba, width, height, pBAvBuf, pBAvX, pBAvY, avSize, accentOrange);
-  } else {
-    drawProceduralAvatar(rgba, width, height, match.playerB.displayName, pBAvX, pBAvY, avSize, accentOrange);
-  }
-
-  // Player B Names
-  const pBName = String(match.playerB.displayName || 'Player B').slice(0, 15);
-  const pBIgn = String(match.playerB.bgmiIgn || 'Unknown').slice(0, 15);
-  drawText(rgba, width, height, pBName, rightX + cardW - 105, cardY + 55, 3, whiteText, 'right');
-  drawText(rgba, width, height, pBIgn, rightX + cardW - 105, cardY + 84, 2, accentOrange, 'right');
-  drawText(rgba, width, height, 'IGN:', rightX + cardW - 145 - pBIgn.length * 12, cardY + 84, 2, mutedText, 'right');
-
-  // Sub-badge: Opponent
-  fillRect(rgba, width, height, rightX + 20, cardY + 145, cardW - 40, 32, badgeBg);
-  strokeRect(rgba, width, height, rightX + 20, cardY + 145, cardW - 40, 32, panelBorder, 1);
-  drawText(rgba, width, height, 'OPPONENT', rightX + cardW / 2, cardY + 154, 2, slateText, 'center');
-
-  // 7. Footer Bar (y: 345 to 405)
-  const footerY = 345;
-  fillRect(rgba, width, height, 0, footerY, width, height - footerY, [14, 20, 34, 255]);
-  fillRect(rgba, width, height, 0, footerY, width, 1, panelBorder);
-
-  // Status color mapping
-  let statusColor = accentOrange;
-  if (match.status === ARENA_STATUS.LIVE) statusColor = [34, 197, 94, 255]; // Green
-  else if (match.status === ARENA_STATUS.COMPLETED) statusColor = [16, 185, 129, 255]; // Emerald
-  else if (match.status === ARENA_STATUS.UNDER_REVIEW) statusColor = [239, 68, 68, 255]; // Red
-  else if (match.status === ARENA_STATUS.RESULT_PENDING) statusColor = [234, 179, 8, 255]; // Yellow
-  else if (match.status === ARENA_STATUS.ROOM_READY) statusColor = [168, 85, 247, 255]; // Purple
-
-  drawText(rgba, width, height, 'STATUS:', 35, footerY + 22, 2, mutedText, 'left');
-  drawText(rgba, width, height, String(match.status || 'ACTIVE'), 100, footerY + 22, 2, statusColor, 'left');
-
-  // Volunteer on Right
-  const volLabel = match.volunteerId
+  // Volunteer Info
+  const volLabel = match?.volunteerId
     ? volunteerDisplayName || `VOLUNTEER ASSIGNED`
     : 'AWAITING VOLUNTEER';
-  drawText(rgba, width, height, 'OFFICIAL:', width - 280, footerY + 22, 2, mutedText, 'left');
-  drawText(rgba, width, height, String(volLabel).slice(0, 20), width - 35, footerY + 22, 2, whiteText, 'right');
+  const volColor = match?.volunteerId ? '#FFFFFF' : '#F59E0B';
 
-  return encodePngRgba(width, height, rgba);
+  const svg = `
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="420" viewBox="0 0 800 420">
+  <!-- Base Background -->
+  <rect width="800" height="420" fill="#0B0F19"/>
+  <rect x="0" y="0" width="800" height="4" fill="#F97316"/>
+  <rect x="0" y="0" width="800" height="420" fill="none" stroke="#1F2937" stroke-width="1"/>
+
+  <!-- Header -->
+  <text x="35" y="42" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="20" font-weight="bold" fill="#F97316" letter-spacing="1">MATCH DISTRICT</text>
+  <text x="35" y="62" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="600" fill="#94A3B8" letter-spacing="1">1V1 CHALLENGE ARENA</text>
+
+  <!-- Match ID Badge -->
+  <rect x="615" y="24" width="150" height="34" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
+  <text x="690" y="47" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="15" font-weight="bold" fill="#FFFFFF">${matchIdStr}</text>
+  <line x1="35" y1="78" x2="765" y2="78" stroke="#1F2937" stroke-width="1"/>
+
+  <!-- Center VS Indicator -->
+  <rect x="355" y="145" width="90" height="120" rx="10" fill="#1E293B" stroke="#F97316" stroke-width="2"/>
+  <text x="400" y="200" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="34" font-weight="900" fill="#F97316">VS</text>
+  <text x="400" y="228" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="bold" fill="#FFFFFF">BGMI</text>
+  <text x="400" y="248" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="11" font-weight="600" fill="#94A3B8">TDM 1V1</text>
+
+  <!-- Player A Panel (Left) -->
+  <rect x="35" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
+  <rect x="35" y="95" width="5" height="235" rx="2" fill="#F97316"/>
+  <text x="52" y="122" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">PLAYER A • CHALLENGER</text>
+
+  ${avatarSvgA}
+
+  <text x="142" y="152" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="18" font-weight="bold" fill="#FFFFFF">${nameA}</text>
+  <text x="142" y="178" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${ignA}</tspan></text>
+  <text x="142" y="202" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${uidA}</tspan></text>
+
+  <rect x="50" y="280" width="275" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
+  <text x="187" y="301" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8">CHALLENGER</text>
+
+  <!-- Player B Panel (Right) -->
+  <rect x="460" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
+  <rect x="760" y="95" width="5" height="235" rx="2" fill="#F97316"/>
+  <text x="477" y="122" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">PLAYER B • OPPONENT</text>
+
+  ${avatarSvgB}
+
+  <text x="567" y="152" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="18" font-weight="bold" fill="#FFFFFF">${nameB}</text>
+  <text x="567" y="178" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${ignB}</tspan></text>
+  <text x="567" y="202" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${uidB}</tspan></text>
+
+  <rect x="475" y="280" width="275" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
+  <text x="612" y="301" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8">OPPONENT</text>
+
+  <!-- Footer Bar -->
+  <rect x="0" y="350" width="800" height="70" fill="#0D1322"/>
+  <line x1="0" y1="350" x2="800" y2="350" stroke="#1F2937" stroke-width="1"/>
+
+  <text x="35" y="391" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="bold" fill="#64748B">STATUS</text>
+  <rect x="95" y="372" width="${badgeWidth}" height="28" rx="6" fill="${statusBg}" stroke="${statusBorder}" stroke-width="1"/>
+  <text x="${95 + badgeWidth / 2}" y="391" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="${statusColor}">${statusText}</text>
+
+  <text x="765" y="391" text-anchor="end" font-family="'Nirmala UI', 'Mangal', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="bold" fill="#94A3B8">OFFICIAL: <tspan fill="${volColor}">${escapeXml(truncate(volLabel, 22))}</tspan></text>
+</svg>
+`;
+
+  return renderSvgToPng(svg);
 }
 
 // ============================================================================
 // Challenge Card PNG Generator (for #available-challenges)
 // ============================================================================
 
-export function generateChallengeCardPng(challenge, { creatorDisplayName = null, creatorIgn = null, avatars = new Map(), acceptedOpponent = null } = {}) {
-  const width = 800;
-  const height = 420;
-  const rgba = Buffer.alloc(width * height * 4);
+export function generateChallengeCardPng(
+  challenge,
+  { creatorDisplayName = null, creatorIgn = null, creatorUid = null, avatars = new Map(), acceptedOpponent = null } = {}
+) {
+  const cId = escapeXml(String(challenge?.challengeId || 'CHALLENGE'));
+  const cName = escapeXml(truncate(creatorDisplayName || `User#${challenge?.creatorId?.slice?.(-4) || '1'}`, 16));
+  const cIgnStr = escapeXml(truncate(creatorIgn || 'BGMI PLAYER', 16));
+  const cUidStr = escapeXml(truncate(creatorUid || challenge?.creatorUid || '', 15));
 
-  // Palettes
-  const bgMain = [11, 15, 25, 255];
-  const panelBg = [17, 24, 39, 255];
-  const panelBorder = [31, 41, 55, 255];
-  const accentOrange = [249, 115, 22, 255];
-  const whiteText = [255, 255, 255, 255];
-  const slateText = [148, 163, 184, 255];
-  const mutedText = [100, 116, 139, 255];
-  const badgeBg = [30, 41, 59, 255];
+  // Challenger Avatar
+  const cAvUri = getAvatarDataUri(avatars.get(String(challenge?.creatorId)));
+  const cInitial = escapeXml((creatorDisplayName || 'C').trim().slice(0, 1).toUpperCase() || 'C');
 
-  // 1. Base
-  fillRect(rgba, width, height, 0, 0, width, height, bgMain);
-  fillRect(rgba, width, height, 0, 0, width, 4, accentOrange);
-  strokeRect(rgba, width, height, 0, 0, width, height, panelBorder, 1);
+  const cAvatarSvg = cAvUri
+    ? `<defs><clipPath id="avatar-clip-c"><circle cx="92" cy="175" r="36" /></clipPath></defs>
+       <circle cx="92" cy="175" r="36" fill="#1E293B" />
+       <image href="${cAvUri}" x="56" y="139" width="72" height="72" clip-path="url(#avatar-clip-c)" preserveAspectRatio="xMidYMid slice" />
+       <circle cx="92" cy="175" r="36" fill="none" stroke="#F97316" stroke-width="2" />`
+    : `<circle cx="92" cy="175" r="36" fill="#1E293B" stroke="#F97316" stroke-width="2" />
+       <text x="92" y="184" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="22" font-weight="bold" fill="#F97316">${cInitial}</text>`;
 
-  // 2. Header
-  drawText(rgba, width, height, 'MATCH DISTRICT', 35, 22, 3, accentOrange, 'left');
-  drawText(rgba, width, height, 'OPEN 1V1 CHALLENGE', 35, 48, 2, slateText, 'left');
-
-  const cId = String(challenge.challengeId || 'CHALLENGE');
-  fillRect(rgba, width, height, width - 210, 22, 175, 34, badgeBg);
-  strokeRect(rgba, width, height, width - 210, 22, 175, 34, panelBorder, 1);
-  drawText(rgba, width, height, cId, width - 122, 30, 3, whiteText, 'center');
-
-  fillRect(rgba, width, height, 35, 76, width - 70, 1, panelBorder);
-
-  // 3. Center VS
-  const vsX = 355;
-  const vsY = 145;
-  const vsW = 90;
-  const vsH = 115;
-  fillRect(rgba, width, height, vsX, vsY, vsW, vsH, badgeBg);
-  strokeRect(rgba, width, height, vsX, vsY, vsW, vsH, accentOrange, 2);
-  drawText(rgba, width, height, 'VS', vsX + vsW / 2, vsY + 22, 6, accentOrange, 'center');
-  drawText(rgba, width, height, 'BGMI', vsX + vsW / 2, vsY + 72, 2, whiteText, 'center');
-  drawText(rgba, width, height, 'TDM 1V1', vsX + vsW / 2, vsY + 90, 2, slateText, 'center');
-
-  // 4. Challenger Panel (Left)
-  const leftX = 35;
-  const cardY = 95;
-  const cardW = 300;
-  const cardH = 225;
-
-  fillRect(rgba, width, height, leftX, cardY, cardW, cardH, panelBg);
-  strokeRect(rgba, width, height, leftX, cardY, cardW, cardH, panelBorder, 1);
-  fillRect(rgba, width, height, leftX, cardY, 4, cardH, accentOrange);
-
-  drawText(rgba, width, height, 'CHALLENGER', leftX + 20, cardY + 16, 2, slateText, 'left');
-
-  const avSize = 72;
-  const cAvX = leftX + 20;
-  const cAvY = cardY + 45;
-  const cAvBuf = avatars.get(String(challenge.creatorId));
-  const cName = String(creatorDisplayName || `User#${challenge.creatorId?.slice?.(-4) || '1'}`).slice(0, 15);
-  const cIgnStr = String(creatorIgn || 'BGMI PLAYER').slice(0, 15);
-
-  if (cAvBuf) {
-    drawCircularAvatar(rgba, width, height, cAvBuf, cAvX, cAvY, avSize, accentOrange);
-  } else {
-    drawProceduralAvatar(rgba, width, height, cName, cAvX, cAvY, avSize, accentOrange);
-  }
-
-  drawText(rgba, width, height, cName, leftX + 105, cardY + 55, 3, whiteText, 'left');
-  drawText(rgba, width, height, 'IGN:', leftX + 105, cardY + 84, 2, mutedText, 'left');
-  drawText(rgba, width, height, cIgnStr, leftX + 145, cardY + 84, 2, accentOrange, 'left');
-
-  fillRect(rgba, width, height, leftX + 20, cardY + 145, cardW - 40, 32, badgeBg);
-  strokeRect(rgba, width, height, leftX + 20, cardY + 145, cardW - 40, 32, panelBorder, 1);
-  drawText(rgba, width, height, 'READY TO FIGHT', leftX + cardW / 2, cardY + 154, 2, slateText, 'center');
-
-  // 5. Right Panel: Opponent or Open Slot
-  const rightX = 465;
-  fillRect(rgba, width, height, rightX, cardY, cardW, cardH, panelBg);
-  strokeRect(rgba, width, height, rightX, cardY, cardW, cardH, panelBorder, 1);
-
+  // Right Panel: Opponent or Open Slot
+  let rightPanelSvg = '';
   if (acceptedOpponent) {
-    // Show accepted opponent
-    fillRect(rgba, width, height, rightX + cardW - 4, cardY, 4, cardH, accentOrange);
-    drawText(rgba, width, height, 'OPPONENT', rightX + cardW - 20, cardY + 16, 2, slateText, 'right');
+    const opName = escapeXml(truncate(acceptedOpponent.displayName || 'Opponent', 16));
+    const opIgn = escapeXml(truncate(acceptedOpponent.bgmiIgn || 'Unknown', 16));
+    const opUid = escapeXml(truncate(acceptedOpponent.bgmiUid || '', 15));
+    const opAvUri = getAvatarDataUri(avatars.get(String(acceptedOpponent.discordId)));
+    const opInitial = escapeXml((acceptedOpponent.displayName || 'O').trim().slice(0, 1).toUpperCase() || 'O');
 
-    const opAvX = rightX + cardW - 20 - avSize;
-    const opAvY = cardY + 45;
-    const opAvBuf = avatars.get(String(acceptedOpponent.discordId));
-    const opName = String(acceptedOpponent.displayName || 'Opponent').slice(0, 15);
-    const opIgn = String(acceptedOpponent.bgmiIgn || 'Unknown').slice(0, 15);
+    const opAvatarSvg = opAvUri
+      ? `<defs><clipPath id="avatar-clip-op"><circle cx="517" cy="175" r="36" /></clipPath></defs>
+         <circle cx="517" cy="175" r="36" fill="#1E293B" />
+         <image href="${opAvUri}" x="481" y="139" width="72" height="72" clip-path="url(#avatar-clip-op)" preserveAspectRatio="xMidYMid slice" />
+         <circle cx="517" cy="175" r="36" fill="none" stroke="#F97316" stroke-width="2" />`
+      : `<circle cx="517" cy="175" r="36" fill="#1E293B" stroke="#F97316" stroke-width="2" />
+         <text x="517" y="184" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="22" font-weight="bold" fill="#F97316">${opInitial}</text>`;
 
-    if (opAvBuf) {
-      drawCircularAvatar(rgba, width, height, opAvBuf, opAvX, opAvY, avSize, accentOrange);
-    } else {
-      drawProceduralAvatar(rgba, width, height, opName, opAvX, opAvY, avSize, accentOrange);
-    }
+    rightPanelSvg = `
+      <rect x="460" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
+      <rect x="760" y="95" width="5" height="235" rx="2" fill="#F97316"/>
+      <text x="477" y="122" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">OPPONENT</text>
 
-    drawText(rgba, width, height, opName, rightX + cardW - 105, cardY + 55, 3, whiteText, 'right');
-    drawText(rgba, width, height, opIgn, rightX + cardW - 105, cardY + 84, 2, accentOrange, 'right');
+      ${opAvatarSvg}
 
-    fillRect(rgba, width, height, rightX + 20, cardY + 145, cardW - 40, 32, badgeBg);
-    strokeRect(rgba, width, height, rightX + 20, cardY + 145, cardW - 40, 32, panelBorder, 1);
-    drawText(rgba, width, height, 'CHALLENGE ACCEPTED', rightX + cardW / 2, cardY + 154, 2, slateText, 'center');
+      <text x="567" y="152" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="18" font-weight="bold" fill="#FFFFFF">${opName}</text>
+      <text x="567" y="178" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${opIgn}</tspan></text>
+      ${opUid ? `<text x="567" y="202" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${opUid}</tspan></text>` : ''}
+
+      <rect x="475" y="280" width="275" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
+      <text x="612" y="301" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8">CHALLENGE ACCEPTED</text>
+    `;
   } else {
-    // Open Challenge Slot
-    drawText(rgba, width, height, 'SLOT OPEN', rightX + cardW - 20, cardY + 16, 2, mutedText, 'right');
+    rightPanelSvg = `
+      <rect x="460" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
+      <text x="477" y="122" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#64748B" letter-spacing="1">SLOT OPEN</text>
 
-    // Dashed placeholder box
-    strokeRect(rgba, width, height, rightX + 30, cardY + 50, cardW - 60, 80, mutedText, 1);
-    drawText(rgba, width, height, 'AWAITING OPPONENT', rightX + cardW / 2, cardY + 75, 2, slateText, 'center');
-    drawText(rgba, width, height, 'CLICK ACCEPT BELOW', rightX + cardW / 2, cardY + 98, 2, accentOrange, 'center');
+      <rect x="480" y="140" width="265" height="115" rx="8" fill="none" stroke="#334155" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="612" y="190" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="14" font-weight="bold" fill="#94A3B8">AWAITING OPPONENT</text>
+      <text x="612" y="215" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#F97316">CLICK ACCEPT BELOW</text>
 
-    fillRect(rgba, width, height, rightX + 20, cardY + 145, cardW - 40, 32, badgeBg);
-    strokeRect(rgba, width, height, rightX + 20, cardY + 145, cardW - 40, 32, panelBorder, 1);
-    drawText(rgba, width, height, 'FREE TDM 1V1 MATCH', rightX + cardW / 2, cardY + 154, 2, slateText, 'center');
+      <rect x="475" y="280" width="275" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
+      <text x="612" y="301" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8">FREE TDM 1V1 MATCH</text>
+    `;
   }
 
-  // 6. Footer
-  const footerY = 345;
-  fillRect(rgba, width, height, 0, footerY, width, height - footerY, [14, 20, 34, 255]);
-  fillRect(rgba, width, height, 0, footerY, width, 1, panelBorder);
+  // Footer Status
+  const statusStr = String(challenge?.status || 'OPEN');
+  let statusCol = '#22C55E';
+  let statusBg = '#052E16';
+  let statusBorder = '#22C55E';
+  if (statusStr === 'ACCEPTED' || statusStr === ARENA_STATUS.WAITING_FOR_VOLUNTEER) {
+    statusCol = '#60A5FA';
+    statusBg = '#172554';
+    statusBorder = '#3B82F6';
+  } else if (statusStr === 'CANCELLED' || statusStr === 'EXPIRED') {
+    statusCol = '#9CA3AF';
+    statusBg = '#1F2937';
+    statusBorder = '#4B5563';
+  }
 
-  const statusStr = String(challenge.status || 'OPEN');
-  let statusCol = accentOrange;
-  if (statusStr === 'OPEN') statusCol = [34, 197, 94, 255]; // Green
-  else if (statusStr === 'ACCEPTED') statusCol = [59, 130, 246, 255]; // Blue
-  else if (statusStr === 'CANCELLED' || statusStr === 'EXPIRED') statusCol = [107, 114, 128, 255]; // Gray
+  const statusText = statusStr === ARENA_STATUS.WAITING_FOR_VOLUNTEER ? 'ACCEPTED' : statusStr;
+  const badgeWidth = Math.max(90, statusText.length * 9 + 24);
 
-  drawText(rgba, width, height, 'STATUS:', 35, footerY + 22, 2, mutedText, 'left');
-  drawText(rgba, width, height, statusStr, 105, footerY + 22, 2, statusCol, 'left');
-
-  const expiryInfo = challenge.expiresAt
+  const expiryInfo = challenge?.expiresAt
     ? `EXPIRES: ${new Date(challenge.expiresAt).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })}`
     : 'NO TIMEOUT';
-  drawText(rgba, width, height, expiryInfo, width - 35, footerY + 22, 2, slateText, 'right');
 
-  return encodePngRgba(width, height, rgba);
+  const svg = `
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="420" viewBox="0 0 800 420">
+  <!-- Base Background -->
+  <rect width="800" height="420" fill="#0B0F19"/>
+  <rect x="0" y="0" width="800" height="4" fill="#F97316"/>
+  <rect x="0" y="0" width="800" height="420" fill="none" stroke="#1F2937" stroke-width="1"/>
+
+  <!-- Header -->
+  <text x="35" y="42" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="20" font-weight="bold" fill="#F97316" letter-spacing="1">MATCH DISTRICT</text>
+  <text x="35" y="62" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="600" fill="#94A3B8" letter-spacing="1">OPEN 1V1 CHALLENGE</text>
+
+  <!-- Challenge ID Badge -->
+  <rect x="615" y="24" width="150" height="34" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
+  <text x="690" y="47" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="15" font-weight="bold" fill="#FFFFFF">${cId}</text>
+  <line x1="35" y1="78" x2="765" y2="78" stroke="#1F2937" stroke-width="1"/>
+
+  <!-- Center VS Indicator -->
+  <rect x="355" y="145" width="90" height="120" rx="10" fill="#1E293B" stroke="#F97316" stroke-width="2"/>
+  <text x="400" y="200" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="34" font-weight="900" fill="#F97316">VS</text>
+  <text x="400" y="228" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="bold" fill="#FFFFFF">BGMI</text>
+  <text x="400" y="248" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="11" font-weight="600" fill="#94A3B8">TDM 1V1</text>
+
+  <!-- Challenger Panel (Left) -->
+  <rect x="35" y="95" width="305" height="235" rx="10" fill="#111827" stroke="#1F2937" stroke-width="1"/>
+  <rect x="35" y="95" width="5" height="235" rx="2" fill="#F97316"/>
+  <text x="52" y="122" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8" letter-spacing="1">CHALLENGER</text>
+
+  ${cAvatarSvg}
+
+  <text x="142" y="152" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="18" font-weight="bold" fill="#FFFFFF">${cName}</text>
+  <text x="142" y="178" font-family="'Nirmala UI', 'Mangal', 'Noto Sans Devanagari', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="600" fill="#94A3B8">IGN: <tspan fill="#F97316" font-weight="bold">${cIgnStr}</tspan></text>
+  ${cUidStr ? `<text x="142" y="202" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="500" fill="#64748B">UID: <tspan fill="#CBD5E1">${cUidStr}</tspan></text>` : ''}
+
+  <rect x="50" y="280" width="275" height="32" rx="6" fill="#1E293B" stroke="#334155" stroke-width="1"/>
+  <text x="187" y="301" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="#94A3B8">READY TO FIGHT</text>
+
+  <!-- Right Panel -->
+  ${rightPanelSvg}
+
+  <!-- Footer Bar -->
+  <rect x="0" y="350" width="800" height="70" fill="#0D1322"/>
+  <line x1="0" y1="350" x2="800" y2="350" stroke="#1F2937" stroke-width="1"/>
+
+  <text x="35" y="391" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="bold" fill="#64748B">STATUS</text>
+  <rect x="95" y="372" width="${badgeWidth}" height="28" rx="6" fill="${statusBg}" stroke="${statusBorder}" stroke-width="1"/>
+  <text x="${95 + badgeWidth / 2}" y="391" text-anchor="middle" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="bold" fill="${statusCol}">${statusText}</text>
+
+  <text x="765" y="391" text-anchor="end" font-family="'Nirmala UI', 'Segoe UI', Arial, sans-serif" font-size="13" font-weight="bold" fill="#94A3B8">${escapeXml(expiryInfo)}</text>
+</svg>
+`;
+
+  return renderSvgToPng(svg);
 }
 
 // ============================================================================
