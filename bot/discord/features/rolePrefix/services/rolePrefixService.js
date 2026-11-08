@@ -102,6 +102,7 @@ export function isMemberManageable(botMember, targetMember) {
 
 /**
  * Strips all managed guild prefixes from a nickname.
+ * Handles both spaced and unspaced variants without stacking or loops.
  * @param {string} currentName
  * @param {Array<string>} managedPrefixes
  * @returns {string}
@@ -109,13 +110,21 @@ export function isMemberManageable(botMember, targetMember) {
 export function stripManagedPrefix(currentName, managedPrefixes = []) {
   if (!currentName) return '';
   let result = String(currentName).trim();
-  for (const prefix of managedPrefixes) {
-    if (!prefix) continue;
-    const cleanPfx = prefix.trim();
-    const pfxWithSpace = `${cleanPfx} `;
-    if (result.startsWith(pfxWithSpace)) {
-      result = result.slice(pfxWithSpace.length).trim();
-      break;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const prefix of managedPrefixes) {
+      if (!prefix) continue;
+      const cleanPfx = prefix.trim();
+      if (result.startsWith(`${cleanPfx} `)) {
+        result = result.slice(cleanPfx.length + 1).trim();
+        changed = true;
+        break;
+      } else if (result.startsWith(cleanPfx)) {
+        result = result.slice(cleanPfx.length).trim();
+        changed = true;
+        break;
+      }
     }
   }
   return result;
@@ -123,6 +132,7 @@ export function stripManagedPrefix(currentName, managedPrefixes = []) {
 
 /**
  * Formats a nickname with a prefix ensuring Discord 32-character maximum.
+ * Uses exact PREFIX + NICKNAME format (no spaces).
  * Never adds duplicate prefix.
  * @param {string} prefix
  * @param {string} baseName
@@ -134,18 +144,20 @@ export function formatPrefixedNickname(prefix, baseName) {
   if (!cleanPrefix) return cleanBase.slice(0, 32);
   if (!cleanBase) return cleanPrefix.slice(0, 32);
 
-  const prefixWithSpace = `${cleanPrefix} `;
-  if (cleanBase.startsWith(prefixWithSpace)) {
-    cleanBase = cleanBase.slice(prefixWithSpace.length).trim();
+  while (cleanBase.startsWith(`${cleanPrefix} `)) {
+    cleanBase = cleanBase.slice(cleanPrefix.length + 1).trim();
+  }
+  while (cleanBase.startsWith(cleanPrefix)) {
+    cleanBase = cleanBase.slice(cleanPrefix.length).trim();
   }
 
-  const candidate = `${prefixWithSpace}${cleanBase}`;
+  const candidate = `${cleanPrefix}${cleanBase}`;
   if (candidate.length <= 32) {
     return candidate;
   }
 
-  const available = Math.max(1, 32 - prefixWithSpace.length);
-  return `${prefixWithSpace}${cleanBase.slice(0, available)}`.slice(0, 32);
+  const available = Math.max(1, 32 - cleanPrefix.length);
+  return `${cleanPrefix}${cleanBase.slice(0, available)}`.slice(0, 32);
 }
 
 /**
@@ -228,7 +240,6 @@ export async function applyRolePrefixToGuildMembers(guild, roleId, prefix) {
   if (!role) return stats;
 
   const guildConfigs = getGuildRolePrefixesFromCache(guild.id);
-  const prefixWithSpace = `${prefix.trim()} `;
 
   // Ensure members cache is populated
   const members = Array.from(role.members?.values?.() || []);
@@ -236,6 +247,17 @@ export async function applyRolePrefixToGuildMembers(guild, roleId, prefix) {
 
   for (const member of members) {
     if (member.user?.bot) {
+      stats.skipped++;
+      continue;
+    }
+
+    // Role-based eligibility check: member must actually hold the role
+    const hasRole = member.roles?.cache
+      ? member.roles.cache.has(roleId)
+      : Array.isArray(member.roles)
+      ? member.roles.some((r) => (r.id || r) === roleId)
+      : true;
+    if (!hasRole) {
       stats.skipped++;
       continue;
     }
@@ -249,15 +271,15 @@ export async function applyRolePrefixToGuildMembers(guild, roleId, prefix) {
     // Check active config: if another higher role takes precedence, honor that
     const activeConfig = resolveActivePrefixConfig(member, guildConfigs);
     const targetPrefix = activeConfig?.prefix || prefix;
-    const targetPrefixWithSpace = `${targetPrefix.trim()} `;
 
-    if (member.displayName?.startsWith(targetPrefixWithSpace)) {
-      stats.alreadyPrefixed++;
+    const targetNick = computeTargetNickname(member, guildConfigs);
+    if (!targetNick) {
+      stats.skipped++;
       continue;
     }
 
-    const targetNick = computeTargetNickname(member, guildConfigs);
-    if (targetNick === member.nickname) {
+    // Idempotent: If member already has the target nickname or current nickname matches target
+    if (member.nickname === targetNick || (!member.nickname && targetNick === member.user?.username)) {
       stats.alreadyPrefixed++;
       continue;
     }
@@ -853,16 +875,44 @@ export async function handleRolePrefixMemberUpdate(oldMember, newMember) {
   const guildConfigs = getGuildRolePrefixesFromCache(guild.id);
   if (!guildConfigs || guildConfigs.length === 0) return;
 
-  const oldRoles = oldMember?.roles?.cache;
-  const newRoles = newMember.roles?.cache;
+  const configuredRoleIds = new Set(guildConfigs.map((c) => c.roleId));
+
+  const oldRoleIds = new Set(
+    oldMember?.roles?.cache
+      ? Array.from(oldMember.roles.cache.keys())
+      : Array.isArray(oldMember?.roles)
+      ? oldMember.roles.map((r) => r.id || r)
+      : []
+  );
+
+  const newRoleIds = new Set(
+    newMember.roles?.cache
+      ? Array.from(newMember.roles.cache.keys())
+      : Array.isArray(newMember.roles)
+      ? newMember.roles.map((r) => r.id || r)
+      : []
+  );
+
+  let hadConfiguredRole = false;
+  let hasConfiguredRole = false;
+  for (const roleId of configuredRoleIds) {
+    if (oldRoleIds.has(roleId)) hadConfiguredRole = true;
+    if (newRoleIds.has(roleId)) hasConfiguredRole = true;
+  }
 
   let rolesChanged = false;
-  if (oldRoles && newRoles) {
-    if (oldRoles.size !== newRoles.size) {
-      rolesChanged = true;
-    } else {
-      for (const id of newRoles.keys()) {
-        if (!oldRoles.has(id)) {
+  if (oldRoleIds.size !== newRoleIds.size) {
+    rolesChanged = true;
+  } else {
+    for (const id of newRoleIds) {
+      if (!oldRoleIds.has(id)) {
+        rolesChanged = true;
+        break;
+      }
+    }
+    if (!rolesChanged) {
+      for (const id of oldRoleIds) {
+        if (!newRoleIds.has(id)) {
           rolesChanged = true;
           break;
         }
@@ -876,6 +926,21 @@ export async function handleRolePrefixMemberUpdate(oldMember, newMember) {
     return;
   }
 
+  // Strict role eligibility check:
+  // Apply the configured prefix only to members who have the selected Discord role.
+  // Do not assign the prefix to members who do not have that role.
+  // Do not use an existing nickname prefix as a substitute for checking role membership.
+  // If a member never held a configured role, do not touch their nickname.
+  if (!hasConfiguredRole && !hadConfiguredRole) {
+    return;
+  }
+
+  // If member has no configured role now and roles didn't change (e.g. they changed nickname),
+  // do not touch their nickname since they do not hold any configured role.
+  if (!hasConfiguredRole && !rolesChanged) {
+    return;
+  }
+
   const botMember = guild.members?.me;
   const { manageable } = isMemberManageable(botMember, newMember);
   if (!manageable) {
@@ -885,8 +950,8 @@ export async function handleRolePrefixMemberUpdate(oldMember, newMember) {
   // Calculate target nickname for newMember
   const targetNick = computeTargetNickname(newMember, guildConfigs);
 
-  // If nickname already matches target, nothing to do
-  if (targetNick === newMember.nickname) {
+  // If nickname already matches target, nothing to do (idempotent)
+  if (targetNick === newMember.nickname || (!newMember.nickname && targetNick === newMember.user?.username)) {
     return;
   }
 

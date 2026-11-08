@@ -146,14 +146,14 @@ function createMockEnvironment(options = {}) {
   const player3 = {
     id: 'player-3',
     guildId,
-    displayName: 'DSx IGxShanaya',
-    nickname: 'DSx IGxShanaya',
+    displayName: 'DSxIGxShanaya',
+    nickname: 'DSxIGxShanaya',
     roles: {
       cache: new Map([[dsxRole.id, dsxRole]]),
       highest: dsxRole,
     },
     manageable: true,
-    setNickname: async function(n) { this.nickname = n; this.displayName = n || 'IGxShanaya'; },
+    setNickname: async function(n) { this.nickname = n; this.displayName = n || 'DSxIGxShanaya'; },
     user: { id: 'player-3', username: 'IGxShanaya', bot: false },
   };
   members.set(player3.id, player3);
@@ -204,19 +204,31 @@ function createMockEnvironment(options = {}) {
 }
 
 test('1. formatPrefixedNickname and stripManagedPrefix format correctly and observe 32-character limit', () => {
-  assert.equal(formatPrefixedNickname('DSx', 'KOKAINE'), 'DSx KOKAINE');
-  assert.equal(formatPrefixedNickname('DSx', 'Player123'), 'DSx Player123');
-  assert.equal(formatPrefixedNickname('DSx', 'DSx IGxShanaya'), 'DSx IGxShanaya', 'Never double prefixes');
+  // Format must be PREFIX + NICKNAME with no spaces
+  assert.equal(formatPrefixedNickname('DSx', 'KOKAINE'), 'DSxKOKAINE');
+  assert.equal(formatPrefixedNickname('DSx', 'FARHAN'), 'DSxFARHAN');
+  assert.equal(formatPrefixedNickname('DSx', 'HEXON'), 'DSxHEXON');
+  assert.equal(formatPrefixedNickname('DSx', 'TUNTUN'), 'DSxTUNTUN');
+  assert.equal(formatPrefixedNickname('DSx', 'Player123'), 'DSxPlayer123');
+  assert.equal(formatPrefixedNickname('DSx', 'IGxShanaya'), 'DSxIGxShanaya');
+
+  // Never double prefixes or stack
+  assert.equal(formatPrefixedNickname('DSx', 'DSxIGxShanaya'), 'DSxIGxShanaya', 'Already prefixed remains single prefix');
+  assert.equal(formatPrefixedNickname('DSx', 'DSx IGxShanaya'), 'DSxIGxShanaya', 'Cleans spaced prefix to unspaced format');
+  assert.equal(formatPrefixedNickname('DSx', 'DSxDSxKOKAINE'), 'DSxKOKAINE', 'Strips repeated prefix');
 
   // 32-character limit truncation
   const longName = 'VeryVeryLongUsernameThatExceedsThirtyTwoChars';
   const formatted = formatPrefixedNickname('DSx', longName);
   assert.ok(formatted.length <= 32, `Length should be <= 32, was ${formatted.length}`);
-  assert.ok(formatted.startsWith('DSx '), 'Starts with prefix');
+  assert.ok(formatted.startsWith('DSx'), 'Starts with prefix');
+  assert.ok(!formatted.startsWith('DSx '), 'Does not include space after prefix');
 
   // Stripping
+  assert.equal(stripManagedPrefix('DSxKOKAINE', ['DSx']), 'KOKAINE');
   assert.equal(stripManagedPrefix('DSx KOKAINE', ['DSx']), 'KOKAINE');
-  assert.equal(stripManagedPrefix('MD StaffMember', ['DSx', 'MD']), 'StaffMember');
+  assert.equal(stripManagedPrefix('DSxDSxKOKAINE', ['DSx']), 'KOKAINE');
+  assert.equal(stripManagedPrefix('MDStaffMember', ['DSx', 'MD']), 'StaffMember');
   assert.equal(stripManagedPrefix('KOKAINE', ['DSx']), 'KOKAINE');
 });
 
@@ -316,12 +328,12 @@ test('3. Configure DSx for a role: Wizard flow with role selection and confirmat
   assert.equal(saved[0].roleId, 'role-dsx');
 
   // Existing members verification:
-  // player1 had "KOKAINE" -> should become "DSx KOKAINE"
-  assert.equal(env.player1.nickname, 'DSx KOKAINE');
-  // player2 had null -> should become "DSx Player123"
-  assert.equal(env.player2.nickname, 'DSx Player123');
-  // player3 had "DSx IGxShanaya" -> already prefixed, unchanged
-  assert.equal(env.player3.nickname, 'DSx IGxShanaya');
+  // player1 had "KOKAINE" -> should become "DSxKOKAINE" (no spaces)
+  assert.equal(env.player1.nickname, 'DSxKOKAINE');
+  // player2 had null -> should become "DSxPlayer123"
+  assert.equal(env.player2.nickname, 'DSxPlayer123');
+  // player3 had "DSxIGxShanaya" -> already prefixed, unchanged
+  assert.equal(env.player3.nickname, 'DSxIGxShanaya');
   // owner and admin were skipped due to hierarchy
   assert.equal(env.ownerMember.nickname, 'ServerOwner');
   assert.equal(env.adminMember.nickname, 'AdminGuy');
@@ -361,7 +373,7 @@ test('4. Newly assigned role members receive DSx automatically via GuildMemberUp
   };
 
   await handleRolePrefixMemberUpdate(oldMember, newPlayer);
-  assert.equal(newPlayer.nickname, 'DSx ShadowHunter', 'Newly added role member should automatically get prefix');
+  assert.equal(newPlayer.nickname, 'DSxShadowHunter', 'Newly added role member should automatically get prefix with no space');
 });
 
 test('5. Removing the role removes only the managed prefix and preserves the rest of the nickname', async () => {
@@ -381,8 +393,8 @@ test('5. Removing the role removes only the managed prefix and preserves the res
     id: 'leaving-player-5',
     guildId: guild.id,
     guild,
-    displayName: 'DSx ProGamer',
-    nickname: 'DSx ProGamer',
+    displayName: 'DSxProGamer',
+    nickname: 'DSxProGamer',
     roles: {
       cache: new Map(), // Role was removed
       highest: { position: 1 },
@@ -436,12 +448,12 @@ test('6. Member nickname changes preserve the configured prefix and prevent infi
 
   const oldMember = {
     ...memberChangingNick,
-    displayName: 'DSx OldCustomNick',
-    nickname: 'DSx OldCustomNick',
+    displayName: 'DSxOldCustomNick',
+    nickname: 'DSxOldCustomNick',
   };
 
   await handleRolePrefixMemberUpdate(oldMember, memberChangingNick);
-  assert.equal(memberChangingNick.nickname, 'DSx NewCustomNick', 'Prefix must be preserved when user changes nickname');
+  assert.equal(memberChangingNick.nickname, 'DSxNewCustomNick', 'Prefix must be preserved when user changes nickname');
   assert.equal(updateCalls, 1);
 
   // If another event arrives with the already-prefixed nickname, it should be a no-op
@@ -493,15 +505,15 @@ test('7. Multiple role configurations with deterministic priority based on role 
   };
 
   const target = computeTargetNickname(dualRoleMember, configs);
-  assert.equal(target, 'MD DualMember', 'Higher role prefix (MD) should take precedence');
+  assert.equal(target, 'MDDualMember', 'Higher role prefix (MD) should take precedence');
 
   // When staffRole is removed and member only has dsxRole, prefix smoothly transitions to DSx
   dualRoleMember.roles.cache.delete(staffRole.id);
-  dualRoleMember.displayName = 'MD DualMember';
-  dualRoleMember.nickname = 'MD DualMember';
+  dualRoleMember.displayName = 'MDDualMember';
+  dualRoleMember.nickname = 'MDDualMember';
 
   const newTarget = computeTargetNickname(dualRoleMember, configs);
-  assert.equal(newTarget, 'DSx DualMember', 'Prefix should transition to lower role without stacking prefixes');
+  assert.equal(newTarget, 'DSxDualMember', 'Prefix should transition to lower role without stacking prefixes');
 });
 
 test('8. Different servers maintain independent configurations', async () => {
@@ -592,5 +604,85 @@ test('10. .role pre refresh command reapplies prefixes', async () => {
   });
 
   assert.ok(refreshReply.includes('Role Prefix Refresh Completed!'));
-  assert.equal(player1.nickname, 'DSx KOKAINE', 'player1 nickname should be refreshed to prefixed version');
+  assert.equal(player1.nickname, 'DSxKOKAINE', 'player1 nickname should be refreshed to unspaced prefixed version');
+});
+
+test('11. Members WITHOUT the role are NEVER assigned the prefix', async () => {
+  clearRolePrefixMemoryCache();
+  const env = createMockEnvironment();
+  const { guild, dsxRole } = env;
+
+  await saveRolePrefix({
+    guildId: guild.id,
+    roleId: dsxRole.id,
+    roleName: dsxRole.name,
+    prefix: 'DSx',
+    rolePosition: 20,
+  });
+
+  let updateCalls = 0;
+  const nonRoleMember = {
+    id: 'non-role-player',
+    guildId: guild.id,
+    guild,
+    displayName: 'OrdinaryGuy',
+    nickname: 'OrdinaryGuy',
+    roles: {
+      cache: new Map(), // No DSx role
+      highest: { position: 1 },
+    },
+    manageable: true,
+    setNickname: async function(n) {
+      updateCalls++;
+      this.nickname = n;
+      this.displayName = n;
+    },
+    user: { id: 'non-role-player', username: 'OrdinaryGuy', bot: false },
+  };
+
+  // 1. Changing nickname when not having the role
+  const oldMember = { ...nonRoleMember, nickname: 'OldOrdinaryGuy', displayName: 'OldOrdinaryGuy' };
+  await handleRolePrefixMemberUpdate(oldMember, nonRoleMember);
+  assert.equal(nonRoleMember.nickname, 'OrdinaryGuy', 'Member without role must never receive prefix');
+  assert.equal(updateCalls, 0, 'No nickname updates should be queued');
+
+  // 2. Member without role who happens to have DSx in their own custom nickname
+  const customDSxUser = {
+    ...nonRoleMember,
+    displayName: 'DSxCoolGuy',
+    nickname: 'DSxCoolGuy',
+  };
+  const oldCustomDSx = { ...customDSxUser, nickname: 'DSxOldGuy', displayName: 'DSxOldGuy' };
+  await handleRolePrefixMemberUpdate(oldCustomDSx, customDSxUser);
+  assert.equal(customDSxUser.nickname, 'DSxCoolGuy', 'Nickname must not be modified if user never held configured role');
+  assert.equal(updateCalls, 0, 'No nickname updates should be queued');
+});
+
+test('12. Role Hierarchy: skips server owner and equal/higher roles gracefully', async () => {
+  clearRolePrefixMemoryCache();
+  const env = createMockEnvironment();
+  const { guild, dsxRole, ownerMember, adminMember, botMember } = env;
+
+  await saveRolePrefix({
+    guildId: guild.id,
+    roleId: dsxRole.id,
+    roleName: dsxRole.name,
+    prefix: 'DSx',
+    rolePosition: 20,
+  });
+
+  // Owner has role-dsx, but is server owner -> cannot be managed
+  const ownerCheck = isMemberManageable(botMember, ownerMember);
+  assert.equal(ownerCheck.manageable, false);
+  assert.ok(ownerCheck.reason.includes('Server Owner'));
+
+  // Admin has role-dsx, but adminRole (position 60) > botRole (position 50) -> cannot be managed
+  const adminCheck = isMemberManageable(botMember, adminMember);
+  assert.equal(adminCheck.manageable, false);
+  assert.ok(adminCheck.reason.includes('Role Hierarchy'));
+
+  // Direct member update on admin member should be a no-op
+  const oldAdmin = { ...adminMember, nickname: 'AdminGuy', displayName: 'AdminGuy' };
+  await handleRolePrefixMemberUpdate(oldAdmin, adminMember);
+  assert.equal(adminMember.nickname, 'AdminGuy', 'Admin nickname remains untouched due to role hierarchy');
 });
