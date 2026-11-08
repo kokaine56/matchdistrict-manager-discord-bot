@@ -17,7 +17,8 @@ import {
 } from '../models/arenaModels.js';
 import { buildCreateChallengePanel, buildArenaInfoPanel } from './arenaNotificationService.js';
 
-export const ARENA_CHANNEL_PREFIX = '𝟏𝐕𝟏 𝐓𝐃𝐌｜';
+export const ARENA_CHANNEL_PREFIX = '1V1-TDM | ';
+export const ARENA_DYNAMIC_CHANNEL_PREFIX = '𝟏𝐕𝟏 𝐓𝐃𝐌｜';
 
 export function formatArenaChannelName(slug) {
   return `${ARENA_CHANNEL_PREFIX}${slug}`;
@@ -71,7 +72,7 @@ export async function setupArenaChannels(guild, adminUser) {
       ],
     });
   } else if (mainCategory.name !== '1V1 TDM' && typeof mainCategory.setName === 'function') {
-    await mainCategory.setName('1V1 TDM').catch(() => {});
+    await mainCategory.setName('1V1 TDM').catch(() => { });
     mainCategory.name = '1V1 TDM';
   }
 
@@ -81,10 +82,13 @@ export async function setupArenaChannels(guild, adminUser) {
     const lookupNames = new Set([
       targetName.toLowerCase(),
       slug.toLowerCase(),
-      `𝟏𝐯𝟏｜${slug.toLowerCase()}`,
+      `1v1-tdm | ${slug.toLowerCase()}`,
       `𝟏𝐯𝟏 𝐭𝐝𝐦｜${slug.toLowerCase()}`,
+      `𝟏𝐯𝟏｜${slug.toLowerCase()}`,
       ...aliases.map((a) => a.toLowerCase()),
       ...aliases.map((a) => formatArenaChannelName(a).toLowerCase()),
+      ...aliases.map((a) => `1v1-tdm | ${a.toLowerCase()}`),
+      ...aliases.map((a) => `𝟏𝐯𝟏 𝐭𝐝𝐦｜${a.toLowerCase()}`),
       ...aliases.map((a) => `𝟏𝐯𝟏｜${a.toLowerCase()}`),
     ]);
 
@@ -96,6 +100,12 @@ export async function setupArenaChannels(guild, adminUser) {
       ch = findInCache(
         guild.channels?.cache,
         (c) => c.parentId === mainCategory.id && lookupNames.has((c.name || '').toLowerCase())
+      );
+    }
+    if (!ch) {
+      ch = findInCache(
+        guild.channels?.cache,
+        (c) => lookupNames.has((c.name || '').toLowerCase())
       );
     }
     if (!ch) {
@@ -134,7 +144,7 @@ export async function setupArenaChannels(guild, adminUser) {
         deny: lockedChannelDeny,
       },
     ],
-  }, ['arena-info']);
+  }, ['arena-info', '1V1-TDM | info', '𝟏𝐕𝟏 𝐓𝐃𝐌｜info', '𝟏𝐕𝟏｜arena-info']);
   if (typeof infoChannel.permissionOverwrites?.edit === 'function') {
     await infoChannel.permissionOverwrites.edit(guild.id, {
       ViewChannel: true,
@@ -143,11 +153,11 @@ export async function setupArenaChannels(guild, adminUser) {
       CreatePublicThreads: false,
       CreatePrivateThreads: false,
       SendMessagesInThreads: false,
-    }).catch(() => {});
+    }).catch(() => { });
   }
 
-  // #create-challenge (read only for @everyone, no threads)
-  const createChannel = await ensureChannel(config.createChannelId, 'create-challenge', {
+  // #create (read only for @everyone, no threads)
+  const createChannel = await ensureChannel(config.createChannelId, 'create', {
     permissionOverwrites: [
       {
         id: guild.id,
@@ -155,7 +165,7 @@ export async function setupArenaChannels(guild, adminUser) {
         deny: lockedChannelDeny,
       },
     ],
-  });
+  }, ['create-challenge', '1V1-TDM | create', '𝟏𝐕𝟏 𝐓𝐃𝐌｜create-challenge', '𝟏𝐕𝟏｜create-challenge']);
   if (typeof createChannel.permissionOverwrites?.edit === 'function') {
     await createChannel.permissionOverwrites.edit(guild.id, {
       ViewChannel: true,
@@ -164,11 +174,11 @@ export async function setupArenaChannels(guild, adminUser) {
       CreatePublicThreads: false,
       CreatePrivateThreads: false,
       SendMessagesInThreads: false,
-    }).catch(() => {});
+    }).catch(() => { });
   }
 
-  // #available-challenges (read only for @everyone, no threads)
-  const availableChannel = await ensureChannel(config.availableChannelId, 'available-challenges', {
+  // #available-matches (read only for @everyone, no threads)
+  const availableChannel = await ensureChannel(config.availableChannelId, 'available-matches', {
     permissionOverwrites: [
       {
         id: guild.id,
@@ -176,7 +186,7 @@ export async function setupArenaChannels(guild, adminUser) {
         deny: lockedChannelDeny,
       },
     ],
-  });
+  }, ['available-challenges', '1V1-TDM | available-matches', '𝟏𝐕𝟏 𝐓𝐃𝐌｜available-challenges', '𝟏𝐕𝟏｜available-challenges']);
   if (typeof availableChannel.permissionOverwrites?.edit === 'function') {
     await availableChannel.permissionOverwrites.edit(guild.id, {
       ViewChannel: true,
@@ -185,7 +195,7 @@ export async function setupArenaChannels(guild, adminUser) {
       CreatePublicThreads: false,
       CreatePrivateThreads: false,
       SendMessagesInThreads: false,
-    }).catch(() => {});
+    }).catch(() => { });
   }
 
   // #room-maker-panel (public visibility for all server members, read only for @everyone, no threads)
@@ -201,7 +211,7 @@ export async function setupArenaChannels(guild, adminUser) {
         },
       ],
     },
-    ['volunteer-panel']
+    ['volunteer-panel', '1V1-TDM | room-maker-panel', '𝟏𝐕𝟏 𝐓𝐃𝐌｜room-maker-panel', '𝟏𝐕𝟏｜room-maker-panel']
   );
 
   // Ensure @everyone can view and thread creation is disabled idempotently
@@ -225,7 +235,7 @@ export async function setupArenaChannels(guild, adminUser) {
         deny: lockedChannelDeny,
       },
     ],
-  });
+  }, ['1V1-TDM | match-results', '𝟏𝐕𝟏 𝐓𝐃𝐌｜match-results', '𝟏𝐕𝟏｜match-results']);
   if (typeof matchResults.permissionOverwrites?.edit === 'function') {
     await matchResults.permissionOverwrites.edit(guild.id, {
       ViewChannel: true,
@@ -234,11 +244,11 @@ export async function setupArenaChannels(guild, adminUser) {
       CreatePublicThreads: false,
       CreatePrivateThreads: false,
       SendMessagesInThreads: false,
-    }).catch(() => {});
+    }).catch(() => { });
   }
 
-  // #challenge-support (normal public text channel with short pinned note, no bot logic)
-  const supportChannel = await ensureChannel(config.supportChannelId, 'challenge-support', {
+  // #match-support (normal public text channel with short pinned note, no bot logic)
+  const supportChannel = await ensureChannel(config.supportChannelId, 'match-support', {
     permissionOverwrites: [
       {
         id: guild.id,
@@ -249,9 +259,9 @@ export async function setupArenaChannels(guild, adminUser) {
         ],
       },
     ],
-  }, ['arena-support']);
+  }, ['challenge-support', 'arena-support', '1V1-TDM | match-support', '𝟏𝐕𝟏 𝐓𝐃𝐌｜challenge-support', '𝟏𝐕𝟏｜challenge-support']);
 
-  // Pin note in #challenge-support if not yet pinned
+  // Pin note in #match-support if not yet pinned
   try {
     const pins = typeof supportChannel.messages?.fetchPinned === 'function'
       ? await supportChannel.messages.fetchPinned().catch(() => null)
@@ -284,7 +294,7 @@ export async function setupArenaChannels(guild, adminUser) {
         ],
       },
     ],
-  }, ['arena-evidence']);
+  }, ['arena-evidence', '1V1-TDM | evidence', '𝟏𝐕𝟏 𝐓𝐃𝐌｜evidence', '𝟏𝐕𝟏｜arena-evidence']);
   if (typeof evidenceChannel.permissionOverwrites?.edit === 'function') {
     await evidenceChannel.permissionOverwrites.edit(guild.id, {
       ViewChannel: false,
@@ -292,7 +302,16 @@ export async function setupArenaChannels(guild, adminUser) {
       CreatePublicThreads: false,
       CreatePrivateThreads: false,
       SendMessagesInThreads: false,
-    }).catch(() => {});
+    }).catch(() => { });
+  }
+  if (typeof evidenceChannel.permissionOverwrites?.edit === 'function') {
+    await evidenceChannel.permissionOverwrites.edit(guild.id, {
+      ViewChannel: false,
+      SendMessages: false,
+      CreatePublicThreads: false,
+      CreatePrivateThreads: false,
+      SendMessagesInThreads: false,
+    }).catch(() => { });
   }
 
   // Rename any active match channels to adhere to naming convention
@@ -312,7 +331,7 @@ export async function setupArenaChannels(guild, adminUser) {
           const ch = guild.channels?.cache?.get(m.matchChannelId) || (await guild.channels?.fetch?.(m.matchChannelId).catch(() => null));
           const targetName = formatMatchChannelName(m.matchId);
           if (ch && ch.name !== targetName && typeof ch.setName === 'function') {
-            await ch.setName(targetName).catch(() => {});
+            await ch.setName(targetName).catch(() => { });
             ch.name = targetName;
           }
         }
@@ -321,7 +340,7 @@ export async function setupArenaChannels(guild, adminUser) {
           const ch = guild.channels?.cache?.get(rmChId) || (await guild.channels?.fetch?.(rmChId).catch(() => null));
           const targetName = formatRoomMakerChannelName(m.matchId);
           if (ch && ch.name !== targetName && typeof ch.setName === 'function') {
-            await ch.setName(targetName).catch(() => {});
+            await ch.setName(targetName).catch(() => { });
             ch.name = targetName;
           }
         }
@@ -341,7 +360,7 @@ export async function setupArenaChannels(guild, adminUser) {
     if (firstMatchCategory && typeof firstMatchCategory.setName === 'function') {
       const currentName = (firstMatchCategory.name || '').toUpperCase();
       if (currentName === 'ARENA MATCHES' || currentName === '1V1 CHALLENGE ARENA') {
-        await firstMatchCategory.setName('1V1 TDM').catch(() => {});
+        await firstMatchCategory.setName('1V1 TDM').catch(() => { });
         firstMatchCategory.name = '1V1 TDM';
       }
     }
@@ -386,7 +405,7 @@ export async function setupArenaChannels(guild, adminUser) {
       existingInfoMsg = await infoChannel.messages.fetch(infoMessageId).catch(() => null);
     }
     if (existingInfoMsg) {
-      await queueMessageEdit(existingInfoMsg, infoPayload).catch(() => {});
+      await queueMessageEdit(existingInfoMsg, infoPayload).catch(() => { });
     } else {
       const newMsg = await queueChannelSend(infoChannel, infoPayload);
       infoMessageId = newMsg?.id || null;
@@ -399,10 +418,10 @@ export async function setupArenaChannels(guild, adminUser) {
         const msgList = Array.isArray(msgs) ? msgs : Array.from(msgs.values ? msgs.values() : []);
         existingInfoMsg = msgList.find((m) => m.embeds?.[0]?.title?.includes('MATCH DISTRICT – 1V1') || m.author?.bot) || null;
       }
-    } catch (_) {}
+    } catch (_) { }
 
     if (existingInfoMsg) {
-      await queueMessageEdit(existingInfoMsg, infoPayload).catch(() => {});
+      await queueMessageEdit(existingInfoMsg, infoPayload).catch(() => { });
       infoMessageId = existingInfoMsg.id;
     } else {
       const newMsg = await queueChannelSend(infoChannel, infoPayload);
@@ -449,7 +468,7 @@ export async function getOrCreateMatchCategory(guild, config) {
         const currentName = (category.name || '').toUpperCase();
         if (currentName === 'ARENA MATCHES' || currentName === '1V1 CHALLENGE ARENA') {
           const expectedName = i === 0 ? '1V1 TDM' : `1V1 TDM ${i + 1}`;
-          await category.setName(expectedName).catch(() => {});
+          await category.setName(expectedName).catch(() => { });
           category.name = expectedName;
         }
       }
@@ -486,12 +505,12 @@ export async function getOrCreateMatchCategory(guild, config) {
 
 export function formatMatchChannelName(matchId) {
   const digits = formatMatchId(matchId).replace('MD-', '');
-  return `${ARENA_CHANNEL_PREFIX}match-${digits}`;
+  return `${ARENA_DYNAMIC_CHANNEL_PREFIX}match-${digits}`;
 }
 
 export function formatRoomMakerChannelName(matchId) {
   const digits = formatMatchId(matchId).replace('MD-', '');
-  return `${ARENA_CHANNEL_PREFIX}roommaker-${digits}`;
+  return `${ARENA_DYNAMIC_CHANNEL_PREFIX}roommaker-${digits}`;
 }
 
 export async function createMatchChannel(guild, match, config) {
@@ -614,7 +633,7 @@ export async function removeRoomMakerFromRoomMakerChannel(channel, roomMakerId) 
   } else if (typeof channel.permissionOverwrites?.edit === 'function') {
     await channel.permissionOverwrites.edit(roomMakerId, {
       ViewChannel: false,
-    }).catch(() => {});
+    }).catch(() => { });
   }
 }
 
@@ -735,15 +754,20 @@ export async function deleteArenaChannels(guild, config = null) {
         const nameLower = rawName.toLowerCase();
         const unPrefixed = rawName.startsWith(ARENA_CHANNEL_PREFIX)
           ? rawName.slice(ARENA_CHANNEL_PREFIX.length).toLowerCase()
-          : (rawName.startsWith('𝟏𝐕𝟏｜') ? rawName.slice(4).toLowerCase() : nameLower);
+          : (rawName.startsWith(ARENA_DYNAMIC_CHANNEL_PREFIX)
+            ? rawName.slice(ARENA_DYNAMIC_CHANNEL_PREFIX.length).toLowerCase()
+            : (rawName.startsWith('𝟏𝐕𝟏｜') ? rawName.slice(4).toLowerCase() : nameLower));
         if (
           unPrefixed === 'info' ||
           unPrefixed === 'arena-info' ||
+          unPrefixed === 'create' ||
           unPrefixed === 'create-challenge' ||
+          unPrefixed === 'available-matches' ||
           unPrefixed === 'available-challenges' ||
           unPrefixed === 'volunteer-panel' ||
           unPrefixed === 'room-maker-panel' ||
           unPrefixed === 'match-results' ||
+          unPrefixed === 'match-support' ||
           unPrefixed === 'challenge-support' ||
           unPrefixed === 'evidence' ||
           unPrefixed === 'arena-evidence' ||
@@ -751,6 +775,8 @@ export async function deleteArenaChannels(guild, config = null) {
           unPrefixed.startsWith('roommaker-') ||
           unPrefixed.startsWith('room-') ||
           nameLower.startsWith(ARENA_CHANNEL_PREFIX.toLowerCase()) ||
+          nameLower.startsWith(ARENA_DYNAMIC_CHANNEL_PREFIX.toLowerCase()) ||
+          nameLower.startsWith('1v1-tdm |') ||
           nameLower.startsWith('𝟏𝐯𝟏｜')
         ) {
           channelsToDelete.set(String(c.id), c);

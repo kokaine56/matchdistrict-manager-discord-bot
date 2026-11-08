@@ -418,6 +418,8 @@ export async function createArenaChallenge(data) {
     createdAt: data.createdAt ? new Date(data.createdAt) : now,
     acceptedAt: data.acceptedAt ? new Date(data.acceptedAt) : null,
     expiresAt: data.expiresAt ? new Date(data.expiresAt) : new Date(now.getTime() + ARENA_CONSTANTS.CHALLENGE_EXPIRY_MS),
+    creationNotified: data.creationNotified === true,
+    creationNotifiedAt: data.creationNotifiedAt ? new Date(data.creationNotifiedAt) : null,
   };
 
   if (isMongoConnected()) {
@@ -492,6 +494,66 @@ export async function updateArenaChallenge(challengeId, updates) {
   return { ...merged };
 }
 
+/**
+ * Atomically marks a challenge as notified for creation (@here).
+ * Guarantees exactly-once notification delivery.
+ */
+export async function atomicClaimChallengeNotification(challengeId) {
+  if (!challengeId) return { ok: false };
+  const now = new Date();
+
+  if (isMongoConnected()) {
+    const db = getMongoDb();
+    const res = await db.collection(ARENA_COLLECTIONS.CHALLENGES).findOneAndUpdate(
+      {
+        challengeId: String(challengeId),
+        creationNotified: { $ne: true },
+      },
+      {
+        $set: {
+          creationNotified: true,
+          creationNotifiedAt: now,
+        },
+      },
+      { returnDocument: 'after' }
+    );
+    const updated = res?.value !== undefined ? res.value : res;
+    return updated ? { ok: true, challenge: updated } : { ok: false };
+  }
+
+  const c = memChallenges.get(String(challengeId));
+  if (c && !c.creationNotified) {
+    c.creationNotified = true;
+    c.creationNotifiedAt = now;
+    return { ok: true, challenge: { ...c } };
+  }
+  return { ok: false };
+}
+
+/**
+ * Returns any non-OPEN challenges that still have a lingering Discord message ID.
+ */
+export async function getChallengesWithLingeringMessages(guildId = null) {
+  if (isMongoConnected()) {
+    const db = getMongoDb();
+    const filter = {
+      status: { $ne: ARENA_STATUS.OPEN },
+      discordMessageId: { $ne: null },
+    };
+    if (guildId) filter.guildId = String(guildId);
+    return db.collection(ARENA_COLLECTIONS.CHALLENGES).find(filter).toArray();
+  }
+
+  return [...memChallenges.values()]
+    .filter(
+      (c) =>
+        c.status !== ARENA_STATUS.OPEN &&
+        Boolean(c.discordMessageId) &&
+        (!guildId || c.guildId === String(guildId))
+    )
+    .map((c) => ({ ...c }));
+}
+
 // ============================================================================
 // Match Operations
 // ============================================================================
@@ -525,6 +587,9 @@ export async function createArenaMatch(data) {
     roomChannelId: data.roomMakerChannelId ? String(data.roomMakerChannelId) : (data.roomChannelId ? String(data.roomChannelId) : null),
     roomMessageId: data.roomMessageId ? String(data.roomMessageId) : null,
     roomReports: Array.isArray(data.roomReports) ? data.roomReports : [],
+    roomMakerNotifiedForWaiting: false,
+    roomMakerNotifiedAt: null,
+    roomMakerNotificationCount: 0,
     status: data.status || ARENA_STATUS.WAITING_FOR_VOLUNTEER,
     winnerId: null,
     loserId: null,
@@ -737,6 +802,7 @@ export async function atomicClaimArenaMatch(matchId, volunteerId, limit = 1) {
           status: ARENA_STATUS.VOLUNTEER_ASSIGNED,
           volunteerId: String(volunteerId),
           assignedAt: now,
+          roomMakerNotifiedForWaiting: false,
           updatedAt: now,
         },
       },
@@ -813,6 +879,7 @@ export async function atomicClaimArenaMatch(matchId, volunteerId, limit = 1) {
   match.status = ARENA_STATUS.VOLUNTEER_ASSIGNED;
   match.volunteerId = String(volunteerId);
   match.assignedAt = now;
+  match.roomMakerNotifiedForWaiting = false;
   match.updatedAt = now;
 
   vol.activeMatches = (vol.activeMatches || 0) + 1;
@@ -848,6 +915,7 @@ export async function atomicLeaveArenaMatch(matchId, roomMakerId = null) {
     volunteerWarningSent: false,
     volunteerWarningDueAt: new Date(now.getTime() + ARENA_CONSTANTS.VOLUNTEER_WARNING_MS),
     volunteerTimeoutDueAt: new Date(now.getTime() + ARENA_CONSTANTS.VOLUNTEER_TIMEOUT_MS),
+    roomMakerNotifiedForWaiting: false,
     updatedAt: now,
   };
 
@@ -913,6 +981,49 @@ export async function atomicLeaveArenaMatch(matchId, roomMakerId = null) {
     match: { ...memMatches.get(String(matchId)) },
     previousRoomMakerId: String(previous.volunteerId),
   };
+}
+
+/**
+ * Atomically claims the right to send an @here notification in #room-maker-panel for a match
+ * waiting for a Room Maker. Only succeeds once per WAITING_FOR_VOLUNTEER entry.
+ */
+export async function atomicClaimRoomMakerNotification(matchId) {
+  if (!matchId) return { ok: false };
+  const now = new Date();
+
+  if (isMongoConnected()) {
+    const db = getMongoDb();
+    const res = await db.collection(ARENA_COLLECTIONS.MATCHES).findOneAndUpdate(
+      {
+        matchId: String(matchId),
+        status: ARENA_STATUS.WAITING_FOR_VOLUNTEER,
+        roomMakerNotifiedForWaiting: { $ne: true },
+      },
+      {
+        $set: {
+          roomMakerNotifiedForWaiting: true,
+          roomMakerNotifiedAt: now,
+          updatedAt: now,
+        },
+        $inc: {
+          roomMakerNotificationCount: 1,
+        },
+      },
+      { returnDocument: 'after' }
+    );
+    const updated = res?.value !== undefined ? res.value : res;
+    return updated ? { ok: true, match: updated } : { ok: false };
+  }
+
+  const m = memMatches.get(String(matchId));
+  if (m && m.status === ARENA_STATUS.WAITING_FOR_VOLUNTEER && !m.roomMakerNotifiedForWaiting) {
+    m.roomMakerNotifiedForWaiting = true;
+    m.roomMakerNotifiedAt = now;
+    m.roomMakerNotificationCount = (m.roomMakerNotificationCount || 0) + 1;
+    m.updatedAt = now;
+    return { ok: true, match: { ...m } };
+  }
+  return { ok: false };
 }
 
 export const ROOM_ISSUE_TYPES = {

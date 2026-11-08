@@ -22,6 +22,7 @@ import {
   buildMatchChannelEmbed,
   buildArenaStatusEmbed,
   purgeStandaloneRoomMakerMessages,
+  sendRoomMakerNeededNotification,
 } from './arenaNotificationService.js';
 import { fetchMatchAvatars } from './arenaImageService.js';
 import { queueMessageEdit, queueChannelSend } from '../../../../../discordQueue.js';
@@ -298,6 +299,8 @@ export async function handleLeaveMatch(guild, member, matchId, isAdminAction = f
         const payload = await buildVolunteerPanelEmbed(updatedMatch, null, { avatars, guild, client: guild.client });
         await queueMessageEdit(volMsg, payload).catch(() => {});
       }
+      // Send @here notification since match is waiting for a Room Maker again
+      await sendRoomMakerNeededNotification(guild, updatedMatch, volPanel);
     }
   }
 

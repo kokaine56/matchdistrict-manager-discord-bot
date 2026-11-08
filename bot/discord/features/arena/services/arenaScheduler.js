@@ -2,6 +2,7 @@ import {
   ARENA_STATUS,
   ARENA_FINAL_STATUSES,
   getActiveChallenges,
+  getChallengesWithLingeringMessages,
   getArenaMatchesByStatus,
   updateArenaChallenge,
   updateArenaMatch,
@@ -23,7 +24,7 @@ import {
 } from './arenaChannelService.js';
 import { transitionArenaStatus, handleScreenshotTimeout } from './arenaMatchService.js';
 import { handleFileDispute } from './arenaDisputeService.js';
-import { queueMessageEdit, queueChannelSend } from '../../../../../discordQueue.js';
+import { queueMessageEdit, queueChannelSend, queueMessageDelete } from '../../../../../discordQueue.js';
 
 let schedulerInterval = null;
 let activeClient = null;
@@ -114,10 +115,23 @@ export async function checkArenaLifecycles(client) {
 async function expireChallenge(client, challenge) {
   const updated = await updateArenaChallenge(challenge.challengeId, {
     status: ARENA_STATUS.EXPIRED,
+    discordMessageId: null,
   });
 
   const guild = client.guilds?.cache?.get(challenge.guildId);
-  if (guild) await refreshArenaChallengeCard(guild, updated, { client });
+  if (guild && challenge.discordChannelId && challenge.discordMessageId) {
+    const ch =
+      guild.channels?.cache?.get(challenge.discordChannelId) ||
+      (await guild.channels?.fetch?.(challenge.discordChannelId).catch(() => null));
+    if (ch) {
+      const msg =
+        ch.messages?.cache?.get(challenge.discordMessageId) ||
+        (await ch.messages?.fetch?.(challenge.discordMessageId).catch(() => null));
+      if (msg) {
+        await queueMessageDelete(msg).catch(() => { });
+      }
+    }
+  }
 
   await logArenaAction({
     action: 'CHALLENGE_EXPIRED',
@@ -250,15 +264,46 @@ export async function recoverArenaOnStartup(client) {
       const config = await getArenaConfig(guild.id);
       if (!config) continue;
 
-      // 1. Restore persistent panel message in #create-challenge in place
+      // 1. Restore persistent panel message in #create in place
       if (config.createChannelId) {
         await setupArenaChannels(guild, null).catch((err) => {
           console.warn(`[Arena] ⚠️ Error restoring persistent panel in ${guild.id}:`, err.message);
         });
       }
 
-      // Rebuild open challenge cards in place from current MongoDB player profiles.
+      const now = new Date();
+
+      // 1b. Check MongoDB for open challenges whose expiry time has passed, expire and delete them
       for (const challenge of await getActiveChallenges(guild.id)) {
+        if (challenge.expiresAt && now >= new Date(challenge.expiresAt)) {
+          await expireChallenge(client, challenge);
+        }
+      }
+
+      // 1c. Clean up any other lingering challenge messages that no longer have an active OPEN challenge
+      const lingeringChallenges = await getChallengesWithLingeringMessages(guild.id);
+      for (const lc of lingeringChallenges) {
+        if (lc.discordChannelId && lc.discordMessageId) {
+          const ch =
+            guild.channels.cache.get(lc.discordChannelId) ||
+            (await guild.channels.fetch(lc.discordChannelId).catch(() => null));
+          if (ch) {
+            const msg =
+              ch.messages?.cache?.get(lc.discordMessageId) ||
+              (await ch.messages?.fetch?.(lc.discordMessageId).catch(() => null));
+            if (msg) {
+              await queueMessageDelete(msg).catch(() => {});
+            }
+          }
+          await updateArenaChallenge(lc.challengeId, { discordMessageId: null });
+        }
+      }
+
+      // 1d. Rebuild surviving open challenge cards in place from current MongoDB player profiles.
+      for (const challenge of await getActiveChallenges(guild.id)) {
+        if (challenge.expiresAt && now >= new Date(challenge.expiresAt)) {
+          continue;
+        }
         if (!challenge.discordChannelId && config.availableChannelId) {
           challenge.discordChannelId = config.availableChannelId;
           await updateArenaChallenge(challenge.challengeId, { discordChannelId: config.availableChannelId });

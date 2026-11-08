@@ -105,7 +105,7 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
         `• Category: **${res.mainCategory.name}**\n` +
         `• Information: <#${res.infoChannel.id}>\n` +
         `• Create Panel: <#${res.createChannel.id}>\n` +
-        `• Available Challenges: <#${res.availableChannel.id}>\n` +
+        `• Available Matches: <#${res.availableChannel.id}>\n` +
         `• Room Maker Panel: <#${res.volunteerPanel.id}>\n` +
         `• Match Results: <#${res.matchResults.id}>\n` +
         `• Support: <#${res.supportChannel.id}>\n` +

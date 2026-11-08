@@ -13,6 +13,8 @@ import {
   updateArenaMatch,
   updateArenaChallenge,
   formatMatchId,
+  atomicClaimChallengeNotification,
+  atomicClaimRoomMakerNotification,
 } from '../models/arenaModels.js';
 import {
   generateMatchCardPng,
@@ -49,8 +51,8 @@ export function buildCreateChallengePanel() {
 }
 
 export function buildArenaInfoPanel(channelIds = {}) {
-  const createMention = channelIds.createChannelId ? `<#${channelIds.createChannelId}>` : '#create-challenge';
-  const availableMention = channelIds.availableChannelId ? `<#${channelIds.availableChannelId}>` : '#available-challenges';
+  const createMention = channelIds.createChannelId ? `<#${channelIds.createChannelId}>` : '#create';
+  const availableMention = channelIds.availableChannelId ? `<#${channelIds.availableChannelId}>` : '#available-matches';
   const resultsMention = channelIds.matchResultsId ? `<#${channelIds.matchResultsId}>` : '#match-results';
 
   const embed = new EmbedBuilder()
@@ -84,6 +86,56 @@ export function buildArenaInfoPanel(channelIds = {}) {
     .setFooter({ text: 'Match District TDM • Fair Play & Sportsmanship' });
 
   return { embeds: [embed] };
+}
+
+/**
+ * Notifies online members via @here when a new challenge is created in #available-matches.
+ * Guarantees exactly-once send via atomic DB claim.
+ */
+export async function sendChallengeCreationNotification(guild, challenge, availableChannel) {
+  if (!guild || !challenge || !availableChannel) return false;
+
+  const claimed = await atomicClaimChallengeNotification(challenge.challengeId);
+  if (!claimed.ok) {
+    return false;
+  }
+
+  const content = `@here A new BGMI TDM 1V1 challenge is available! Head over to <#${availableChannel.id}> and accept the challenge.`;
+  try {
+    await queueChannelSend(availableChannel, {
+      content,
+      allowedMentions: { parse: ['everyone'] },
+    });
+    return true;
+  } catch (err) {
+    console.warn(`[Arena] ⚠️ Failed to send challenge creation @here notification in ${availableChannel.id}:`, err?.message || err);
+    return false;
+  }
+}
+
+/**
+ * Notifies online members via @here when a match enters WAITING_FOR_VOLUNTEER in #room-maker-panel.
+ * Guarantees exactly-once send per WAITING_FOR_VOLUNTEER transition via atomic DB claim.
+ */
+export async function sendRoomMakerNeededNotification(guild, match, volunteerPanel) {
+  if (!guild || !match || !volunteerPanel) return false;
+
+  const claimed = await atomicClaimRoomMakerNotification(match.matchId);
+  if (!claimed.ok) {
+    return false;
+  }
+
+  const content = `@here A BGMI TDM 1V1 match needs a Room Maker! Visit <#${volunteerPanel.id}> and claim an available match.`;
+  try {
+    await queueChannelSend(volunteerPanel, {
+      content,
+      allowedMentions: { parse: ['everyone'] },
+    });
+    return true;
+  } catch (err) {
+    console.warn(`[Arena] ⚠️ Failed to send Room Maker needed @here notification in ${volunteerPanel.id}:`, err?.message || err);
+    return false;
+  }
 }
 
 // All builders hydrate live Discord + MongoDB data (display names, avatars, IGN/UID,

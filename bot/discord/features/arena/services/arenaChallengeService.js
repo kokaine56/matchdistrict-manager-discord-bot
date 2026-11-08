@@ -20,12 +20,14 @@ import {
   buildMatchChannelEmbed,
   buildArenaStatusEmbed,
   safeDirectMessage,
+  sendChallengeCreationNotification,
+  sendRoomMakerNeededNotification,
 } from './arenaNotificationService.js';
 import {
   createMatchChannel,
   createRoomMakerChannel,
 } from './arenaChannelService.js';
-import { queueChannelSend, queueMessageEdit } from '../../../../../discordQueue.js';
+import { queueChannelSend, queueMessageEdit, queueMessageDelete } from '../../../../../discordQueue.js';
 
 export async function validatePlayerForAction(member, action = 'create') {
   if (!member) return { valid: false, error: 'Member is required' };
@@ -143,6 +145,9 @@ export async function handleCreateChallenge(guild, member) {
   // Update player cooldown timestamp
   await upsertArenaPlayer(member.id, { lastChallengeCreatedAt: now });
 
+  // Send @here notification to online members strictly once
+  await sendChallengeCreationNotification(guild, challenge, availableChannel);
+
   await logArenaAction({
     action: 'CHALLENGE_CREATED',
     challengeId,
@@ -169,9 +174,12 @@ export async function handleCancelChallenge(guild, member, challengeId) {
     return { ok: false, error: `❌ Challenge cannot be cancelled (current status: \`${challenge.status}\`).` };
   }
 
-  const updated = await updateArenaChallenge(challengeId, { status: ARENA_STATUS.CANCELLED });
+  const updated = await updateArenaChallenge(challengeId, {
+    status: ARENA_STATUS.CANCELLED,
+    discordMessageId: null,
+  });
 
-  // Update embed in #available-challenges
+  // Delete challenge card from #available-matches
   if (challenge.discordChannelId && challenge.discordMessageId) {
     const ch =
       guild.channels.cache.get(challenge.discordChannelId) ||
@@ -179,8 +187,7 @@ export async function handleCancelChallenge(guild, member, challengeId) {
     if (ch) {
       const msg = ch.messages?.cache?.get(challenge.discordMessageId) || (await ch.messages?.fetch?.(challenge.discordMessageId).catch(() => null));
       if (msg) {
-        const payload = await buildChallengeEmbed(updated, member.displayName, { guild, client: guild.client });
-        await queueMessageEdit(msg, payload).catch(() => { });
+        await queueMessageDelete(msg).catch(() => { });
       }
     }
   }
@@ -231,6 +238,7 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
     status: ARENA_STATUS.WAITING_FOR_VOLUNTEER,
     opponentId: member.id,
     acceptedAt: new Date(),
+    discordMessageId: null,
   });
 
   // Atomically reserve activeMatchId on both players
@@ -315,8 +323,9 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
   }
 
   // 2. Post in #room-maker-panel (Room Maker Panel)
+  let volPanel = null;
   if (config?.volunteerPanelId) {
-    const volPanel =
+    volPanel =
       guild.channels.cache.get(config.volunteerPanelId) ||
       (await guild.channels.fetch(config.volunteerPanelId).catch(() => null));
     if (volPanel) {
@@ -325,6 +334,8 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
       if (volMsg?.id) {
         match.panelMessageId = volMsg.id;
       }
+      // Send @here notification to Room Makers
+      await sendRoomMakerNeededNotification(guild, match, volPanel);
     }
   }
 
@@ -338,7 +349,7 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
     panelMessageId: match.panelMessageId,
   });
 
-  // 3. Update Challenge embed in #available-challenges (ACCEPTED, no buttons)
+  // 3. Delete open Challenge card from #available-matches
   if (challenge.discordChannelId && challenge.discordMessageId) {
     const ch =
       guild.channels.cache.get(challenge.discordChannelId) ||
@@ -346,14 +357,7 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
     if (ch) {
       const msg = ch.messages?.cache?.get(challenge.discordMessageId) || (await ch.messages?.fetch?.(challenge.discordMessageId).catch(() => null));
       if (msg) {
-        const payload = await buildChallengeEmbed(updatedChallenge, creator.displayName, {
-          creatorIgn: creator.bgmiIgn,
-          creatorUid: creator.bgmiUid,
-          acceptedOpponent: accepter,
-          guild,
-          client: guild?.client || client,
-        });
-        await queueMessageEdit(msg, payload).catch(() => { });
+        await queueMessageDelete(msg).catch(() => { });
       }
     }
   }
