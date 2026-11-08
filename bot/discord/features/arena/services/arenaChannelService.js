@@ -405,3 +405,98 @@ export async function deleteMatchChannel(guild, channelId) {
   if (!channel) return;
   await queueChannelDelete(channel, 'Arena match completed or expired');
 }
+
+export async function deleteArenaChannels(guild, config = null) {
+  if (!guild) throw new Error('Guild is required');
+
+  const cfg = config || (await getArenaConfig(guild.id)) || {};
+  let deletedChannels = 0;
+  let deletedCategories = 0;
+
+  // Set of category IDs to identify child channels and categories to delete
+  const targetCategoryIds = new Set();
+  if (cfg.categoryId) targetCategoryIds.add(String(cfg.categoryId));
+  if (Array.isArray(cfg.matchCategories)) {
+    for (const catId of cfg.matchCategories) {
+      if (catId) targetCategoryIds.add(String(catId));
+    }
+  }
+
+  // Also discover any categories by name
+  const allChannels = Array.from(guild.channels?.cache?.values?.() || []);
+  for (const c of allChannels) {
+    if (c.type === ChannelType.GuildCategory) {
+      const catName = (c.name || '').toUpperCase();
+      if (catName === '1V1 CHALLENGE ARENA' || catName.startsWith('ARENA MATCHES')) {
+        targetCategoryIds.add(String(c.id));
+      }
+    }
+  }
+
+  // 1. Collect all child channels to delete
+  const channelsToDelete = new Map();
+
+  // Known channel IDs from config
+  const knownChannelIds = [
+    cfg.createChannelId,
+    cfg.availableChannelId,
+    cfg.volunteerPanelId,
+    cfg.matchResultsId,
+    cfg.supportChannelId,
+    cfg.evidenceChannelId,
+  ].filter(Boolean);
+
+  for (const chId of knownChannelIds) {
+    const ch = guild.channels?.cache?.get(chId) || (await guild.channels?.fetch?.(chId).catch(() => null));
+    if (ch && ch.type !== ChannelType.GuildCategory) {
+      channelsToDelete.set(String(ch.id), ch);
+    }
+  }
+
+  // Any channel whose parent is in targetCategoryIds or matching arena channel names
+  for (const c of allChannels) {
+    if (c.type !== ChannelType.GuildCategory) {
+      if (c.parentId && targetCategoryIds.has(String(c.parentId))) {
+        channelsToDelete.set(String(c.id), c);
+      } else {
+        const nameLower = (c.name || '').toLowerCase();
+        if (
+          nameLower === 'create-challenge' ||
+          nameLower === 'available-challenges' ||
+          nameLower === 'volunteer-panel' ||
+          nameLower === 'match-results' ||
+          nameLower === 'challenge-support' ||
+          nameLower === 'arena-evidence' ||
+          nameLower.startsWith('match-md-')
+        ) {
+          channelsToDelete.set(String(c.id), c);
+        }
+      }
+    }
+  }
+
+  // Delete all child channels first
+  for (const ch of channelsToDelete.values()) {
+    try {
+      await queueChannelDelete(ch, '1v1 Arena Deletion');
+      deletedChannels++;
+    } catch (err) {
+      console.warn(`[Arena] ⚠️ Failed to delete channel ${ch.name || ch.id}:`, err.message);
+    }
+  }
+
+  // 2. Delete all categories
+  for (const catId of targetCategoryIds) {
+    const cat = guild.channels?.cache?.get(catId) || (await guild.channels?.fetch?.(catId).catch(() => null));
+    if (cat) {
+      try {
+        await queueChannelDelete(cat, '1v1 Arena Deletion');
+        deletedCategories++;
+      } catch (err) {
+        console.warn(`[Arena] ⚠️ Failed to delete category ${cat.name || cat.id}:`, err.message);
+      }
+    }
+  }
+
+  return { deletedChannels, deletedCategories };
+}

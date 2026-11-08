@@ -906,3 +906,113 @@ export async function getArenaLogs(matchIdOrChallengeId = null, limit = 20) {
     .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
     .slice(0, limit);
 }
+
+// ============================================================================
+// Complete Arena Deletion
+// ============================================================================
+
+export async function deleteAllArenaData(guildId) {
+  const gId = String(guildId);
+  const result = {
+    configsDeleted: 0,
+    challengesDeleted: 0,
+    matchesDeleted: 0,
+    disputesDeleted: 0,
+    logsDeleted: 0,
+    playersDeleted: 0,
+    volunteersDeleted: 0,
+  };
+
+  if (isMongoConnected()) {
+    const db = getMongoDb();
+
+    // 1. Fetch matches for guild to get all matchIds
+    const guildMatches = await db.collection(ARENA_COLLECTIONS.MATCHES).find({ guildId: gId }).toArray();
+    const matchIds = guildMatches.map((m) => String(m.matchId));
+
+    // 2. Fetch challenges for guild to get all challengeIds
+    const guildChallenges = await db.collection(ARENA_COLLECTIONS.CHALLENGES).find({ guildId: gId }).toArray();
+    const challengeIds = guildChallenges.map((c) => String(c.challengeId));
+
+    // 3. Delete config
+    const cfgRes = await db.collection(ARENA_COLLECTIONS.CONFIG).deleteMany({ guildId: gId });
+    result.configsDeleted = cfgRes.deletedCount || 0;
+
+    // 4. Delete challenges
+    const chRes = await db.collection(ARENA_COLLECTIONS.CHALLENGES).deleteMany({ guildId: gId });
+    result.challengesDeleted = chRes.deletedCount || 0;
+
+    // 5. Delete matches
+    const mRes = await db.collection(ARENA_COLLECTIONS.MATCHES).deleteMany({ guildId: gId });
+    result.matchesDeleted = mRes.deletedCount || 0;
+
+    // 6. Delete disputes
+    const dispFilter = matchIds.length > 0 ? { matchId: { $in: matchIds } } : { matchId: '__none__' };
+    const dispRes = await db.collection(ARENA_COLLECTIONS.DISPUTES).deleteMany(dispFilter);
+    result.disputesDeleted = dispRes.deletedCount || 0;
+
+    // 7. Delete logs
+    const orClauses = [{ 'metadata.guildId': gId }];
+    if (matchIds.length > 0) orClauses.push({ matchId: { $in: matchIds } });
+    if (challengeIds.length > 0) orClauses.push({ challengeId: { $in: challengeIds } });
+    const logRes = await db.collection(ARENA_COLLECTIONS.LOGS).deleteMany({ $or: orClauses });
+    result.logsDeleted = logRes.deletedCount || 0;
+
+    // 8. Delete players (all registered BGMI details, stats, activeMatchId)
+    const pRes = await db.collection(ARENA_COLLECTIONS.PLAYERS).deleteMany({});
+    result.playersDeleted = pRes.deletedCount || 0;
+
+    // 9. Delete volunteers
+    const vRes = await db.collection(ARENA_COLLECTIONS.VOLUNTEERS).deleteMany({});
+    result.volunteersDeleted = vRes.deletedCount || 0;
+
+    return result;
+  }
+
+  // In-memory fallback
+  if (memConfig.has(gId)) {
+    memConfig.delete(gId);
+    result.configsDeleted = 1;
+  }
+
+  const matchIds = [];
+  for (const [mId, m] of memMatches.entries()) {
+    if (m.guildId === gId) {
+      matchIds.push(mId);
+      memMatches.delete(mId);
+      result.matchesDeleted++;
+    }
+  }
+
+  const challengeIds = [];
+  for (const [cId, c] of memChallenges.entries()) {
+    if (c.guildId === gId) {
+      challengeIds.push(cId);
+      memChallenges.delete(cId);
+      result.challengesDeleted++;
+    }
+  }
+
+  for (const [dId, d] of memDisputes.entries()) {
+    if (matchIds.includes(d.matchId)) {
+      memDisputes.delete(dId);
+      result.disputesDeleted++;
+    }
+  }
+
+  for (let i = memLogs.length - 1; i >= 0; i--) {
+    const l = memLogs[i];
+    if (matchIds.includes(l.matchId) || challengeIds.includes(l.challengeId) || l.metadata?.guildId === gId) {
+      memLogs.splice(i, 1);
+      result.logsDeleted++;
+    }
+  }
+
+  result.playersDeleted = memPlayers.size;
+  memPlayers.clear();
+
+  result.volunteersDeleted = memVolunteers.size;
+  memVolunteers.clear();
+
+  return result;
+}

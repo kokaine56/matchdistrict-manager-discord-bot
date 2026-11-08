@@ -1273,4 +1273,78 @@ test.describe('1v1 Challenge Arena Test Suite', () => {
       else process.env.ARENA_IMAGE_DIAGNOSTICS = previousDiagnostics;
     }
   });
+
+  test('19. Admin .arena delete removes all channels, categories, and database records cleanly', async () => {
+    const env = createMockArenaEnvironment();
+    const admin = env.addMember('admin-del', 'AdminDel', { isAdmin: true });
+    const regularMember = env.addMember('user-del', 'UserDel');
+
+    // 1. Non-admin is rejected
+    let replyNonAdmin = null;
+    await handleArenaCommand(env.guild, regularMember, null, ['delete'], (msg) => {
+      replyNonAdmin = typeof msg === 'string' ? msg : msg.content;
+    });
+    assert.match(replyNonAdmin, /Permission Denied/);
+
+    // 2. Provision arena with .arena setup
+    let setupReply = null;
+    await handleArenaCommand(env.guild, admin, null, ['setup'], (msg) => {
+      setupReply = typeof msg === 'string' ? msg : msg.content;
+    });
+    assert.match(setupReply, /Setup Complete/);
+
+    // Verify channels and category exist
+    const config = await getArenaConfig(env.guild.id);
+    assert.ok(config.categoryId);
+    assert.ok(env.guild.channels.cache.has(config.categoryId));
+    assert.ok(env.guild.channels.cache.has(config.createChannelId));
+    assert.ok(env.guild.channels.cache.has(config.availableChannelId));
+    assert.ok(env.guild.channels.cache.has(config.volunteerPanelId));
+
+    // Register a player, create a challenge, and create a match
+    await upsertArenaPlayer('del-pA', { displayName: 'PlayerDelA', bgmiIgn: 'IgnDelA', bgmiUid: '9999900001' });
+    await upsertArenaPlayer('del-pB', { displayName: 'PlayerDelB', bgmiIgn: 'IgnDelB', bgmiUid: '9999900002' });
+    const match = await createArenaMatch({
+      matchId: 'MD-99999',
+      guildId: env.guild.id,
+      status: ARENA_STATUS.WAITING_FOR_VOLUNTEER,
+      playerA: { discordId: 'del-pA', displayName: 'PlayerDelA', bgmiIgn: 'IgnDelA', bgmiUid: '9999900001' },
+      playerB: { discordId: 'del-pB', displayName: 'PlayerDelB', bgmiIgn: 'IgnDelB', bgmiUid: '9999900002' },
+    });
+
+    // 3. Admin runs .arena delete
+    let deleteReply = null;
+    await handleArenaCommand(env.guild, admin, null, ['delete'], (msg) => {
+      deleteReply = msg;
+    });
+
+    assert.ok(deleteReply && deleteReply.embeds && deleteReply.embeds.length === 1);
+    assert.match(deleteReply.embeds[0].data.title, /1v1 Challenge Arena Deleted/);
+
+    // 4. Verify channels and categories are removed from Discord
+    assert.equal(env.guild.channels.cache.has(config.categoryId), false, 'Main category must be deleted');
+    assert.equal(env.guild.channels.cache.has(config.createChannelId), false, 'Create channel must be deleted');
+    assert.equal(env.guild.channels.cache.has(config.availableChannelId), false, 'Available channel must be deleted');
+    assert.equal(env.guild.channels.cache.has(config.volunteerPanelId), false, 'Volunteer panel must be deleted');
+
+    // 5. Verify database records are cleared
+    const postConfig = await getArenaConfig(env.guild.id);
+    assert.equal(postConfig, null, 'Config document must be deleted');
+
+    const postMatch = await getArenaMatch('MD-99999');
+    assert.equal(postMatch, null, 'Match document must be deleted');
+
+    const postPlayerA = await getArenaPlayer('del-pA');
+    assert.equal(postPlayerA, null, 'Player A document must be deleted');
+
+    // 6. Idempotent re-setup succeeds cleanly
+    let reSetupReply = null;
+    await handleArenaCommand(env.guild, admin, null, ['setup'], (msg) => {
+      reSetupReply = typeof msg === 'string' ? msg : msg.content;
+    });
+    assert.match(reSetupReply, /Setup Complete/);
+    const newConfig = await getArenaConfig(env.guild.id);
+    assert.ok(newConfig && newConfig.categoryId);
+    assert.ok(env.guild.channels.cache.has(newConfig.categoryId));
+  });
 });

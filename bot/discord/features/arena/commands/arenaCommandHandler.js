@@ -23,9 +23,11 @@ import {
   getArenaLogs,
   atomicReleasePlayerMatch,
   logArenaAction,
+  deleteAllArenaData,
 } from '../models/arenaModels.js';
 import {
   setupArenaChannels,
+  deleteArenaChannels,
   addVolunteerToMatchChannel,
   removeVolunteerFromMatchChannel,
 } from '../services/arenaChannelService.js';
@@ -37,6 +39,7 @@ import {
 } from '../services/arenaDisputeService.js';
 import {
   transitionArenaStatus,
+  cancelAllScreenshotTimers,
 } from '../services/arenaMatchService.js';
 import {
   refreshArenaMatchCards,
@@ -74,6 +77,7 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
       .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
       .setDescription(
         '• `.arena setup` — Create or verify all arena categories, channels, and persistent panels.\n' +
+        '• `.arena delete` — Delete all arena channels, categories, and database records.\n' +
         '• `.arena active` — View open challenges and active matches.\n' +
         '• `.arena matches [status]` — List matches filtered by status.\n' +
         '• `.arena cancel <id> <reason>` — Cancel a match or challenge and free players.\n' +
@@ -107,6 +111,49 @@ export async function handleArenaCommand(guild, member, channel, args, replyFn, 
       );
     } catch (err) {
       return replyFn(`❌ Setup failed: ${err.message}`);
+    }
+  }
+
+  // 2. .arena delete
+  if (subCmd === 'delete') {
+    try {
+      // 1. Cancel any active screenshot / interaction timers
+      cancelAllScreenshotTimers();
+
+      // 2. Delete all Discord channels and categories
+      const channelStats = await deleteArenaChannels(guild, config);
+
+      // 3. Delete all database records (config, challenges, matches, disputes, logs, players, volunteers)
+      const dbStats = await deleteAllArenaData(guild.id);
+
+      const summaryEmbed = new EmbedBuilder()
+        .setTitle('🗑️ 1v1 Challenge Arena Deleted')
+        .setColor(ARENA_CONSTANTS.ORANGE_COLOR)
+        .setDescription(
+          'All 1v1 Challenge Arena channels, categories, and database records have been completely deleted.\n\n' +
+          'You can run `.arena setup` at any time to reinitialize the arena from scratch.'
+        )
+        .addFields(
+          {
+            name: 'Discord Channels Removed',
+            value: `• Channels: **${channelStats.deletedChannels}**\n• Categories: **${channelStats.deletedCategories}**`,
+            inline: true,
+          },
+          {
+            name: 'Database Records Cleared',
+            value:
+              `• Matches: **${dbStats.matchesDeleted}**\n` +
+              `• Challenges: **${dbStats.challengesDeleted}**\n` +
+              `• Players / Profiles: **${dbStats.playersDeleted}**\n` +
+              `• Disputes: **${dbStats.disputesDeleted}**`,
+            inline: true,
+          }
+        )
+        .setFooter({ text: 'Match District Arena Administration' });
+
+      return replyFn({ embeds: [summaryEmbed] });
+    } catch (err) {
+      return replyFn(`❌ Failed to delete arena: ${err.message}`);
     }
   }
 

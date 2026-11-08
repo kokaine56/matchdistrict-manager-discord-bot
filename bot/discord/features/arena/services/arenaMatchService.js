@@ -10,7 +10,6 @@ import {
 import {
   buildMatchChannelEmbed,
   buildResultVerificationPayload,
-  refreshArenaMatchCards,
 } from './arenaNotificationService.js';
 import { fetchMatchAvatars } from './arenaImageService.js';
 import {
@@ -29,6 +28,13 @@ export function cancelScreenshotTimer(matchId) {
     clearTimeout(activeScreenshotTimers.get(matchId));
     activeScreenshotTimers.delete(matchId);
   }
+}
+
+export function cancelAllScreenshotTimers() {
+  for (const timer of activeScreenshotTimers.values()) {
+    clearTimeout(timer);
+  }
+  activeScreenshotTimers.clear();
 }
 
 export async function handleScreenshotTimeout(guild, matchId, volunteerId) {
@@ -164,10 +170,9 @@ export async function submitRoomDetails(guild, member, matchId, roomId, roomPass
         if (msg) {
           const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
           const payload = await buildMatchChannelEmbed(updatedMatch, member.displayName, { avatars, guild, client: guild.client });
-          await queueMessageEdit(msg, payload).catch(() => {});
+          await queueMessageEdit(msg, payload).catch(() => { });
         }
       }
-      await refreshArenaMatchCards(guild, updatedMatch, { updatePrivate: false, updateVolunteerPanel: true });
 
       // Post room credentials in private channel (never in public channels)
       await queueChannelSend(channel, {
@@ -223,11 +228,9 @@ export async function startMatch(guild, member, matchId) {
         if (msg) {
           const avatars = await fetchMatchAvatars(guild.client, updatedMatch);
           const payload = await buildMatchChannelEmbed(updatedMatch, member.displayName, { avatars, guild, client: guild.client });
-          await queueMessageEdit(msg, payload).catch(() => {});
+          await queueMessageEdit(msg, payload).catch(() => { });
         }
       }
-
-      await refreshArenaMatchCards(guild, updatedMatch, { updatePrivate: false, updateVolunteerPanel: true });
 
       await queueChannelSend(channel, {
         content: `⚔️ **MATCH IS NOW LIVE!**\nGood luck to both players. The volunteer will submit the winner once the game concludes.`,
@@ -258,7 +261,7 @@ export async function initiateWinnerSubmission(guild, member, matchId, winnerSid
   const winnerPlayer = winnerSide === 'A' ? match.playerA : match.playerB;
   const loserPlayer = winnerSide === 'A' ? match.playerB : match.playerA;
 
-  const updatedMatch = await updateArenaMatch(matchId, {
+  await updateArenaMatch(matchId, {
     pendingWinnerId: winnerPlayer.discordId,
     pendingLoserId: loserPlayer.discordId,
     screenshotRequestedAt: new Date(),
@@ -279,8 +282,6 @@ export async function initiateWinnerSubmission(guild, member, matchId, winnerSid
           `<@${member.id}>, please upload the end-game scoreboard / match result screenshot in this channel within **5 minutes**.\n` +
           `*You have been temporarily granted \`Send Messages\` and \`Attach Files\` permissions for this upload.*`,
       });
-
-      await refreshArenaMatchCards(guild, updatedMatch, { updateVolunteerPanel: false });
 
       // Start 5-minute timeout timer
       cancelScreenshotTimer(matchId);
@@ -357,8 +358,6 @@ export async function processWinnerScreenshot(guild, match, volunteerMember, att
   });
   if (!transition.ok) return transition;
   const updatedMatch = transition.match;
-
-  await refreshArenaMatchCards(guild, updatedMatch);
 
   // 3. Post verification payload with Confirm and Dispute buttons
   if (match.matchChannelId) {

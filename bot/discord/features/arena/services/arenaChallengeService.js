@@ -19,12 +19,11 @@ import {
   buildVolunteerPanelEmbed,
   buildMatchChannelEmbed,
   safeDirectMessage,
-  refreshArenaChallengeCard,
 } from './arenaNotificationService.js';
 import {
   createMatchChannel,
 } from './arenaChannelService.js';
-import { queueChannelSend } from '../../../../../discordQueue.js';
+import { queueChannelSend, queueMessageEdit } from '../../../../../discordQueue.js';
 
 export async function validatePlayerForAction(member, action = 'create') {
   if (!member) return { valid: false, error: 'Member is required' };
@@ -38,7 +37,7 @@ export async function validatePlayerForAction(member, action = 'create') {
   // Refresh display name in background
   const displayName = member.displayName || member.user?.username || 'Player';
   if (player.displayName !== displayName) {
-    await upsertArenaPlayer(discordId, { displayName }).catch(() => {});
+    await upsertArenaPlayer(discordId, { displayName }).catch(() => { });
   }
 
   if (player.suspended) {
@@ -170,7 +169,19 @@ export async function handleCancelChallenge(guild, member, challengeId) {
 
   const updated = await updateArenaChallenge(challengeId, { status: ARENA_STATUS.CANCELLED });
 
-  await refreshArenaChallengeCard(guild, updated, { client: guild.client });
+  // Update embed in #available-challenges
+  if (challenge.discordChannelId && challenge.discordMessageId) {
+    const ch =
+      guild.channels.cache.get(challenge.discordChannelId) ||
+      (await guild.channels.fetch(challenge.discordChannelId).catch(() => null));
+    if (ch) {
+      const msg = ch.messages?.cache?.get(challenge.discordMessageId) || (await ch.messages?.fetch?.(challenge.discordMessageId).catch(() => null));
+      if (msg) {
+        const payload = await buildChallengeEmbed(updated, member.displayName, { guild, client: guild.client });
+        await queueMessageEdit(msg, payload).catch(() => { });
+      }
+    }
+  }
 
   await logArenaAction({
     action: 'CHALLENGE_CANCELLED',
@@ -301,8 +312,25 @@ export async function handleAcceptChallenge(guild, member, challengeId, client) 
     panelMessageId: match.panelMessageId,
   });
 
-  // 3. Update the stored public challenge image in place, without exposing private match data.
-  await refreshArenaChallengeCard(guild, updatedChallenge, { client: guild?.client || client });
+  // 3. Update Challenge embed in #available-challenges (ACCEPTED, no buttons)
+  if (challenge.discordChannelId && challenge.discordMessageId) {
+    const ch =
+      guild.channels.cache.get(challenge.discordChannelId) ||
+      (await guild.channels.fetch(challenge.discordChannelId).catch(() => null));
+    if (ch) {
+      const msg = ch.messages?.cache?.get(challenge.discordMessageId) || (await ch.messages?.fetch?.(challenge.discordMessageId).catch(() => null));
+      if (msg) {
+        const payload = await buildChallengeEmbed(updatedChallenge, creator.displayName, {
+          creatorIgn: creator.bgmiIgn,
+          creatorUid: creator.bgmiUid,
+          acceptedOpponent: accepter,
+          guild,
+          client: guild?.client || client,
+        });
+        await queueMessageEdit(msg, payload).catch(() => { });
+      }
+    }
+  }
 
   // 4. DM both players (best effort)
   const channelLink = matchChannel ? `<#${matchChannel.id}>` : `channel match-${match.matchId.toLowerCase()}`;
