@@ -699,6 +699,25 @@ export async function logMemberJoined(member, dmStatus = null) {
   });
 
   await sendAuditLog(guild, 'member', embed);
+
+  if (dmStatus) {
+    const dmTitle = dmStatus.delivered ? 'Welcome DM Delivered' : 'Welcome DM Delivery Failed';
+    const dmColor = dmStatus.delivered ? AUDIT_COLORS.SUCCESS : AUDIT_COLORS.WARN;
+    const dmFields = [
+      { name: 'Member', value: `<@${member.id}> (${member.user?.tag || member.displayName || member.id})`, inline: true },
+      { name: 'Status', value: dmStatus.delivered ? 'Delivered' : `Failed (${dmStatus.reason || 'Closed DMs'})`, inline: true },
+    ];
+    if (dmStatus.reason) {
+      dmFields.push({ name: 'Reason', value: dmStatus.reason, inline: true });
+    }
+    const dmEmbed = createAuditEmbed({
+      title: dmTitle,
+      color: dmColor,
+      description: `Welcome DM ${dmStatus.delivered ? 'delivered to' : 'failed for'} **${member.user?.tag || member.displayName || member.id}** (<@${member.id}>)`,
+      fields: dmFields,
+    });
+    await sendAuditLog(guild, 'dm', dmEmbed).catch(() => {});
+  }
 }
 
 /**

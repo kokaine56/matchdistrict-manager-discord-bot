@@ -156,6 +156,13 @@ import {
   recoverTicketChannels,
 } from './ticketService.js';
 import {
+  buildDynamicWelcomeMessage,
+  resolveDynamicWelcomeMessage,
+  resolveActiveInviteEvents,
+  resolveOpenTournaments,
+  resolveImportantChannels,
+} from './welcomeService.js';
+import {
   handleMessageModeration,
   handleMessageUpdateModeration,
   handleMuteCommand,
@@ -337,6 +344,11 @@ export {
   logTournamentAction,
   handleRemoveThreadsCommand,
   isThreadAdmin,
+  buildDynamicWelcomeMessage,
+  resolveDynamicWelcomeMessage,
+  resolveActiveInviteEvents,
+  resolveOpenTournaments,
+  resolveImportantChannels,
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1137,11 +1149,7 @@ export function isAdmin(member) {
  * Formats the official MatchDistrict welcome message for a new member.
  */
 export function buildWelcomeMessage(name) {
-  return `Hey **${name}**! Welcome to **Match District** 🎉\n\n` +
-    `Match District is an esports platform where you can join tournaments, register your squad, follow live leaderboards and results, and get verified prize payouts.\n\n` +
-    `🌐 https://matchdistrict.in\n\n` +
-    `See you in the battleground! 🚀\n` +
-    `— **Team MatchDistrict**`;
+  return buildDynamicWelcomeMessage({ name });
 }
 
 /**
@@ -2728,7 +2736,7 @@ export async function handleGuildMemberAdd(member) {
       return;
     }
 
-    const welcomeMessage = buildWelcomeMessage(name);
+    const welcomeMessage = await resolveDynamicWelcomeMessage(member);
 
     // Attempt to deliver welcome DM
     let dmDelivered = false;

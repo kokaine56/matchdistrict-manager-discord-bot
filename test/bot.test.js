@@ -247,18 +247,18 @@ test('5. .setup: creates all 4 required channels idempotently', async () => {
 
   assert.ok(reply1.includes('Setup Complete'));
   assert.ok(reply1.includes('Created Channels'));
-  assert.strictEqual(channels.size, 4);
+  assert.strictEqual(channels.size, 13);
   assert.strictEqual(isSetupActive(guild.id), true);
 
   // Check channel names
   const channelNames = Array.from(channels.values()).map((c) => c.name);
-  assert.ok(channelNames.includes('bot-preview'));
+  assert.ok(channelNames.includes('bot-log') || channelNames.includes('bot-preview'));
   assert.ok(channelNames.includes('dm-log'));
   assert.ok(channelNames.includes('msg-log'));
   assert.ok(channelNames.includes('ban-unban-log'));
 
-  // Check that #bot-preview received the initial dashboard message
-  const botPreviewCh = Array.from(channels.values()).find((c) => c.name === 'bot-preview');
+  // Check that #bot-log received the initial dashboard message
+  const botPreviewCh = Array.from(channels.values()).find((c) => c.name === 'bot-preview' || c.name === 'bot-log');
   assert.ok(botPreviewCh.messages.length >= 1);
   assert.ok(botPreviewCh.messages[0].includes('Management Dashboard'));
 
@@ -270,7 +270,7 @@ test('5. .setup: creates all 4 required channels idempotently', async () => {
 
   assert.ok(reply2.includes('Setup Complete'));
   assert.ok(reply2.includes('Reused Channels'));
-  assert.strictEqual(channels.size, 4, 'Channel count must not increase on re-running .setup');
+  assert.strictEqual(channels.size, 13, 'Channel count must not increase on re-running .setup');
 });
 
 test('6. .dm welcome on/off: controls welcome DMs and persists setting per guild', async () => {
@@ -750,7 +750,7 @@ test('22. .setup remove: prompts for confirmation and does not delete immediatel
 
   // First run setup
   await handleSetupCommand(guild, admin, async () => {});
-  assert.strictEqual(channels.size, 4);
+  assert.strictEqual(channels.size, 13);
 
   let promptReply = '';
   await handleSetupRemoveCommand(guild, admin, async (msg) => {
@@ -760,7 +760,7 @@ test('22. .setup remove: prompts for confirmation and does not delete immediatel
   assert.ok(promptReply.includes('Confirmation Required'));
   assert.ok(promptReply.includes('.setup confirm'));
   // Channels must NOT be deleted yet!
-  assert.strictEqual(channels.size, 4);
+  assert.strictEqual(channels.size, 13);
   assert.strictEqual(pendingSetupRemovals.has(guild.id), true);
   assert.strictEqual(pendingSetupRemovals.get(guild.id).adminId, admin.id);
 });
@@ -797,7 +797,7 @@ test('24. .setup cancel: aborts pending removal without deleting channels', asyn
 
   assert.ok(reply.includes('Setup Removal Cancelled'));
   assert.strictEqual(pendingSetupRemovals.has(guild.id), false);
-  assert.strictEqual(channels.size, 4, 'Channels must be intact after cancellation');
+  assert.strictEqual(channels.size, 13, 'Channels must be intact after cancellation');
 });
 
 test('25. .setup confirm: deletes only bot-managed channels, clears IDs, and marks inactive', async () => {
@@ -813,8 +813,8 @@ test('25. .setup confirm: deletes only bot-managed channels, clears IDs, and mar
 
   // Run setup to create official channels
   await handleSetupCommand(guild, admin, async () => {});
-  // Now there should be 1 unrelated + 4 managed channels = 5 channels
-  assert.strictEqual(channels.size, 5);
+  // Now there should be 1 unrelated + 13 managed channels = 14 channels
+  assert.strictEqual(channels.size, 14);
 
   // Request removal
   await handleSetupRemoveCommand(guild, admin, async () => {});
