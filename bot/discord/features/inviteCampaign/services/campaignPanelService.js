@@ -238,36 +238,37 @@ export function buildLeaderboardMessagePayload(campaign, rows, pngResult) {
 
 async function fetchLeaderboardAvatars(client, rows) {
   const avatars = new Map();
-  if (typeof globalThis.fetch !== 'function') return avatars;
+  if (typeof globalThis.fetch !== 'function' || !client) return avatars;
   await Promise.all(rows.map(async (row) => {
     const userId = String(row.userId || '');
     if (!userId) return;
     let avatarUrl = null;
     try {
-      const user = await client.users?.fetch?.(userId);
-      avatarUrl = user?.displayAvatarURL?.({ extension: 'png', size: 64, forceStatic: true }) || null;
+      const user =
+        client.users?.cache?.get(userId) ||
+        (await client.users?.fetch?.(userId).catch(() => null));
+      // Only fetch when the user has a custom Discord profile picture
+      if (user && user.avatar) {
+        avatarUrl =
+          typeof user.avatarURL === 'function'
+            ? user.avatarURL({ extension: 'png', size: 64, forceStatic: true })
+            : user.displayAvatarURL?.({ extension: 'png', size: 64, forceStatic: true });
+      }
     } catch {
-      // Fall back to Discord's deterministic default avatar for this user ID below.
+      avatarUrl = null;
     }
-    const urls = avatarUrl ? [avatarUrl] : [];
+    if (!avatarUrl) return;
+
     try {
-      const defaultIndex = Number((BigInt(userId) >> 22n) % 6n);
-      urls.push(`https://cdn.discordapp.com/embed/avatars/${defaultIndex}.png`);
-    } catch {
-      return;
-    }
-    for (const url of urls) {
-      try {
-        const response = await fetch(url, { signal: AbortSignal.timeout(4000) });
-        if (!response.ok) continue;
+      const response = await fetch(avatarUrl, { signal: AbortSignal.timeout(4000) });
+      if (response.ok) {
         const bytes = Buffer.from(await response.arrayBuffer());
         if (bytes.length <= 1024 * 1024) {
           avatars.set(userId, bytes);
-          return;
         }
-      } catch {
-        // Try the Discord default avatar when the custom avatar is unavailable.
       }
+    } catch {
+      // Fallback is automatically rendered by drawCircularAvatar
     }
   }));
   return avatars;
@@ -415,59 +416,4 @@ export async function postCampaignFinalResults(client, campaign) {
     isFinalizing: true,
   });
   return res?.message || null;
-}
-
-const pendingAutoUpdates = new Map();
-
-/**
- * Schedules an automatic refresh of the campaign's leaderboard message when invite counts change.
- * Debounces rapid successive changes (e.g. bulk joins/leaves) to avoid hitting Discord rate limits.
- *
- * @param {import('discord.js').Client} client
- * @param {string|object} campaignOrId
- * @param {number} [delayMs=1000]
- */
-export function scheduleLeaderboardAutoUpdate(client, campaignOrId, delayMs = 1000) {
-  const campaignId = typeof campaignOrId === 'string' ? campaignOrId : campaignOrId?.campaignId;
-  if (!campaignId || !client) return;
-
-  if (pendingAutoUpdates.has(campaignId)) {
-    clearTimeout(pendingAutoUpdates.get(campaignId).timer);
-  }
-
-  const runUpdate = async () => {
-    pendingAutoUpdates.delete(campaignId);
-    try {
-      const fresh = await getInviteCampaignById(campaignId);
-      if (!fresh || fresh.status === CAMPAIGN_STATUS.ENDED || !fresh.leaderboardMessageId) {
-        return;
-      }
-      await ensureOrUpdateLeaderboardMessage(client, fresh, {
-        allowCreateIfMissing: false,
-      });
-    } catch (err) {
-      console.warn(
-        `[InviteCampaign] ⚠️ Auto-update leaderboard error for ${campaignId}:`,
-        err.message
-      );
-    }
-  };
-
-  if (delayMs <= 0) {
-    runUpdate();
-    return;
-  }
-
-  const timer = setTimeout(runUpdate, delayMs);
-  if (typeof timer?.unref === 'function') {
-    timer.unref();
-  }
-  pendingAutoUpdates.set(campaignId, { timer, client, campaignId });
-}
-
-export function clearPendingLeaderboardUpdates() {
-  for (const entry of pendingAutoUpdates.values()) {
-    if (entry.timer) clearTimeout(entry.timer);
-  }
-  pendingAutoUpdates.clear();
 }

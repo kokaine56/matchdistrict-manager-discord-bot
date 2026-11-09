@@ -38,7 +38,6 @@ import {
 import {
   ensureOrUpdateCampaignPanel,
   ensureOrUpdateLeaderboardMessage,
-  clearPendingLeaderboardUpdates,
 } from '../services/campaignPanelService.js';
 import {
   parseAndValidateRewards,
@@ -71,7 +70,6 @@ export function clearInviteInteractionCaches() {
   generateButtonCooldowns.clear();
   leaderboardRefreshCooldowns.clear();
   activeUserInviteViews.clear();
-  clearPendingLeaderboardUpdates();
 }
 
 /**

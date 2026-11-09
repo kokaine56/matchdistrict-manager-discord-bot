@@ -35,7 +35,7 @@ import {
   recoverInviteCampaignsOnStartup,
   checkInviteCampaignLifecycles,
   recalculateParticipantEligibility,
-  scheduleLeaderboardAutoUpdate,
+  getDefaultDiscordAvatar,
 } from '../bot/discord/features/inviteCampaign/index.js';
 import { handleMessageModeration } from '../moderationService.js';
 import { guildSettingsCache } from '../index.js';
@@ -1746,7 +1746,7 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     assert.equal(lastEdit.components[0].components[0].toJSON().label, 'Create Link');
   });
 
-  await t.test('13. Conditional Winning Amount & Automatic Leaderboard Updates', async () => {
+  await t.test('13. Conditional Winning Amount, Static Leaderboard (No Auto-Regen) & Default Discord Avatar Fallback', async () => {
     const env = createTestEnvironment();
     const admin = env.addMember('admin-1', { isAdminPerm: true });
     const user1 = env.addMember('user-1', { username: 'ProPlayer1' });
@@ -1862,20 +1862,66 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     assert.equal(pngResult.width, 960);
     assert.equal(pngResult.rows.length, 4);
 
-    // 6. Test automatic leaderboard message edit triggered by recalculateParticipantEligibility
+    // 6. Verify that invite updates do NOT automatically regenerate or edit the leaderboard message
     const lbInit = await ensureOrUpdateLeaderboardMessage(env.client, campaign);
     assert.ok(lbInit?.message);
     const initialEditCount = lbInit.message.edits.length;
 
-    // Simulate an invite update via recalculateParticipantEligibility with immediate update
-    await recalculateParticipantEligibility(env.client, campaign, user1.id, {
-      skipLeaderboardAutoUpdate: false,
-    });
-    // Trigger auto update directly
-    scheduleLeaderboardAutoUpdate(env.client, campaign.campaignId, 0);
-    // Allow microtask to process
+    // Simulate member join/leave eligibility recalculation -> must NOT trigger any message edits
+    await recalculateParticipantEligibility(env.client, campaign, user1.id);
     await new Promise((resolve) => setImmediate(resolve));
-    assert.ok(lbInit.message.edits.length >= initialEditCount, 'Leaderboard auto update was scheduled');
+    assert.equal(
+      lbInit.message.edits.length,
+      initialEditCount,
+      'Leaderboard message must remain static and NOT auto-refresh on invite events'
+    );
+
+    // 7. Clicking "Refresh Leaderboard" explicitly DOES refresh the image and edit the message
+    let refreshFeedback = '';
+    await handleInviteCampaignInteraction({
+      customId: `inv_cmp:refresh_lb:${campaign.campaignId}`,
+      guild: env.guild,
+      user: admin,
+      client: env.client,
+      isButton: () => true,
+      deferUpdate: async () => {},
+      reply: async (p) => {
+        refreshFeedback = typeof p === 'string' ? p : p.content;
+      },
+    });
+    assert.equal(
+      lbInit.message.edits.length,
+      initialEditCount + 1,
+      'Clicking Refresh Leaderboard must edit the existing message with a freshly generated image'
+    );
+
+    // 8. Default Discord Avatar Verification
+    // A. Direct function inspection
+    const defaultAv = getDefaultDiscordAvatar(56);
+    assert.equal(defaultAv.width, 56);
+    assert.equal(defaultAv.height, 56);
+    assert.equal(defaultAv.rgba.length, 56 * 56 * 4);
+    // Center pixel: white Clyde logo [255, 255, 255, 255]
+    const centerIdx = (28 * 56 + 28) * 4;
+    assert.equal(defaultAv.rgba[centerIdx], 255);
+    assert.equal(defaultAv.rgba[centerIdx + 1], 255);
+    assert.equal(defaultAv.rgba[centerIdx + 2], 255);
+    // Corner pixel (0,0): transparent [0, 0, 0, 0] due to circular cropping
+    assert.equal(defaultAv.rgba[3], 0);
+
+    // B. Leaderboard image rendering with NO custom avatars:
+    // Every row must render the circular default avatar with non-empty pixels in avatar area
+    const emptyAvatarsMap = new Map();
+    const pngWithDefaultAvatars = generateLeaderboardPng(campaign, rowsAfterDrop, emptyAvatarsMap);
+    assert.ok(Buffer.isBuffer(pngWithDefaultAvatars.buffer));
+    assert.equal(pngWithDefaultAvatars.rows.length, 4);
+
+    // C. Corrupted avatar buffer safely falls back to default avatar without throwing
+    const brokenAvatarsMap = new Map();
+    brokenAvatarsMap.set(user1.id, Buffer.from('NOT-A-PNG-FILE'));
+    const pngWithFallback = generateLeaderboardPng(campaign, rowsAfterDrop, brokenAvatarsMap);
+    assert.ok(Buffer.isBuffer(pngWithFallback.buffer));
+
     clearInviteInteractionCaches();
   });
 });

@@ -1,4 +1,5 @@
 import zlib from 'node:zlib';
+import { Resvg } from '@resvg/resvg-js';
 
 /**
  * Parses and normalizes reward configuration input into a sorted array of
@@ -405,9 +406,69 @@ function decodeAvatarPng(buffer) {
   return { width, height, rgba };
 }
 
-function drawCircularAvatar(rgba, width, height, avatar, x, y, size) {
-  const decoded = decodeAvatarPng(avatar);
+let cachedDefaultDiscordAvatar = null;
+
+/**
+ * Returns a cached, circular 56x56 default avatar containing the official Discord application logo
+ * on Discord Blurple (#5865F2) with circular alpha masking.
+ *
+ * @param {number} [size=56]
+ * @returns {{ size: number, width: number, height: number, rgba: Buffer }}
+ */
+export function getDefaultDiscordAvatar(size = 56) {
+  if (cachedDefaultDiscordAvatar && cachedDefaultDiscordAvatar.size === size) {
+    return cachedDefaultDiscordAvatar;
+  }
+
+  try {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 56 56">
+      <circle cx="28" cy="28" r="28" fill="#5865F2"/>
+      <path fill="#FFFFFF" transform="translate(10, 14.5) scale(0.283)" d="M107.7,8.07A105.15,105.15,0,0,0,81.47,0a72.06,72.06,0,0,0-3.36,6.83A97.68,97.68,0,0,0,49,6.83,72.37,72.37,0,0,0,45.64,0,105.89,105.89,0,0,0,19.39,8.09C2.79,32.65-1.71,56.6.54,80.21h0A105.73,105.73,0,0,0,32.71,96.36,77.7,77.7,0,0,0,39.6,85.25a68.42,68.42,0,0,1-10.85-5.18c.91-.66,1.8-1.34,2.66-2a75.57,75.57,0,0,0,64.32,0c.87.71,1.76,1.39,2.66,2a68.68,68.68,0,0,1-10.87,5.19,77,77,0,0,0,6.89,11.1A105.25,105.25,0,0,0,126.6,80.22h0C129.24,52.84,122.09,29.11,107.7,8.07ZM42.45,65.69C36.18,65.69,31,60,31,53s5-12.74,11.43-12.74S54,45.91,53.89,53,48.84,65.69,42.45,65.69Zm42.24,0C78.41,65.69,73.25,60,73.25,53s5-12.74,11.44-12.74S96.23,45.91,96.12,53,91.08,65.69,84.69,65.69Z"/>
+    </svg>`;
+    const rendered = new Resvg(svg).render();
+    cachedDefaultDiscordAvatar = {
+      size,
+      width: rendered.width,
+      height: rendered.height,
+      rgba: rendered.pixels,
+    };
+    return cachedDefaultDiscordAvatar;
+  } catch {
+    const radius = size / 2;
+    const rgba = Buffer.alloc(size * size * 4);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const ox = x + 0.5 - radius;
+        const oy = y + 0.5 - radius;
+        if (ox * ox + oy * oy <= radius * radius) {
+          const idx = (y * size + x) * 4;
+          rgba[idx] = 88;
+          rgba[idx + 1] = 101;
+          rgba[idx + 2] = 242;
+          rgba[idx + 3] = 255;
+        }
+      }
+    }
+    cachedDefaultDiscordAvatar = {
+      size,
+      width: size,
+      height: size,
+      rgba,
+    };
+    return cachedDefaultDiscordAvatar;
+  }
+}
+
+export function drawCircularAvatar(rgba, width, height, avatar, x, y, size) {
+  let decoded = null;
+  if (avatar && Buffer.isBuffer(avatar)) {
+    decoded = decodeAvatarPng(avatar);
+  }
+  if (!decoded) {
+    decoded = getDefaultDiscordAvatar(size);
+  }
   if (!decoded) return;
+
   const radius = size / 2;
   for (let dy = 0; dy < size; dy++) {
     for (let dx = 0; dx < size; dx++) {
@@ -416,9 +477,23 @@ function drawCircularAvatar(rgba, width, height, avatar, x, y, size) {
       const sx = Math.min(decoded.width - 1, Math.floor((dx / size) * decoded.width));
       const sy = Math.min(decoded.height - 1, Math.floor((dy / size) * decoded.height));
       const si = (sy * decoded.width + sx) * 4;
+      const a = decoded.rgba[si + 3];
+      if (a === 0) continue;
+
       const di = ((y + dy) * width + x + dx) * 4;
-      rgba[di] = decoded.rgba[si]; rgba[di + 1] = decoded.rgba[si + 1];
-      rgba[di + 2] = decoded.rgba[si + 2]; rgba[di + 3] = decoded.rgba[si + 3];
+      if (a === 255) {
+        rgba[di] = decoded.rgba[si];
+        rgba[di + 1] = decoded.rgba[si + 1];
+        rgba[di + 2] = decoded.rgba[si + 2];
+        rgba[di + 3] = 255;
+      } else {
+        const aNorm = a / 255;
+        const invA = 1 - aNorm;
+        rgba[di] = Math.round(decoded.rgba[si] * aNorm + rgba[di] * invA);
+        rgba[di + 1] = Math.round(decoded.rgba[si + 1] * aNorm + rgba[di + 1] * invA);
+        rgba[di + 2] = Math.round(decoded.rgba[si + 2] * aNorm + rgba[di + 2] * invA);
+        rgba[di + 3] = 255;
+      }
     }
   }
 }
@@ -658,7 +733,7 @@ export function generateLeaderboardPng(campaign, rows = [], avatars = new Map())
       const avatarX = 155;
       const avatarY = ry + Math.floor((rowHeight - avatarSize) / 2);
       const avatarBuffer = avatars instanceof Map ? avatars.get(String(row.userId)) : avatars?.[String(row.userId)];
-      if (avatarBuffer) drawCircularAvatar(rgba, width, height, avatarBuffer, avatarX, avatarY, avatarSize);
+      drawCircularAvatar(rgba, width, height, avatarBuffer, avatarX, avatarY, avatarSize);
       drawText(
         rgba,
         width,
