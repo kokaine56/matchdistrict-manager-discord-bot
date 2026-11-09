@@ -34,6 +34,8 @@ import {
   handleInviteCampaignMemberRemove,
   recoverInviteCampaignsOnStartup,
   checkInviteCampaignLifecycles,
+  recalculateParticipantEligibility,
+  scheduleLeaderboardAutoUpdate,
 } from '../bot/discord/features/inviteCampaign/index.js';
 import { handleMessageModeration } from '../moderationService.js';
 import { guildSettingsCache } from '../index.js';
@@ -289,10 +291,17 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     let updated = await getInviteCampaignById(campaign.campaignId);
     assert.equal(updated.minInviteThreshold, 10);
     assert.equal(updated.requiredInvites, 10);
-    assert.deepEqual(computeCampaignLeaderboardRows(updated, [
+    const rows = computeCampaignLeaderboardRows(updated, [
       { userId: 'u1', successfulInvites: 9 },
       { userId: 'u2', successfulInvites: 10 },
-    ], env.guild).map((row) => row.userId), ['u2']);
+    ], env.guild);
+    // Both participants appear on leaderboard in sorted order
+    assert.deepEqual(rows.map((row) => row.userId), ['u2', 'u1']);
+    // u2 (10 invites >= 10 threshold) qualifies for prize #1 (₹50)
+    assert.equal(rows[0].winningAmountFormatted, '₹50');
+    // u1 (9 invites < 10 threshold) has a blank winning amount cell
+    assert.equal(rows[1].winningAmountFormatted, '');
+    assert.equal(rows[1].winningAmount, 0);
 
     await handleInviteCommand(env.guild, admin, env.inviteChannel, ['min', '0'], (text) => { response = text; }, env.client);
     assert.match(response, /positive whole number/);
@@ -542,7 +551,7 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     ]);
   });
 
-  await t.test('3. Minimum Invite Threshold Visibility (Below Threshold Hidden, Reaching Threshold Visible, Dropping Below Disappears)', async () => {
+  await t.test('3. Conditional Winning Amount & Show All Inviters (All Inviters Visible, Blank When Below Threshold or Outside Prize Ranks)', async () => {
     const env = createTestEnvironment();
     const admin = env.addMember('admin-1', { isAdminPerm: true });
     const userA = env.addMember('user-a', { username: 'AlphaUser' });
@@ -550,7 +559,7 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     const userC = env.addMember('user-c', { username: 'CharlieUser' });
     const userD = env.addMember('user-d', { username: 'DeltaUser' });
 
-    // Threshold = 10; Rewards: #1=50, #2=20, #3=10
+    // Threshold = 10; Rewards: #1=50, #2=20, #3=10 (only top 3 get prizes)
     const campaign = await createInviteCampaign({
       guildId: env.guildId,
       name: 'Threshold 10 Event',
@@ -594,27 +603,46 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
       await getCampaignParticipant(campaign.campaignId, userD.id),
     ];
 
-    // Users with 3 and 9 invites MUST NOT appear; users with 15 and 10 MUST appear
+    // All 4 inviters must appear on leaderboard in descending order of invites
     let rows = computeCampaignLeaderboardRows(campaign, participants, env.guild);
-    assert.equal(rows.length, 2);
+    assert.equal(rows.length, 4, 'All active inviters must appear on the leaderboard');
+
+    // Rank 1: userD with 15 invites (meets threshold >= 10, qualifies for #1 prize ₹50)
     assert.equal(rows[0].userId, userD.id);
     assert.equal(rows[0].invites, 15);
     assert.equal(rows[0].rank, 1);
     assert.equal(rows[0].winningAmountFormatted, '₹50');
+    assert.equal(rows[0].winningAmount, 50);
 
+    // Rank 2: userC with 10 invites (meets threshold >= 10, qualifies for #2 prize ₹20)
     assert.equal(rows[1].userId, userC.id);
     assert.equal(rows[1].invites, 10);
     assert.equal(rows[1].rank, 2);
     assert.equal(rows[1].winningAmountFormatted, '₹20');
+    assert.equal(rows[1].winningAmount, 20);
 
-    // User B reaches 10 invites -> automatically becomes visible on next update
+    // Rank 3: userB with 9 invites (below threshold 10 -> Winning Amount must be completely blank, not ₹0)
+    assert.equal(rows[2].userId, userB.id);
+    assert.equal(rows[2].invites, 9);
+    assert.equal(rows[2].rank, 3);
+    assert.equal(rows[2].winningAmountFormatted, '', 'Below threshold must be completely blank');
+    assert.equal(rows[2].winningAmount, 0);
+
+    // Rank 4: userA with 3 invites (below threshold 10 -> Winning Amount must be completely blank, not ₹0)
+    assert.equal(rows[3].userId, userA.id);
+    assert.equal(rows[3].invites, 3);
+    assert.equal(rows[3].rank, 4);
+    assert.equal(rows[3].winningAmountFormatted, '', 'Below threshold must be completely blank');
+    assert.equal(rows[3].winningAmount, 0);
+
+    // User B crosses threshold from 9 to 11 invites -> qualifies for prize at their rank!
     await upsertCampaignParticipant(campaign.campaignId, env.guildId, userB.id, {
-      successfulInvites: 10,
+      successfulInvites: 11,
       isEligible: true,
       eligibleAt: new Date('2026-11-07T11:00:00Z'),
     });
 
-    // User C drops from 10 to 9 invites (due to leave) -> disappears from leaderboard!
+    // User C drops from 10 to 9 invites (due to leave) -> remains on leaderboard but Winning Amount is removed immediately
     await upsertCampaignParticipant(campaign.campaignId, env.guildId, userC.id, {
       successfulInvites: 9,
       isEligible: false,
@@ -629,10 +657,65 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     ];
 
     rows = computeCampaignLeaderboardRows(campaign, updatedParticipants, env.guild);
-    assert.equal(rows.length, 2);
+    assert.equal(rows.length, 4, 'All 4 inviters still visible on leaderboard');
+    // #1 userD (15 invites) -> ₹50
     assert.equal(rows[0].userId, userD.id);
+    assert.equal(rows[0].winningAmountFormatted, '₹50');
+    // #2 userB (11 invites) -> now qualifies for #2 prize ₹20
     assert.equal(rows[1].userId, userB.id);
-    assert.ok(!rows.some((r) => r.userId === userC.id), 'User C who dropped to 9 must not appear');
+    assert.equal(rows[1].rank, 2);
+    assert.equal(rows[1].winningAmountFormatted, '₹20');
+    // #3 userC (dropped to 9 invites < 10) -> winning amount removed immediately to blank
+    assert.equal(rows[2].userId, userC.id);
+    assert.equal(rows[2].rank, 3);
+    assert.equal(rows[2].invites, 9);
+    assert.equal(rows[2].winningAmountFormatted, '', 'Dropped below threshold must have blank winning amount');
+    assert.equal(rows[2].winningAmount, 0);
+    // #4 userA (3 invites) -> blank
+    assert.equal(rows[3].userId, userA.id);
+    assert.equal(rows[3].winningAmountFormatted, '');
+
+    // Rule: Qualified for threshold but outside prize positions must also be completely blank
+    // Set userA to 10 invites (meets threshold >= 10), but rank 4 is outside top 3 prize rewards
+    await upsertCampaignParticipant(campaign.campaignId, env.guildId, userA.id, {
+      successfulInvites: 10,
+      isEligible: true,
+      eligibleAt: new Date('2026-11-07T12:00:00Z'),
+    });
+    // Set userC to 12 invites so userA is at Rank 4
+    await upsertCampaignParticipant(campaign.campaignId, env.guildId, userC.id, {
+      successfulInvites: 12,
+      isEligible: true,
+      eligibleAt: new Date('2026-11-07T12:00:00Z'),
+    });
+
+    const fourQualifiedParticipants = [
+      await getCampaignParticipant(campaign.campaignId, userA.id),
+      await getCampaignParticipant(campaign.campaignId, userB.id),
+      await getCampaignParticipant(campaign.campaignId, userC.id),
+      await getCampaignParticipant(campaign.campaignId, userD.id),
+    ];
+    rows = computeCampaignLeaderboardRows(campaign, fourQualifiedParticipants, env.guild);
+    assert.equal(rows.length, 4);
+    // userD: 15 (#1) -> ₹50
+    assert.equal(rows[0].userId, userD.id);
+    assert.equal(rows[0].winningAmountFormatted, '₹50');
+    // userC: 12 (#2) -> ₹20
+    assert.equal(rows[1].userId, userC.id);
+    assert.equal(rows[1].winningAmountFormatted, '₹20');
+    // userB: 11 (#3) -> ₹10
+    assert.equal(rows[2].userId, userB.id);
+    assert.equal(rows[2].winningAmountFormatted, '₹10');
+    // userA: 10 (#4) meets threshold >= 10, but outside top 3 rewards -> MUST BE COMPLETELY BLANK
+    assert.equal(rows[3].userId, userA.id);
+    assert.equal(rows[3].rank, 4);
+    assert.equal(rows[3].winningAmountFormatted, '', 'Meets threshold but outside prize positions must be blank');
+    assert.equal(rows[3].winningAmount, 0);
+
+    // Verify PNG generator runs on rows with blank winning amounts without error
+    const pngResult = generateLeaderboardPng(campaign, rows);
+    assert.ok(Buffer.isBuffer(pngResult.buffer));
+    assert.equal(pngResult.rows.length, 4);
   });
 
   await t.test('4. Dynamic Ranking, Reward Reassignment When Rankings Change & Deterministic Tie-Breaking', async () => {
@@ -1661,5 +1744,138 @@ test('Invite & Earn — Configurable Rewards, Minimum Threshold & Live Image Lea
     assert.ok(restoredEmbedJson.fields.some((f) => f.name === '⏰ Ends At (IST)'));
     assert.equal(restoredEmbedJson.image, undefined);
     assert.equal(lastEdit.components[0].components[0].toJSON().label, 'Create Link');
+  });
+
+  await t.test('13. Conditional Winning Amount & Automatic Leaderboard Updates', async () => {
+    const env = createTestEnvironment();
+    const admin = env.addMember('admin-1', { isAdminPerm: true });
+    const user1 = env.addMember('user-1', { username: 'ProPlayer1' });
+    const user2 = env.addMember('user-2', { username: 'ProPlayer2' });
+    const user3 = env.addMember('user-3', { username: 'ProPlayer3' });
+    const user4 = env.addMember('user-4', { username: 'ProPlayer4' });
+
+    // Campaign: threshold = 5, prizes for top 2 only (#1 = ₹100, #2 = ₹50)
+    const campaign = await createInviteCampaign({
+      guildId: env.guildId,
+      name: 'Conditional Prize Championship',
+      description: 'Top 2 inviters win prizes!',
+      status: CAMPAIGN_STATUS.ACTIVE,
+      minInviteThreshold: 5,
+      rewards: [
+        { position: 1, amount: 100 },
+        { position: 2, amount: 50 },
+      ],
+      endAt: new Date(Date.now() + 86400000),
+      inviteChannelId: env.inviteChannel.id,
+      announcementChannelId: env.anncChannel.id,
+      createdBy: admin.id,
+    });
+
+    // 1. Initial State: No participants with >0 invites -> empty state
+    const emptyRows = computeCampaignLeaderboardRows(campaign, [], env.guild);
+    assert.equal(emptyRows.length, 0);
+    const emptyPng = generateLeaderboardPng(campaign, emptyRows);
+    assert.ok(Buffer.isBuffer(emptyPng.buffer));
+
+    // 2. Add participants with varying invite counts
+    // user1: 10 invites (meets threshold >= 5, rank 1 -> ₹100)
+    // user2: 6 invites (meets threshold >= 5, rank 2 -> ₹50)
+    // user3: 5 invites (meets threshold >= 5, rank 3 -> outside top 2 prize positions -> blank!)
+    // user4: 2 invites (below threshold 5, rank 4 -> below threshold -> blank!)
+    const participants = [
+      { userId: user1.id, username: 'ProPlayer1', successfulInvites: 10, eligibleAt: new Date('2026-11-07T08:00:00Z') },
+      { userId: user2.id, username: 'ProPlayer2', successfulInvites: 6, eligibleAt: new Date('2026-11-07T08:30:00Z') },
+      { userId: user3.id, username: 'ProPlayer3', successfulInvites: 5, eligibleAt: new Date('2026-11-07T09:00:00Z') },
+      { userId: user4.id, username: 'ProPlayer4', successfulInvites: 2, eligibleAt: null },
+    ];
+
+    const rows = computeCampaignLeaderboardRows(campaign, participants, env.guild);
+    assert.equal(rows.length, 4, 'All 4 inviters must appear on the leaderboard');
+
+    // Rank 1: user1 (10 invites >= 5 threshold, rank 1 prize is ₹100)
+    assert.equal(rows[0].userId, user1.id);
+    assert.equal(rows[0].rank, 1);
+    assert.equal(rows[0].invites, 10);
+    assert.equal(rows[0].winningAmount, 100);
+    assert.equal(rows[0].winningAmountFormatted, '₹100');
+
+    // Rank 2: user2 (6 invites >= 5 threshold, rank 2 prize is ₹50)
+    assert.equal(rows[1].userId, user2.id);
+    assert.equal(rows[1].rank, 2);
+    assert.equal(rows[1].invites, 6);
+    assert.equal(rows[1].winningAmount, 50);
+    assert.equal(rows[1].winningAmountFormatted, '₹50');
+
+    // Rank 3: user3 (5 invites >= 5 threshold, but outside configured top 2 positions -> blank!)
+    assert.equal(rows[2].userId, user3.id);
+    assert.equal(rows[2].rank, 3);
+    assert.equal(rows[2].invites, 5);
+    assert.equal(rows[2].winningAmount, 0);
+    assert.equal(rows[2].winningAmountFormatted, '', 'Outside prize ranks must be completely blank');
+
+    // Rank 4: user4 (2 invites < 5 threshold -> below threshold -> blank!)
+    assert.equal(rows[3].userId, user4.id);
+    assert.equal(rows[3].rank, 4);
+    assert.equal(rows[3].invites, 2);
+    assert.equal(rows[3].winningAmount, 0);
+    assert.equal(rows[3].winningAmountFormatted, '', 'Below threshold must be completely blank');
+
+    // 3. User 4 crosses threshold from 2 to 8 invites -> becomes Rank 2!
+    // User 2 (6 invites) is pushed to Rank 3 (outside top 2 prizes -> becomes blank)!
+    const updatedParticipants1 = [
+      { userId: user1.id, username: 'ProPlayer1', successfulInvites: 10, eligibleAt: new Date('2026-11-07T08:00:00Z') },
+      { userId: user4.id, username: 'ProPlayer4', successfulInvites: 8, eligibleAt: new Date('2026-11-07T09:30:00Z') },
+      { userId: user2.id, username: 'ProPlayer2', successfulInvites: 6, eligibleAt: new Date('2026-11-07T08:30:00Z') },
+      { userId: user3.id, username: 'ProPlayer3', successfulInvites: 5, eligibleAt: new Date('2026-11-07T09:00:00Z') },
+    ];
+    const rowsAfterOvertake = computeCampaignLeaderboardRows(campaign, updatedParticipants1, env.guild);
+    assert.equal(rowsAfterOvertake[1].userId, user4.id);
+    assert.equal(rowsAfterOvertake[1].rank, 2);
+    assert.equal(rowsAfterOvertake[1].winningAmountFormatted, '₹50', 'Crossing threshold and entering top 2 receives prize');
+    assert.equal(rowsAfterOvertake[2].userId, user2.id);
+    assert.equal(rowsAfterOvertake[2].rank, 3);
+    assert.equal(rowsAfterOvertake[2].winningAmountFormatted, '', 'Pushed out of prize positions becomes blank');
+
+    // 4. User 1 falls below threshold (drops from 10 to 4 invites due to invited members leaving)
+    const updatedParticipants2 = [
+      { userId: user4.id, username: 'ProPlayer4', successfulInvites: 8, eligibleAt: new Date('2026-11-07T09:30:00Z') },
+      { userId: user2.id, username: 'ProPlayer2', successfulInvites: 6, eligibleAt: new Date('2026-11-07T08:30:00Z') },
+      { userId: user3.id, username: 'ProPlayer3', successfulInvites: 5, eligibleAt: new Date('2026-11-07T09:00:00Z') },
+      { userId: user1.id, username: 'ProPlayer1', successfulInvites: 4, eligibleAt: null },
+    ];
+    const rowsAfterDrop = computeCampaignLeaderboardRows(campaign, updatedParticipants2, env.guild);
+    assert.equal(rowsAfterDrop[0].userId, user4.id);
+    assert.equal(rowsAfterDrop[0].rank, 1);
+    assert.equal(rowsAfterDrop[0].winningAmountFormatted, '₹100');
+    assert.equal(rowsAfterDrop[1].userId, user2.id);
+    assert.equal(rowsAfterDrop[1].rank, 2);
+    assert.equal(rowsAfterDrop[1].winningAmountFormatted, '₹50');
+    assert.equal(rowsAfterDrop[3].userId, user1.id);
+    assert.equal(rowsAfterDrop[3].rank, 4);
+    assert.equal(rowsAfterDrop[3].invites, 4);
+    assert.equal(rowsAfterDrop[3].winningAmount, 0);
+    assert.equal(rowsAfterDrop[3].winningAmountFormatted, '', 'Falling below threshold strips prize amount immediately');
+
+    // 5. Test PNG generator on rows with mixed blank and filled winning amounts
+    const pngResult = generateLeaderboardPng(campaign, rowsAfterDrop);
+    assert.ok(Buffer.isBuffer(pngResult.buffer));
+    assert.equal(pngResult.width, 960);
+    assert.equal(pngResult.rows.length, 4);
+
+    // 6. Test automatic leaderboard message edit triggered by recalculateParticipantEligibility
+    const lbInit = await ensureOrUpdateLeaderboardMessage(env.client, campaign);
+    assert.ok(lbInit?.message);
+    const initialEditCount = lbInit.message.edits.length;
+
+    // Simulate an invite update via recalculateParticipantEligibility with immediate update
+    await recalculateParticipantEligibility(env.client, campaign, user1.id, {
+      skipLeaderboardAutoUpdate: false,
+    });
+    // Trigger auto update directly
+    scheduleLeaderboardAutoUpdate(env.client, campaign.campaignId, 0);
+    // Allow microtask to process
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(lbInit.message.edits.length >= initialEditCount, 'Leaderboard auto update was scheduled');
+    clearInviteInteractionCaches();
   });
 });

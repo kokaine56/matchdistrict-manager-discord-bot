@@ -133,12 +133,19 @@ export function formatRewardsSummary(rewards) {
 }
 
 /**
- * Computes the sorted, threshold-filtered leaderboard rows for a campaign.
+ * Computes the sorted leaderboard rows for a campaign.
  *
- * Deterministic Tie-Breaking Rule:
- * 1. Higher valid invite count (`successfulInvites`) ranks first.
- * 2. Earlier timestamp of reaching threshold / latest valid invite (`eligibleAt` ascending) ranks first.
- * 3. Lexical comparison of Discord `userId` (`String(a.userId).localeCompare(String(b.userId))`) breaks any remaining tie.
+ * Rules:
+ * 1. Shows all active participants who have made at least one successful invite.
+ * 2. Deterministic Tie-Breaking:
+ *    - Higher valid invite count (`successfulInvites`) ranks first.
+ *    - Earlier timestamp of reaching threshold / latest valid invite (`eligibleAt` ascending) ranks first.
+ *    - Lexical comparison of Discord `userId` (`String(a.userId).localeCompare(String(b.userId))`) breaks any remaining tie.
+ * 3. Conditional Winning Amount:
+ *    - Members below the minimum invite threshold have a completely blank Winning Amount cell.
+ *    - Once a member crosses the minimum threshold, their rank determines their reward amount.
+ *    - Participants qualifying for threshold but outside configured prize positions also have a blank Winning Amount cell.
+ *    - If a member drops below the threshold, their winning amount is immediately removed/blank.
  *
  * @param {object} campaign
  * @param {Array<object>} participants
@@ -161,13 +168,15 @@ export function computeCampaignLeaderboardRows(campaign, participants, guild = n
   );
   const rewards = Array.isArray(campaign.rewards) ? campaign.rewards : [];
 
-  const qualified = participants.filter((p) => {
+  // Show all active participants who have made at least one successful invite
+  const activeInviters = participants.filter((p) => {
     if (!p || p.disqualified || p.inviterLeftServer) return false;
     const count = Number(p.successfulInvites || 0);
-    return count >= threshold;
+    return count > 0;
   });
 
-  qualified.sort((a, b) => {
+  // Sort participants by successful invites descending with deterministic tie-breaking
+  activeInviters.sort((a, b) => {
     const countDiff = Number(b.successfulInvites || 0) - Number(a.successfulInvites || 0);
     if (countDiff !== 0) return countDiff;
 
@@ -178,7 +187,7 @@ export function computeCampaignLeaderboardRows(campaign, participants, guild = n
     return String(a.userId || '').localeCompare(String(b.userId || ''));
   });
 
-  return qualified.map((p, index) => {
+  return activeInviters.map((p, index) => {
     const rank = index + 1;
     const uid = String(p.userId);
     const cachedMember = guild?.members?.cache?.get?.(uid);
@@ -189,15 +198,26 @@ export function computeCampaignLeaderboardRows(campaign, participants, guild = n
       cachedMember?.user?.username ||
       `User#${uid.slice(-4)}`;
 
-    const winningAmount = getRewardAmountForRank(rewards, rank);
+    const count = Number(p.successfulInvites || 0);
+
+    // Conditional Winning Amount:
+    // - Below minimum invite threshold -> completely blank (winningAmount = 0, winningAmountFormatted = '')
+    // - Meets threshold & within prize positions -> configured reward amount formatted
+    // - Meets threshold & outside prize positions -> completely blank
+    const meetsThreshold = count >= threshold;
+    const prizeAmount = getRewardAmountForRank(rewards, rank);
+    const qualifiesForPrize = meetsThreshold && prizeAmount > 0;
+
+    const winningAmount = qualifiesForPrize ? prizeAmount : 0;
+    const winningAmountFormatted = qualifiesForPrize ? formatRupeeAmount(prizeAmount) : '';
 
     return {
       rank,
       userId: uid,
       username: String(rawName),
-      invites: Number(p.successfulInvites || 0),
+      invites: count,
       winningAmount,
-      winningAmountFormatted: formatRupeeAmount(winningAmount),
+      winningAmountFormatted,
     };
   });
 }
@@ -603,7 +623,7 @@ export function generateLeaderboardPng(campaign, rows = [], avatars = new Map())
       rgba,
       width,
       height,
-      `NO PARTICIPANTS WITH ${minInviteThreshold}+ INVITES YET`,
+      'NO PARTICIPANTS ON THE LEADERBOARD YET',
       width / 2,
       ry + 25,
       3,
@@ -661,17 +681,25 @@ export function generateLeaderboardPng(campaign, rows = [], avatars = new Map())
         whiteText,
         'center'
       );
-      drawText(
-        rgba,
-        width,
-        height,
-        row.winningAmountFormatted || formatRupeeAmount(row.winningAmount),
-        colAmountX,
-        ry + 25,
-        3,
-        row.winningAmount > 0 ? greenMoney : mutedText,
-        'right'
-      );
+
+      // Winning Amount column: completely blank if participant does not qualify for a prize
+      const amountText =
+        row.winningAmountFormatted !== undefined
+          ? String(row.winningAmountFormatted || '')
+          : (Number(row.winningAmount || 0) > 0 ? formatRupeeAmount(row.winningAmount) : '');
+      if (amountText) {
+        drawText(
+          rgba,
+          width,
+          height,
+          amountText,
+          colAmountX,
+          ry + 25,
+          3,
+          greenMoney,
+          'right'
+        );
+      }
     }
   }
 

@@ -9,6 +9,7 @@ import {
   getReferralsForCampaign,
   getParticipantsForCampaign,
 } from '../models/inviteCampaignModels.js';
+import { scheduleLeaderboardAutoUpdate } from './campaignPanelService.js';
 
 let liveUserViewRefreshHook = null;
 
@@ -121,6 +122,10 @@ export async function recalculateParticipantEligibility(client, campaign, userId
         String(userId),
         updatedParticipant
       ).catch(() => {});
+    }
+
+    if (client && freshCampaign?.leaderboardMessageId && options.skipLeaderboardAutoUpdate !== true) {
+      scheduleLeaderboardAutoUpdate(client, freshCampaign.campaignId);
     }
 
     return updatedParticipant;

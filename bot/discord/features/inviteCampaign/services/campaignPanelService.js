@@ -416,3 +416,58 @@ export async function postCampaignFinalResults(client, campaign) {
   });
   return res?.message || null;
 }
+
+const pendingAutoUpdates = new Map();
+
+/**
+ * Schedules an automatic refresh of the campaign's leaderboard message when invite counts change.
+ * Debounces rapid successive changes (e.g. bulk joins/leaves) to avoid hitting Discord rate limits.
+ *
+ * @param {import('discord.js').Client} client
+ * @param {string|object} campaignOrId
+ * @param {number} [delayMs=1000]
+ */
+export function scheduleLeaderboardAutoUpdate(client, campaignOrId, delayMs = 1000) {
+  const campaignId = typeof campaignOrId === 'string' ? campaignOrId : campaignOrId?.campaignId;
+  if (!campaignId || !client) return;
+
+  if (pendingAutoUpdates.has(campaignId)) {
+    clearTimeout(pendingAutoUpdates.get(campaignId).timer);
+  }
+
+  const runUpdate = async () => {
+    pendingAutoUpdates.delete(campaignId);
+    try {
+      const fresh = await getInviteCampaignById(campaignId);
+      if (!fresh || fresh.status === CAMPAIGN_STATUS.ENDED || !fresh.leaderboardMessageId) {
+        return;
+      }
+      await ensureOrUpdateLeaderboardMessage(client, fresh, {
+        allowCreateIfMissing: false,
+      });
+    } catch (err) {
+      console.warn(
+        `[InviteCampaign] ⚠️ Auto-update leaderboard error for ${campaignId}:`,
+        err.message
+      );
+    }
+  };
+
+  if (delayMs <= 0) {
+    runUpdate();
+    return;
+  }
+
+  const timer = setTimeout(runUpdate, delayMs);
+  if (typeof timer?.unref === 'function') {
+    timer.unref();
+  }
+  pendingAutoUpdates.set(campaignId, { timer, client, campaignId });
+}
+
+export function clearPendingLeaderboardUpdates() {
+  for (const entry of pendingAutoUpdates.values()) {
+    if (entry.timer) clearTimeout(entry.timer);
+  }
+  pendingAutoUpdates.clear();
+}
