@@ -11,6 +11,7 @@ import {
   queueMessageEdit,
   queueMessageDelete,
   queueBulkDelete,
+  queueDirectMessage,
 } from './discordQueue.js';
 import { getCachedRoleMemberCount } from './memberCacheService.js';
 import process from 'node:process';
@@ -38,6 +39,7 @@ import {
 import {
   logRolesGiven,
   logRolesRemoved,
+  logTournamentAction,
 } from './auditLogger.js';
 import {
   isMongoConnected,
@@ -1751,6 +1753,11 @@ export function buildTournamentControlPanelButtons(tournamentId) {
 
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
+      .setCustomId(`dash:cancel_team:list:${tournamentId}:0`)
+      .setLabel('Cancel Team')
+      .setEmoji('🚫')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
       .setCustomId(`dash:screen:danger:${tournamentId}`)
       .setLabel('Danger Zone')
       .setEmoji('⚠️')
@@ -1853,6 +1860,732 @@ export async function handleRenderDangerZoneScreen(interaction, tournamentId) {
     await interaction.update(payload).catch(() => {});
   } else if (typeof interaction.reply === 'function') {
     await interaction.reply(payload).catch(() => {});
+  }
+}
+
+/**
+ * Server-side check if a member has permission to manage tournaments:
+ * - Server Owner
+ * - Administrator
+ * - Manage Server (ManageGuild)
+ * - Tourney-mod role
+ *
+ * @param {import('discord.js').Guild} guild
+ * @param {import('discord.js').GuildMember} member
+ * @param {object|null} savedTournament
+ * @returns {boolean}
+ */
+export function canManageTournament(guild, member, savedTournament = null) {
+  if (!guild || !member) return false;
+  const isOwner = guild.ownerId === member.id;
+  const hasAdmin = Boolean(member.permissions?.has?.(PermissionFlagsBits.Administrator));
+  const hasManageServer = Boolean(member.permissions?.has?.(PermissionFlagsBits.ManageGuild));
+  const tourneyModRoleId = savedTournament?.tourneyModRoleId || savedTournament?.modsRoleId;
+  const hasTourneyModRole = Boolean(
+    member.roles?.cache && (
+      (tourneyModRoleId && member.roles.cache.has(tourneyModRoleId)) ||
+      (typeof member.roles.cache.some === 'function' &&
+        member.roles.cache.some((r) => (r.name || '').toLowerCase() === 'tourney-mod'))
+    )
+  );
+  return isOwner || hasAdmin || hasManageServer || hasTourneyModRole;
+}
+
+/**
+ * Retrieves confirmed teams for a tournament from MongoDB / savedTournament state.
+ * @param {import('discord.js').Guild} guild
+ * @param {string} tournamentId
+ * @param {object|null} savedTournament
+ * @returns {Promise<Array<object>>}
+ */
+export async function getConfirmedTeamsFromDb(guild, tournamentId, savedTournament = null) {
+  const teamsMap = new Map();
+  const currentSaved = savedTournament || guildSettingsCache[guild?.id]?.tournaments?.[tournamentId];
+
+  // 1. Read from savedTournament.verifiedRegistrations
+  if (currentSaved?.verifiedRegistrations) {
+    for (const [key, reg] of Object.entries(currentSaved.verifiedRegistrations)) {
+      if (reg && reg.status !== 'CANCELLED') {
+        const teamId = String(reg.teamId || reg.registrationId || key);
+        const leaderId = String(reg.discordId || reg.captain?.discord_id || '');
+        const memberIds = Array.isArray(reg.discordMemberIds)
+          ? reg.discordMemberIds.map(String)
+          : [leaderId, ...(Array.isArray(reg.mentionedMemberIds) ? reg.mentionedMemberIds.map(String) : [])].filter(Boolean);
+        teamsMap.set(teamId, {
+          teamId,
+          registrationId: String(reg.registrationId || teamId),
+          teamName: reg.teamName || 'Unknown Team',
+          teamLeader: reg.captain?.ign || (leaderId ? `<@${leaderId}>` : 'Leader'),
+          leaderId,
+          memberIds,
+          squad: reg.squad || [],
+          status: reg.status || 'CONFIRMED',
+          verifiedAt: reg.verifiedAt || null,
+        });
+      }
+    }
+  }
+
+  // 2. Read from MongoDB discord_configurable_teams if present
+  if (isMongoConnected()) {
+    try {
+      const db = getDb();
+      if (db) {
+        const dbTeams = await db.collection('discord_configurable_teams').find({
+          tournamentId,
+          status: { $ne: 'CANCELLED' },
+        }).toArray();
+
+        for (const dbT of dbTeams) {
+          const teamId = String(dbT.teamId || dbT._id);
+          if (!teamsMap.has(teamId)) {
+            const leaderId = String(dbT.leaderDiscordId || '');
+            const memberIds = [
+              leaderId,
+              ...(Array.isArray(dbT.players) ? dbT.players.map((p) => String(p.discordId || p.id)) : []),
+            ].filter(Boolean);
+            teamsMap.set(teamId, {
+              teamId,
+              registrationId: String(dbT.registrationId || teamId),
+              teamName: dbT.teamName || 'Unknown Team',
+              teamLeader: leaderId ? `<@${leaderId}>` : 'Leader',
+              leaderId,
+              memberIds,
+              squad: dbT.players || [],
+              status: dbT.status || 'CONFIRMED',
+            });
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[Discord Bot] Error querying discord_configurable_teams for ${tournamentId}:`, err.message);
+    }
+  }
+
+  // 3. Enrich with round allocation info from savedTournament.rounds
+  if (currentSaved?.rounds) {
+    for (const round of Object.values(currentSaved.rounds)) {
+      if (!round || !Array.isArray(round.groups)) continue;
+      for (const group of round.groups) {
+        if (!group || !Array.isArray(group.slots)) continue;
+        for (const slot of group.slots) {
+          if (slot.status === 'OCCUPIED' && (slot.teamId || slot.teamName)) {
+            const matchingTeam = Array.from(teamsMap.values()).find(
+              (t) => t.teamId === String(slot.teamId) || t.teamName.toLowerCase() === String(slot.teamName).toLowerCase()
+            );
+            if (matchingTeam) {
+              matchingTeam.allocatedRound = round.name || round.roundId;
+              matchingTeam.allocatedRoundId = round.roundId;
+              matchingTeam.allocatedGroup = group.groupNumber || group.name;
+              matchingTeam.allocatedGroupId = group.channelId || group.roleId;
+              matchingTeam.allocatedSlotNumber = slot.slotNumber;
+            } else if (slot.teamName) {
+              const teamId = String(slot.teamId || slot.slotNumber);
+              teamsMap.set(teamId, {
+                teamId,
+                registrationId: teamId,
+                teamName: slot.teamName,
+                teamLeader: slot.leaderId ? `<@${slot.leaderId}>` : 'Slot Leader',
+                leaderId: String(slot.leaderId || ''),
+                memberIds: Array.isArray(slot.memberIds) ? slot.memberIds.map(String) : [],
+                squad: [],
+                status: 'CONFIRMED',
+                allocatedRound: round.name || round.roundId,
+                allocatedRoundId: round.roundId,
+                allocatedGroup: group.groupNumber || group.name,
+                allocatedGroupId: group.channelId || group.roleId,
+                allocatedSlotNumber: slot.slotNumber,
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return Array.from(teamsMap.values()).sort((a, b) => a.teamName.localeCompare(b.teamName));
+}
+
+/**
+ * Renders the confirmed teams list with select menu (25 per page), Previous, Next, and Back buttons.
+ */
+export async function handleCancelTeamListScreen(interaction, tournamentId, page = 0) {
+  const guild = interaction.guild;
+  const currentSettings = guildSettingsCache[guild.id] || {};
+  let savedTournament = currentSettings.tournaments?.[tournamentId];
+  if (!savedTournament && isMongoConnected()) {
+    savedTournament = await getTournamentFromDb(guild.id, tournamentId);
+  }
+  savedTournament ||= { tournamentId, guildId: guild.id, tournamentTitle: 'Tournament' };
+
+  if (!canManageTournament(guild, interaction.member, savedTournament)) {
+    const deniedText = '🚫 **Permission Denied:** You must be a server Administrator, have `Manage Server` permission, or have the `Tourney-mod` role to cancel teams.';
+    if (interaction.deferred || interaction.replied) await interaction.editReply({ content: deniedText, components: [] });
+    else await interaction.reply({ content: deniedText, ephemeral: true });
+    return true;
+  }
+
+  const teams = await getConfirmedTeamsFromDb(guild, tournamentId, savedTournament);
+  const pageSize = 25;
+  const totalPages = Math.max(1, Math.ceil(teams.length / pageSize));
+  const currentPage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
+  const pageTeams = teams.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🚫 Cancel Confirmed Team · ${savedTournament.tournamentTitle || tournamentId}`)
+    .setColor(0xED4245)
+    .setDescription(
+      teams.length === 0
+        ? '⚠️ **No confirmed teams found for this tournament.**\n\nThere are currently no active confirmed teams registered on the website or verified through the bot.'
+        : `Select a confirmed team from the menu below to initiate slot cancellation.\n\n` +
+          `• **Total Confirmed Teams:** **${teams.length}**\n` +
+          `• **Page:** **${currentPage + 1}** of **${totalPages}**\n\n` +
+          `*Note: After choosing a team, you will be prompted for a cancellation reason (10 to 500 characters).*`
+    )
+    .setFooter({ text: `Tournament ID: ${tournamentId} • Page ${currentPage + 1}/${totalPages}` })
+    .setTimestamp();
+
+  const components = [];
+
+  if (pageTeams.length > 0) {
+    const selectMenu = new StringSelectMenuBuilder()
+      .setCustomId(`dash:cancel_team:select:${tournamentId}:${currentPage}`)
+      .setPlaceholder('Select a confirmed team to cancel...')
+      .addOptions(
+        pageTeams.map((t) => {
+          const leaderDisplay = t.teamLeader ? String(t.teamLeader).replace(/<@!?|>/g, '') : 'Unknown';
+          const allocText = t.allocatedRound ? ` [${t.allocatedRound} G${t.allocatedGroup}]` : '';
+          return {
+            label: t.teamName.slice(0, 100),
+            value: String(t.teamId),
+            description: `Leader: ${leaderDisplay}${allocText}`.slice(0, 100),
+            emoji: '🚫',
+          };
+        })
+      );
+    components.push(new ActionRowBuilder().addComponents(selectMenu));
+  }
+
+  const navButtons = [
+    new ButtonBuilder()
+      .setCustomId(`dash:cancel_team:page:${tournamentId}:${currentPage - 1}`)
+      .setLabel('Previous')
+      .setEmoji('◀️')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(currentPage === 0),
+    new ButtonBuilder()
+      .setCustomId(`dash:cancel_team:page:${tournamentId}:${currentPage + 1}`)
+      .setLabel('Next')
+      .setEmoji('▶️')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(currentPage >= totalPages - 1),
+    new ButtonBuilder()
+      .setCustomId(`dash:cancel_team:back:${tournamentId}`)
+      .setLabel('Back')
+      .setEmoji('⬅️')
+      .setStyle(ButtonStyle.Secondary),
+  ];
+
+  components.push(new ActionRowBuilder().addComponents(navButtons));
+
+  const payload = { embeds: [embed], components };
+  if (typeof interaction.update === 'function' && !interaction.replied && !interaction.deferred) {
+    await interaction.update(payload).catch(() => {});
+  } else if (interaction.deferred || interaction.replied) {
+    await interaction.editReply(payload).catch(() => {});
+  } else if (typeof interaction.reply === 'function') {
+    await interaction.reply(payload).catch(() => {});
+  }
+  return true;
+}
+
+/**
+ * Handles picking a team from the select menu: opens the cancellation reason modal.
+ */
+export async function handleCancelTeamSelect(interaction, tournamentId) {
+  const guild = interaction.guild;
+  const currentSettings = guildSettingsCache[guild?.id] || {};
+  const savedTournament = currentSettings.tournaments?.[tournamentId];
+
+  if (!canManageTournament(guild, interaction.member, savedTournament)) {
+    await interaction.reply({
+      content: '🚫 **Permission Denied:** You must be a server Administrator, have `Manage Server` permission, or have the `Tourney-mod` role to cancel teams.',
+      ephemeral: true,
+    });
+    return true;
+  }
+
+  const selectedTeamId = interaction.values?.[0];
+  if (!selectedTeamId) {
+    await interaction.reply({ content: '⚠️ Please select a team to cancel.', ephemeral: true });
+    return true;
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(`dash:cancel_team:modal:${tournamentId}:${selectedTeamId}`)
+    .setTitle('Cancel Team Slot');
+
+  const reasonInput = new TextInputBuilder()
+    .setCustomId('cancellation_reason')
+    .setLabel('Reason for cancellation')
+    .setStyle(TextInputStyle.Paragraph)
+    .setPlaceholder('Enter the reason for cancelling this team slot (sent to team leader by DM)...')
+    .setRequired(true)
+    .setMinLength(10)
+    .setMaxLength(500);
+
+  modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
+  await interaction.showModal(modal);
+  return true;
+}
+
+/**
+ * Handles modal submit: displays confirmation screen in the same dashboard message.
+ */
+export async function handleCancelTeamModalSubmit(interaction, tournamentId, teamId) {
+  const guild = interaction.guild;
+  const currentSettings = guildSettingsCache[guild?.id] || {};
+  let savedTournament = currentSettings.tournaments?.[tournamentId];
+  if (!savedTournament && isMongoConnected()) {
+    savedTournament = await getTournamentFromDb(guild.id, tournamentId);
+  }
+  savedTournament ||= { tournamentId, guildId: guild.id, tournamentTitle: 'Tournament' };
+
+  if (!canManageTournament(guild, interaction.member, savedTournament)) {
+    await interaction.reply({
+      content: '🚫 **Permission Denied:** You must be a server Administrator, have `Manage Server` permission, or have the `Tourney-mod` role to cancel teams.',
+      ephemeral: true,
+    });
+    return true;
+  }
+
+  const reason = interaction.fields?.getTextInputValue?.('cancellation_reason')?.trim() || '';
+  if (reason.length < 10 || reason.length > 500) {
+    await interaction.reply({
+      content: '⚠️ **Invalid Reason:** Reason for cancellation must be between 10 and 500 characters.',
+      ephemeral: true,
+    });
+    return true;
+  }
+
+  const teams = await getConfirmedTeamsFromDb(guild, tournamentId, savedTournament);
+  const targetTeam = teams.find((t) => String(t.teamId) === String(teamId) || String(t.registrationId) === String(teamId));
+
+  if (!targetTeam) {
+    await interaction.reply({
+      content: '⚠️ **Team Not Found:** The selected team was not found or is no longer active.',
+      ephemeral: true,
+    });
+    return true;
+  }
+
+  let warningLine = '';
+  if (targetTeam.allocatedRound) {
+    warningLine = `⚠️ **Warning:** This team is already allocated to **${targetTeam.allocatedRound} — Group ${targetTeam.allocatedGroup}** (Slot #${targetTeam.allocatedSlotNumber}).\n` +
+      `Confirming will free this slot, remove group roles, revoke group and IDP channel access, and update slotlists.`;
+  }
+
+  savedTournament.pendingTeamCancellations ||= {};
+  savedTournament.pendingTeamCancellations[teamId] = {
+    teamId,
+    teamName: targetTeam.teamName,
+    leaderId: targetTeam.leaderId,
+    memberIds: targetTeam.memberIds,
+    reason,
+    adminId: interaction.user.id,
+    adminTag: interaction.user.tag || interaction.user.username,
+    createdAt: new Date().toISOString(),
+  };
+  guildSettingsCache[guild.id] ||= {};
+  guildSettingsCache[guild.id].tournaments ||= {};
+  guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
+  saveGuildSettings(guildSettingsCache);
+  if (isMongoConnected()) {
+    await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+  }
+
+  const squadDisplay = targetTeam.memberIds && targetTeam.memberIds.length > 0
+    ? targetTeam.memberIds.map((id) => `<@${id}>`).join(', ')
+    : 'None registered';
+
+  const confirmEmbed = new EmbedBuilder()
+    .setTitle('⚠️ Confirm Team Cancellation')
+    .setColor(0xED4245)
+    .setDescription(
+      `Are you sure you want to cancel the registration for **${targetTeam.teamName}**?\n\n` +
+      `• **Team Name:** \`${targetTeam.teamName}\`\n` +
+      `• **Team Leader:** ${targetTeam.leaderId ? `<@${targetTeam.leaderId}>` : targetTeam.teamLeader}\n` +
+      `• **Squad Members:** ${squadDisplay}\n` +
+      `• **Cancellation Reason:**\n> _${reason}_\n\n` +
+      (warningLine ? `${warningLine}\n\n` : '') +
+      `**What will happen upon confirmation:**\n` +
+      `• Registration marked as **CANCELLED** in MongoDB and synced with website.\n` +
+      `• Team leader will be notified via Direct Message with the cancellation reason.\n` +
+      `• Tournament and group roles will be removed from squad members.\n` +
+      `• Any allocated round, group, and IDP channel access will be revoked and slots freed.\n` +
+      `• Registered-team channel listings and dashboard counters will be updated in place.\n` +
+      `• The team's verification code will be permanently invalidated.`
+    )
+    .setFooter({ text: `Tournament ID: ${tournamentId} • Team ID: ${teamId}` })
+    .setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`dash:cancel_team:confirm:${tournamentId}:${teamId}`)
+      .setLabel('Confirm Cancellation')
+      .setEmoji('✅')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`dash:cancel_team:list:${tournamentId}:0`)
+      .setLabel('Back')
+      .setEmoji('⬅️')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  if (typeof interaction.update === 'function') {
+    await interaction.update({ embeds: [confirmEmbed], components: [row] });
+  } else if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
+    await interaction.reply({ embeds: [confirmEmbed], components: [row] });
+  }
+  return true;
+}
+
+const cancellingTeamsInProgress = new Set();
+
+/**
+ * Handles confirmation of team cancellation: runs atomic actions through rate-limited queue,
+ * notifies website, cleans up roles/channels/slots, sends leader DM and logs to #tournament-log.
+ */
+export async function handleCancelTeamConfirm(interaction, tournamentId, teamId) {
+  const guild = interaction.guild;
+  const currentSettings = guildSettingsCache[guild?.id] || {};
+  let savedTournament = currentSettings.tournaments?.[tournamentId];
+  if (!savedTournament && isMongoConnected()) {
+    savedTournament = await getTournamentFromDb(guild.id, tournamentId);
+  }
+  savedTournament ||= { tournamentId, guildId: guild.id, tournamentTitle: 'Tournament' };
+
+  if (!canManageTournament(guild, interaction.member, savedTournament)) {
+    const deniedText = '🚫 **Permission Denied:** You must be a server Administrator, have `Manage Server` permission, or have the `Tourney-mod` role to cancel teams.';
+    if (interaction.deferred || interaction.replied) await interaction.editReply({ content: deniedText, components: [] });
+    else await interaction.reply({ content: deniedText, ephemeral: true });
+    return true;
+  }
+
+  // Atomic lock to prevent rapid double-clicks
+  const lockKey = `${tournamentId}:${teamId}`;
+  if (cancellingTeamsInProgress.has(lockKey)) {
+    return true;
+  }
+  cancellingTeamsInProgress.add(lockKey);
+
+  try {
+    const pendingData = savedTournament.pendingTeamCancellations?.[teamId];
+    const teams = await getConfirmedTeamsFromDb(guild, tournamentId, savedTournament);
+    const targetTeam = teams.find((t) => String(t.teamId) === String(teamId) || String(t.registrationId) === String(teamId)) || {
+      teamId,
+      registrationId: teamId,
+      teamName: pendingData?.teamName || 'Team',
+      leaderId: pendingData?.leaderId || '',
+      memberIds: pendingData?.memberIds || [],
+    };
+
+    const reason = pendingData?.reason || 'Cancelled by tournament administrator.';
+
+    // 1. Tell website that registration is cancelled
+    let websiteSuccess = false;
+    let websiteError = null;
+
+    try {
+      const apiUrl = getBackendApiUrl();
+      const secret = getBackendBotSecret();
+      const response = await fetch(`${apiUrl}/api/bot/tournaments/${encodeURIComponent(tournamentId)}/registrations/${encodeURIComponent(teamId)}/cancel`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          ...(secret ? { Authorization: `Bearer ${secret}`, 'x-bot-secret': secret } : {}),
+          'x-guild-id': guild.id,
+        },
+        body: JSON.stringify({
+          registration_id: teamId,
+          reason,
+          cancelled_by: interaction.user.tag || interaction.user.username || interaction.user.id,
+          guild_id: guild.id,
+        }),
+      });
+
+      const resJson = await response.json().catch(() => ({}));
+      if (response.ok && resJson.success) {
+        websiteSuccess = true;
+      } else {
+        websiteError = new Error(resJson.message || resJson.error || `HTTP ${response.status}`);
+      }
+    } catch (netErr) {
+      websiteError = netErr;
+    }
+
+    if (!websiteSuccess) {
+      cancellingTeamsInProgress.delete(lockKey);
+      const errorEmbed = new EmbedBuilder()
+        .setTitle('❌ Team Cancellation Failed')
+        .setColor(0xED4245)
+        .setDescription(
+          `**Could not cancel team on the website:**\n> ${websiteError?.message || 'Unknown network error'}\n\n` +
+          `The cancellation was halted to keep Discord and website in sync. You can retry cancellation below.`
+        );
+
+      const retryRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`dash:cancel_team:confirm:${tournamentId}:${teamId}`)
+          .setLabel('Retry Cancellation')
+          .setEmoji('🔄')
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId(`dash:cancel_team:list:${tournamentId}:0`)
+          .setLabel('Back to List')
+          .setEmoji('⬅️')
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ embeds: [errorEmbed], components: [retryRow] });
+      } else {
+        await interaction.update({ embeds: [errorEmbed], components: [retryRow] });
+      }
+      return true;
+    }
+
+    // 2. Mark team's registration as CANCELLED in MongoDB
+    savedTournament.verifiedRegistrations ||= {};
+    const regRecord = savedTournament.verifiedRegistrations[teamId] || {
+      registrationId: teamId,
+      teamId,
+      teamName: targetTeam.teamName,
+      discordId: targetTeam.leaderId,
+      discordMemberIds: targetTeam.memberIds,
+    };
+    regRecord.status = 'CANCELLED';
+    regRecord.cancellationReason = reason;
+    regRecord.cancelledBy = interaction.user.tag || interaction.user.id;
+    regRecord.cancelledAt = new Date().toISOString();
+    savedTournament.verifiedRegistrations[teamId] = regRecord;
+
+    delete savedTournament.pendingTeamCancellations?.[teamId];
+
+    if (isMongoConnected()) {
+      try {
+        const db = getDb();
+        if (db) {
+          await db.collection('discord_configurable_teams').updateOne(
+            { tournamentId, teamId },
+            { $set: { status: 'CANCELLED', cancellationReason: reason, cancelledBy: interaction.user.id, cancelledAt: new Date() } }
+          );
+          await db.collection('discord_configurable_entries').updateMany(
+            { tournamentId, teamId },
+            { $set: { status: 'CANCELLED', cancellationReason: reason, cancelledAt: new Date() } }
+          );
+          await db.collection('discord_configurable_slots').updateMany(
+            { tournamentId, teamId },
+            { $set: { status: 'OPEN', teamId: null, teamName: null } }
+          );
+          await db.collection('pending_tournament_verifications').updateMany(
+            { tournamentId, $or: [{ registrationId: teamId }, { teamName: targetTeam.teamName }] },
+            { $set: { status: 'cancelled', invalidatedAt: new Date() } }
+          );
+        }
+      } catch (dbErr) {
+        console.warn(`[Discord Bot] MongoDB team cancellation update warning:`, dbErr.message);
+      }
+    }
+
+    // 3. Remove tournament role from team members (except members in another confirmed team of this tournament)
+    const otherConfirmedMemberIds = new Set();
+    for (const [otherId, otherReg] of Object.entries(savedTournament.verifiedRegistrations || {})) {
+      if (otherId !== teamId && otherReg && otherReg.status !== 'CANCELLED') {
+        for (const mid of otherReg.discordMemberIds || []) {
+          otherConfirmedMemberIds.add(String(mid));
+        }
+      }
+    }
+
+    for (const memberId of targetTeam.memberIds || []) {
+      if (!otherConfirmedMemberIds.has(String(memberId)) && savedTournament.roleId) {
+        const member = await guild.members.fetch(memberId).catch(() => null);
+        if (member) {
+          await queueRoleRemove(member, savedTournament.roleId, `Tournament team cancelled: ${targetTeam.teamName}`).catch(() => {});
+        }
+      }
+    }
+
+    // 4. Free allocated round and group slots, remove group role and channel access
+    let freedSlotInfo = null;
+    if (savedTournament.rounds) {
+      for (const round of Object.values(savedTournament.rounds)) {
+        if (!round || !Array.isArray(round.groups)) continue;
+        for (const group of round.groups) {
+          if (!group || !Array.isArray(group.slots)) continue;
+          for (const slot of group.slots) {
+            if (slot.teamId === teamId || (slot.teamName && slot.teamName.toLowerCase() === targetTeam.teamName.toLowerCase())) {
+              freedSlotInfo = {
+                roundName: round.name || round.roundId,
+                groupName: group.groupNumber || group.name,
+                slotNumber: slot.slotNumber,
+              };
+              slot.status = 'AVAILABLE';
+              delete slot.teamId;
+              delete slot.teamName;
+              delete slot.leaderId;
+              delete slot.memberIds;
+
+              if (group.roleId) {
+                for (const mid of targetTeam.memberIds || []) {
+                  const m = await guild.members.fetch(mid).catch(() => null);
+                  if (m) await queueRoleRemove(m, group.roleId, `Team slot cancelled: ${targetTeam.teamName}`).catch(() => {});
+                }
+              }
+
+              if (group.channelId) {
+                const gch = guild.channels.cache.get(group.channelId) || await guild.channels.fetch(group.channelId).catch(() => null);
+                if (gch && gch.permissionOverwrites) {
+                  for (const mid of targetTeam.memberIds || []) {
+                    await gch.permissionOverwrites.delete(mid, 'Team cancelled').catch(() => {});
+                  }
+                }
+              }
+
+              if (group.idpChannelId) {
+                const idpCh = guild.channels.cache.get(group.idpChannelId) || await guild.channels.fetch(group.idpChannelId).catch(() => null);
+                if (idpCh && idpCh.permissionOverwrites) {
+                  for (const mid of targetTeam.memberIds || []) {
+                    await idpCh.permissionOverwrites.delete(mid, 'Team cancelled').catch(() => {});
+                  }
+                }
+              }
+            }
+          }
+
+          // Remove from qualified teams if present
+          if (Array.isArray(group.qualifiedTeams)) {
+            group.qualifiedTeams = group.qualifiedTeams.filter((qt) => qt.teamId !== teamId && qt.teamName !== targetTeam.teamName);
+          }
+        }
+      }
+    }
+
+    guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
+    saveGuildSettings(guildSettingsCache);
+    if (isMongoConnected()) {
+      await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+    }
+
+    // 5. Update registered-teams channel listing in place
+    try {
+      if (savedTournament.channels?.tournamentTeamsId) {
+        const teamsChannel = guild.channels.cache.get(savedTournament.channels.tournamentTeamsId) ||
+          await guild.channels.fetch(savedTournament.channels.tournamentTeamsId).catch(() => null);
+        if (teamsChannel) {
+          const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId).catch(() => null);
+          const activeTeams = (backendData?.teams || []).filter((t) => t.id !== teamId && t.team_name !== targetTeam.teamName);
+          await updateTeamsRosterMessages(guild, backendData?.tournament || { id: tournamentId, title: savedTournament.tournamentTitle }, activeTeams, teamsChannel, savedTournament);
+        }
+      }
+    } catch (rosterErr) {
+      console.warn('[Discord Bot] Teams roster update error after cancellation:', rosterErr.message);
+    }
+
+    // 6. Send DM to team leader
+    let dmDelivered = false;
+    let leaderUser = null;
+    if (targetTeam.leaderId) {
+      try {
+        leaderUser = await interaction.client.users.fetch(targetTeam.leaderId).catch(() => null);
+        if (leaderUser) {
+          await queueDirectMessage(leaderUser, {
+            content:
+              `Your team **${targetTeam.teamName}** has been removed from **${savedTournament.tournamentTitle || 'the tournament'}**.\n\n` +
+              `Reason: ${reason}\n\n` +
+              `If you think this is a mistake, please contact the organisers.`,
+          });
+          dmDelivered = true;
+        }
+      } catch (dmErr) {
+        console.warn(`[Discord Bot] Could not send cancellation DM to team leader <@${targetTeam.leaderId}>:`, dmErr.message);
+        dmDelivered = false;
+      }
+    }
+
+    // 7. Send log entry to tournament-log
+    try {
+      await logTournamentAction(guild, 'TEAM_CANCELLED', {
+        tournamentId,
+        tournamentTitle: savedTournament.tournamentTitle,
+        teamName: targetTeam.teamName,
+        teamId,
+        adminId: interaction.user.id,
+        adminTag: interaction.user.tag || interaction.user.username,
+        reason,
+        time: new Date(),
+      });
+      await sendTournamentManagementLog(
+        guild,
+        { id: tournamentId, title: savedTournament.tournamentTitle },
+        null,
+        'Team Slot Cancelled',
+        interaction.user,
+        [
+          { name: 'Team Name', value: targetTeam.teamName },
+          { name: 'Team ID', value: String(teamId) },
+          { name: 'Leader', value: targetTeam.leaderId ? `<@${targetTeam.leaderId}>` : targetTeam.teamLeader },
+          { name: 'Reason', value: reason },
+          { name: 'DM Status', value: dmDelivered ? 'Delivered' : 'DMs closed / Undelivered' },
+          ...(freedSlotInfo ? [{ name: 'Freed Slot', value: `${freedSlotInfo.roundName} Group ${freedSlotInfo.groupName} Slot #${freedSlotInfo.slotNumber}` }] : []),
+        ]
+      );
+    } catch (logErr) {
+      console.warn('[Discord Bot] Tournament log error on team cancellation:', logErr.message);
+    }
+
+    // 8. Keep dashboard on the current screen with result embed
+    const dmStatusNotice = dmDelivered
+      ? '✅ Team leader has been notified via Direct Message.'
+      : '⚠️ **Note:** Team leader could not be notified (DMs closed or user not found).';
+
+    const successEmbed = new EmbedBuilder()
+      .setTitle('✅ Team Cancelled Successfully')
+      .setColor(0x57F287)
+      .setDescription(
+        `Team **${targetTeam.teamName}** has been successfully removed from **${savedTournament.tournamentTitle || tournamentId}**.\n\n` +
+        `• **Cancellation Reason:**\n> _${reason}_\n\n` +
+        `• **Cancelled By:** <@${interaction.user.id}>\n` +
+        `• **Leader Notification:** ${dmStatusNotice}\n` +
+        (freedSlotInfo ? `• **Freed Slot:** ${freedSlotInfo.roundName} Group ${freedSlotInfo.groupName} Slot #${freedSlotInfo.slotNumber}\n` : '') +
+        `• **Website & Verification:** Registration status updated to Cancelled, slot freed, verification code invalidated.`
+      )
+      .setFooter({ text: `Tournament ID: ${tournamentId} • Team ID: ${teamId}` })
+      .setTimestamp();
+
+    const resultRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`dash:cancel_team:back:${tournamentId}`)
+        .setLabel('Back to Dashboard')
+        .setEmoji('⬅️')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`dash:cancel_team:list:${tournamentId}:0`)
+        .setLabel('Cancel Another Team')
+        .setEmoji('🚫')
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ embeds: [successEmbed], components: [resultRow] });
+    } else {
+      await interaction.update({ embeds: [successEmbed], components: [resultRow] });
+    }
+    return true;
+  } finally {
+    cancellingTeamsInProgress.delete(lockKey);
   }
 }
 
@@ -2252,13 +2985,45 @@ export async function handleDashboardNavigationInteraction(interaction) {
   if (match) {
     [tournamentId, savedTournament] = match;
   } else {
-    const candidateId = idParts.find((p) => settings.tournaments?.[p]);
+    const candidateId = idParts.find((p) => settings.tournaments?.[p]) || idParts[3];
     if (candidateId) {
       tournamentId = candidateId;
-      savedTournament = settings.tournaments[candidateId];
+      savedTournament = settings.tournaments?.[candidateId];
+      if (!savedTournament && isMongoConnected() && interaction.guild) {
+        savedTournament = await getTournamentFromDb(interaction.guild.id, candidateId);
+        if (savedTournament) {
+          settings.tournaments ||= {};
+          settings.tournaments[candidateId] = savedTournament;
+          guildSettingsCache[interaction.guild.id] = settings;
+        }
+      }
     }
   }
-  if (!tournamentId || !savedTournament) return false;
+  if (!tournamentId) return false;
+  if (!savedTournament && screen !== 'cancel_team') return false;
+
+  if (screen === 'cancel_team') {
+    if (action === 'list' || action === 'page') {
+      const page = parseInt(idParts[4] || '0', 10);
+      return await handleCancelTeamListScreen(interaction, tournamentId, page);
+    }
+    if (action === 'select') {
+      return await handleCancelTeamSelect(interaction, tournamentId);
+    }
+    if (action === 'modal') {
+      const teamId = idParts[4];
+      return await handleCancelTeamModalSubmit(interaction, tournamentId, teamId);
+    }
+    if (action === 'confirm') {
+      const teamId = idParts[4];
+      return await handleCancelTeamConfirm(interaction, tournamentId, teamId);
+    }
+    if (action === 'back') {
+      updateDashboardNavigation(interaction.guild, tournamentId, 'home');
+      await handleBackToTournamentPanel(interaction, tournamentId);
+      return true;
+    }
+  }
   if (screen === 'settings' && action === 'prefix-submit') {
     await submitTournamentPrefixModal(interaction, tournamentId, savedTournament);
     return true;

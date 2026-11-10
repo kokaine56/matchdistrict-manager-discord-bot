@@ -98,21 +98,20 @@ describe('Short Channel Prefix & Danger Zone Requirements', () => {
 
   test('5. Main Dashboard Buttons: Replaces Delete All Channels & Delete Tournament with single red Danger Zone button', () => {
     const rows = buildTournamentControlPanelButtons('tour-test-123');
-    assert.equal(rows.length, 2);
+    assert.ok(rows.length >= 2);
 
     const row1Buttons = rows[0].components;
     assert.equal(row1Buttons.length, 5);
 
     const row2Buttons = rows[1].components;
-    assert.equal(row2Buttons.length, 1);
-
-    const dangerZoneBtn = row2Buttons[0].data;
+    const dangerZoneBtn = row2Buttons.find((b) => b.data.label === 'Danger Zone')?.data;
+    assert.ok(dangerZoneBtn, 'Danger Zone button should exist in row 2');
     assert.equal(dangerZoneBtn.label, 'Danger Zone');
     assert.equal(dangerZoneBtn.style, ButtonStyle.Danger);
     assert.equal(dangerZoneBtn.custom_id, 'dash:screen:danger:tour-test-123');
 
     // Ensure neither "Delete All Channels" nor "Delete Tournament" exist on main dashboard
-    const allLabels = [...row1Buttons, ...row2Buttons].map((b) => b.data.label);
+    const allLabels = rows.flatMap((r) => r.components).map((b) => b.data.label);
     assert.ok(!allLabels.includes('Delete All Channels'));
     assert.ok(!allLabels.includes('Delete Tournament'));
   });

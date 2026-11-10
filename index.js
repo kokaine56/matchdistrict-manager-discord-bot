@@ -3400,18 +3400,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const roundAnnouncementModal = interaction.isModalSubmit?.() && (
       interaction.customId?.startsWith('dash:round:announcement-submit:') ||
       interaction.customId?.startsWith('dash:registration-submit:') ||
-      interaction.customId?.startsWith('dash:settings:prefix-submit:')
+      interaction.customId?.startsWith('dash:settings:prefix-submit:') ||
+      interaction.customId?.startsWith('dash:cancel_team:modal:')
     );
     const isUserSelectInteraction = interaction.isUserSelectMenu?.() === true;
     const interactionCustomId = String(interaction.customId || '');
     const isDashboardComponent = (interaction.isButton?.() || isUserSelectInteraction) && interactionCustomId.startsWith('dash:');
-    const opensDashboardModal = interaction.isButton?.() && (
+    const opensDashboardModal = (interaction.isButton?.() || interaction.isStringSelectMenu?.()) && (
       interactionCustomId.startsWith('md_tour_create_round:') ||
       interactionCustomId.startsWith('md_round_edit:') ||
       interactionCustomId.startsWith('dash:round:announcement:') ||
       interactionCustomId.startsWith('dash:settings:edit-prefix:') ||
       interactionCustomId.startsWith('dash:add-team-method:open-registration:') ||
-      interactionCustomId.startsWith('dash:add-team:group:')
+      interactionCustomId.startsWith('dash:add-team:group:') ||
+      interactionCustomId.startsWith('dash:cancel_team:select:')
     );
 
     // Acknowledge before any Mongo lookup or dashboard recovery work. Main actions
@@ -3492,6 +3494,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     if (interaction.isStringSelectMenu() && (
+      interaction.customId?.startsWith('dash:cancel_team:select:') ||
       interaction.customId?.startsWith('dash:qualify:select:') ||
       interaction.customId?.startsWith('md_tour_') ||
       interaction.customId?.startsWith('md_round_') ||
@@ -3500,6 +3503,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       interaction.customId?.startsWith('md_select_qualify_teams') ||
       interaction.customId === 'md_select_tournament'
     )) {
+      if (interaction.customId?.startsWith('dash:cancel_team:select:')) {
+        const handled = await handleDashboardNavigationInteraction(interaction);
+        if (handled) return;
+      }
       if (interaction.customId?.startsWith('dash:qualify:select:')) {
         await handleDashboardQualifySelection(interaction);
         return;

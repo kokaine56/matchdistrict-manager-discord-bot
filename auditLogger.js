@@ -947,6 +947,19 @@ export async function logTournamentAction(guild, actionType, details = {}) {
       ];
       break;
 
+    case 'TEAM_CANCELLED':
+      title = 'Team Registration Cancelled';
+      color = AUDIT_COLORS.DELETE;
+      fields = [
+        { name: 'Tournament', value: details.tournamentTitle || details.tournamentId || 'Tournament', inline: true },
+        { name: 'Team Name', value: details.teamName || 'Unknown Team', inline: true },
+        { name: 'Team ID', value: `\`${details.teamId}\``, inline: true },
+        { name: 'Performed By', value: adminDisplay, inline: true },
+        { name: 'Reason', value: details.reason || 'No reason provided', inline: false },
+        { name: 'Time', value: `<t:${nowTs}:F>`, inline: true },
+      ];
+      break;
+
     case 'ROLES_SYNCED':
       title = 'Tournament Roles Synchronized';
       color = AUDIT_COLORS.UPDATE;
