@@ -3,11 +3,17 @@ import assert from 'node:assert/strict';
 import { ChannelType, PermissionFlagsBits } from 'discord.js';
 import {
   handleAnncSetupCommand,
+  handleAnncMenuCommand,
   handleAnnouncementChannelMessage,
   handleAnnouncementInteraction,
   formatAnnouncementDm,
   extractTargetMentions,
   getAnnouncementChannelId,
+  fetchAvailableTextChannels,
+  buildDeliveryMethodPayload,
+  buildChannelSelectionPayload,
+  buildComposeModal,
+  buildChannelPreviewPayload,
 } from '../announcementService.js';
 import { getPendingAnnouncement } from '../mongoService.js';
 import { guildSettingsCache } from '../index.js';
@@ -565,5 +571,419 @@ Good luck!`;
     const handledNonAdmin = await handleAnnouncementChannelMessage(nonAdminMessage);
     assert.equal(handledNonAdmin, true); // consumed but ignored
     assert.equal(replyCalled, false);
+  });
+
+  test('13. Menu Command: Rejects non-administrators from .annc', async () => {
+    let replyText = '';
+    const nonAdminMember = {
+      id: 'user-regular',
+      guild: { ownerId: 'server-owner' },
+      permissions: { has: () => false },
+    };
+    const mockGuild = { id: 'g13', channels: { cache: new Map() } };
+
+    await handleAnncMenuCommand(
+      mockGuild,
+      nonAdminMember,
+      { id: 'ch13' },
+      (msg) => { replyText = typeof msg === 'string' ? msg : msg.content; },
+      ''
+    );
+
+    assert.ok(replyText.includes('Permission Denied'));
+  });
+
+  test('14. Menu Command: Displays Delivery Method Selector with Channel and DM options', async () => {
+    let replyPayload = null;
+    const adminMember = {
+      id: 'admin-14',
+      user: { id: 'admin-14', tag: 'Admin#0001' },
+      guild: { ownerId: 'admin-14' },
+      permissions: { has: () => true },
+    };
+    const mockGuild = { id: 'g14', channels: { cache: new Map() } };
+
+    await handleAnncMenuCommand(
+      mockGuild,
+      adminMember,
+      { id: 'ch14' },
+      (msg) => { replyPayload = msg; },
+      ''
+    );
+
+    assert.ok(replyPayload);
+    assert.ok(replyPayload.embeds?.[0]?.data?.title.includes('Announcement Manager'));
+    const buttons = replyPayload.components[0].components;
+    assert.equal(buttons.length, 3);
+    assert.ok(buttons[0].data.label.includes('Channel Announcement'));
+    assert.ok(buttons[1].data.label.includes('Member DM Announcement'));
+    assert.ok(buttons[2].data.label.includes('Cancel'));
+  });
+
+  test('15. Menu Command (.annc channel): Opens Channel Selection dropdown directly', async () => {
+    let replyPayload = null;
+    const adminMember = {
+      id: 'admin-15',
+      user: { id: 'admin-15', tag: 'Admin#0001' },
+      guild: { ownerId: 'admin-15' },
+      permissions: { has: () => true },
+    };
+    const channelsMap = new Map([
+      ['ch-1', { id: 'ch-1', name: 'general', type: ChannelType.GuildText, position: 0, permissionsFor: () => ({ has: () => true }) }],
+      ['ch-2', { id: 'ch-2', name: 'announcements', type: ChannelType.GuildAnnouncement, position: 1, permissionsFor: () => ({ has: () => true }) }],
+    ]);
+    const mockGuild = { id: 'g15', channels: { cache: channelsMap }, members: { me: { id: 'bot-1' } } };
+
+    await handleAnncMenuCommand(
+      mockGuild,
+      adminMember,
+      { id: 'ch15' },
+      (msg) => { replyPayload = msg; },
+      'channel',
+      ['channel', 'Important update for everyone!']
+    );
+
+    assert.ok(replyPayload);
+    assert.ok(replyPayload.embeds?.[0]?.data?.title.includes('Select Target Channels'));
+    const selectMenu = replyPayload.components[0].components[0];
+    assert.ok(selectMenu.data.custom_id.startsWith('annc:select_channels:'));
+    assert.equal(selectMenu.options.length, 2);
+    assert.equal(selectMenu.data.min_values, 1);
+    assert.equal(selectMenu.data.max_values, 2);
+  });
+
+  test('16. Channel Filter: fetchAvailableTextChannels filters text types and checks bot permissions', () => {
+    const mockBot = { id: 'bot-id' };
+    const channelsMap = new Map([
+      ['voice-1', { id: 'v1', name: 'General Voice', type: ChannelType.GuildVoice, position: 1 }],
+      ['category-1', { id: 'c1', name: 'Category', type: ChannelType.GuildCategory, position: 0 }],
+      [
+        'text-valid',
+        {
+          id: 't1',
+          name: 'general-chat',
+          type: ChannelType.GuildText,
+          position: 2,
+          permissionsFor: (me) => ({ has: (flag) => flag === PermissionFlagsBits.ViewChannel || flag === PermissionFlagsBits.SendMessages }),
+        },
+      ],
+      [
+        'text-no-send',
+        {
+          id: 't2',
+          name: 'read-only',
+          type: ChannelType.GuildText,
+          position: 3,
+          permissionsFor: (me) => ({ has: (flag) => flag === PermissionFlagsBits.ViewChannel }), // lacks SendMessages
+        },
+      ],
+      [
+        'news-valid',
+        {
+          id: 'n1',
+          name: 'news',
+          type: ChannelType.GuildAnnouncement,
+          position: 4,
+          permissionsFor: (me) => ({ has: () => true }),
+        },
+      ],
+    ]);
+
+    const mockGuild = {
+      channels: { cache: channelsMap },
+      members: { me: mockBot },
+    };
+
+    const eligible = fetchAvailableTextChannels(mockGuild);
+    assert.equal(eligible.length, 2);
+    assert.equal(eligible[0].id, 't1');
+    assert.equal(eligible[1].id, 'n1');
+  });
+
+  test('17. Interaction: Selecting channels transitions to confirmation preview when content exists', async () => {
+    const adminId = 'admin-17';
+    const announcementId = 'annc-flow-17';
+    const channelsMap = new Map([
+      ['ch-general', { id: 'ch-general', name: 'general', type: ChannelType.GuildText }],
+      ['ch-updates', { id: 'ch-updates', name: 'updates', type: ChannelType.GuildText }],
+    ]);
+    const mockGuild = { id: 'g17', channels: { cache: channelsMap } };
+
+    // Seed pending announcement with pre-existing content
+    const { savePendingAnnouncement } = await import('../mongoService.js');
+    await savePendingAnnouncement({
+      announcementId,
+      guildId: 'g17',
+      channelId: 'ch-cmd',
+      authorId: adminId,
+      content: 'Server maintenance scheduled for tonight at 11 PM IST.',
+      createdAt: new Date(),
+    });
+
+    let updatedPayload = null;
+    const selectInteraction = {
+      isStringSelectMenu: () => true,
+      customId: `annc:select_channels:${announcementId}`,
+      values: ['ch-general', 'ch-updates'],
+      user: { id: adminId },
+      member: { id: adminId, permissions: { has: () => true }, guild: { ownerId: adminId } },
+      guild: mockGuild,
+      update: async (payload) => { updatedPayload = payload; },
+    };
+
+    await handleAnnouncementInteraction(selectInteraction);
+
+    assert.ok(updatedPayload);
+    assert.ok(updatedPayload.embeds?.[0]?.data?.title.includes('Channel Announcement Preview'));
+    assert.ok(updatedPayload.embeds[0].data.description.includes('ch-general'));
+    assert.ok(updatedPayload.embeds[0].data.description.includes('ch-updates'));
+    assert.ok(updatedPayload.embeds[0].data.description.includes('Server maintenance scheduled'));
+
+    const actionRow = updatedPayload.components[0];
+    const buttons = actionRow.components;
+    assert.equal(buttons.length, 3);
+    assert.ok(buttons[0].data.label.includes('Confirm & Send'));
+    assert.ok(buttons[1].data.label.includes('Edit Message'));
+    assert.ok(buttons[2].data.label.includes('Cancel'));
+
+    const pendingAfter = await getPendingAnnouncement(announcementId);
+    assert.deepEqual(pendingAfter.targetChannelIds, ['ch-general', 'ch-updates']);
+  });
+
+  test('18. Modal Interaction: Submitting modal saves content and renders confirmation preview', async () => {
+    const adminId = 'admin-18';
+    const announcementId = 'annc-flow-18';
+    const channelsMap = new Map([
+      ['ch-annc', { id: 'ch-annc', name: 'official-announcements', type: ChannelType.GuildText }],
+    ]);
+    const mockGuild = { id: 'g18', channels: { cache: channelsMap } };
+
+    const { savePendingAnnouncement } = await import('../mongoService.js');
+    await savePendingAnnouncement({
+      announcementId,
+      guildId: 'g18',
+      channelId: 'ch-origin',
+      authorId: adminId,
+      targetChannelIds: ['ch-annc'],
+      content: '',
+      createdAt: new Date(),
+    });
+
+    let previewPayload = null;
+    const modalInteraction = {
+      isModalSubmit: () => true,
+      customId: `annc:modal:${announcementId}`,
+      user: { id: adminId },
+      member: { id: adminId, permissions: { has: () => true }, guild: { ownerId: adminId } },
+      guild: mockGuild,
+      fields: {
+        getTextInputValue: (field) => {
+          if (field === 'annc_title') return '🏆 GRAND TOURNAMENT FINALS';
+          if (field === 'annc_content') return 'Matches begin this Sunday at 6 PM. Good luck to all squads!';
+          return '';
+        },
+      },
+      update: async (payload) => { previewPayload = payload; },
+    };
+
+    await handleAnnouncementInteraction(modalInteraction);
+
+    assert.ok(previewPayload);
+    assert.ok(previewPayload.embeds?.[0]?.data?.title.includes('Channel Announcement Preview'));
+    assert.ok(previewPayload.embeds[0].data.description.includes('GRAND TOURNAMENT FINALS'));
+    assert.ok(previewPayload.embeds[0].data.description.includes('Matches begin this Sunday'));
+
+    const pendingAfter = await getPendingAnnouncement(announcementId);
+    assert.ok(pendingAfter.content.includes('GRAND TOURNAMENT FINALS'));
+  });
+
+  test('19. Channel Confirm: Immediately deletes pending record, sends messages, skips missing permissions, and posts delivery summary', async () => {
+    const adminId = 'admin-19';
+    const announcementId = 'annc-confirm-19';
+
+    const sentInChannel1 = [];
+    const channel1 = {
+      id: 'target-ch-1',
+      name: 'tournament-announcements',
+      permissionsFor: () => ({ has: () => true }),
+      send: async (msg) => {
+        sentInChannel1.push(msg);
+        return { id: 'sent-msg-1' };
+      },
+    };
+
+    const channel2Restricted = {
+      id: 'target-ch-2',
+      name: 'admin-only',
+      permissionsFor: () => ({
+        has: (flag) => flag === PermissionFlagsBits.ViewChannel, // has View, but lacks Send
+      }),
+      send: async () => { throw new Error('Missing permissions'); },
+    };
+
+    const originChannelMessages = [];
+    const originChannel = {
+      id: 'origin-ch',
+      send: async (msg) => {
+        originChannelMessages.push(msg);
+        return { id: 'summary-msg' };
+      },
+    };
+
+    const channelsMap = new Map([
+      ['target-ch-1', channel1],
+      ['target-ch-2', channel2Restricted],
+      ['origin-ch', originChannel],
+    ]);
+
+    const mockGuild = {
+      id: 'g19',
+      channels: { cache: channelsMap },
+      members: { me: { id: 'bot-19' } },
+    };
+
+    const { savePendingAnnouncement } = await import('../mongoService.js');
+    await savePendingAnnouncement({
+      announcementId,
+      guildId: 'g19',
+      channelId: 'origin-ch',
+      authorId: adminId,
+      targetChannelIds: ['target-ch-1', 'target-ch-2'],
+      content: '🚨 Registration deadline extended by 24 hours!',
+      deliveryType: 'channel',
+      createdAt: new Date(),
+    });
+
+    let updatePayload = null;
+    const confirmInteraction = {
+      isButton: () => true,
+      customId: `annc:confirm_channel:${announcementId}`,
+      user: { id: adminId },
+      member: { id: adminId, permissions: { has: () => true }, guild: { ownerId: adminId } },
+      channel: originChannel,
+      guild: mockGuild,
+      message: { embeds: [{ data: { title: '📢 Channel Announcement Preview' } }] },
+      update: async (payload) => { updatePayload = payload; },
+    };
+
+    await handleAnnouncementInteraction(confirmInteraction);
+
+    // 1. Pending announcement deleted immediately to prevent double sending
+    const pendingAfter = await getPendingAnnouncement(announcementId);
+    assert.equal(pendingAfter, null);
+
+    // 2. Buttons in preview message are disabled
+    assert.ok(updatePayload);
+    const disabledButtons = updatePayload.components[0].components;
+    assert.ok(disabledButtons.every((btn) => btn.data.disabled === true));
+
+    // 3. Wait for background delivery queue
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // 4. Sent successfully to channel 1
+    assert.equal(sentInChannel1.length, 1);
+    assert.ok(sentInChannel1[0].content.includes('Registration deadline extended'));
+
+    // 5. Summary embed posted with successful & skipped details
+    assert.equal(originChannelMessages.length, 1);
+    const summaryEmbed = originChannelMessages[0].embeds[0];
+    assert.ok(summaryEmbed.data.title.includes('Channel Announcement Summary'));
+    assert.ok(summaryEmbed.data.description.includes('Sent Successfully:** **1**'));
+    assert.ok(summaryEmbed.data.description.includes('Skipped (Missing Permissions):** **1**'));
+    assert.ok(summaryEmbed.data.description.includes('target-ch-1'));
+    assert.ok(summaryEmbed.data.description.includes('target-ch-2'));
+  });
+
+  test('20. Channel Cancel: Disables preview buttons, deletes pending record, sends 0 messages', async () => {
+    const adminId = 'admin-20';
+    const announcementId = 'annc-cancel-20';
+    let sendCount = 0;
+
+    const channel1 = {
+      id: 'ch-target-20',
+      send: async () => { sendCount++; },
+    };
+    const channelsMap = new Map([['ch-target-20', channel1]]);
+    const mockGuild = { id: 'g20', channels: { cache: channelsMap } };
+
+    const { savePendingAnnouncement } = await import('../mongoService.js');
+    await savePendingAnnouncement({
+      announcementId,
+      guildId: 'g20',
+      channelId: 'ch-origin-20',
+      authorId: adminId,
+      targetChannelIds: ['ch-target-20'],
+      content: 'This announcement will be cancelled.',
+      deliveryType: 'channel',
+      createdAt: new Date(),
+    });
+
+    let updatePayload = null;
+    const cancelInteraction = {
+      isButton: () => true,
+      customId: `annc:cancel:${announcementId}`,
+      user: { id: adminId },
+      member: { id: adminId, permissions: { has: () => true }, guild: { ownerId: adminId } },
+      guild: mockGuild,
+      message: { embeds: [{ data: { title: '📢 Channel Announcement Preview' } }] },
+      update: async (payload) => { updatePayload = payload; },
+    };
+
+    await handleAnnouncementInteraction(cancelInteraction);
+
+    // Record deleted
+    const pendingAfter = await getPendingAnnouncement(announcementId);
+    assert.equal(pendingAfter, null);
+
+    // Embed updated to cancelled
+    assert.ok(updatePayload);
+    assert.ok(updatePayload.embeds[0].data.title.includes('Cancelled'));
+    assert.ok(updatePayload.embeds[0].data.description.includes('No messages were sent'));
+    const buttons = updatePayload.components[0].components;
+    assert.ok(buttons.every((b) => b.data.disabled === true));
+
+    // Zero messages sent
+    assert.equal(sendCount, 0);
+  });
+
+  test('21. Channel Authorization: Non-author administrator cannot confirm, edit, or cancel channel announcement', async () => {
+    const authorAdminId = 'author-admin-21';
+    const intruderAdminId = 'intruder-admin-21';
+    const announcementId = 'annc-auth-21';
+
+    const { savePendingAnnouncement } = await import('../mongoService.js');
+    await savePendingAnnouncement({
+      announcementId,
+      guildId: 'g21',
+      channelId: 'ch-21',
+      authorId: authorAdminId,
+      targetChannelIds: ['ch-21'],
+      content: 'Strict authorization test',
+      deliveryType: 'channel',
+      createdAt: new Date(),
+    });
+
+    let replyPayload = null;
+    let updateCalled = false;
+    const intruderInteraction = {
+      isButton: () => true,
+      customId: `annc:confirm_channel:${announcementId}`,
+      user: { id: intruderAdminId },
+      member: { id: intruderAdminId, permissions: { has: () => true }, guild: { ownerId: 'owner-21' } },
+      message: { embeds: [{ data: { title: 'Preview' } }] },
+      reply: async (payload) => { replyPayload = payload; },
+      update: async () => { updateCalled = true; },
+    };
+
+    await handleAnnouncementInteraction(intruderInteraction);
+
+    assert.equal(updateCalled, false);
+    assert.ok(replyPayload);
+    assert.equal(replyPayload.ephemeral, true);
+    assert.ok(replyPayload.content.includes('Permission Denied'));
+
+    // Record remains pending
+    const stillPending = await getPendingAnnouncement(announcementId);
+    assert.ok(stillPending);
   });
 });

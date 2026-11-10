@@ -670,6 +670,15 @@ export const COMMAND_DIRECTORY = [
     permission: 'Admin Only',
   },
   {
+    name: 'annc',
+    category: COMMAND_CATEGORIES.CONFIGURATION,
+    syntax: (p) => `${p}annc [channel|setup]`,
+    description: 'Launch announcement manager to send channel announcements or configure DM delivery.',
+    aliases: (p) => [`${p}announcement`],
+    adminOnly: true,
+    permission: 'Admin Only',
+  },
+  {
     name: 'annc setup',
     category: COMMAND_CATEGORIES.CONFIGURATION,
     syntax: (p) => `${p}annc setup`,

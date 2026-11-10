@@ -6,6 +6,10 @@ import {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  StringSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } from 'discord.js';
 import {
   queueChannelCreate,
@@ -273,9 +277,40 @@ export async function handleAnnouncementChannelMessage(message) {
   // Check for target mentions (@everyone or roles)
   const targetInfo = extractTargetMentions(message);
   if (!targetInfo.hasTarget) {
-    await message.reply(
-      '⚠️ **Notice:** You must mention a role (e.g. `@role`) or `@everyone` in your message to choose who receives this announcement DM.'
+    const announcementId = crypto.randomUUID?.() || `annc_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+
+    await savePendingAnnouncement({
+      announcementId,
+      guildId: message.guild.id,
+      channelId: message.channel.id,
+      authorId: message.author.id,
+      authorTag: message.author.tag || message.author.username,
+      content: message.content,
+      originalContent: message.content,
+      deliveryType: 'channel',
+      files: message.attachments && message.attachments.size > 0 ? Array.from(message.attachments.values()).map((a) => a.url) : [],
+      createdAt: new Date(),
+    });
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`annc:method:channel:${announcementId}`)
+        .setLabel('Send to Channels')
+        .setEmoji('📢')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`annc:cancel:${announcementId}`)
+        .setLabel('Cancel')
+        .setEmoji('❌')
+        .setStyle(ButtonStyle.Danger)
     );
+
+    await message.reply({
+      content:
+        '⚠️ **Notice:** You must mention a role (e.g. `@role`) or `@everyone` in your message to choose who receives this announcement DM.\n\n' +
+        '💡 *Want to broadcast this message to Discord channels instead? Click **Send to Channels** below.*',
+      components: [row],
+    });
     return true;
   }
 
@@ -377,17 +412,334 @@ export async function handleAnnouncementChannelMessage(message) {
 }
 
 /**
- * Handles Confirm and Cancel button interactions for pending announcement DMs.
- * @param {import('discord.js').ButtonInteraction} interaction
+ * Fetches and filters available text channels in the guild where the bot can send messages.
+ * @param {import('discord.js').Guild} guild
+ * @returns {Array<import('discord.js').GuildTextBasedChannel>}
+ */
+export function fetchAvailableTextChannels(guild) {
+  if (!guild || !guild.channels?.cache) return [];
+  const channels = Array.from(guild.channels.cache.values());
+  const me = guild.members?.me || guild.me || null;
+
+  return channels
+    .filter((ch) => {
+      // Must be text-based guild channel (GuildText = 0, GuildAnnouncement = 5)
+      const isTextType =
+        ch.type === ChannelType.GuildText ||
+        ch.type === ChannelType.GuildAnnouncement ||
+        ch.type === 0 ||
+        ch.type === 5;
+      if (!isTextType) return false;
+
+      // Check bot permissions if permissionsFor is available
+      if (typeof ch.permissionsFor === 'function' && me) {
+        const perms = ch.permissionsFor(me);
+        if (perms && typeof perms.has === 'function') {
+          const canView = perms.has(PermissionFlagsBits.ViewChannel) || perms.has('ViewChannel');
+          const canSend = perms.has(PermissionFlagsBits.SendMessages) || perms.has('SendMessages');
+          if (!canView || !canSend) return false;
+        }
+      }
+      return true;
+    })
+    .sort((a, b) => {
+      const posA = typeof a.position === 'number' ? a.position : 0;
+      const posB = typeof b.position === 'number' ? b.position : 0;
+      if (posA !== posB) return posA - posB;
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    });
+}
+
+/**
+ * Builds the delivery method selection payload (Channel Announcement vs Member DM).
+ * @param {import('discord.js').Guild} guild
+ * @param {import('discord.js').GuildMember} member
+ * @param {string} announcementId
+ * @returns {{ embeds: Array<EmbedBuilder>, components: Array<ActionRowBuilder> }}
+ */
+export function buildDeliveryMethodPayload(guild, member, announcementId) {
+  const embed = new EmbedBuilder()
+    .setTitle('📢 Match District Announcement Manager')
+    .setColor(0x5865F2)
+    .setDescription(
+      `Welcome to the Announcement Manager! Please select how you want to deliver your announcement:\n\n` +
+      `**1️⃣ Channel Announcement** 📢\n` +
+      `Broadcast your announcement directly to one or multiple server text channels with an interactive channel selector.\n\n` +
+      `**2️⃣ Member DM Announcement** 📩\n` +
+      `Deliver direct messages to server members based on assigned roles via the dedicated announcement DM channel.\n\n` +
+      `*Choose an option below to proceed:*`
+    )
+    .setFooter({ text: `ID: ${announcementId}` })
+    .setTimestamp();
+
+  const actionRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`annc:method:channel:${announcementId}`)
+      .setLabel('Channel Announcement')
+      .setEmoji('📢')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`annc:method:dm:${announcementId}`)
+      .setLabel('Member DM Announcement')
+      .setEmoji('📩')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`annc:cancel:${announcementId}`)
+      .setLabel('Cancel')
+      .setEmoji('❌')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  return {
+    embeds: [embed],
+    components: [actionRow],
+  };
+}
+
+/**
+ * Builds the channel selection dropdown payload.
+ * @param {import('discord.js').Guild} guild
+ * @param {import('discord.js').GuildMember} member
+ * @param {string} announcementId
+ * @returns {{ embeds: Array<EmbedBuilder>, components: Array<ActionRowBuilder> }}
+ */
+export function buildChannelSelectionPayload(guild, member, announcementId) {
+  const availableChannels = fetchAvailableTextChannels(guild);
+
+  if (!availableChannels || availableChannels.length === 0) {
+    const errorEmbed = new EmbedBuilder()
+      .setTitle('📢 Channel Announcement — No Eligible Channels')
+      .setColor(0xED4245)
+      .setDescription(
+        '⚠️ No eligible text channels were found where the bot has permission to view and send messages.\n\n' +
+        'Please ensure the bot has **View Channel** and **Send Messages** permissions in your server channels.'
+      );
+
+    const cancelRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`annc:cancel:${announcementId}`)
+        .setLabel('Dismiss')
+        .setStyle(ButtonStyle.Secondary)
+    );
+
+    return {
+      embeds: [errorEmbed],
+      components: [cancelRow],
+    };
+  }
+
+  const maxSelectable = Math.min(availableChannels.length, 25);
+  const options = availableChannels.slice(0, 25).map((ch) => ({
+    label: `#${ch.name || 'channel'}`.slice(0, 100),
+    value: String(ch.id),
+    description: (ch.topic ? ch.topic.slice(0, 95) : `Channel ID: ${ch.id}`).slice(0, 100),
+    emoji: ch.type === ChannelType.GuildAnnouncement || ch.type === 5 ? '📢' : '💬',
+  }));
+
+  const selectMenu = new StringSelectMenuBuilder()
+    .setCustomId(`annc:select_channels:${announcementId}`)
+    .setPlaceholder('Select channel(s) for the announcement...')
+    .setMinValues(1)
+    .setMaxValues(maxSelectable)
+    .addOptions(options);
+
+  const menuRow = new ActionRowBuilder().addComponents(selectMenu);
+
+  const cancelRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`annc:cancel:${announcementId}`)
+      .setLabel('Cancel')
+      .setEmoji('❌')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  const embed = new EmbedBuilder()
+    .setTitle('📢 Select Target Channels')
+    .setColor(0x5865F2)
+    .setDescription(
+      `Select one or more channels from the dropdown below where you want to send this announcement.\n\n` +
+      `• **Available Channels:** ${availableChannels.length} channel(s) found.\n` +
+      `• **Selection Range:** Select between 1 and **${maxSelectable}** channel(s).\n\n` +
+      `*After choosing channels, you will be prompted to compose/confirm your message.*`
+    )
+    .setFooter({ text: `ID: ${announcementId}` })
+    .setTimestamp();
+
+  return {
+    embeds: [embed],
+    components: [menuRow, cancelRow],
+  };
+}
+
+/**
+ * Builds the announcement composition modal.
+ * @param {string} announcementId
+ * @param {string} initialContent
+ * @returns {ModalBuilder}
+ */
+export function buildComposeModal(announcementId, initialContent = '') {
+  const modal = new ModalBuilder()
+    .setCustomId(`annc:modal:${announcementId}`)
+    .setTitle('Compose Announcement');
+
+  const titleInput = new TextInputBuilder()
+    .setCustomId('annc_title')
+    .setLabel('Title / Header (Optional)')
+    .setStyle(TextInputStyle.Short)
+    .setPlaceholder('e.g. 🏆 TOURNAMENT REGISTRATIONS OPEN!')
+    .setRequired(false)
+    .setMaxLength(256);
+
+  const contentInput = new TextInputBuilder()
+    .setCustomId('annc_content')
+    .setLabel('Announcement Message')
+    .setStyle(TextInputStyle.Paragraph)
+    .setPlaceholder('Type your announcement message here. Markdown formatting is supported.')
+    .setRequired(true)
+    .setMaxLength(4000);
+
+  if (initialContent) {
+    contentInput.setValue(initialContent.slice(0, 4000));
+  }
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(titleInput),
+    new ActionRowBuilder().addComponents(contentInput)
+  );
+
+  return modal;
+}
+
+/**
+ * Builds the confirmation preview payload for a channel announcement.
+ * @param {object} pending
+ * @param {import('discord.js').Guild} guild
+ * @returns {{ embeds: Array<EmbedBuilder>, components: Array<ActionRowBuilder> }}
+ */
+export function buildChannelPreviewPayload(pending, guild) {
+  const targetChannels = (pending.targetChannelIds || [])
+    .map((id) => {
+      const ch = guild?.channels?.cache?.get(id);
+      return ch ? `<#${id}> (#${ch.name})` : `<#${id}>`;
+    })
+    .join(', ') || 'No channels selected';
+
+  const previewEmbed = new EmbedBuilder()
+    .setTitle('📢 Channel Announcement Preview')
+    .setColor(0x5865F2)
+    .setDescription(
+      `**Target Channels:** ${targetChannels}\n` +
+      `**Total Channels:** **${pending.targetChannelIds?.length || 0}** channel(s)\n\n` +
+      `────────────────────────────────────────\n` +
+      `**Announcement Preview:**\n\n` +
+      `${pending.content || '_No content entered yet._'}\n\n` +
+      `────────────────────────────────────────\n` +
+      `*Review the announcement above. Click **Confirm & Send** to publish, **Edit Message** to modify content, or **Cancel** to abort.*`
+    )
+    .setFooter({
+      text: `Author: ${pending.authorTag || pending.authorId} • ID: ${pending.announcementId}`,
+    })
+    .setTimestamp();
+
+  const actionRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`annc:confirm_channel:${pending.announcementId}`)
+      .setLabel('Confirm & Send')
+      .setEmoji('✅')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`annc:compose:${pending.announcementId}`)
+      .setLabel('Edit Message')
+      .setEmoji('✏️')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`annc:cancel:${pending.announcementId}`)
+      .setLabel('Cancel')
+      .setEmoji('❌')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  return {
+    embeds: [previewEmbed],
+    components: [actionRow],
+  };
+}
+
+/**
+ * Handles .annc menu and .annc channel commands.
+ * @param {import('discord.js').Guild} guild
+ * @param {import('discord.js').GuildMember} member
+ * @param {import('discord.js').TextChannel} channel
+ * @param {Function} replyFn
+ * @param {string} subCmd
+ * @param {string[]} args
+ */
+export async function handleAnncMenuCommand(guild, member, channel, replyFn, subCmd, args = []) {
+  if (!guild || !member) return;
+
+  if (!isAdmin(member)) {
+    await replyFn('🚫 **Permission Denied:** Only administrators can configure or send announcements.');
+    return;
+  }
+
+  const announcementId = crypto.randomUUID?.() || `annc_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+
+  let initialContent = '';
+  if (subCmd === 'channel' && args.length > 1) {
+    initialContent = args.slice(1).join(' ').trim();
+  }
+
+  await savePendingAnnouncement({
+    announcementId,
+    guildId: guild.id,
+    channelId: channel?.id || null,
+    authorId: member.user?.id || member.id,
+    authorTag: member.user?.tag || member.user?.username || member.displayName || 'Administrator',
+    deliveryType: 'channel',
+    content: initialContent,
+    createdAt: new Date(),
+  });
+
+  if (subCmd === 'channel') {
+    const payload = buildChannelSelectionPayload(guild, member, announcementId);
+    await replyFn(payload);
+    return;
+  }
+
+  const payload = buildDeliveryMethodPayload(guild, member, announcementId);
+  await replyFn(payload);
+}
+
+/**
+ * Handles Confirm and Cancel button, select menu, and modal interactions for pending announcements.
+ * @param {import('discord.js').Interaction} interaction
  * @returns {Promise<boolean>}
  */
 export async function handleAnnouncementInteraction(interaction) {
-  if (!interaction || !interaction.isButton?.()) return false;
+  if (
+    !interaction ||
+    (!interaction.isButton?.() &&
+      !interaction.isStringSelectMenu?.() &&
+      !interaction.isSelectMenu?.() &&
+      !interaction.isModalSubmit?.())
+  ) {
+    return false;
+  }
+
   const customId = String(interaction.customId || '');
   if (!customId.startsWith('annc:')) return false;
 
   const idParts = customId.split(':');
-  const [, action, announcementId] = idParts;
+  const action = idParts[1];
+  let announcementId;
+  let methodType = null;
+
+  if (action === 'method') {
+    methodType = idParts[2];
+    announcementId = idParts[3];
+  } else {
+    announcementId = idParts[2];
+  }
 
   // Retrieve pending announcement from MongoDB / cache
   const pending = await getPendingAnnouncement(announcementId);
@@ -401,7 +753,7 @@ export async function handleAnnouncementInteraction(interaction) {
     return true;
   }
 
-  // Authorization check: Only the administrator who posted the announcement can use the buttons
+  // Authorization check: Only the administrator who created the announcement can use the controls
   if (interaction.user.id !== pending.authorId) {
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({
@@ -412,30 +764,202 @@ export async function handleAnnouncementInteraction(interaction) {
     return true;
   }
 
-  // Build disabled buttons row
-  const disabledRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`annc:confirm:${announcementId}`)
-      .setLabel('Confirm')
-      .setEmoji('✅')
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(true),
-    new ButtonBuilder()
-      .setCustomId(`annc:cancel:${announcementId}`)
-      .setLabel('Cancel')
-      .setEmoji('❌')
-      .setStyle(ButtonStyle.Danger)
-      .setDisabled(true)
-  );
+  // Build disabled buttons row matching the interaction type
+  const isChannelFlow =
+    pending.deliveryType === 'channel' ||
+    (Array.isArray(pending.targetChannelIds) && pending.targetChannelIds.length > 0);
 
+  const disabledRow = isChannelFlow
+    ? new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`annc:confirm_channel:${announcementId}`)
+          .setLabel('Confirm & Send')
+          .setEmoji('✅')
+          .setStyle(ButtonStyle.Success)
+          .setDisabled(true),
+        new ButtonBuilder()
+          .setCustomId(`annc:compose:${announcementId}`)
+          .setLabel('Edit Message')
+          .setEmoji('✏️')
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(true),
+        new ButtonBuilder()
+          .setCustomId(`annc:cancel:${announcementId}`)
+          .setLabel('Cancel')
+          .setEmoji('❌')
+          .setStyle(ButtonStyle.Danger)
+          .setDisabled(true)
+      )
+    : new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`annc:confirm:${announcementId}`)
+          .setLabel('Confirm')
+          .setEmoji('✅')
+          .setStyle(ButtonStyle.Success)
+          .setDisabled(true),
+        new ButtonBuilder()
+          .setCustomId(`annc:cancel:${announcementId}`)
+          .setLabel('Cancel')
+          .setEmoji('❌')
+          .setStyle(ButtonStyle.Danger)
+          .setDisabled(true)
+      );
+
+  // 1. Delivery method switch
+  if (action === 'method') {
+    if (methodType === 'channel') {
+      pending.deliveryType = 'channel';
+      await savePendingAnnouncement(pending);
+      const payload = buildChannelSelectionPayload(interaction.guild, interaction.member, announcementId);
+      if (typeof interaction.update === 'function') {
+        await interaction.update(payload).catch(() => {});
+      } else if (typeof interaction.editReply === 'function') {
+        await interaction.editReply(payload).catch(() => {});
+      }
+      return true;
+    }
+
+    if (methodType === 'dm') {
+      const anncChId = await getAnnouncementChannelId(interaction.guild?.id);
+      const dmGuideEmbed = new EmbedBuilder()
+        .setTitle('📩 Member DM Announcements Guide')
+        .setColor(0x5865F2)
+        .setDescription(
+          `Member DM announcements are sent through the dedicated announcement DM channel.\n\n` +
+          `**How to use:**\n` +
+          `1. Go to ${anncChId ? `<#${anncChId}>` : 'the designated `#announcement-dm` channel (run `.annc setup` to create it)'}.\n` +
+          `2. Post your announcement message and mention the target role(s) (e.g. \`@role\`) or \`@everyone\`.\n` +
+          `3. The bot will automatically display a preview with recipient counts and Confirm / Cancel buttons.\n` +
+          `4. Click **Confirm** to start DM delivery in the background.`
+        )
+        .setFooter({ text: `ID: ${announcementId}` });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`annc:method:channel:${announcementId}`)
+          .setLabel('Switch to Channel Announcement')
+          .setEmoji('📢')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(`annc:cancel:${announcementId}`)
+          .setLabel('Dismiss')
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+      if (typeof interaction.update === 'function') {
+        await interaction.update({ embeds: [dmGuideEmbed], components: [row] }).catch(() => {});
+      }
+      return true;
+    }
+  }
+
+  // 2. Select target channels from dropdown
+  if (action === 'select_channels') {
+    const selectedChannelIds = Array.isArray(interaction.values) ? interaction.values : [];
+    if (selectedChannelIds.length === 0) {
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: '⚠️ Please select at least one channel.', ephemeral: true }).catch(() => {});
+      }
+      return true;
+    }
+
+    pending.targetChannelIds = selectedChannelIds;
+    pending.deliveryType = 'channel';
+    await savePendingAnnouncement(pending);
+
+    if (pending.content && pending.content.trim().length > 0) {
+      const previewPayload = buildChannelPreviewPayload(pending, interaction.guild);
+      if (typeof interaction.update === 'function') {
+        await interaction.update(previewPayload).catch(() => {});
+      } else if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
+        await interaction.reply(previewPayload).catch(() => {});
+      }
+    } else {
+      const composePromptEmbed = new EmbedBuilder()
+        .setTitle('📢 Target Channels Selected')
+        .setColor(0x5865F2)
+        .setDescription(
+          `**Selected Channels:** ${selectedChannelIds.map((id) => `<#${id}>`).join(', ')}\n` +
+          `**Total Channels:** **${selectedChannelIds.length}**\n\n` +
+          `Now, click **Compose Announcement** below to write your message, or click **Cancel** to abort.`
+        )
+        .setFooter({ text: `ID: ${announcementId}` });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`annc:compose:${announcementId}`)
+          .setLabel('Compose Announcement')
+          .setEmoji('✏️')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(`annc:cancel:${announcementId}`)
+          .setLabel('Cancel')
+          .setEmoji('❌')
+          .setStyle(ButtonStyle.Danger)
+      );
+
+      if (typeof interaction.update === 'function') {
+        await interaction.update({ embeds: [composePromptEmbed], components: [row] }).catch(() => {});
+      } else if (typeof interaction.reply === 'function' && !interaction.replied && !interaction.deferred) {
+        await interaction.reply({ embeds: [composePromptEmbed], components: [row] }).catch(() => {});
+      }
+    }
+    return true;
+  }
+
+  // 3. Open compose modal
+  if (action === 'compose') {
+    const modal = buildComposeModal(announcementId, pending.content);
+    if (typeof interaction.showModal === 'function') {
+      await interaction.showModal(modal).catch((err) => {
+        console.error('[Announcement Modal Error]', err);
+      });
+    }
+    return true;
+  }
+
+  // 4. Modal submit
+  if (action === 'modal') {
+    const title = interaction.fields?.getTextInputValue?.('annc_title')?.trim() || '';
+    const content = interaction.fields?.getTextInputValue?.('annc_content')?.trim() || '';
+
+    if (!content) {
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: '⚠️ Announcement message content cannot be empty.', ephemeral: true }).catch(() => {});
+      }
+      return true;
+    }
+
+    const fullContent = title ? `**${title}**\n\n${content}` : content;
+    pending.content = fullContent;
+    await savePendingAnnouncement(pending);
+
+    const previewPayload = buildChannelPreviewPayload(pending, interaction.guild);
+    if (typeof interaction.update === 'function') {
+      await interaction.update(previewPayload).catch(async () => {
+        if (!interaction.replied && !interaction.deferred) {
+          await interaction.reply(previewPayload).catch(() => {});
+        }
+      });
+    } else if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply(previewPayload).catch(() => {});
+    }
+    return true;
+  }
+
+  // 5. Cancel action
   if (action === 'cancel') {
-    // Delete pending record from MongoDB straight away
+    // Delete pending record straight away
     await deletePendingAnnouncement(announcementId);
+
+    const cancelMsg = isChannelFlow
+      ? `❌ **Cancelled:** This announcement was cancelled by <@${interaction.user.id}>. No messages were sent.`
+      : `❌ **Cancelled:** This announcement was cancelled by <@${interaction.user.id}>. No DMs were sent.`;
 
     const cancelledEmbed = EmbedBuilder.from(interaction.message?.embeds?.[0] || {})
       .setTitle('📢 Announcement Cancelled')
       .setColor(0xED4245)
-      .setDescription(`❌ **Cancelled:** This announcement was cancelled by <@${interaction.user.id}>. No DMs were sent.`);
+      .setDescription(cancelMsg);
 
     if (typeof interaction.update === 'function') {
       await interaction.update({ embeds: [cancelledEmbed], components: [disabledRow] }).catch(() => {});
@@ -445,6 +969,113 @@ export async function handleAnnouncementInteraction(interaction) {
     return true;
   }
 
+  // 6. Confirm Channel Announcement
+  if (action === 'confirm_channel') {
+    // Delete pending record from MongoDB straight away to prevent double-confirmation
+    await deletePendingAnnouncement(announcementId);
+
+    const sendingEmbed = EmbedBuilder.from(interaction.message?.embeds?.[0] || {})
+      .setTitle('📢 Channel Announcement Sending...')
+      .setColor(0xFEE75C)
+      .setDescription(
+        `⏳ **Sending...** Delivering announcement to **${pending.targetChannelIds?.length || 0}** channel(s) in the background...`
+      );
+
+    if (typeof interaction.update === 'function') {
+      await interaction.update({ embeds: [sendingEmbed], components: [disabledRow] }).catch(() => {});
+    } else if (typeof interaction.editReply === 'function') {
+      await interaction.editReply({ embeds: [sendingEmbed], components: [disabledRow] }).catch(() => {});
+    }
+
+    // Start background delivery to selected channels
+    (async () => {
+      const guild = interaction.guild;
+      const targetChannelIds = pending.targetChannelIds || [];
+      const channelPayload = {
+        content: pending.content,
+        ...(Array.isArray(pending.files) && pending.files.length > 0 ? { files: pending.files } : {}),
+      };
+
+      const successfulChannels = [];
+      const failedChannels = [];
+      const skippedChannels = [];
+
+      const me = guild?.members?.me || guild?.me || null;
+
+      for (const channelId of targetChannelIds) {
+        let channel = guild?.channels?.cache?.get(channelId);
+        if (!channel && typeof guild?.channels?.fetch === 'function') {
+          channel = await guild.channels.fetch(channelId).catch(() => null);
+        }
+        if (!channel && typeof interaction.client?.channels?.fetch === 'function') {
+          channel = await interaction.client.channels.fetch(channelId).catch(() => null);
+        }
+
+        if (!channel) {
+          failedChannels.push({ id: channelId, reason: 'Channel not found or deleted' });
+          continue;
+        }
+
+        // Check bot permissions: must have ViewChannel and SendMessages
+        if (typeof channel.permissionsFor === 'function' && me) {
+          const perms = channel.permissionsFor(me);
+          if (perms && typeof perms.has === 'function') {
+            const canView = perms.has(PermissionFlagsBits.ViewChannel) || perms.has('ViewChannel');
+            const canSend = perms.has(PermissionFlagsBits.SendMessages) || perms.has('SendMessages');
+            if (!canView || !canSend) {
+              skippedChannels.push({
+                id: channelId,
+                name: channel.name,
+                reason: !canView ? 'Bot lacks View Channel permission' : 'Bot lacks Send Messages permission',
+              });
+              continue;
+            }
+          }
+        }
+
+        try {
+          await queueChannelSend(channel, channelPayload);
+          successfulChannels.push({ id: channelId, name: channel.name });
+        } catch (err) {
+          failedChannels.push({ id: channelId, name: channel.name, reason: err?.message || 'Send error' });
+        }
+      }
+
+      // Build summary embed
+      const isAllFailed = successfulChannels.length === 0 && (failedChannels.length > 0 || skippedChannels.length > 0);
+      const summaryEmbed = new EmbedBuilder()
+        .setTitle('📢 Channel Announcement Summary')
+        .setColor(isAllFailed ? 0xED4245 : 0x57F287)
+        .setDescription(
+          `**Delivery Results:**\n` +
+          `• **Sent Successfully:** **${successfulChannels.length}**\n` +
+          `• **Skipped (Missing Permissions):** **${skippedChannels.length}**\n` +
+          `• **Failed:** **${failedChannels.length}**\n` +
+          `• **Total Channels:** **${targetChannelIds.length}**\n\n` +
+          (successfulChannels.length > 0
+            ? `**Sent To:**\n${successfulChannels.map((c) => `• <#${c.id}>`).join('\n')}\n\n`
+            : '') +
+          (skippedChannels.length > 0
+            ? `**Skipped Channels (Permissions):**\n${skippedChannels.map((c) => `• <#${c.id}> — _${c.reason}_`).join('\n')}\n\n`
+            : '') +
+          (failedChannels.length > 0
+            ? `**Failed Channels:**\n${failedChannels.map((c) => `• <#${c.id}> — _${c.reason}_`).join('\n')}`
+            : '')
+        )
+        .setFooter({ text: `ID: ${announcementId}` })
+        .setTimestamp();
+
+      await queueChannelSend(interaction.channel, {
+        embeds: [summaryEmbed],
+      });
+    })().catch((err) => {
+      console.error(`[Announcement Channel Delivery Error] for ${announcementId}:`, err);
+    });
+
+    return true;
+  }
+
+  // 7. Confirm DM Announcement (preserved)
   if (action === 'confirm') {
     // Delete pending record from MongoDB straight away to prevent double-confirmation
     await deletePendingAnnouncement(announcementId);

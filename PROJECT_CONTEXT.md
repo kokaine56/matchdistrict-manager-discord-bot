@@ -86,7 +86,9 @@ matchdistrict-manager-discord-bot/
   * `.role pre refresh`: Reapplies all active configured role prefixes across eligible server members through the rate-limited queue, reporting detailed summary metrics.
 * **Support & Announcements**:
   * `.ticket setup`: Installs interactive support ticket creation panel.
-  * `.annc setup`: Configures announcements publishing channel.
+  * `.annc`: Interactive announcement manager providing choice between direct **Channel Announcement** (select one or multiple server text channels via dropdown, compose modal, confirmation preview, delivery summary) and **Member DM Announcement** (via `#announcement-dm`).
+  * `.annc channel`: Directly opens the interactive channel selection dropdown menu to compose and dispatch a channel announcement.
+  * `.annc setup`: Configures the private announcement DM dispatch channel (`#announcement-dm`).
 * **1v1 TDM System**:
   * `.tdm setup` (alias `.arena setup`): Admin-only idempotent provisioning of the 1v1 TDM categories (`1V1 TDM`), channels (including public `#room-maker-panel`), and persistent panels without requiring or creating a Room Maker role.
   * `.tdm delete` (alias `.arena delete`): Admin-only command that completely tears down all 1v1 TDM Discord channels (`#create-challenge`, `#available-challenges`, `#room-maker-panel`, `#match-results`, `#challenge-support`, `#evidence`, match channels), categories (`1V1 TDM*`), active timers, and purges all TDM database documents (`arena_config`, `arena_challenges`, `arena_matches`, `arena_disputes`, `arena_logs`, `arena_players`, `arena_volunteers`). Safe to re-run `.tdm setup` cleanly afterwards.

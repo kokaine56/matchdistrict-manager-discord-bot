@@ -172,6 +172,7 @@ import {
 } from './moderationService.js';
 import {
   handleAnncSetupCommand,
+  handleAnncMenuCommand,
   handleAnnouncementChannelMessage,
   handleAnnouncementInteraction,
 } from './announcementService.js';
@@ -2993,7 +2994,7 @@ client.on(Events.MessageCreate, async (message) => {
           await message.reply(`ℹ️ Usage: \`${PREFIX}member count <custom text>\` — Example: \`${PREFIX}member count Our Community\``);
         }
         return;
-      } else if (cmd === 'annc') {
+      } else if (cmd === 'annc' || cmd === 'announcement') {
         const subCmd = (args[0] || '').toLowerCase();
         if (subCmd === 'setup') {
           await handleAnncSetupCommand(
@@ -3004,7 +3005,14 @@ client.on(Events.MessageCreate, async (message) => {
           );
           return;
         }
-        await message.reply(`ℹ️ **Usage:** \`${PREFIX}annc setup\` — Setup the announcement DM channel.`);
+        await handleAnncMenuCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+          subCmd,
+          args
+        );
         return;
       } else if (cmd === 'ticket') {
         const subCmd = (args[0] || '').toLowerCase();
