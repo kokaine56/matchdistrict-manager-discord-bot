@@ -243,6 +243,15 @@ async function ensureMongoIndexes() {
     await orgLinkCol.createIndex({ guildId: 1 }, { unique: true });
     await orgLinkCol.createIndex({ organiserId: 1 });
     await orgLinkCol.createIndex({ status: 1 });
+    // Enforce 1-to-1 active connection constraint: only 1 active server per organiser
+    await orgLinkCol.createIndex(
+      { organiserId: 1 },
+      { unique: true, partialFilterExpression: { status: 'linked' } }
+    ).catch(() => {});
+    await orgLinkCol.createIndex(
+      { guildId: 1 },
+      { unique: true, partialFilterExpression: { status: 'linked' } }
+    ).catch(() => {});
 
     const ticketCol = mongoDb.collection('discord_tickets');
     await ticketCol.createIndex({ guildId: 1, ticketNumber: 1 });
@@ -1579,15 +1588,30 @@ export async function saveOrganiserLink(guildId, linkData) {
   try {
     const orgLinkCol = mongoDb.collection('discord_organiser_links');
     const now = new Date().toISOString();
+    const orgId = linkData.organiserId || linkData.organizerId;
+    // Atomically disconnect any previously linked server for this organiser
+    if (orgId) {
+      await orgLinkCol.updateMany(
+        { organiserId: orgId, status: 'linked', guildId: { $ne: guildId } },
+        {
+          $set: {
+            status: 'replaced',
+            unlinkedAt: now,
+            updatedAt: now,
+          },
+        }
+      );
+    }
     await orgLinkCol.updateOne(
       { guildId },
       {
         $set: {
           guildId,
-          organiserId: linkData.organiserId || linkData.organizerId,
+          organiserId: orgId,
           organiserName: linkData.organiserName || linkData.organizerName || 'Organiser',
           organiserHandle: linkData.organiserHandle || linkData.organizerHandle || '',
           guildName: linkData.guildName || 'Discord Server',
+          guildIcon: linkData.guildIcon || null,
           status: 'linked',
           linkedBy: linkData.linkedBy || null,
           linkedAt: linkData.linkedAt || now,
@@ -1632,7 +1656,7 @@ export async function getOrganiserLinkForGuild(guildId) {
  * @param {string} unlinkedBy Discord user ID
  * @returns {Promise<boolean>}
  */
-export async function unlinkOrganiserGuild(guildId, unlinkedBy = null) {
+export async function unlinkOrganiserGuild(guildId, unlinkedBy = null, status = 'unlinked') {
   if (!isMongoConnected() || !guildId) return false;
   try {
     const orgLinkCol = mongoDb.collection('discord_organiser_links');
@@ -1641,7 +1665,7 @@ export async function unlinkOrganiserGuild(guildId, unlinkedBy = null) {
       { guildId },
       {
         $set: {
-          status: 'unlinked',
+          status,
           unlinkedAt: now,
           unlinkedBy,
           updatedAt: now,
@@ -1988,6 +2012,117 @@ export async function deletePendingAnnouncement(announcementId) {
     return true;
   } catch (err) {
     console.warn(`[MongoDB] ⚠️ Error deleting pending announcement ${announcementId}:`, err.message);
+    return false;
+  }
+}
+
+/**
+ * In-memory fallback caches for organiser verification configs.
+ */
+const localOrganiserVerificationConfigs = new Map();
+const localOrganiserVerifications = [];
+
+/**
+ * Saves organiser verification configuration (channel and role) for a guild.
+ * @param {string} guildId
+ * @param {object} config { verificationChannelId, organiserRoleId, updatedBy }
+ * @returns {Promise<boolean>}
+ */
+export async function saveOrganiserVerificationConfig(guildId, config) {
+  if (!guildId || !config) return false;
+  const now = new Date().toISOString();
+  const doc = {
+    guildId,
+    verificationChannelId: config.verificationChannelId || null,
+    organiserRoleId: config.organiserRoleId || null,
+    updatedBy: config.updatedBy || null,
+    updatedAt: now,
+  };
+  localOrganiserVerificationConfigs.set(guildId, doc);
+
+  if (!isMongoConnected()) return true;
+  try {
+    const col = mongoDb.collection('discord_organiser_verification_configs');
+    await col.updateOne(
+      { guildId },
+      { $set: doc },
+      { upsert: true }
+    );
+    return true;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error saving organiser verification config for guild ${guildId}:`, err.message);
+    return false;
+  }
+}
+
+/**
+ * Retrieves organiser verification config for a guild.
+ * @param {string} guildId
+ * @returns {Promise<object|null>}
+ */
+export async function getOrganiserVerificationConfig(guildId) {
+  if (!guildId) return null;
+  if (!isMongoConnected()) {
+    return localOrganiserVerificationConfigs.get(guildId) || null;
+  }
+  try {
+    const col = mongoDb.collection('discord_organiser_verification_configs');
+    const doc = await col.findOne({ guildId });
+    if (doc) {
+      const { _id, ...cleanDoc } = doc;
+      localOrganiserVerificationConfigs.set(guildId, cleanDoc);
+      return cleanDoc;
+    }
+    return localOrganiserVerificationConfigs.get(guildId) || null;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error fetching organiser verification config for guild ${guildId}:`, err.message);
+    return localOrganiserVerificationConfigs.get(guildId) || null;
+  }
+}
+
+/**
+ * Loads all active organiser verification configs from MongoDB.
+ * @returns {Promise<Array<object>>}
+ */
+export async function loadAllOrganiserVerificationConfigs() {
+  if (!isMongoConnected()) {
+    return Array.from(localOrganiserVerificationConfigs.values());
+  }
+  try {
+    const col = mongoDb.collection('discord_organiser_verification_configs');
+    const docs = await col.find({}).toArray();
+    const cleanDocs = docs.map(({ _id, ...clean }) => clean);
+    cleanDocs.forEach(d => {
+      if (d.guildId) localOrganiserVerificationConfigs.set(d.guildId, d);
+    });
+    return cleanDocs;
+  } catch (err) {
+    console.warn('[MongoDB] ⚠️ Error loading all organiser verification configs:', err.message);
+    return Array.from(localOrganiserVerificationConfigs.values());
+  }
+}
+
+/**
+ * Records an organiser verification attempt/result in MongoDB.
+ * @param {object} record
+ * @returns {Promise<boolean>}
+ */
+export async function recordOrganiserVerification(record) {
+  if (!record) return false;
+  const now = new Date().toISOString();
+  const entry = {
+    ...record,
+    createdAt: record.createdAt || now,
+  };
+  localOrganiserVerifications.push(entry);
+
+  if (!isMongoConnected()) return true;
+  try {
+    const col = mongoDb.collection('discord_organiser_verifications');
+    await col.insertOne(entry);
+    return true;
+  } catch (err) {
+    console.warn('[MongoDB] ⚠️ Error recording organiser verification:', err.message);
     return false;
   }
 }

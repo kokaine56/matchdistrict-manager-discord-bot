@@ -231,6 +231,12 @@ import {
   handleHelpInteraction,
   getHelpResponse,
 } from './helpService.js';
+import {
+  initOrganiserVerificationConfigsCache,
+  handleOrganiserVerificationSetupCommand,
+  handleOrganiserVerificationInteraction,
+  handleOrganiserActivationMessage,
+} from './organiserVerificationService.js';
 
 
 export {
@@ -2803,6 +2809,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   startRoleSyncScheduler(readyClient);
   startRegistrationScheduler(readyClient);
   setSlotChartClient(readyClient);
+  await initOrganiserVerificationConfigsCache();
 
   // Verify bot moderation permissions across joined guilds
   for (const guild of readyClient.guilds.cache.values()) {
@@ -2936,6 +2943,9 @@ client.on(Events.MessageCreate, async (message) => {
     const handledScheduleUpload = await handleScheduleImageUploadMessage(message);
     if (handledScheduleUpload) return;
 
+    // Check if message is an organiser activation code in the verification channel
+    await handleOrganiserActivationMessage(message);
+
     const content = message.content?.trim();
 
     // Diagnostic notice if message content intent is stripped by Discord Gateway
@@ -2966,6 +2976,16 @@ client.on(Events.MessageCreate, async (message) => {
 
       if (cmd === 'setup') {
         const subCmd = (args[0] || '').toLowerCase();
+        const subCmd2 = (args[1] || '').toLowerCase();
+        if (subCmd === 'org' && (subCmd2 === 'verification' || subCmd2 === 'verify')) {
+          await handleOrganiserVerificationSetupCommand(
+            message.guild,
+            message.member,
+            message.channel,
+            (payload) => message.reply(payload)
+          );
+          return;
+        }
         if (subCmd === 'tournament') {
           await handleSetupTournamentCommand(message);
           return;
@@ -3334,6 +3354,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // Handle support ticket interactions (select menus & buttons)
   if (interaction.customId?.startsWith('ticket:')) {
     const handled = await handleTicketInteraction(interaction);
+    if (handled) return;
+  }
+
+  // Handle organiser verification interactions (.setup org verification panel & role claim)
+  if (interaction.customId?.startsWith('org_verify:') || interaction.customId?.startsWith('org_claim_role:')) {
+    const handled = await handleOrganiserVerificationInteraction(interaction);
     if (handled) return;
   }
 

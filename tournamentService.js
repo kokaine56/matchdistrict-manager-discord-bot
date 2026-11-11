@@ -12019,6 +12019,7 @@ export async function executeOrganiserLinkVerification({
         code,
         guild_id: guild.id,
         guild_name: guild.name,
+        guild_icon: guild.icon || null,
         discord_user_id: user.id,
       }),
     });
@@ -12042,10 +12043,30 @@ export async function executeOrganiserLinkVerification({
   const organiser = data.organizer;
   const tournaments = data.tournaments || [];
 
+  // Handle superseded previous server connection if one was replaced
+  if (data.previousGuildId && data.previousGuildId !== guild.id) {
+    console.log(`[Discord Bot] [corr:${corrId}] Organiser previous server ${data.previousGuildId} replaced by ${guild.id}`);
+    try {
+      await unlinkOrganiserGuild(data.previousGuildId, user.id, 'replaced');
+      if (guildSettingsCache[data.previousGuildId]) {
+        delete guildSettingsCache[data.previousGuildId].organiserLink;
+        saveGuildSettings(guildSettingsCache);
+      }
+      await recordAuditLog(data.previousGuildId, 'UNLINK_ORGANISER', {
+        guildId: data.previousGuildId,
+        adminId: user.id,
+        reason: `Connection replaced by new Discord server ${guild.name} (${guild.id})`,
+      }).catch(() => {});
+    } catch (prevErr) {
+      console.warn(`[Discord Bot] [corr:${corrId}] Warning clearing previous guild ${data.previousGuildId}:`, prevErr.message);
+    }
+  }
+
   // Save link persistently to MongoDB
   const linkDoc = {
     guildId: guild.id,
     guildName: guild.name,
+    guildIcon: guild.icon || null,
     organiserId: organiser.id,
     organiserName: organiser.name,
     organiserHandle: organiser.handle,
@@ -12207,13 +12228,13 @@ export async function handleOrganiserCommand(guild, member, channel, args = [], 
 
   // Check if an organiser linking code was provided in the arguments
   let codeCandidate = null;
-  if (sub === 'link' && args[1]) {
+  if ((sub === 'link' || sub === 'setup') && args[1]) {
     codeCandidate = args.slice(1).join(' ').trim();
   } else if (firstArg && (firstArg.toUpperCase().startsWith('MD-ORG-') || /^MD-ORG/i.test(firstArg))) {
     codeCandidate = firstArg;
   } else if (argStr && /^MD-ORG-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/i.test(argStr)) {
     codeCandidate = argStr;
-  } else if (firstArg && firstArg.length >= 10 && firstArg.includes('-') && !['unlink', 'status', 'help'].includes(sub)) {
+  } else if (firstArg && firstArg.length >= 10 && firstArg.includes('-') && !['unlink', 'status', 'help', 'setup'].includes(sub)) {
     codeCandidate = firstArg;
   }
 
