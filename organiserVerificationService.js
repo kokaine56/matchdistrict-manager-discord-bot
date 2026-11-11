@@ -100,7 +100,7 @@ function buildSetupPanel(guild, draft = {}) {
     .setColor(0x5865f2)
     .setDescription(
       'Configure automated Match District organiser accreditation verification for this Discord server.\n\n' +
-      'When approved organisers paste their activation code (`MD-ORG-XXXXXX`) in the verification channel, ' +
+      'When approved organisers paste their verification code (`MD-VERIFY-XXXXXX`) in the verification channel, ' +
       'the bot validates it with Match District, links their Discord account, and assigns the Organisers role.'
     )
     .addFields(
@@ -303,7 +303,7 @@ export async function handleOrganiserVerificationInteraction(interaction) {
         'Organiser Verification system is now active!\n\n' +
         `• **Verification Channel:** <#${config.verificationChannelId}>\n` +
         `• **Organisers Role:** <@&${config.organiserRoleId}>\n\n` +
-        'Organisers can now paste their `MD-ORG-XXXXXX` activation code into the channel to become verified.'
+        'Organisers can now paste their `MD-VERIFY-XXXXXX` verification code into the channel to become verified.'
       )
       .setFooter({ text: 'Match District Organiser System' })
       .setTimestamp();
@@ -330,8 +330,26 @@ export async function handleOrganiserActivationMessage(message) {
   if (message.channelId !== config.verificationChannelId) return;
 
   const content = (message.content || '').trim();
-  // Match standard activation code format MD-ORG-XXXXXX
-  const codeMatch = content.match(/\b(MD-ORG-[A-Z0-9]{4,16})\b/i);
+
+  // If someone accidentally pastes an MD-ORG-... Discord Server Linking code in #organiser-verify:
+  const orgLinkingMatch = content.match(/\b(MD-ORG-[A-Z0-9-]{6,36})\b/i);
+  if (orgLinkingMatch) {
+    await message.delete().catch(() => {});
+    const infoEmbed = new EmbedBuilder()
+      .setTitle('ℹ️ Discord Server Linking Code Detected')
+      .setColor(0x5865f2)
+      .setDescription(
+        `Hey <@${message.author.id}>, \`${orgLinkingMatch[1]}\` is your **Discord Server Linking Code** used to connect your bot to your own Discord server via \`.organiser setup\`.\n\n` +
+        `To verify your organizer account on Match District, please submit your **Organizer Verification Code** (\`MD-VERIFY-XXXXXX\`) generated from your organizer dashboard.`
+      )
+      .setFooter({ text: 'Match District Organiser System' });
+    const replyMsg = await message.channel.send({ content: `<@${message.author.id}>`, embeds: [infoEmbed] });
+    setTimeout(() => replyMsg.delete().catch(() => {}), 15000);
+    return;
+  }
+
+  // Match official organizer verification code format MD-VERIFY-XXXXXX
+  const codeMatch = content.match(/\b(MD-VERIFY-[A-Z0-9]{4,16})\b/i);
   if (!codeMatch) return;
 
   const activationCode = codeMatch[1].toUpperCase();
