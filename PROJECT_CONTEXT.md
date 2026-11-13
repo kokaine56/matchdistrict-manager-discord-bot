@@ -235,10 +235,37 @@ Tests are located in `test/` and run natively with `node --test`:
 * `test/teamCancellationMembershipRelease.test.js`: Validates team cancellation and deletion membership release across MongoDB `discord_tournament_player_memberships`, in-memory caches, queries, exclusivity validation, and immediate re-eligibility for all former squad members in the same tournament.
 * `test/verificationSessionLifecycle.test.js`: Validates tournament verification session creation, in-memory dual-layer caching, non-destructive bulk cleanup, atomic claiming, re-verification superseding without index collisions, teammate selection interaction reliability with uncached channels, and clear user guidance on expired/cancelled sessions.
 * `test/registeredTeamVerificationConsistency.test.js`: Validates unified source-of-truth between the `#registered-team` channel dashboard and `#verification` rejection logic. Covers zero confirmed teams, blocking on genuinely active teams, immediate unblocking on admin/organiser cancellation or deletion, in-place dashboard message synchronization, cross-tournament isolation, and bot restart persistence.
+* `test/completeRegistrationCleanupAndIdentity.test.js`: Validates the complete tournament registration cleanup protocol (Scenarios 1–11): freeing all 4 squad members, leader re-registration, cross-squad re-joining, tournament isolation, permanent identity persistence across team deletion, rejection of old verification codes, restart persistence, and dashboard sync.
+* `test/verificationPrivacyAndSpamProtection.test.js`: Validates the 4 mandatory overhaul tests: immediate verification code auto-deletion, anti-spam single active session and single Continue prompt enforcement, offline recovery leftover code auto-cleanup with permission handling, and permanent Match District ID ↔ Discord account linking without false account mismatch errors.
 
 ---
 
 ## 8. Recent Key Architectural Updates
+* **Website & Discord Bot Verification System Overhaul**:
+  - **Verification Code Privacy & Auto-Delete**:
+    - User messages containing 8-character verification codes in `#verification` channels are deleted immediately upon receipt.
+    - Gracefully handles missing Discord permissions (`Manage Messages`, `Read Message History`, `View Channel`) with clear diagnostic warning logs.
+    - **Offline Recovery**: When the bot boots up or reconnects, `cleanupLegacyPublicVerificationPrompts` scans `#verification` channels, identifies leftover user messages containing 8-character verification codes posted while offline, and automatically deletes them while preserving bot announcements and instructions.
+  - **Anti-Spam & Single Verification Session Enforcement**:
+    - `getActivePendingTournamentVerificationForUser({ tournamentId, starterDiscordId, registrationId })` enforces exactly one active verification session per user or registration at any time.
+    - Duplicate code submissions or rapid clicking reject new session creation and notify the user: *"A verification session is already in progress. Please press Continue on your existing verification prompt, or wait for it to expire."*
+    - Exactly one "Continue" button prompt is maintained; prompt messages auto-delete after timeout or upon clicking Continue.
+  - **Permanent Match District ID ↔ Discord Account Linking**:
+    - Immutable Discord User ID snowflake mapping stored in MongoDB `discord_permanent_identities` and PostgreSQL `user_discord_connections`.
+    - 1-to-1 account link constraint enforced: one Match District account can link to at most one Discord account, and vice versa.
+    - Survives bot restarts, team cancellations, team deletions, and tournament completions.
+    - Subsequent verifications by the same Discord user across tournaments automatically verify without prompting re-linking.
+    - Spoofing prevention: rejects codes belonging to different Match District accounts (*"This verification code was created for a different Match District user account"* or *"This Match District account is already linked to a different Discord account"*).
+  - **Website Profile Connected Accounts Section**:
+    - Integrated `DiscordConnectCard` inside `Profile.jsx` Settings tab under a dedicated "Connected Accounts" card.
+    - Displays Discord branding, connection status badge, Discord avatar, `@username`, Display Name, and Discord User ID.
+    - Unlink confirmation dialog: clearly warns that unlinking stops Discord bot verification integration while keeping account, registrations, and history safe.
+    - Unlinking removes identity from both PostgreSQL (`user_discord_connections`, `users`, `auth_identities`) and MongoDB `discord_permanent_identities`.
+  - **Resolved "Different Match District Account" Error**:
+    - Root cause: `/api/bot/tournaments/:id/verification/check-code` previously compared in-game player ID (`reg.captain_uid`) instead of the authenticated account ID (`reg.user_id`).
+    - Fixed endpoint to return canonical `match_district_user_id` and `user_id`. Discord bot compares canonical string IDs, resolving false rejections when re-registering after team deletion.
+  - **Complete Registration Deletion Protocol**:
+    - Implemented `deleteTournamentRegistrationComplete` in `configurableTournamentData.js`: atomically wipes all tournament-specific data (teams, entries, slots, memberships, and pending verification sessions) for all 4 team members while preserving permanent account identity.
 * **Registered Team Data & Verification Consistency**:
   - Resolved contradiction between `#registered-team` showing 0 confirmed teams while `#verification` falsely rejected users citing membership in a deleted/cancelled squad (*"Already in verified team 'Team ताऊ'"*).
   - Unified single source of truth across Discord bot and website backend: candidate participants are now exclusively checked against currently active confirmed/approved teams (`status NOT IN ('CANCELLED', 'DELETED')` and `isDeleted !== true`).

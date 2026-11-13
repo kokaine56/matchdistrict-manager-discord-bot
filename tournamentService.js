@@ -60,6 +60,7 @@ import {
   saveTournamentToDb,
   createPendingTournamentVerification,
   getPendingTournamentVerification,
+  getActivePendingTournamentVerificationForUser,
   claimPendingTournamentVerification,
   releasePendingTournamentVerificationClaim,
   finishPendingTournamentVerification,
@@ -1188,18 +1189,46 @@ export async function cleanupLegacyPublicVerificationPrompts(guild) {
     if (!channelId) continue;
     const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
     if (!channel?.messages?.fetch) continue;
+
+    // Graceful check for Discord permissions
+    const me = guild.members?.me || await guild.members.fetchMe?.().catch(() => null);
+    if (me && channel.permissionsFor) {
+      const perms = channel.permissionsFor(me);
+      if (perms) {
+        if (!perms.has('ViewChannel') || !perms.has('ReadMessageHistory')) {
+          console.warn(`[Discord Bot] ⚠️ Missing 'ViewChannel' or 'ReadMessageHistory' permission in #${channel.name || channel.id} (${guild.name}) to scan for offline verification messages.`);
+          continue;
+        }
+        if (!perms.has('ManageMessages')) {
+          console.warn(`[Discord Bot] ⚠️ Missing 'ManageMessages' permission in #${channel.name || channel.id} (${guild.name}) to auto-delete leftover verification codes.`);
+        }
+      }
+    }
+
     let before;
     for (let page = 0; page < 20; page++) {
-      const messages = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) }).catch(() => null);
+      const messages = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) }).catch((fetchErr) => {
+        console.warn(`[Discord Bot] ⚠️ Failed fetching messages in #${channel.name || channel.id}:`, fetchErr?.message || fetchErr);
+        return null;
+      });
       if (!messages?.size) break;
       for (const message of messages.values()) {
         const hasLegacyPrompt = message.components?.some((row) => row.components?.some((component) => {
           const id = String(component.customId || '');
           return id.startsWith('tver:select:') || id.startsWith('tver:cancel:') || id.startsWith('tver:continue:') || id === 'tver:open_modal';
         }));
-        if (hasLegacyPrompt) await message.delete().catch(() => { });
+        // Clean up leftover user verification codes submitted while bot was offline
+        const isLeftoverCode = !message.author?.bot && /^\s*[A-Z0-9]{8}\s*$/i.test(message.content || '');
+
+        if (hasLegacyPrompt || isLeftoverCode) {
+          await message.delete().catch((delErr) => {
+            if (delErr.code === 50013 || delErr.message?.toLowerCase().includes('missing permissions')) {
+              console.warn(`[Discord Bot] ⚠️ Missing 'Manage Messages' permission to delete message in #${channel.name || channel.id} (${guild.name}).`);
+            }
+          });
+        }
       }
-      before = messages.last()?.id;
+      before = (typeof messages.last === 'function' ? messages.last() : Array.from(messages.values()).pop())?.id;
       if (messages.size < 100) break;
     }
     await upsertManagedMessage(guild.client, {
@@ -1462,7 +1491,16 @@ export async function handleTournamentVerificationMessage(message) {
   const code = String(message.content || '').toUpperCase();
   if (!/^[A-Z0-9]{8}$/.test(code)) return false;
 
-  await message.delete().catch(() => { });
+  try {
+    await message.delete();
+  } catch (delErr) {
+    if (delErr.code === 50013 || delErr.message?.toLowerCase().includes('missing permissions')) {
+      console.warn(`[Discord Bot] ⚠️ Missing 'Manage Messages' permission to delete verification code in #${message.channel.name || message.channel.id} (${message.guild.name}).`);
+    } else {
+      console.warn(`[Discord Bot] Could not delete verification code message:`, delErr?.message || delErr);
+    }
+  }
+
   const attempt = getVerificationAttemptState(message.guild.id, message.author.id);
   const sendTemporaryReason = async (reason) => {
     const reply = await message.channel.send({
@@ -1477,6 +1515,16 @@ export async function handleTournamentVerificationMessage(message) {
 
   if (attempt.blocked) {
     await sendTemporaryReason('too many attempts; try again in 10 minutes.');
+    return true;
+  }
+
+  // Prevent duplicate verification responses and button spam for the same user
+  const activeExistingSession = await getActivePendingTournamentVerificationForUser({
+    tournamentId,
+    starterDiscordId: message.author.id,
+  });
+  if (activeExistingSession) {
+    await sendTemporaryReason('a verification session is already in progress. Please press Continue on your existing verification prompt, or wait for it to expire.');
     return true;
   }
 
@@ -1514,6 +1562,16 @@ export async function handleTournamentVerificationMessage(message) {
 
     if (!checked.result.registration_id) throw new Error('Check-code API returned no registration_id');
 
+    // Check if another user already has an active session for this exact registration
+    const activeRegSession = await getActivePendingTournamentVerificationForUser({
+      tournamentId,
+      registrationId: String(checked.result.registration_id),
+    });
+    if (activeRegSession && String(activeRegSession.starterDiscordId) !== String(message.author.id)) {
+      await sendTemporaryReason('a verification session for this team is already in progress. Please complete that session or wait for it to expire.');
+      return true;
+    }
+
     // 3. Identity validation:
     // If registered leader has a bound Discord ID, verify message sender matches
     if (checked.result.captain_discord_id && String(checked.result.captain_discord_id) !== String(message.author.id)) {
@@ -1521,17 +1579,28 @@ export async function handleTournamentVerificationMessage(message) {
       return true;
     }
 
+    // Canonical Match District user ID comparison
+    const registeredCaptainUserId = String(checked.result.match_district_user_id || checked.result.captain_user_id || checked.result.user_id || checked.result.captain_uid || '').trim();
+
     // Prevent one Discord account from registering as multiple independent users
-    const registeredCaptainUid = checked.result.captain_uid || checked.result.captain_user_id;
-    if (linkedIdentity && registeredCaptainUid && String(linkedIdentity.matchDistrictUserId) !== String(registeredCaptainUid)) {
+    if (linkedIdentity && registeredCaptainUserId && String(linkedIdentity.matchDistrictUserId) !== registeredCaptainUserId) {
       await sendTemporaryReason('this verification code was created for a different Match District user account.');
       return true;
     }
 
-    if (!linkedIdentity && registeredCaptainUid) {
+    // Prevent another Discord account from claiming a Match District account that is already linked
+    if (registeredCaptainUserId) {
+      const existingIdentityByMD = await getPermanentDiscordIdentityByMatchDistrictId(registeredCaptainUserId);
+      if (existingIdentityByMD && String(existingIdentityByMD.discordUserId) !== String(message.author.id)) {
+        await sendTemporaryReason('this Match District account is already linked to a different Discord account.');
+        return true;
+      }
+    }
+
+    if (!linkedIdentity && registeredCaptainUserId) {
       try {
         linkedIdentity = await savePermanentDiscordIdentity({
-          matchDistrictUserId: registeredCaptainUid,
+          matchDistrictUserId: registeredCaptainUserId,
           discordUserId: message.author.id,
           discordUsername: message.author.tag || message.author.username,
         });

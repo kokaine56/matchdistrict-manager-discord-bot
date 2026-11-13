@@ -667,6 +667,60 @@ export async function getPendingTournamentVerification(pendingId) {
   return localPendingVerifications.get(pid) || null;
 }
 
+/**
+ * Checks for an existing active verification session for a user or registration.
+ * Ensures exactly one active session exists and prevents duplicate Continue prompts / buttons.
+ * @param {object} params
+ * @param {string} params.tournamentId
+ * @param {string} [params.starterDiscordId]
+ * @param {string} [params.registrationId]
+ * @returns {Promise<object|null>}
+ */
+export async function getActivePendingTournamentVerificationForUser({ tournamentId, starterDiscordId, registrationId }) {
+  const tourId = tournamentId != null ? String(tournamentId).trim() : null;
+  const starterId = starterDiscordId != null ? String(starterDiscordId).trim() : null;
+  const regId = registrationId != null ? String(registrationId).trim() : null;
+  const now = new Date();
+
+  if (isMongoConnected()) {
+    try {
+      const col = mongoDb.collection('pending_tournament_verifications');
+      const orConditions = [];
+      if (starterId) orConditions.push({ starterDiscordId: starterId });
+      if (regId) orConditions.push({ registrationId: regId });
+
+      if (orConditions.length > 0) {
+        const query = {
+          status: { $in: ['active', 'awaiting_continue'] },
+          expiresAt: { $gt: now },
+          $or: orConditions,
+        };
+        if (tourId) query.tournamentId = tourId;
+        const doc = await col.findOne(query);
+        if (doc) return doc;
+      }
+    } catch (err) {
+      console.warn('[MongoDB] Warning querying active pending verification:', err.message);
+    }
+  }
+
+  for (const session of localPendingVerifications.values()) {
+    if (
+      (!tourId || String(session.tournamentId) === tourId) &&
+      ['active', 'awaiting_continue'].includes(session.status) &&
+      session.expiresAt &&
+      new Date(session.expiresAt) > now
+    ) {
+      if ((starterId && String(session.starterDiscordId) === starterId) ||
+          (regId && String(session.registrationId) === regId)) {
+        return session;
+      }
+    }
+  }
+
+  return null;
+}
+
 export async function claimPendingTournamentVerification(pendingId, starterDiscordId) {
   const pid = String(pendingId);
   const starterId = String(starterDiscordId);
