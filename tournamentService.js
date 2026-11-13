@@ -41,6 +41,7 @@ import {
   logRolesRemoved,
   logTournamentAction,
 } from './auditLogger.js';
+import { releaseTeamPlayerMemberships } from './configurableTournamentData.js';
 import {
   isMongoConnected,
   getDb,
@@ -55,6 +56,8 @@ import {
   releasePendingTournamentVerificationClaim,
   finishPendingTournamentVerification,
   cancelPendingTournamentVerification,
+  cancelPendingTournamentVerificationsByTeam,
+  expirePendingTournamentVerificationById,
   expirePendingTournamentVerifications,
   deleteTournamentFromDb,
   getTournamentFromDb,
@@ -1259,12 +1262,25 @@ async function requestVerificationCheck(guild, tournamentId, code) {
 }
 
 async function showVerifiedCodeSelection(interaction, pending, { edit = true } = {}) {
+  const channel = interaction.channel || (interaction.channelId ? (
+    interaction.guild?.channels?.cache?.get(interaction.channelId) ||
+    await interaction.guild?.channels?.fetch(interaction.channelId).catch(() => null)
+  ) : null);
+
   if (pending.teammatesNeeded <= 0) {
+    let savedTournament = guildSettingsCache[pending.guildId]?.tournaments?.[pending.tournamentId];
+    if (!savedTournament) {
+      savedTournament = await getTournamentFromDb(pending.guildId, pending.tournamentId).catch(() => null);
+      if (savedTournament && guildSettingsCache[pending.guildId]) {
+        guildSettingsCache[pending.guildId].tournaments ||= {};
+        guildSettingsCache[pending.guildId].tournaments[pending.tournamentId] = savedTournament;
+      }
+    }
     return completeTournamentVerification({
       guild: interaction.guild,
-      channel: interaction.channel,
+      channel: channel || interaction.channel,
       tournamentId: pending.tournamentId,
-      savedTournament: guildSettingsCache[pending.guildId]?.tournaments?.[pending.tournamentId],
+      savedTournament,
       registrationId: pending.registrationId,
       pendingId: pending.pendingId,
       captainId: pending.starterDiscordId,
@@ -1296,7 +1312,16 @@ async function completeTournamentVerification({
     return true;
   }
   if (!pending) {
-    await editPrivateReply(interaction, { content: 'This verification is no longer active. Start again with a new code.', components: [] });
+    const latest = await getPendingTournamentVerification(pendingId);
+    if (latest?.status === 'completed') {
+      await editPrivateReply(interaction, { content: 'Verification for this team is already completed.', components: [] });
+    } else if (latest?.status === 'cancelled') {
+      await editPrivateReply(interaction, { content: 'This verification was cancelled. Please submit your verification code again.', components: [] });
+    } else if (latest?.expiresAt && new Date(latest.expiresAt).getTime() <= Date.now()) {
+      await editPrivateReply(interaction, { content: 'This verification session has expired. Please submit your verification code again.', components: [] });
+    } else {
+      await editPrivateReply(interaction, { content: 'Verification is currently being processed. Please wait a moment.', components: [] });
+    }
     return true;
   }
 
@@ -1358,7 +1383,10 @@ async function completeTournamentVerification({
     }
 
     const allMemberMentions = [captainId, ...teammateIds].map(id => `<@${id}>`).join(', ');
-    await channel.send(`Team ${resolvedTeamName} is confirmed!\nTeam Leader & Squad: ${allMemberMentions}`).catch(() => { });
+    if (channel?.send) {
+      await channel.send(`Team ${resolvedTeamName} is confirmed!
+Team Leader & Squad: ${allMemberMentions}`).catch(() => { });
+    }
     await editPrivateReply(interaction, { content: 'Verification completed successfully.', components: [] });
 
     await sendTournamentManagementLog(
@@ -1501,14 +1529,20 @@ export async function handleTournamentVerificationInteraction(interaction) {
       }
     }
 
-    if (!pendingId || !interaction.guild || !interaction.channel) {
-      await replyPrivate(interaction, { content: 'This verification is no longer active.' });
+    if (!pendingId || !interaction.guild || !interaction.channelId) {
+      await replyPrivate(interaction, { content: 'This verification is no longer active. Please submit your verification code again to restart.' });
       return true;
     }
 
+    // Gracefully resolve channel even if uncached in client cache
+    const channel = interaction.channel || (interaction.channelId ? (
+      interaction.guild.channels.cache.get(interaction.channelId) ||
+      await interaction.guild.channels.fetch(interaction.channelId).catch(() => null)
+    ) : null);
+
     const pending = await getPendingTournamentVerification(pendingId);
     if (!pending || String(pending.starterDiscordId) !== String(interaction.user.id)) {
-      await replyPrivate(interaction, { content: "This isn't your verification." });
+      await replyPrivate(interaction, { content: "This isn't your verification session. If you are verifying a team, please submit your own verification code." });
       return true;
     }
 
@@ -1517,36 +1551,49 @@ export async function handleTournamentVerificationInteraction(interaction) {
       return true;
     }
 
-    if (new Date(pending.expiresAt).getTime() <= Date.now()) {
+    const now = Date.now();
+    const isExpired = pending.expiresAt && new Date(pending.expiresAt).getTime() <= now;
+    if (isExpired || pending.status === 'expired') {
       await expirePendingTournamentVerificationById(pendingId, interaction.user.id).catch(() => { });
-      await replyPrivate(interaction, { content: 'This verification has expired. Start again with a new code.' });
+      await replyPrivate(interaction, { content: 'This verification session has expired. Please submit your verification code in the channel again to start a fresh session.' });
+      return true;
+    }
+
+    if (pending.status === 'completed') {
+      await replyPrivate(interaction, { content: 'This team has already been successfully verified and confirmed.' });
+      return true;
+    }
+
+    if (pending.status === 'cancelled') {
+      await replyPrivate(interaction, { content: 'This verification session was cancelled. Please submit your verification code again if you wish to verify.' });
+      return true;
+    }
+
+    if (pending.status === 'superseded') {
+      await replyPrivate(interaction, { content: 'A newer verification attempt has replaced this session. Please use the most recent verification prompt or submit your code again.' });
+      return true;
+    }
+
+    if (pending.status !== 'active') {
+      await replyPrivate(interaction, { content: 'This verification is no longer active. Please submit your verification code again to restart.' });
       return true;
     }
 
     if (action === 'continue' && interaction.isButton?.()) {
-      if (pending.status !== 'active' || pending.completionClaimed) {
-        await replyPrivate(interaction, { content: 'This verification is no longer active.' });
-        return true;
-      }
       const promptTimer = verificationPromptTimers.get(pendingId);
       if (promptTimer) clearTimeout(promptTimer);
       verificationPromptTimers.delete(pendingId);
-      await interaction.message.delete().catch(() => { });
+      await interaction.message?.delete?.().catch(() => { });
       return await showVerifiedCodeSelection(interaction, pending);
-    }
-
-    if (pending.status !== 'active' || pending.completionClaimed) {
-      await replyPrivate(interaction, { content: 'This verification is no longer active.' });
-      return true;
     }
 
     if (action === 'cancel' && interaction.isButton?.()) {
       const cancelled = await cancelPendingTournamentVerification(pendingId, interaction.user.id);
       if (!cancelled) {
-        await replyPrivate(interaction, { content: 'This verification is no longer active.' });
+        await replyPrivate(interaction, { content: 'This verification could not be cancelled or is already finished.' });
         return true;
       }
-      await interaction.editReply({ content: 'Verification cancelled. The code remains unused.', components: [] }).catch(() => { });
+      await editPrivateReply(interaction, { content: 'Verification cancelled. The code remains unused.', components: [] });
       return true;
     }
 
@@ -1576,14 +1623,21 @@ export async function handleTournamentVerificationInteraction(interaction) {
           return true;
         }
       }
-      const savedTournament = guildSettingsCache[pending.guildId]?.tournaments?.[pending.tournamentId];
+      let savedTournament = guildSettingsCache[pending.guildId]?.tournaments?.[pending.tournamentId];
+      if (!savedTournament) {
+        savedTournament = await getTournamentFromDb(pending.guildId, pending.tournamentId).catch(() => null);
+        if (savedTournament && guildSettingsCache[pending.guildId]) {
+          guildSettingsCache[pending.guildId].tournaments ||= {};
+          guildSettingsCache[pending.guildId].tournaments[pending.tournamentId] = savedTournament;
+        }
+      }
       if (!savedTournament) {
         await replyPrivate(interaction, { content: 'Tournament verification is no longer configured.' });
         return true;
       }
       return await completeTournamentVerification({
         guild: interaction.guild,
-        channel: interaction.channel,
+        channel: channel || interaction.channel,
         tournamentId: pending.tournamentId,
         savedTournament,
         registrationId: pending.registrationId,
@@ -1602,9 +1656,6 @@ export async function handleTournamentVerificationInteraction(interaction) {
   }
 }
 
-/**
- * Builds the Tournament Control Panel Discord Embed.
- */
 export function buildTournamentControlPanelEmbed(tournament, summary, channelsStatus, roleInfo = null, roundsData = {}) {
   const isConfigured = Boolean(channelsStatus?.isConfigured);
   const statusColor = isConfigured ? 0x22c55e : 0xeab308; // Green or Gold
@@ -1933,7 +1984,8 @@ export async function getConfirmedTeamsFromDb(guild, tournamentId, savedTourname
       if (db) {
         const dbTeams = await db.collection('discord_configurable_teams').find({
           tournamentId,
-          status: { $ne: 'CANCELLED' },
+          status: { $nin: ['CANCELLED', 'DELETED'] },
+          isDeleted: { $ne: true },
         }).toArray();
 
         for (const dbT of dbTeams) {
@@ -2397,6 +2449,14 @@ export async function handleCancelTeamConfirm(interaction, tournamentId, teamId)
       } catch (dbErr) {
         console.warn(`[Discord Bot] MongoDB team cancellation update warning:`, dbErr.message);
       }
+    }
+
+    // Release all player memberships so that players are immediately eligible to register or join another squad in this tournament
+    await releaseTeamPlayerMemberships(tournamentId, teamId).catch((relErr) => {
+      console.warn(`[Discord Bot] Error releasing memberships for cancelled team ${teamId}:`, relErr.message);
+    });
+    if (targetTeam?.registrationId && String(targetTeam.registrationId) !== String(teamId)) {
+      await releaseTeamPlayerMemberships(tournamentId, String(targetTeam.registrationId)).catch(() => {});
     }
 
     // 3. Remove tournament role from team members (except members in another confirmed team of this tournament)
@@ -10945,7 +11005,7 @@ export async function publishGroupCredentials(guild, tournamentId, roundId, grou
   }
 
   const occupiedSlots = (group.slots || []).filter((slot) => slot?.status === 'OCCUPIED' && slot.teamName);
-  const verifiedEntries = Object.values(savedTournament.verifiedRegistrations || {});
+  const verifiedEntries = Object.values(savedTournament.verifiedRegistrations || {}).filter((entry) => entry && entry.status !== 'CANCELLED');
   const verifiedTeamIds = new Set(verifiedEntries.flatMap((entry) => [String(entry.registrationId || ''), String(entry.teamId || '')]));
   const verifiedTeamNames = new Set(verifiedEntries.map((entry) => String(entry.teamName || '').trim().toLowerCase()).filter(Boolean));
   const unverifiedTeams = occupiedSlots.filter((slot) =>

@@ -362,84 +362,314 @@ async function ensureMongoIndexes() {
   }
 }
 
+export const localPendingVerifications = new Map();
+
 export async function createPendingTournamentVerification(record) {
-  ensurePersistenceAvailable();
-  await mongoDb.collection('pending_tournament_verifications').insertOne({
+  const now = new Date();
+  const pid = String(record.pendingId);
+  const regId = String(record.registrationId);
+  const starterId = String(record.starterDiscordId);
+  const tourId = record.tournamentId;
+
+  // 1. Supersede any older active or awaiting_continue verifications for this team or user in this tournament
+  for (const [id, session] of localPendingVerifications.entries()) {
+    if (
+      session.tournamentId === tourId &&
+      ['active', 'awaiting_continue'].includes(session.status) &&
+      (session.registrationId === regId || session.starterDiscordId === starterId)
+    ) {
+      session.status = 'superseded';
+      session.supersededAt = now;
+      session.completionClaimed = false;
+    }
+  }
+
+  if (isMongoConnected()) {
+    try {
+      await mongoDb.collection('pending_tournament_verifications').updateMany(
+        {
+          tournamentId: tourId,
+          status: { $in: ['active', 'awaiting_continue'] },
+          $or: [
+            { registrationId: regId },
+            { starterDiscordId: starterId },
+          ],
+        },
+        {
+          $set: { status: 'superseded', supersededAt: now },
+          $unset: { completionClaimed: '', completionClaimedAt: '' },
+        }
+      );
+    } catch (supErr) {
+      console.warn('[MongoDB] Warning superseding prior verifications:', supErr.message);
+    }
+  }
+
+  const doc = {
     ...record,
-    registrationId: String(record.registrationId),
+    pendingId: pid,
+    registrationId: regId,
+    starterDiscordId: starterId,
     status: record.status || 'active',
     completionClaimed: false,
-    createdAt: new Date(),
-  });
+    createdAt: now,
+    expiresAt: record.expiresAt instanceof Date ? record.expiresAt : new Date(record.expiresAt || (Date.now() + 10 * 60 * 1000)),
+  };
+
+  localPendingVerifications.set(pid, doc);
+
+  if (isMongoConnected()) {
+    await mongoDb.collection('pending_tournament_verifications').insertOne({
+      ...doc,
+    });
+  }
 }
 
 export async function getPendingTournamentVerification(pendingId) {
-  if (!isMongoConnected() || !pendingId) return null;
-  return mongoDb.collection('pending_tournament_verifications').findOne({ pendingId: String(pendingId) });
+  if (!pendingId) return null;
+  const pid = String(pendingId);
+  if (isMongoConnected()) {
+    try {
+      const fromDb = await mongoDb.collection('pending_tournament_verifications').findOne({ pendingId: pid });
+      if (fromDb) {
+        localPendingVerifications.set(pid, fromDb);
+        return fromDb;
+      }
+    } catch (err) {
+      console.warn('[MongoDB] Warning fetching pending verification from DB:', err.message);
+    }
+  }
+  return localPendingVerifications.get(pid) || null;
 }
 
 export async function claimPendingTournamentVerification(pendingId, starterDiscordId) {
-  if (!isMongoConnected()) return null;
+  const pid = String(pendingId);
+  const starterId = String(starterDiscordId);
   const now = new Date();
-  const result = await mongoDb.collection('pending_tournament_verifications').findOneAndUpdate({
-    pendingId: String(pendingId),
-    starterDiscordId: String(starterDiscordId),
-    status: 'active',
-    completionClaimed: { $ne: true },
-    expiresAt: { $gt: now },
-  }, { $set: { completionClaimed: true, completionClaimedAt: now } }, { returnDocument: 'after' });
-  return result?.value || result || null;
+  const staleClaimThreshold = new Date(Date.now() - 30 * 1000);
+
+  // In-memory check first
+  const local = localPendingVerifications.get(pid);
+  if (local) {
+    if (String(local.starterDiscordId) !== starterId || local.status !== 'active') {
+      return null;
+    }
+    if (local.expiresAt && new Date(local.expiresAt).getTime() <= now.getTime()) {
+      return null;
+    }
+    const isActivelyClaimed = local.completionClaimed === true &&
+      local.completionClaimedAt &&
+      new Date(local.completionClaimedAt).getTime() >= staleClaimThreshold.getTime();
+    if (isActivelyClaimed) {
+      return null;
+    }
+    local.completionClaimed = true;
+    local.completionClaimedAt = now;
+  }
+
+  if (isMongoConnected()) {
+    try {
+      const result = await mongoDb.collection('pending_tournament_verifications').findOneAndUpdate({
+        pendingId: pid,
+        starterDiscordId: starterId,
+        status: 'active',
+        expiresAt: { $gt: now },
+        $or: [
+          { completionClaimed: { $ne: true } },
+          { completionClaimedAt: { $lt: staleClaimThreshold } },
+        ],
+      }, { $set: { completionClaimed: true, completionClaimedAt: now } }, { returnDocument: 'after' });
+      const doc = result?.value || result || null;
+      if (doc) {
+        localPendingVerifications.set(pid, doc);
+        return doc;
+      }
+      if (!local) return null;
+    } catch (dbErr) {
+      console.warn('[MongoDB] Warning claiming pending verification in DB:', dbErr.message);
+    }
+  }
+
+  return localPendingVerifications.get(pid) || null;
 }
 
 export async function releasePendingTournamentVerificationClaim(pendingId, starterDiscordId) {
-  if (!isMongoConnected()) return false;
-  const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
-    pendingId: String(pendingId),
-    starterDiscordId: String(starterDiscordId),
-    status: 'active',
-    completionClaimed: true,
-    expiresAt: { $gt: new Date() },
-  }, { $set: { completionClaimed: false }, $unset: { completionClaimedAt: '' } });
-  return result.modifiedCount === 1;
+  const pid = String(pendingId);
+  const starterId = String(starterDiscordId);
+  const local = localPendingVerifications.get(pid);
+  if (local) {
+    local.completionClaimed = false;
+    delete local.completionClaimedAt;
+  }
+
+  if (isMongoConnected()) {
+    try {
+      const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
+        pendingId: pid,
+        starterDiscordId: starterId,
+        status: 'active',
+      }, { $set: { completionClaimed: false }, $unset: { completionClaimedAt: '' } });
+      return result.modifiedCount >= 1 || Boolean(local);
+    } catch (dbErr) {
+      console.warn('[MongoDB] Warning releasing pending verification claim:', dbErr.message);
+    }
+  }
+  return Boolean(local);
 }
 
 export async function finishPendingTournamentVerification(pendingId, starterDiscordId, status = 'completed') {
-  if (!isMongoConnected()) return false;
-  const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
-    pendingId: String(pendingId),
-    starterDiscordId: String(starterDiscordId),
-    status: 'active',
-    completionClaimed: true,
-  }, { $set: { status, completedAt: new Date() }, $unset: { code: '', completionClaimed: '' } });
-  return result.modifiedCount === 1;
+  const pid = String(pendingId);
+  const starterId = String(starterDiscordId);
+  const now = new Date();
+  const local = localPendingVerifications.get(pid);
+  if (local) {
+    local.status = status;
+    local.completedAt = now;
+    local.completionClaimed = false;
+    delete local.code;
+    delete local.completionClaimedAt;
+  }
+
+  if (isMongoConnected()) {
+    try {
+      const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
+        pendingId: pid,
+        starterDiscordId: starterId,
+      }, { $set: { status, completedAt: now }, $unset: { code: '', completionClaimed: '', completionClaimedAt: '' } });
+      return result.modifiedCount >= 1 || Boolean(local);
+    } catch (dbErr) {
+      console.warn('[MongoDB] Warning finishing pending verification:', dbErr.message);
+    }
+  }
+  return Boolean(local);
 }
 
 export async function cancelPendingTournamentVerification(pendingId, starterDiscordId) {
-  if (!isMongoConnected()) return false;
-  const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
-    pendingId: String(pendingId),
-    starterDiscordId: String(starterDiscordId),
-    status: 'active',
-    completionClaimed: { $ne: true },
-    expiresAt: { $gt: new Date() },
-  }, { $set: { status: 'cancelled', cancelledAt: new Date() }, $unset: { code: '' } });
-  return result.modifiedCount === 1;
+  const pid = String(pendingId);
+  const starterId = String(starterDiscordId);
+  const now = new Date();
+  const local = localPendingVerifications.get(pid);
+  if (local) {
+    local.status = 'cancelled';
+    local.cancelledAt = now;
+    local.completionClaimed = false;
+    delete local.code;
+    delete local.completionClaimedAt;
+  }
+
+  if (isMongoConnected()) {
+    try {
+      const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
+        pendingId: pid,
+        starterDiscordId: starterId,
+        status: 'active',
+      }, { $set: { status: 'cancelled', cancelledAt: now }, $unset: { code: '', completionClaimed: '', completionClaimedAt: '' } });
+      return result.modifiedCount >= 1 || Boolean(local);
+    } catch (dbErr) {
+      console.warn('[MongoDB] Warning cancelling pending verification:', dbErr.message);
+    }
+  }
+  return Boolean(local);
+}
+
+export async function cancelPendingTournamentVerificationsByTeam(tournamentId, teamId, teamName) {
+  const now = new Date();
+  const regId = teamId ? String(teamId) : null;
+  const tName = (teamName && teamName.trim().toLowerCase() !== 'your team') ? teamName.trim() : null;
+
+  for (const [id, session] of localPendingVerifications.entries()) {
+    const matchesTour = !tournamentId || session.tournamentId === tournamentId;
+    const matchesTeam = (regId && session.registrationId === regId) || (tName && session.teamName === tName);
+    if (matchesTour && matchesTeam && ['active', 'awaiting_continue'].includes(session.status)) {
+      session.status = 'cancelled';
+      session.cancelledAt = now;
+      session.completionClaimed = false;
+      delete session.code;
+    }
+  }
+
+  if (isMongoConnected()) {
+    try {
+      const orConditions = [];
+      if (regId) orConditions.push({ registrationId: regId });
+      if (tName) orConditions.push({ teamName: tName });
+      if (orConditions.length > 0) {
+        const filter = { $or: orConditions };
+        if (tournamentId) filter.tournamentId = tournamentId;
+        await mongoDb.collection('pending_tournament_verifications').updateMany(
+          filter,
+          { $set: { status: 'cancelled', invalidatedAt: now } }
+        );
+      }
+    } catch (err) {
+      console.warn('[MongoDB] Warning cancelling pending verifications for team:', err.message);
+    }
+  }
 }
 
 export async function expirePendingTournamentVerificationById(pendingId, starterDiscordId) {
-  if (!isMongoConnected()) return false;
-  const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
-    pendingId: String(pendingId), starterDiscordId: String(starterDiscordId), status: { $in: ['awaiting_continue', 'active'] },
-  }, { $set: { status: 'expired', expiredAt: new Date() }, $unset: { code: '', completionClaimed: '' } });
-  return result.modifiedCount === 1;
+  const pid = String(pendingId);
+  const starterId = starterDiscordId ? String(starterDiscordId) : null;
+  const now = new Date();
+  const local = localPendingVerifications.get(pid);
+  if (local) {
+    local.status = 'expired';
+    local.expiredAt = now;
+    local.completionClaimed = false;
+    delete local.code;
+    delete local.completionClaimedAt;
+  }
+
+  if (isMongoConnected()) {
+    try {
+      const filter = {
+        pendingId: pid,
+        status: { $in: ['awaiting_continue', 'active'] },
+      };
+      if (starterId) filter.starterDiscordId = starterId;
+      const result = await mongoDb.collection('pending_tournament_verifications').updateOne(
+        filter,
+        { $set: { status: 'expired', expiredAt: now }, $unset: { code: '', completionClaimed: '', completionClaimedAt: '' } }
+      );
+      return result.modifiedCount >= 1 || Boolean(local);
+    } catch (dbErr) {
+      console.warn('[MongoDB] Warning expiring pending verification by id:', dbErr.message);
+    }
+  }
+  return Boolean(local);
 }
 
 export async function expirePendingTournamentVerifications() {
-  if (!isMongoConnected()) return 0;
-  const result = await mongoDb.collection('pending_tournament_verifications').updateMany({
-    status: { $in: ['awaiting_continue', 'active'] },
-  }, { $set: { status: 'expired', expiredAt: new Date() }, $unset: { code: '', completionClaimed: '' } });
-  return result.modifiedCount;
+  const now = new Date();
+  let modifiedCount = 0;
+
+  for (const [id, session] of localPendingVerifications.entries()) {
+    if (
+      ['awaiting_continue', 'active'].includes(session.status) &&
+      session.expiresAt &&
+      new Date(session.expiresAt).getTime() <= now.getTime()
+    ) {
+      session.status = 'expired';
+      session.expiredAt = now;
+      session.completionClaimed = false;
+      delete session.code;
+      delete session.completionClaimedAt;
+      modifiedCount++;
+    }
+  }
+
+  if (!isMongoConnected()) return modifiedCount;
+
+  try {
+    const result = await mongoDb.collection('pending_tournament_verifications').updateMany({
+      status: { $in: ['awaiting_continue', 'active'] },
+      expiresAt: { $lte: now },
+    }, { $set: { status: 'expired', expiredAt: now }, $unset: { code: '', completionClaimed: '', completionClaimedAt: '' } });
+    return result.modifiedCount;
+  } catch (dbErr) {
+    console.warn('[MongoDB] Warning expiring pending verifications in bulk:', dbErr.message);
+    return modifiedCount;
+  }
 }
 
 /**

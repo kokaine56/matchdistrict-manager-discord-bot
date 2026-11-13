@@ -170,7 +170,12 @@ matchdistrict-manager-discord-bot/
   * `.ping` / `.status` / `.help`: Diagnostic and guidance commands.
 
 ### Interactive Components & Modals
-* **Tournament Control Panel**: Button components to open/close registrations, view rounds, publish room credentials, allocate slots, and qualify teams.
+* **Tournament Control Panel**: Button components to open/close registrations, view rounds, publish room credentials, allocate slots, qualify teams, and cancel team slots.
+  * **Cancel Team Feature**:
+    * **Authorization**: Accessible exclusively by Administrators, members with `Manage Server` (`ManageGuild`), or users with the `Tourney-mod` role, enforced server-side.
+    * **Admin Workflow**: Clicking "Cancel Team" edits the dashboard into a paginated list (25 confirmed teams per page from MongoDB and `verifiedRegistrations`, with Previous/Next and Back buttons).
+    * **Modal & Confirmation**: Selecting a team opens a modal with a required "Reason for cancellation" field (paragraph, 10–500 chars). Submitting presents a detailed confirmation screen with team name, leader, squad members, allocation warnings (round, group, slot #), and consequence breakdown.
+    * **Atomic Execution**: On confirmation (with double-click protection), calls website API (`POST /api/bot/tournaments/:id/registrations/:registrationId/cancel`) first—halting and allowing retry if website fails; marks MongoDB registration status `CANCELLED` with audit metadata; removes tournament roles (unless member belongs to another active team); frees round/group slots, removes group roles and channel/IDP overrides; updates registered-team listings in `#tournament-teams` and dashboard counters; permanently invalidates verification codes; dispatches a formatted DM to the team leader with reason via the rate-limited queue; and posts an audit log entry to `#tournament-log`.
 * **Result Submissions**: Players submit match end screenshots and scores via Discord modals and attachments. Admins approve/reject directly via button rows in private result review channels.
 * **Organizer Verification**: Prompts organizers to verify ownership via temporary verification code linking Discord server to MatchDistrict website organizer profile.
 
@@ -217,6 +222,7 @@ matchdistrict-manager-discord-bot/
 Tests are located in `test/` and run natively with `node --test`:
 * `test/arena.test.js`: 1v1 Challenge Arena lifecycle, public volunteer panel, atomic claiming concurrency, modals, and scheduler tests.
 * `test/bot.test.js`: Core bot startup, configuration, and intent tests.
+* `test/cancelTeam.test.js`: Tests server-side permissions, confirmed team queries, modal input validation (10–500 chars), atomic cancellation lifecycle, website synchronization rollback, role cleanup, slot freeing, leader DMs, and dashboard navigation routing.
 * `test/tournament.test.js` & `test/configurableTournament.test.js`: Channel provisioning, round progressions, group allocations.
 * `test/inviteCampaign.test.js`: Invite tracking, milestone roles, and leaderboard calculations.
 * `test/moderation.test.js` & `test/ticket.test.js`: Moderation commands and support ticket lifecycles.
@@ -224,4 +230,38 @@ Tests are located in `test/` and run natively with `node --test`:
 * `test/rolePrefix.test.js`: Server-specific role nickname prefix configuration, wizard flows, automatic sync, hierarchy handling, and priority resolution.
 * `test/help.test.js`: Complete command directory inspection, permission-based category visibility, interactive pagination, and backwards compatibility.
 * `test/mongo_conflict.test.js` & `test/keepAliveServer.test.js`: Database concurrency and HTTP health server.
+* `test/organiserLinkingOneToOne.test.js`: Validates 1-to-1 organiser-to-server linking, atomic superseding/replacement in MongoDB, in-memory cache invalidation, and `.organiser setup` command argument handling.
+* `test/organiserVerification.test.js`: Validates `.setup org verification` admin interactive configuration panel, channel & role dropdowns, MongoDB persistence, `#organiser-verify` activation code message monitoring (`MD-VERIFY-XXXXXX`), backend verification API integration, role assignment, and role claim fallback button.
+* `test/teamCancellationMembershipRelease.test.js`: Validates team cancellation and deletion membership release across MongoDB `discord_tournament_player_memberships`, in-memory caches, queries, exclusivity validation, and immediate re-eligibility for all former squad members in the same tournament.
+* `test/verificationSessionLifecycle.test.js`: Validates tournament verification session creation, in-memory dual-layer caching, non-destructive bulk cleanup, atomic claiming, re-verification superseding without index collisions, teammate selection interaction reliability with uncached channels, and clear user guidance on expired/cancelled sessions.
+
+---
+
+## 8. Recent Key Architectural Updates
+* **Tournament Verification Session Lifecycle Hardening**:
+  - Resolved the bug where verification sessions prematurely became inactive during teammate selection (*"This verification is no longer active"*).
+  - Fixed bulk session expiration sweep (`expirePendingTournamentVerifications` in `mongoService.js`): filtered query strictly to `expiresAt: { $lte: now }`. Previously, startup, gateway reconnect, and legacy prompt cleanup routines swept all `active` and `awaiting_continue` records regardless of time remaining, terminating in-flight verifications.
+  - Implemented dual-store persistence with `localPendingVerifications` in-memory map backing `pending_tournament_verifications`: prevents database disconnection drops, caches active state, and accelerates lookup speed.
+  - Resilient interaction handling in `handleTournamentVerificationInteraction` (`tournamentService.js`): resolves channel dynamically via `interaction.channelId` and cache/fetch fallback when `interaction.channel` is uncached/null in Discord.js v14 ephemeral interactions, avoiding false session rejection.
+  - Superseding on re-verification: when a team or user resubmits an 8-character verification code while a prior session is active, `createPendingTournamentVerification` marks earlier records as `status: 'superseded'`, eliminating unique index `E11000` duplicate key errors.
+  - Scoped team cancellation & deletion cleanup: introduced `cancelPendingTournamentVerificationsByTeam(tournamentId, teamId, teamName)` in `mongoService.js` and integrated into `configurableTournamentData.js` and `tournamentService.js`. Enforces exact tournament scoping and ignores default `'Your team'` names, protecting unrelated squads.
+  - Precise status diagnostics: distinct, user-friendly responses for completed, cancelled, expired, superseded, or in-flight verification sessions with restart instructions.
+* **Tournament Team Cancellation & Deletion Membership Release**:
+  - Resolved team membership locking after admin cancellation or squad deletion: when a verified or enrolled team is cancelled or deleted, all former members (leader, players, substitutes) are immediately released and become fully eligible to register or join another squad in the same tournament.
+  - Linked `handleCancelTeamConfirm` in `tournamentService.js` to `releaseTeamPlayerMemberships(tournamentId, teamId)`: purges active records from MongoDB `discord_tournament_player_memberships` and cache `localPlayerMemberships` for `teamId` and `registrationId`.
+  - Hardened `getConfigurableTeamsForUser`, `getConfigurableTeamsForTournament`, `getEnrolledTeamsCount`, and `getConfigurableTeamByName` in `configurableTournamentData.js`: strictly filters out teams with `status: { $nin: ['CANCELLED', 'DELETED'] }` and `isDeleted: { $ne: true }` in both MongoDB queries and in-memory caches.
+  - Upgraded `checkTournamentPlayerExclusivity`: actively cross-references membership `teamId`s against active tournament teams; detects and auto-heals stale memberships belonging to cancelled/deleted teams without generating false conflicts.
+  - Hardened `saveConfigurableTeamWithExclusivity`: within atomic locks and transactions/fallbacks, detects and purges stale MongoDB membership records from previously cancelled/deleted teams to avoid unique index `E11000` collisions (`tournamentId: 1, discordUserId: 1`).
+  - Added `team.status === 'CANCELLED'` check to `isTeamVerifiedForTournament` in `configurableRegistrationService.js` to reject cancelled squads from slot selection.
+* **Organizer Activation & Discord Verification System (MD-VERIFY vs MD-ORG Separation)**:
+  - Strict distinction enforced: `MD-ORG-...` is exclusively for Discord Server Linking (`.organiser setup`), while `MD-VERIFY-...` is exclusively for Official Discord Organizer Verification in `#organiser-verify`.
+  - Implemented `.setup org verification` interactive admin setup panel (`ChannelSelectMenuBuilder`, `RoleSelectMenuBuilder`, Save button) persisting to MongoDB collection `discord_organiser_verification_configs`.
+  - Automated message listener monitoring `#organiser-verify` channel: automatically extracts `MD-VERIFY-XXXXXX`, intercepts accidental `MD-ORG-...` posts with helpful guidance, deletes public messages to preserve code secrecy, validates through backend `POST /api/bot/organizer/verify-activation`, assigns the `Organisers` role to the member, logs verification records to `discord_organiser_verifications`, and posts clean embeds (`Organizer Verification Successful`, `Invalid Activation Code`, `Activation Code Expired`, `Activation Code Already Used`, `Account Already Linked`).
+  - Added role claim fallback button (`org_claim_role:<userId>`) with permission diagnostics if Discord role hierarchy delays direct role addition.
+* **One-to-One Organiser Discord Server Linking**:
+  - Enforced 1-to-1 relationship between an organiser profile and an active Discord server.
+  - When an organiser connects a new server, the previous active server is atomically updated to `status: 'replaced'` in MongoDB, removed from `guildSettingsCache`, and blocked from executing tournament operations or receiving match credentials.
+  - MongoDB indexes ensure partial uniqueness on `organiserId` and `guildId` for active links (`status: 'linked'`).
+  - Added support for `.organiser setup [code]` alongside direct code and `.organiser link [code]`.
+
 

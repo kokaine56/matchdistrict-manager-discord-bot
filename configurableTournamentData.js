@@ -1215,6 +1215,10 @@ export function extractTeamDiscordMemberships(teamDoc) {
  */
 export async function syncTeamPlayerMemberships(teamDoc) {
   if (!teamDoc || !teamDoc.tournamentId || !teamDoc.teamId) return [];
+  if (['CANCELLED', 'DELETED'].includes(teamDoc.status) || teamDoc.isDeleted === true) {
+    await releaseTeamPlayerMemberships(teamDoc.tournamentId, teamDoc.teamId);
+    return [];
+  }
   const { memberships } = extractTeamDiscordMemberships(teamDoc);
   const newUserIds = new Set(memberships.map((m) => m.discordUserId));
 
@@ -1287,6 +1291,12 @@ export async function releaseTeamPlayerMemberships(tournamentId, teamId) {
     }
   }
 
+  // Also update in-memory team status if present
+  const localTeam = localTeams.get(teamId);
+  if (localTeam && (!localTeam.status || localTeam.status !== 'CANCELLED')) {
+    localTeam.status = 'CANCELLED';
+  }
+
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_tournament_player_memberships');
@@ -1325,7 +1335,7 @@ export async function getTournamentPlayerMemberships(tournamentId) {
 
   // Ensure any in-memory teams for this tournament have their memberships populated
   for (const team of localTeams.values()) {
-    if (team.tournamentId === tournamentId) {
+    if (team.tournamentId === tournamentId && !['CANCELLED', 'DELETED'].includes(team.status) && team.isDeleted !== true) {
       const { memberships } = extractTeamDiscordMemberships(team);
       for (const m of memberships) {
         const key = `${m.tournamentId}:${m.discordUserId}`;
@@ -1372,14 +1382,30 @@ export async function checkTournamentPlayerExclusivity(tournamentId, discordUser
 
   const existingMemberships = await getTournamentPlayerMemberships(tournamentId);
   const membershipByUser = new Map();
-  for (const m of existingMemberships) {
-    if (m.status === 'ACTIVE') {
-      membershipByUser.set(m.discordUserId, m);
-    }
-  }
 
   // Also check enrolled teams in the tournament directly as a secondary safeguard
-  const teamsInTournament = await getConfigurableTeamsForTournament(tournamentId);
+  const rawTeamsInTournament = await getConfigurableTeamsForTournament(tournamentId);
+  const teamsInTournament = rawTeamsInTournament.filter(
+    (t) => !['CANCELLED', 'DELETED'].includes(t.status) && t.isDeleted !== true
+  );
+  const activeTeamIds = new Set(teamsInTournament.map((t) => t.teamId));
+
+  for (const m of existingMemberships) {
+    if (m.status !== 'ACTIVE') continue;
+
+    // Verify that the team this membership belongs to is still active in the tournament
+    if (!activeTeamIds.has(m.teamId)) {
+      const teamDoc = localTeams.get(m.teamId) || (await getConfigurableTeam(m.teamId));
+      if (!teamDoc || ['CANCELLED', 'DELETED'].includes(teamDoc.status) || teamDoc.isDeleted === true) {
+        // Membership is stale from a deleted or cancelled team: release it and do not block user
+        releaseTeamPlayerMemberships(tournamentId, m.teamId).catch(() => {});
+        continue;
+      }
+    }
+
+    membershipByUser.set(m.discordUserId, m);
+  }
+
   for (const team of teamsInTournament) {
     const { memberships } = extractTeamDiscordMemberships(team);
     for (const m of memberships) {
@@ -1394,12 +1420,14 @@ export async function checkTournamentPlayerExclusivity(tournamentId, discordUser
     const existing = membershipByUser.get(uid);
     if (existing && (!excludeTeamId || existing.teamId !== excludeTeamId)) {
       const conflictingTeam = teamsInTournament.find((t) => t.teamId === existing.teamId);
-      conflicts.push({
-        discordUserId: uid,
-        teamId: existing.teamId,
-        teamName: conflictingTeam?.teamName || existing.teamName || null,
-        role: existing.role,
-      });
+      if (conflictingTeam) {
+        conflicts.push({
+          discordUserId: uid,
+          teamId: existing.teamId,
+          teamName: conflictingTeam.teamName || existing.teamName || null,
+          role: existing.role,
+        });
+      }
     }
   }
 
@@ -1501,9 +1529,16 @@ export async function saveConfigurableTeamWithExclusivity(teamDoc, options = {})
                   { session }
                 );
                 if (conflictInDb) {
-                  const conflictErr = new Error('One or more selected members are already assigned to another squad in this tournament.');
-                  conflictErr.code = 'PLAYER_ALREADY_ASSIGNED';
-                  throw conflictErr;
+                  const conflictingTeam = await teamCol.findOne({ teamId: conflictInDb.teamId }, { session });
+                  if (!conflictingTeam || ['CANCELLED', 'DELETED'].includes(conflictingTeam.status) || conflictingTeam.isDeleted === true) {
+                    // Stale membership from cancelled or deleted team: clean it up and proceed
+                    await memCol.deleteMany({ tournamentId, teamId: conflictInDb.teamId }, { session });
+                    await releaseTeamPlayerMemberships(tournamentId, conflictInDb.teamId);
+                  } else {
+                    const conflictErr = new Error('One or more selected members are already assigned to another squad in this tournament.');
+                    conflictErr.code = 'PLAYER_ALREADY_ASSIGNED';
+                    throw conflictErr;
+                  }
                 }
               }
 
@@ -1557,6 +1592,26 @@ export async function saveConfigurableTeamWithExclusivity(teamDoc, options = {})
         }
 
         if (!committedViaTx) {
+          // Check and remove any stale memberships from cancelled/deleted teams before writing
+          if (newUserIds.length > 0) {
+            try {
+              const staleMemberships = await memCol.find({
+                tournamentId,
+                discordUserId: { $in: newUserIds },
+                ...(isEdit ? { teamId: { $ne: teamId } } : {}),
+              }).toArray();
+              for (const sm of staleMemberships) {
+                const smTeam = await teamCol.findOne({ teamId: sm.teamId });
+                if (!smTeam || ['CANCELLED', 'DELETED'].includes(smTeam.status) || smTeam.isDeleted === true) {
+                  await memCol.deleteMany({ tournamentId, teamId: sm.teamId });
+                  await releaseTeamPlayerMemberships(tournamentId, sm.teamId);
+                }
+              }
+            } catch (staleErr) {
+              console.warn('[ConfigurableTournament] ⚠️ Stale membership cleanup warning:', staleErr.message);
+            }
+          }
+
           // Non-replica-set fallback using unique index enforcement on discord_tournament_player_memberships
           const insertedThisAttempt = [];
           try {
@@ -1663,7 +1718,12 @@ export async function getConfigurableTeamByName(tournamentId, teamName) {
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_teams');
-      const doc = await col.findOne({ tournamentId, teamNameLower: lower });
+      const doc = await col.findOne({
+        tournamentId,
+        teamNameLower: lower,
+        status: { $nin: ['CANCELLED', 'DELETED'] },
+        isDeleted: { $ne: true },
+      });
       if (doc) {
         localTeams.set(doc.teamId, doc);
         return doc;
@@ -1674,7 +1734,12 @@ export async function getConfigurableTeamByName(tournamentId, teamName) {
   }
 
   for (const team of localTeams.values()) {
-    if (team.tournamentId === tournamentId && team.teamNameLower === lower) {
+    if (
+      team.tournamentId === tournamentId &&
+      team.teamNameLower === lower &&
+      !['CANCELLED', 'DELETED'].includes(team.status) &&
+      team.isDeleted !== true
+    ) {
       return team;
     }
   }
@@ -1689,6 +1754,8 @@ export async function getConfigurableTeamsForUser(tournamentId, discordId) {
       const docs = await col
         .find({
           tournamentId,
+          status: { $nin: ['CANCELLED', 'DELETED'] },
+          isDeleted: { $ne: true },
           $or: [
             { leaderDiscordId: discordId },
             { 'players.discordId': discordId },
@@ -1709,6 +1776,8 @@ export async function getConfigurableTeamsForUser(tournamentId, discordId) {
   return Array.from(localTeams.values()).filter(
     (t) =>
       t.tournamentId === tournamentId &&
+      !['CANCELLED', 'DELETED'].includes(t.status) &&
+      t.isDeleted !== true &&
       (t.leaderDiscordId === discordId ||
         (t.players && t.players.some((p) => p.discordId === discordId || p.discordUserId === discordId)) ||
         (t.substitutes && t.substitutes.some((s) => s.discordId === discordId || s.discordUserId === discordId)))
@@ -1720,7 +1789,11 @@ export async function getConfigurableTeamsForTournament(tournamentId) {
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_teams');
-      const docs = await col.find({ tournamentId }).toArray();
+      const docs = await col.find({
+        tournamentId,
+        status: { $nin: ['CANCELLED', 'DELETED'] },
+        isDeleted: { $ne: true },
+      }).toArray();
       for (const d of docs) {
         localTeams.set(d.teamId, d);
       }
@@ -1730,7 +1803,9 @@ export async function getConfigurableTeamsForTournament(tournamentId) {
     }
   }
 
-  return Array.from(localTeams.values()).filter((t) => t.tournamentId === tournamentId);
+  return Array.from(localTeams.values()).filter(
+    (t) => t.tournamentId === tournamentId && !['CANCELLED', 'DELETED'].includes(t.status) && t.isDeleted !== true
+  );
 }
 
 export async function getEnrolledTeamsCount(tournamentId) {
@@ -1738,12 +1813,18 @@ export async function getEnrolledTeamsCount(tournamentId) {
   if (isMongoConnected()) {
     try {
       const col = getMongoDb().collection('discord_configurable_teams');
-      return await col.countDocuments({ tournamentId });
+      return await col.countDocuments({
+        tournamentId,
+        status: { $nin: ['CANCELLED', 'DELETED'] },
+        isDeleted: { $ne: true },
+      });
     } catch (err) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error counting teams:`, err.message);
     }
   }
-  return Array.from(localTeams.values()).filter((t) => t.tournamentId === tournamentId).length;
+  return Array.from(localTeams.values()).filter(
+    (t) => t.tournamentId === tournamentId && !['CANCELLED', 'DELETED'].includes(t.status) && t.isDeleted !== true
+  ).length;
 }
 
 export async function deleteConfigurableTeam(teamId) {
@@ -1753,6 +1834,9 @@ export async function deleteConfigurableTeam(teamId) {
 
   // Release all player & substitute memberships for this team
   await releaseTeamPlayerMemberships(existingTeam?.tournamentId || null, teamId);
+  if (existingTeam?.registrationId && String(existingTeam.registrationId) !== String(teamId)) {
+    await releaseTeamPlayerMemberships(existingTeam.tournamentId || null, String(existingTeam.registrationId));
+  }
 
   // Remove entries belonging to this team and release their slot states
   for (const [key, entry] of Array.from(localEntries.entries())) {
@@ -1768,6 +1852,8 @@ export async function deleteConfigurableTeam(teamId) {
 
       const entryCol = getMongoDb().collection('discord_configurable_entries');
       await entryCol.deleteMany({ teamId });
+
+      await cancelPendingTournamentVerificationsByTeam(existingTeam?.tournamentId, teamId, existingTeam?.teamName);
     } catch (err) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error deleting team ${teamId}:`, err.message);
       return false;
@@ -3003,5 +3089,8 @@ export async function cleanUpStaleConfigurableRegistrationsAndEntries(client = n
 
   return { cleanedRegistrations, cleanedEntries };
 }
+
+export { localTeams, localPlayerMemberships };
+
 
 

@@ -201,7 +201,7 @@ export function isTeamVerifiedForTournament(team, tournamentId) {
   if (!team || !tournamentId) return false;
   if (team.tournamentId !== tournamentId) return false;
   if (team.verified === false) return false;
-  if (team.status === 'REVOKED' || team.status === 'UNVERIFIED' || team.status === 'DELETED' || team.isDeleted === true) {
+  if (team.status === 'REVOKED' || team.status === 'UNVERIFIED' || team.status === 'DELETED' || team.status === 'CANCELLED' || team.isDeleted === true) {
     return false;
   }
   if (!team.leaderDiscordId) return false;
