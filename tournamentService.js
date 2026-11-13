@@ -41,7 +41,14 @@ import {
   logRolesRemoved,
   logTournamentAction,
 } from './auditLogger.js';
-import { releaseTeamPlayerMemberships } from './configurableTournamentData.js';
+import {
+  releaseTeamPlayerMemberships,
+  syncTeamPlayerMemberships,
+  checkTournamentPlayerExclusivity,
+  setExternalGuildSettingsGetter,
+} from './configurableTournamentData.js';
+
+setExternalGuildSettingsGetter(() => guildSettingsCache);
 import {
   isMongoConnected,
   getDb,
@@ -1364,6 +1371,7 @@ async function completeTournamentVerification({
       registrationId: String(registrationId),
       teamId: String(registrationId),
       teamName: resolvedTeamName,
+      status: 'CONFIRMED',
       discordId: String(captainId),
       verifiedAt,
       mentionedMemberIds: teammateIds,
@@ -1374,6 +1382,15 @@ async function completeTournamentVerification({
     };
     guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
     await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+
+    await syncTeamPlayerMemberships({
+      tournamentId,
+      teamId: String(registrationId),
+      teamName: resolvedTeamName,
+      leaderDiscordId: String(captainId),
+      players: teammateIds.map((id) => ({ discordId: String(id), id: String(id) })),
+      status: 'CONFIRMED',
+    }).catch((err) => console.warn('[Discord Bot] Warning syncing player memberships on verification:', err.message));
 
     if (savedTournament.roleId) {
       for (const uid of [captainId, ...teammateIds]) {
@@ -1623,6 +1640,43 @@ export async function handleTournamentVerificationInteraction(interaction) {
           return true;
         }
       }
+
+      // Check active tournament team membership exclusivity for all candidate accounts
+      const allCandidateIds = [interaction.user.id, ...selectedIds];
+      const confirmedTeams = await getConfirmedTeamsFromDb(interaction.guild, pending.tournamentId);
+
+      for (const team of confirmedTeams) {
+        // Exclude the registration being verified itself
+        if (String(team.registrationId) === String(pending.registrationId) || String(team.teamId) === String(pending.registrationId)) {
+          continue;
+        }
+        // Only active confirmed teams can block membership
+        if (['CANCELLED', 'DELETED'].includes(team.status) || team.isDeleted === true) {
+          continue;
+        }
+        const teamMembers = new Set((team.memberIds || []).map(String));
+        if (team.leaderId) teamMembers.add(String(team.leaderId));
+
+        const conflictId = allCandidateIds.find((id) => teamMembers.has(String(id)));
+        if (conflictId) {
+          await replyPrivate(interaction, {
+            content: `Discord user <@${conflictId}> is already in verified team "${team.teamName}". Each participant can only join one team per tournament.`,
+          });
+          return true;
+        }
+      }
+
+      const exclCheck = await checkTournamentPlayerExclusivity(pending.tournamentId, allCandidateIds, pending.registrationId);
+      if (!exclCheck.ok) {
+        const firstConflict = exclCheck.conflicts?.[0];
+        const conflictUser = firstConflict?.discordUserId ? `<@${firstConflict.discordUserId}>` : 'A selected member';
+        const teamNameText = firstConflict?.teamName ? ` "${firstConflict.teamName}"` : '';
+        await replyPrivate(interaction, {
+          content: `Discord user ${conflictUser} is already in verified team${teamNameText}. Each participant can only join one team per tournament.`,
+        });
+        return true;
+      }
+
       let savedTournament = guildSettingsCache[pending.guildId]?.tournaments?.[pending.tournamentId];
       if (!savedTournament) {
         savedTournament = await getTournamentFromDb(pending.guildId, pending.tournamentId).catch(() => null);
@@ -1956,7 +2010,7 @@ export async function getConfirmedTeamsFromDb(guild, tournamentId, savedTourname
   // 1. Read from savedTournament.verifiedRegistrations
   if (currentSaved?.verifiedRegistrations) {
     for (const [key, reg] of Object.entries(currentSaved.verifiedRegistrations)) {
-      if (reg && reg.status !== 'CANCELLED') {
+      if (reg && reg.status !== 'CANCELLED' && reg.status !== 'DELETED' && reg.isDeleted !== true) {
         const teamId = String(reg.teamId || reg.registrationId || key);
         const leaderId = String(reg.discordId || reg.captain?.discord_id || '');
         const memberIds = Array.isArray(reg.discordMemberIds)
@@ -3368,7 +3422,7 @@ export async function handleDashboardNavigationInteraction(interaction) {
  * Formats the registered teams list to be published into the shared #tournament-teams channel.
  */
 export function formatTeamsChannelRoster(tournament, teams = []) {
-  const eligibleTeams = teams.filter((t) => t.is_eligible);
+  const eligibleTeams = (teams || []).filter((t) => t.is_eligible && t.status !== 'CANCELLED' && t.status !== 'DELETED' && t.isDeleted !== true);
   const updatedAt = Math.floor(Date.now() / 1000);
   const makeHeader = () => `📋 **Tournament Registered Teams** — **${tournament.title}** (ID: \`${tournament.id}\`)\n` +
     `• **Total Confirmed Teams:** **${eligibleTeams.length}**\n` +
@@ -3434,6 +3488,22 @@ export async function updateTeamsRosterMessages(guild, tournament, teams, teamsC
 
   let backfilledDetails = false;
   savedTournament.verifiedRegistrations ||= {};
+  const activeRegKeys = new Set(
+    (teams || []).filter((item) => item.is_eligible && item.registration_id).map((item) => String(item.registration_id))
+  );
+
+  // 1. Reconcile / prune cancelled, deleted, or rejected teams no longer active
+  for (const [key, reg] of Object.entries(savedTournament.verifiedRegistrations)) {
+    if (reg && reg.status !== 'CANCELLED' && !activeRegKeys.has(key)) {
+      reg.status = 'CANCELLED';
+      reg.cancelledAt = new Date().toISOString();
+      backfilledDetails = true;
+      // Release player memberships so users are immediately free to join/verify another squad in this tournament
+      releaseTeamPlayerMemberships(savedTournament.tournamentId, key).catch(() => {});
+    }
+  }
+
+  // 2. Add or update active confirmed teams
   for (const team of teams.filter(item => item.is_eligible && item.registration_id)) {
     const key = String(team.registration_id);
     const prior = savedTournament.verifiedRegistrations[key];

@@ -1,6 +1,11 @@
 import crypto from 'node:crypto';
 import { getMongoDb, isMongoConnected, acquireLock, releaseLock } from './mongoService.js';
 
+let externalGuildSettingsGetter = null;
+export function setExternalGuildSettingsGetter(fn) {
+  externalGuildSettingsGetter = fn;
+}
+
 // In-memory fallback stores (used when MongoDB is disconnected or in unit tests)
 const localTournaments = new Map(); // tournamentId -> doc
 const localRegistrations = new Map(); // registrationId -> doc
@@ -1396,10 +1401,46 @@ export async function checkTournamentPlayerExclusivity(tournamentId, discordUser
     // Verify that the team this membership belongs to is still active in the tournament
     if (!activeTeamIds.has(m.teamId)) {
       const teamDoc = localTeams.get(m.teamId) || (await getConfigurableTeam(m.teamId));
-      if (!teamDoc || ['CANCELLED', 'DELETED'].includes(teamDoc.status) || teamDoc.isDeleted === true) {
-        // Membership is stale from a deleted or cancelled team: release it and do not block user
-        releaseTeamPlayerMemberships(tournamentId, m.teamId).catch(() => {});
-        continue;
+      if (teamDoc) {
+        if (['CANCELLED', 'DELETED'].includes(teamDoc.status) || teamDoc.isDeleted === true) {
+          releaseTeamPlayerMemberships(tournamentId, m.teamId).catch(() => {});
+          continue;
+        }
+      } else {
+        // Check if it belongs to an active verified registration
+        let isActiveVerified = false;
+        let verifiedTeamName = null;
+        const currentSettings = (typeof externalGuildSettingsGetter === 'function' ? externalGuildSettingsGetter() : null) || {};
+        for (const g of Object.values(currentSettings || {})) {
+          const reg = g.tournaments?.[tournamentId]?.verifiedRegistrations?.[m.teamId];
+          if (reg && reg.status !== 'CANCELLED' && reg.status !== 'DELETED') {
+            isActiveVerified = true;
+            verifiedTeamName = reg.teamName || null;
+            break;
+          }
+        }
+        if (!isActiveVerified && isMongoConnected()) {
+          try {
+            const db = getMongoDb();
+            const tourDoc = await db?.collection('discord_tournaments').findOne({
+              tournamentId,
+              [`verifiedRegistrations.${m.teamId}`]: { $exists: true },
+            });
+            const reg = tourDoc?.verifiedRegistrations?.[m.teamId];
+            if (reg && reg.status !== 'CANCELLED' && reg.status !== 'DELETED') {
+              isActiveVerified = true;
+              verifiedTeamName = reg.teamName || null;
+            }
+          } catch {}
+        }
+        if (!isActiveVerified) {
+          // Stale membership from a removed/cancelled team: release it and do not block user
+          releaseTeamPlayerMemberships(tournamentId, m.teamId).catch(() => {});
+          continue;
+        }
+        if (!m.teamName && verifiedTeamName) {
+          m.teamName = verifiedTeamName;
+        }
       }
     }
 
@@ -1420,14 +1461,12 @@ export async function checkTournamentPlayerExclusivity(tournamentId, discordUser
     const existing = membershipByUser.get(uid);
     if (existing && (!excludeTeamId || existing.teamId !== excludeTeamId)) {
       const conflictingTeam = teamsInTournament.find((t) => t.teamId === existing.teamId);
-      if (conflictingTeam) {
-        conflicts.push({
-          discordUserId: uid,
-          teamId: existing.teamId,
-          teamName: conflictingTeam.teamName || existing.teamName || null,
-          role: existing.role,
-        });
-      }
+      conflicts.push({
+        discordUserId: uid,
+        teamId: existing.teamId,
+        teamName: conflictingTeam?.teamName || existing.teamName || null,
+        role: existing.role,
+      });
     }
   }
 
