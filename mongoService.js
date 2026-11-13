@@ -67,6 +67,14 @@ export function getDb() {
 }
 
 /**
+ * Returns the active MongoClient instance for session/transaction operations.
+ * @returns {import('mongodb').MongoClient|null}
+ */
+export function getMongoClient() {
+  return mongoClient;
+}
+
+/**
  * Ensures MongoDB is connected. Throws a user-friendly error if unavailable.
  */
 export function ensurePersistenceAvailable() {
@@ -352,6 +360,10 @@ async function ensureMongoIndexes() {
     await cfgPendingCol.createIndex({ tournamentId: 1, userId: 1 }, { unique: true });
     await cfgPendingCol.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
+    const permIdentCol = mongoDb.collection('discord_permanent_identities');
+    await permIdentCol.createIndex({ discordUserId: 1 }, { unique: true });
+    await permIdentCol.createIndex({ matchDistrictUserId: 1 }, { unique: true });
+
     await ensureInviteCampaignIndexes(mongoDb);
     await ensureArenaIndexes(mongoDb);
     await ensureRolePrefixIndexes(mongoDb);
@@ -363,6 +375,219 @@ async function ensureMongoIndexes() {
 }
 
 export const localPendingVerifications = new Map();
+export const localPermanentIdentitiesByDiscordId = new Map();
+export const localPermanentIdentitiesByMDId = new Map();
+
+/**
+ * Saves or updates a permanent account-level identity linking between a Match District User ID
+ * and a Discord User ID (immutable Snowflake).
+ *
+ * CRITICAL ARCHITECTURAL CONSTRAINTS:
+ * 1. Independent of tournaments: Exists globally at the account level.
+ * 2. Immutable snowflake: Uses Discord User ID, not mutable username.
+ * 3. 1-to-1 Mapping: Rejects attempts by one Discord account to register as multiple independent Match District users.
+ * 4. Resilient: Survives all tournament-specific registration deletions.
+ *
+ * @param {object} params
+ * @param {string} params.matchDistrictUserId
+ * @param {string} params.discordUserId
+ * @param {string} [params.discordUsername]
+ * @param {object} [params.metadata]
+ * @returns {Promise<object>}
+ */
+export async function savePermanentDiscordIdentity({
+  matchDistrictUserId,
+  discordUserId,
+  discordUsername = '',
+  metadata = {},
+} = {}) {
+  if (!matchDistrictUserId || !discordUserId) {
+    throw new Error('Both matchDistrictUserId and discordUserId are required to link accounts.');
+  }
+
+  const mdId = String(matchDistrictUserId).trim();
+  const dId = String(discordUserId).trim();
+  const username = String(discordUsername || '').trim();
+
+  // 1. Prevent one Discord account from registering as multiple independent users
+  let existingByDiscord = localPermanentIdentitiesByDiscordId.get(dId);
+  if (!existingByDiscord && isMongoConnected()) {
+    try {
+      existingByDiscord = await mongoDb.collection('discord_permanent_identities').findOne({ discordUserId: dId });
+    } catch (err) {
+      console.warn(`[MongoDB] Warning checking Discord identity uniqueness for ${dId}:`, err.message);
+    }
+  }
+
+  if (existingByDiscord && String(existingByDiscord.matchDistrictUserId) !== mdId) {
+    const err = new Error(`This Discord account (<@${dId}>) is already permanently linked to a different Match District user.`);
+    err.code = 'DISCORD_ACCOUNT_ALREADY_LINKED';
+    throw err;
+  }
+
+  // 2. Prevent one Match District user from linking multiple Discord accounts
+  let existingByMD = localPermanentIdentitiesByMDId.get(mdId);
+  if (!existingByMD && isMongoConnected()) {
+    try {
+      existingByMD = await mongoDb.collection('discord_permanent_identities').findOne({ matchDistrictUserId: mdId });
+    } catch (err) {
+      console.warn(`[MongoDB] Warning checking Match District identity uniqueness for ${mdId}:`, err.message);
+    }
+  }
+
+  if (existingByMD && String(existingByMD.discordUserId) !== dId) {
+    const err = new Error(`Match District account (${mdId}) is already permanently linked to a different Discord user.`);
+    err.code = 'USER_ALREADY_LINKED';
+    throw err;
+  }
+
+  const now = new Date();
+  const linkedAt = existingByDiscord?.linkedAt || existingByMD?.linkedAt || now;
+
+  const identityDoc = {
+    matchDistrictUserId: mdId,
+    discordUserId: dId,
+    discordUsername: username || existingByDiscord?.discordUsername || existingByMD?.discordUsername || '',
+    linkedAt,
+    updatedAt: now,
+    ...metadata,
+  };
+
+  localPermanentIdentitiesByDiscordId.set(dId, identityDoc);
+  localPermanentIdentitiesByMDId.set(mdId, identityDoc);
+
+  if (isMongoConnected()) {
+    try {
+      const col = mongoDb.collection('discord_permanent_identities');
+      await col.updateOne(
+        { discordUserId: dId },
+        {
+          $set: identityDoc,
+          $setOnInsert: { createdAt: now },
+        },
+        { upsert: true }
+      );
+    } catch (err) {
+      console.warn(`[MongoDB] ⚠️ Error saving permanent identity for Discord ID ${dId}:`, err.message);
+      throw err;
+    }
+  }
+
+  return identityDoc;
+}
+
+/**
+ * Retrieves the permanent identity record for a given Discord User ID (Snowflake).
+ * @param {string} discordUserId
+ * @returns {Promise<object|null>}
+ */
+export async function getPermanentDiscordIdentityByDiscordId(discordUserId) {
+  if (!discordUserId) return null;
+  const dId = String(discordUserId).trim();
+
+  if (isMongoConnected()) {
+    try {
+      const col = mongoDb.collection('discord_permanent_identities');
+      const doc = await col.findOne({ discordUserId: dId });
+      if (doc) {
+        localPermanentIdentitiesByDiscordId.set(dId, doc);
+        if (doc.matchDistrictUserId) {
+          localPermanentIdentitiesByMDId.set(String(doc.matchDistrictUserId), doc);
+        }
+        return doc;
+      }
+    } catch (err) {
+      console.warn(`[MongoDB] ⚠️ Error fetching permanent identity for Discord ID ${dId}:`, err.message);
+    }
+  }
+
+  return localPermanentIdentitiesByDiscordId.get(dId) || null;
+}
+
+/**
+ * Retrieves the permanent identity record for a given Match District User ID.
+ * @param {string} matchDistrictUserId
+ * @returns {Promise<object|null>}
+ */
+export async function getPermanentDiscordIdentityByMatchDistrictId(matchDistrictUserId) {
+  if (!matchDistrictUserId) return null;
+  const mdId = String(matchDistrictUserId).trim();
+
+  if (isMongoConnected()) {
+    try {
+      const col = mongoDb.collection('discord_permanent_identities');
+      const doc = await col.findOne({ matchDistrictUserId: mdId });
+      if (doc) {
+        localPermanentIdentitiesByMDId.set(mdId, doc);
+        if (doc.discordUserId) {
+          localPermanentIdentitiesByDiscordId.set(String(doc.discordUserId), doc);
+        }
+        return doc;
+      }
+    } catch (err) {
+      console.warn(`[MongoDB] ⚠️ Error fetching permanent identity for Match District ID ${mdId}:`, err.message);
+    }
+  }
+
+  return localPermanentIdentitiesByMDId.get(mdId) || null;
+}
+
+/**
+ * Retrieves all registered permanent identities from MongoDB or memory cache.
+ * @returns {Promise<Array<object>>}
+ */
+export async function getAllPermanentDiscordIdentities() {
+  if (isMongoConnected()) {
+    try {
+      const col = mongoDb.collection('discord_permanent_identities');
+      const docs = await col.find({}).toArray();
+      for (const d of docs) {
+        if (d.discordUserId) localPermanentIdentitiesByDiscordId.set(String(d.discordUserId), d);
+        if (d.matchDistrictUserId) localPermanentIdentitiesByMDId.set(String(d.matchDistrictUserId), d);
+      }
+      return docs;
+    } catch (err) {
+      console.warn('[MongoDB] ⚠️ Error fetching all permanent identities:', err.message);
+    }
+  }
+  return Array.from(localPermanentIdentitiesByDiscordId.values());
+}
+
+/**
+ * Unlinks a Discord account from a Match District user.
+ * NOTE: This is an explicit user/admin account action and must NEVER be called by registration cleanup operations.
+ * @param {string} identifier - discordUserId or matchDistrictUserId
+ * @returns {Promise<boolean>}
+ */
+export async function unlinkPermanentDiscordIdentity(identifier) {
+  if (!identifier) return false;
+  const idStr = String(identifier).trim();
+
+  const matched = localPermanentIdentitiesByDiscordId.get(idStr) || localPermanentIdentitiesByMDId.get(idStr);
+
+  if (matched) {
+    localPermanentIdentitiesByDiscordId.delete(String(matched.discordUserId));
+    localPermanentIdentitiesByMDId.delete(String(matched.matchDistrictUserId));
+  } else {
+    localPermanentIdentitiesByDiscordId.delete(idStr);
+    localPermanentIdentitiesByMDId.delete(idStr);
+  }
+
+  if (isMongoConnected()) {
+    try {
+      const col = mongoDb.collection('discord_permanent_identities');
+      await col.deleteMany({
+        $or: [{ discordUserId: idStr }, { matchDistrictUserId: idStr }],
+      });
+      return true;
+    } catch (err) {
+      console.warn(`[MongoDB] ⚠️ Error unlinking permanent identity for ${idStr}:`, err.message);
+      return false;
+    }
+  }
+
+  return true;
+}
 
 export async function createPendingTournamentVerification(record) {
   const now = new Date();

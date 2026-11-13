@@ -45,6 +45,7 @@ import {
   releaseTeamPlayerMemberships,
   syncTeamPlayerMemberships,
   checkTournamentPlayerExclusivity,
+  deleteTournamentRegistrationComplete,
   setExternalGuildSettingsGetter,
 } from './configurableTournamentData.js';
 
@@ -73,6 +74,10 @@ import {
   enforceSingleActiveRoundInDb,
   findTournamentByBotCommandsChannel,
   purgeAllTournamentDataFromDb,
+  savePermanentDiscordIdentity,
+  getPermanentDiscordIdentityByDiscordId,
+  getPermanentDiscordIdentityByMatchDistrictId,
+  unlinkPermanentDiscordIdentity,
   clearTournamentDeletionLockInDb,
   getPendingTournamentDeletions,
   saveOrganiserLink,
@@ -1392,6 +1397,15 @@ async function completeTournamentVerification({
       status: 'CONFIRMED',
     }).catch((err) => console.warn('[Discord Bot] Warning syncing player memberships on verification:', err.message));
 
+    const captainUid = result.captain_uid || pending.captainUid || result.captain_user_id;
+    if (captainUid) {
+      await savePermanentDiscordIdentity({
+        matchDistrictUserId: captainUid,
+        discordUserId: String(captainId),
+        discordUsername: invokerUser?.tag || invokerUser?.username || '',
+      }).catch((err) => console.warn('[Discord Bot] Warning saving permanent identity on verification:', err.message));
+    }
+
     if (savedTournament.roleId) {
       for (const uid of [captainId, ...teammateIds]) {
         const member = await guild.members.fetch(uid).catch(() => null);
@@ -1466,6 +1480,18 @@ export async function handleTournamentVerificationMessage(message) {
     return true;
   }
 
+  // 1. Participant exclusivity check: prevent user from verifying if already in an active verified team in this tournament
+  const exclCheck = await checkTournamentPlayerExclusivity(tournamentId, [message.author.id]);
+  if (!exclCheck.ok) {
+    const conflict = exclCheck.conflicts?.[0];
+    const teamName = conflict?.teamName ? ` "${conflict.teamName}"` : '';
+    await sendTemporaryReason(`Already in verified team${teamName}. Registration rejected.`);
+    return true;
+  }
+
+  // 2. Resolve user's permanent Match District identity
+  let linkedIdentity = await getPermanentDiscordIdentityByDiscordId(message.author.id);
+
   let pendingId = null;
   try {
     const checked = await requestVerificationCheck(message.guild, tournamentId, code);
@@ -1487,6 +1513,35 @@ export async function handleTournamentVerificationMessage(message) {
     }
 
     if (!checked.result.registration_id) throw new Error('Check-code API returned no registration_id');
+
+    // 3. Identity validation:
+    // If registered leader has a bound Discord ID, verify message sender matches
+    if (checked.result.captain_discord_id && String(checked.result.captain_discord_id) !== String(message.author.id)) {
+      await sendTemporaryReason('that verification code belongs to a different team leader.');
+      return true;
+    }
+
+    // Prevent one Discord account from registering as multiple independent users
+    const registeredCaptainUid = checked.result.captain_uid || checked.result.captain_user_id;
+    if (linkedIdentity && registeredCaptainUid && String(linkedIdentity.matchDistrictUserId) !== String(registeredCaptainUid)) {
+      await sendTemporaryReason('this verification code was created for a different Match District user account.');
+      return true;
+    }
+
+    if (!linkedIdentity && registeredCaptainUid) {
+      try {
+        linkedIdentity = await savePermanentDiscordIdentity({
+          matchDistrictUserId: registeredCaptainUid,
+          discordUserId: message.author.id,
+          discordUsername: message.author.tag || message.author.username,
+        });
+      } catch (identErr) {
+        if (identErr.code === 'DISCORD_ACCOUNT_ALREADY_LINKED' || identErr.code === 'USER_ALREADY_LINKED') {
+          await sendTemporaryReason(identErr.message);
+          return true;
+        }
+      }
+    }
     pendingId = crypto.randomUUID();
     await createPendingTournamentVerification({
       pendingId,
@@ -2025,6 +2080,7 @@ export async function getConfirmedTeamsFromDb(guild, tournamentId, savedTourname
           memberIds,
           squad: reg.squad || [],
           status: reg.status || 'CONFIRMED',
+          is_eligible: true,
           verifiedAt: reg.verifiedAt || null,
         });
       }
@@ -2462,56 +2518,21 @@ export async function handleCancelTeamConfirm(interaction, tournamentId, teamId)
       return true;
     }
 
-    // 2. Mark team's registration as CANCELLED in MongoDB
-    savedTournament.verifiedRegistrations ||= {};
-    const regRecord = savedTournament.verifiedRegistrations[teamId] || {
-      registrationId: teamId,
+    // 2. Complete tournament registration cleanup across all MongoDB collections and in-memory caches
+    await deleteTournamentRegistrationComplete({
+      tournamentId,
       teamId,
-      teamName: targetTeam.teamName,
-      discordId: targetTeam.leaderId,
-      discordMemberIds: targetTeam.memberIds,
-    };
-    regRecord.status = 'CANCELLED';
-    regRecord.cancellationReason = reason;
-    regRecord.cancelledBy = interaction.user.tag || interaction.user.id;
-    regRecord.cancelledAt = new Date().toISOString();
-    savedTournament.verifiedRegistrations[teamId] = regRecord;
-
-    delete savedTournament.pendingTeamCancellations?.[teamId];
-
-    if (isMongoConnected()) {
-      try {
-        const db = getDb();
-        if (db) {
-          await db.collection('discord_configurable_teams').updateOne(
-            { tournamentId, teamId },
-            { $set: { status: 'CANCELLED', cancellationReason: reason, cancelledBy: interaction.user.id, cancelledAt: new Date() } }
-          );
-          await db.collection('discord_configurable_entries').updateMany(
-            { tournamentId, teamId },
-            { $set: { status: 'CANCELLED', cancellationReason: reason, cancelledAt: new Date() } }
-          );
-          await db.collection('discord_configurable_slots').updateMany(
-            { tournamentId, teamId },
-            { $set: { status: 'OPEN', teamId: null, teamName: null } }
-          );
-          await db.collection('pending_tournament_verifications').updateMany(
-            { tournamentId, $or: [{ registrationId: teamId }, { teamName: targetTeam.teamName }] },
-            { $set: { status: 'cancelled', invalidatedAt: new Date() } }
-          );
-        }
-      } catch (dbErr) {
-        console.warn(`[Discord Bot] MongoDB team cancellation update warning:`, dbErr.message);
-      }
-    }
-
-    // Release all player memberships so that players are immediately eligible to register or join another squad in this tournament
-    await releaseTeamPlayerMemberships(tournamentId, teamId).catch((relErr) => {
-      console.warn(`[Discord Bot] Error releasing memberships for cancelled team ${teamId}:`, relErr.message);
+      registrationId: targetTeam?.registrationId || teamId,
+      teamName: targetTeam?.teamName,
+      reason,
+      actorId: interaction.user.id,
+      actorTag: interaction.user.tag || interaction.user.username,
+      guildId: guild.id,
+      savedTournament,
+      purgeRegistration: false,
+    }).catch((delErr) => {
+      console.warn(`[Discord Bot] Complete registration deletion warning for team ${teamId}:`, delErr.message);
     });
-    if (targetTeam?.registrationId && String(targetTeam.registrationId) !== String(teamId)) {
-      await releaseTeamPlayerMemberships(tournamentId, String(targetTeam.registrationId)).catch(() => {});
-    }
 
     // 3. Remove tournament role from team members (except members in another confirmed team of this tournament)
     const otherConfirmedMemberIds = new Set();
@@ -3422,7 +3443,7 @@ export async function handleDashboardNavigationInteraction(interaction) {
  * Formats the registered teams list to be published into the shared #tournament-teams channel.
  */
 export function formatTeamsChannelRoster(tournament, teams = []) {
-  const eligibleTeams = (teams || []).filter((t) => t.is_eligible && t.status !== 'CANCELLED' && t.status !== 'DELETED' && t.isDeleted !== true);
+  const eligibleTeams = (teams || []).filter((t) => (t.is_eligible !== false) && t.status !== 'CANCELLED' && t.status !== 'DELETED' && t.isDeleted !== true);
   const updatedAt = Math.floor(Date.now() / 1000);
   const makeHeader = () => `📋 **Tournament Registered Teams** — **${tournament.title}** (ID: \`${tournament.id}\`)\n` +
     `• **Total Confirmed Teams:** **${eligibleTeams.length}**\n` +
@@ -3448,7 +3469,7 @@ export function formatTeamsChannelRoster(tournament, teams = []) {
     const discordMentions = [...new Set(discordIds.map(id => String(id || '').trim()).filter(id => /^\d{17,20}$/.test(id)))];
     const substituteText = substitutes.length ? substitutes.map(formatPlayer).join(', ') : 'None';
     const squadText = squad.map((player, index) => `  ${index + 1}. ${formatPlayer(player)}`).join('\n');
-    const teamText = `**${i + 1}. ${team.team_name || 'Team'}**\n` +
+    const teamText = `**${i + 1}. ${team.team_name || team.teamName || 'Team'}**\n` +
       `• **Team Leader:** ${formatPlayer(leader.ign || leader.uid ? leader : { ign: team.captain || 'Team Leader', uid: team.captain_uid })}${leaderMention}\n` +
       `• **Squad:**\n${squadText}\n` +
       `• **Substitutes:** ${substituteText}\n` +

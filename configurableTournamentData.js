@@ -1,5 +1,13 @@
 import crypto from 'node:crypto';
-import { getMongoDb, isMongoConnected, acquireLock, releaseLock } from './mongoService.js';
+import {
+  getMongoDb,
+  getMongoClient,
+  isMongoConnected,
+  acquireLock,
+  releaseLock,
+  localPendingVerifications,
+  cancelPendingTournamentVerificationsByTeam,
+} from './mongoService.js';
 
 let externalGuildSettingsGetter = null;
 export function setExternalGuildSettingsGetter(fn) {
@@ -1866,15 +1874,311 @@ export async function getEnrolledTeamsCount(tournamentId) {
   ).length;
 }
 
+export async function deleteTournamentRegistrationComplete({
+  tournamentId,
+  teamId,
+  registrationId = null,
+  teamName = null,
+  reason = 'Registration deleted by tournament administrator.',
+  actorId = null,
+  actorTag = null,
+  guildId = null,
+  savedTournament = null,
+  purgeRegistration = false,
+} = {}) {
+  if (!tournamentId || (!teamId && !registrationId)) {
+    throw new Error('deleteTournamentRegistrationComplete requires tournamentId and either teamId or registrationId.');
+  }
+
+  const primaryTeamId = String(teamId || registrationId);
+  const altRegId = registrationId ? String(registrationId) : null;
+  const targetIds = Array.from(new Set([primaryTeamId, altRegId].filter(Boolean)));
+
+  // 1. Gather all member Discord IDs associated with this team before deletion
+  const freedDiscordIds = new Set();
+  let resolvedTeamName = teamName || '';
+
+  // Check in-memory localTeams
+  for (const tid of targetIds) {
+    const t = localTeams.get(tid);
+    if (t) {
+      if (t.teamName && !resolvedTeamName) resolvedTeamName = t.teamName;
+      if (t.leaderDiscordId) freedDiscordIds.add(String(t.leaderDiscordId));
+      if (Array.isArray(t.players)) {
+        for (const p of t.players) {
+          const pid = p.discordId || p.discordUserId || p.id;
+          if (pid) freedDiscordIds.add(String(pid));
+        }
+      }
+      if (Array.isArray(t.substitutes)) {
+        for (const s of t.substitutes) {
+          const sid = s.discordId || s.discordUserId || s.id;
+          if (sid) freedDiscordIds.add(String(sid));
+        }
+      }
+    }
+  }
+
+  // Check savedTournament / cached guildSettings
+  const currentSettings = typeof externalGuildSettingsGetter === 'function' ? externalGuildSettingsGetter() : null;
+  const tour = savedTournament || (guildId && currentSettings ? currentSettings[guildId]?.tournaments?.[tournamentId] : null);
+  if (tour?.verifiedRegistrations) {
+    for (const tid of targetIds) {
+      const v = tour.verifiedRegistrations[tid];
+      if (v) {
+        if (v.teamName && !resolvedTeamName) resolvedTeamName = v.teamName;
+        if (v.discordId) freedDiscordIds.add(String(v.discordId));
+        if (Array.isArray(v.discordMemberIds)) {
+          for (const mid of v.discordMemberIds) freedDiscordIds.add(String(mid));
+        }
+      }
+    }
+  }
+
+  // Check localPlayerMemberships
+  for (const [key, mem] of localPlayerMemberships.entries()) {
+    if (mem.tournamentId === tournamentId && targetIds.includes(String(mem.teamId))) {
+      if (mem.discordUserId) freedDiscordIds.add(String(mem.discordUserId));
+      localPlayerMemberships.delete(key);
+    }
+  }
+
+  // 2. In-Memory cleanup across local stores
+  for (const tid of targetIds) {
+    localTeams.delete(tid);
+  }
+
+  for (const [key, entry] of Array.from(localEntries.entries())) {
+    if (entry.tournamentId === tournamentId && targetIds.includes(String(entry.teamId || entry.registrationId))) {
+      localEntries.delete(key);
+    }
+  }
+
+  for (const [, slot] of localSlots.entries()) {
+    if (slot.tournamentId === tournamentId && targetIds.includes(String(slot.teamId || slot.registrationId))) {
+      slot.status = 'OPEN';
+      slot.teamId = null;
+      slot.teamName = null;
+    }
+  }
+
+  // Invalidate or remove from localPendingVerifications
+  for (const [pid, session] of localPendingVerifications.entries()) {
+    if (
+      session.tournamentId === tournamentId &&
+      (targetIds.includes(String(session.registrationId)) || (resolvedTeamName && session.teamName === resolvedTeamName))
+    ) {
+      localPendingVerifications.delete(pid);
+    }
+  }
+
+  // Remove verified registration from savedTournament (or mark CANCELLED) and free group/round slots
+  if (tour) {
+    if (tour.verifiedRegistrations) {
+      for (const tid of targetIds) {
+        if (purgeRegistration) {
+          delete tour.verifiedRegistrations[tid];
+        } else {
+          const prev = tour.verifiedRegistrations[tid] || {};
+          tour.verifiedRegistrations[tid] = {
+            ...prev,
+            registrationId: tid,
+            teamId: tid,
+            teamName: resolvedTeamName || prev.teamName || 'Cancelled Team',
+            status: 'CANCELLED',
+            cancellationReason: reason,
+            cancelledBy: actorTag || actorId || 'Admin',
+            cancelledAt: new Date().toISOString(),
+          };
+        }
+      }
+    }
+    if (tour.pendingTeamCancellations) {
+      for (const tid of targetIds) {
+        delete tour.pendingTeamCancellations[tid];
+      }
+    }
+    if (tour.rounds) {
+      for (const round of Object.values(tour.rounds)) {
+        if (!round || !Array.isArray(round.groups)) continue;
+        for (const group of round.groups) {
+          if (!group || !Array.isArray(group.slots)) continue;
+          for (const slot of group.slots) {
+            if (
+              targetIds.includes(String(slot.teamId)) ||
+              (resolvedTeamName && slot.teamName && slot.teamName.toLowerCase() === resolvedTeamName.toLowerCase())
+            ) {
+              slot.status = 'AVAILABLE';
+              delete slot.teamId;
+              delete slot.teamName;
+              delete slot.leaderId;
+              delete slot.memberIds;
+            }
+          }
+          if (Array.isArray(group.qualifiedTeams)) {
+            group.qualifiedTeams = group.qualifiedTeams.filter(
+              (qt) => !targetIds.includes(String(qt.teamId)) && (!resolvedTeamName || qt.teamName !== resolvedTeamName)
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // 3. MongoDB Deletions across all tournament collections
+  if (isMongoConnected()) {
+    const db = getMongoDb();
+    const client = getMongoClient();
+    let session = null;
+    let useTransaction = false;
+
+    if (typeof client?.startSession === 'function') {
+      try {
+        session = client.startSession();
+        session.startTransaction();
+        useTransaction = true;
+      } catch {
+        session = null;
+        useTransaction = false;
+      }
+    }
+
+    const sessionOpts = useTransaction ? { session } : {};
+
+    try {
+      const idFilter = {
+        tournamentId,
+        $or: [
+          { teamId: { $in: targetIds } },
+          { registrationId: { $in: targetIds } },
+        ],
+      };
+
+      // 3.1. Delete team record from discord_configurable_teams
+      await db.collection('discord_configurable_teams').deleteMany(idFilter, sessionOpts);
+
+      // 3.2. Delete entry records from discord_configurable_entries
+      await db.collection('discord_configurable_entries').deleteMany(idFilter, sessionOpts);
+
+      // 3.3. Free slots in discord_configurable_slots
+      await db.collection('discord_configurable_slots').updateMany(
+        idFilter,
+        {
+          $set: { status: 'OPEN', teamId: null, teamName: null, updatedAt: new Date() },
+        },
+        sessionOpts
+      );
+
+      // 3.4. Delete all tournament player memberships for this team
+      await db.collection('discord_tournament_player_memberships').deleteMany(
+        idFilter,
+        sessionOpts
+      );
+
+      // 3.5. Delete / invalidate pending verification sessions
+      const pendingFilter = {
+        tournamentId,
+        $or: [
+          { registrationId: { $in: targetIds } },
+          ...(resolvedTeamName ? [{ teamName: resolvedTeamName }] : []),
+        ],
+      };
+      await db.collection('pending_tournament_verifications').deleteMany(pendingFilter, sessionOpts);
+
+      // 3.6. Update discord_tournaments to unset or mark cancelled
+      const tourQuery = guildId ? { guildId, tournamentId } : { tournamentId };
+      if (purgeRegistration) {
+        const unsetFields = {};
+        for (const tid of targetIds) {
+          unsetFields[`verifiedRegistrations.${tid}`] = '';
+          unsetFields[`pendingTeamCancellations.${tid}`] = '';
+        }
+        await db.collection('discord_tournaments').updateMany(tourQuery, { $unset: unsetFields }, sessionOpts);
+      } else {
+        const setFields = {};
+        const unsetFields = {};
+        for (const tid of targetIds) {
+          setFields[`verifiedRegistrations.${tid}.status`] = 'CANCELLED';
+          setFields[`verifiedRegistrations.${tid}.cancellationReason`] = reason;
+          setFields[`verifiedRegistrations.${tid}.cancelledBy`] = actorTag || actorId || 'Admin';
+          setFields[`verifiedRegistrations.${tid}.cancelledAt`] = new Date().toISOString();
+          unsetFields[`pendingTeamCancellations.${tid}`] = '';
+        }
+        await db.collection('discord_tournaments').updateMany(tourQuery, { $set: setFields, $unset: unsetFields }, sessionOpts);
+      }
+
+      if (useTransaction) {
+        await session.commitTransaction();
+      }
+    } catch (dbErr) {
+      if (useTransaction) {
+        await session.abortTransaction().catch(() => {});
+      }
+      console.warn(`[ConfigurableTournament] ⚠️ Mongo error during complete registration cleanup:`, dbErr.message);
+      // Fallback sequential execution if transaction failed
+      try {
+        await db.collection('discord_configurable_teams').deleteMany({ tournamentId, $or: [{ teamId: { $in: targetIds } }, { registrationId: { $in: targetIds } }] });
+        await db.collection('discord_configurable_entries').deleteMany({ tournamentId, $or: [{ teamId: { $in: targetIds } }, { registrationId: { $in: targetIds } }] });
+        await db.collection('discord_configurable_slots').updateMany({ tournamentId, $or: [{ teamId: { $in: targetIds } }, { registrationId: { $in: targetIds } }] }, { $set: { status: 'OPEN', teamId: null, teamName: null, updatedAt: new Date() } });
+        await db.collection('discord_tournament_player_memberships').deleteMany({ tournamentId, $or: [{ teamId: { $in: targetIds } }, { registrationId: { $in: targetIds } }] });
+        await db.collection('pending_tournament_verifications').deleteMany({ tournamentId, $or: [{ registrationId: { $in: targetIds } }, ...(resolvedTeamName ? [{ teamName: resolvedTeamName }] : [])] });
+      } catch (fallbackErr) {
+        console.warn(`[ConfigurableTournament] ⚠️ Fallback cleanup error:`, fallbackErr.message);
+      }
+    } finally {
+      if (session) {
+        await session.endSession().catch(() => {});
+      }
+    }
+  }
+
+  // 4. Record audit log
+  await recordConfigurableAuditLog({
+    action: 'REGISTRATION_DELETED_COMPLETE',
+    tournamentId,
+    guildId,
+    teamId: primaryTeamId,
+    teamName: resolvedTeamName,
+    actorId: actorId || 'system',
+    actorTag: actorTag || 'Admin',
+    reason,
+    freedCount: freedDiscordIds.size,
+    timestamp: new Date(),
+  }).catch(() => {});
+
+  return {
+    success: true,
+    tournamentId,
+    targetIds,
+    teamName: resolvedTeamName,
+    freedDiscordIds: Array.from(freedDiscordIds),
+  };
+}
+
 export async function deleteConfigurableTeam(teamId) {
   if (!teamId) return false;
   const existingTeam = localTeams.get(teamId) || (await getConfigurableTeam(teamId));
+  const tournamentId = existingTeam?.tournamentId || null;
+  const registrationId = existingTeam?.registrationId ? String(existingTeam.registrationId) : null;
+
+  if (tournamentId) {
+    await deleteTournamentRegistrationComplete({
+      tournamentId,
+      teamId,
+      registrationId,
+      teamName: existingTeam?.teamName || null,
+      actorId: existingTeam?.leaderDiscordId || null,
+      guildId: existingTeam?.guildId || null,
+    });
+    return true;
+  }
+
   localTeams.delete(teamId);
 
   // Release all player & substitute memberships for this team
-  await releaseTeamPlayerMemberships(existingTeam?.tournamentId || null, teamId);
-  if (existingTeam?.registrationId && String(existingTeam.registrationId) !== String(teamId)) {
-    await releaseTeamPlayerMemberships(existingTeam.tournamentId || null, String(existingTeam.registrationId));
+  await releaseTeamPlayerMemberships(null, teamId);
+  if (registrationId && String(registrationId) !== String(teamId)) {
+    await releaseTeamPlayerMemberships(null, String(registrationId));
   }
 
   // Remove entries belonging to this team and release their slot states
@@ -1892,7 +2196,7 @@ export async function deleteConfigurableTeam(teamId) {
       const entryCol = getMongoDb().collection('discord_configurable_entries');
       await entryCol.deleteMany({ teamId });
 
-      await cancelPendingTournamentVerificationsByTeam(existingTeam?.tournamentId, teamId, existingTeam?.teamName);
+      await cancelPendingTournamentVerificationsByTeam(null, teamId, existingTeam?.teamName);
     } catch (err) {
       console.warn(`[ConfigurableTournament] ⚠️ Mongo error deleting team ${teamId}:`, err.message);
       return false;
@@ -3129,7 +3433,7 @@ export async function cleanUpStaleConfigurableRegistrationsAndEntries(client = n
   return { cleanedRegistrations, cleanedEntries };
 }
 
-export { localTeams, localPlayerMemberships };
+export { localTeams, localPlayerMemberships, localEntries, localSlots, localAuditLogs };
 
 
 
