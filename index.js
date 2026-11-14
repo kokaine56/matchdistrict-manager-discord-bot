@@ -237,6 +237,12 @@ import {
   handleOrganiserVerificationInteraction,
   handleOrganiserActivationMessage,
 } from './organiserVerificationService.js';
+import {
+  initCentralVerificationConfigsCache,
+  handleCentralVerificationSetupCommand,
+  handleCentralVerificationInteraction,
+  handleCentralVerificationMessage,
+} from './centralVerificationService.js';
 
 
 export {
@@ -2810,6 +2816,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   startRegistrationScheduler(readyClient);
   setSlotChartClient(readyClient);
   await initOrganiserVerificationConfigsCache();
+  await initCentralVerificationConfigsCache();
 
   // Verify bot moderation permissions across joined guilds
   for (const guild of readyClient.guilds.cache.values()) {
@@ -2927,6 +2934,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     if (message.guild && await handleTournamentVerificationMessage(message)) return;
+    if (message.guild && await handleCentralVerificationMessage(message)) return;
 
     const corrId = crypto.randomBytes(4).toString('hex');
     console.log(`[Discord Bot] [corr:${corrId}] 1. Message event received: guildId=${message.guild?.id || 'DM'}, authorId=${message.author?.id}, hasContent=${Boolean(message.content)}`);
@@ -3090,6 +3098,14 @@ client.on(Events.MessageCreate, async (message) => {
         return;
       } else if (cmd === 'deletemsg' || cmd === 'deletemessage') {
         await handleDeleteManagedMessageCommand(message.guild, message.member, args, (text) => message.reply(text));
+        return;
+      } else if (cmd === 'verify') {
+        await handleCentralVerificationSetupCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          (payload) => message.reply(payload)
+        );
         return;
       } else if (cmd === 'organiser' || cmd === 'organizer') {
         try {
@@ -3372,6 +3388,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // Handle tournament verification interactions (teammate select & cancel)
   if (interaction.customId?.startsWith('tver:')) {
     const handled = await handleTournamentVerificationInteraction(interaction);
+    if (handled) return;
+  }
+
+  // Handle central tournament verification interactions (dashboard controls, modals & confirm/cancel)
+  if (interaction.customId?.startsWith('cver:')) {
+    const handled = await handleCentralVerificationInteraction(interaction);
     if (handled) return;
   }
 

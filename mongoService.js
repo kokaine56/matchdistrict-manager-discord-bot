@@ -279,6 +279,9 @@ async function ensureMongoIndexes() {
     const pendingAnncCol = mongoDb.collection('discord_pending_announcements');
     await pendingAnncCol.createIndex({ announcementId: 1 }, { unique: true });
 
+    const centralVerCol = mongoDb.collection('discord_central_verification_configs');
+    await centralVerCol.createIndex({ guildId: 1 }, { unique: true });
+
     const pendingVerCol = mongoDb.collection('pending_tournament_verifications');
     await pendingVerCol.createIndex({ pendingId: 1 }, { unique: true });
     await pendingVerCol.createIndex(
@@ -2633,6 +2636,98 @@ export async function recordOrganiserVerification(record) {
   } catch (err) {
     console.warn('[MongoDB] ⚠️ Error recording organiser verification:', err.message);
     return false;
+  }
+}
+
+/**
+ * In-memory fallback map for central tournament verification configs when MongoDB is disconnected or in test environments.
+ * Map<guildId, configDoc>
+ */
+export const localCentralVerificationConfigs = new Map();
+
+/**
+ * Saves central verification configuration for a guild persistently to MongoDB.
+ * @param {string} guildId
+ * @param {object} config
+ * @returns {Promise<boolean>}
+ */
+export async function saveCentralVerificationConfig(guildId, config) {
+  if (!guildId || !config) return false;
+  const now = new Date().toISOString();
+  const doc = {
+    guildId,
+    categoryId: config.categoryId || null,
+    setupChannelId: config.setupChannelId || null,
+    verifyChannelId: config.verifyChannelId || null,
+    dashboardMessageId: config.dashboardMessageId || null,
+    enabled: config.enabled !== undefined ? Boolean(config.enabled) : true,
+    soloMentionRequirement: typeof config.soloMentionRequirement === 'number' ? config.soloMentionRequirement : 0,
+    duoMentionRequirement: typeof config.duoMentionRequirement === 'number' ? config.duoMentionRequirement : 2,
+    squadMentionRequirement: typeof config.squadMentionRequirement === 'number' ? config.squadMentionRequirement : 4,
+    updatedBy: config.updatedBy || null,
+    updatedAt: config.updatedAt || now,
+  };
+  localCentralVerificationConfigs.set(guildId, doc);
+
+  if (!isMongoConnected()) return true;
+  try {
+    const col = mongoDb.collection('discord_central_verification_configs');
+    await col.updateOne(
+      { guildId },
+      { $set: doc },
+      { upsert: true }
+    );
+    return true;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error saving central verification config for guild ${guildId}:`, err.message);
+    return false;
+  }
+}
+
+/**
+ * Retrieves central verification config for a guild.
+ * @param {string} guildId
+ * @returns {Promise<object|null>}
+ */
+export async function getCentralVerificationConfig(guildId) {
+  if (!guildId) return null;
+  if (!isMongoConnected()) {
+    return localCentralVerificationConfigs.get(guildId) || null;
+  }
+  try {
+    const col = mongoDb.collection('discord_central_verification_configs');
+    const doc = await col.findOne({ guildId });
+    if (doc) {
+      const { _id, ...cleanDoc } = doc;
+      localCentralVerificationConfigs.set(guildId, cleanDoc);
+      return cleanDoc;
+    }
+    return localCentralVerificationConfigs.get(guildId) || null;
+  } catch (err) {
+    console.warn(`[MongoDB] ⚠️ Error fetching central verification config for guild ${guildId}:`, err.message);
+    return localCentralVerificationConfigs.get(guildId) || null;
+  }
+}
+
+/**
+ * Loads all active central verification configs from MongoDB.
+ * @returns {Promise<Array<object>>}
+ */
+export async function loadAllCentralVerificationConfigs() {
+  if (!isMongoConnected()) {
+    return Array.from(localCentralVerificationConfigs.values());
+  }
+  try {
+    const col = mongoDb.collection('discord_central_verification_configs');
+    const docs = await col.find({}).toArray();
+    const cleanDocs = docs.map(({ _id, ...clean }) => clean);
+    cleanDocs.forEach((d) => {
+      if (d.guildId) localCentralVerificationConfigs.set(d.guildId, d);
+    });
+    return cleanDocs;
+  } catch (err) {
+    console.warn('[MongoDB] ⚠️ Error loading all central verification configs:', err.message);
+    return Array.from(localCentralVerificationConfigs.values());
   }
 }
 

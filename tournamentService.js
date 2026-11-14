@@ -198,7 +198,7 @@ export const REQUIRED_TOURNAMENT_CHANNELS = [
   },
 ];
 
-async function sendTournamentManagementLog(guild, tournament, round, action, actor, details = []) {
+export async function sendTournamentManagementLog(guild, tournament, round, action, actor, details = []) {
   try {
     const saved = guildSettingsCache[guild.id]?.tournaments?.[tournament?.id || tournament?.tournamentId];
     const channelIds = [...new Set([
@@ -1244,6 +1244,12 @@ export async function cleanupLegacyPublicVerificationPrompts(guild) {
       },
     }).catch((error) => console.warn(`[Discord Bot] Could not restore verification information message for ${tournamentId}:`, error.message));
   }
+
+  // Also clean up leftover verification code messages in central verification channel #verify-here
+  try {
+    const { cleanupCentralVerificationOfflineMessages } = await import('./centralVerificationService.js');
+    await cleanupCentralVerificationOfflineMessages(guild).catch(() => {});
+  } catch {}
 }
 
 function getVerificationAttemptState(guildId, userId) {
