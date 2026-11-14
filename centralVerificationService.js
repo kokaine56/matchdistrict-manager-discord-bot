@@ -953,11 +953,11 @@ export async function handleCentralVerificationInteraction(interaction) {
           status: 'CONFIRMED',
         }).catch((err) => console.warn('[CentralVerification] Warning syncing player memberships:', err.message));
 
-        // Save permanent Match District identity if UID is present
-        const captainUid = result.captain_uid || pending.captainUid || result.captain_user_id;
-        if (captainUid) {
+        // Save permanent Match District identity if user ID is present
+        const mdUserId = result.match_district_user_id || pending.matchDistrictUserId || result.captain_user_id || result.user_id;
+        if (mdUserId) {
           await savePermanentDiscordIdentity({
-            matchDistrictUserId: captainUid,
+            matchDistrictUserId: String(mdUserId).trim(),
             discordUserId: String(captainId),
             discordUsername: interaction.user?.tag || interaction.user?.username || '',
           }).catch((err) => console.warn('[CentralVerification] Warning saving permanent identity:', err.message));
@@ -1152,18 +1152,32 @@ export async function handleCentralVerificationMessage(message) {
         ...(secret ? { Authorization: `Bearer ${secret}`, 'x-bot-secret': secret } : {}),
         'x-guild-id': guild.id,
       },
-      body: JSON.stringify({ code, guild_id: guild.id }),
+      body: JSON.stringify({
+        code,
+        guild_id: guild.id,
+        discord_user_id: message.author.id,
+        discord_username: message.author.tag || message.author.username,
+      }),
     });
 
     checkResult = await response.json().catch(() => ({}));
     if (!response.ok || !checkResult.success) {
-      const reason = checkResult.reason || checkResult.error || '';
-      let errorMsg = 'That verification code is invalid.';
-      if (reason === 'already_used') errorMsg = 'That verification code has already been used.';
-      else if (reason === 'not_approved_yet') errorMsg = 'This team registration has not been approved yet.';
-      else if (reason === 'registration_rejected') errorMsg = 'This team registration was rejected by tournament staff.';
-      else if (reason === 'not_found') errorMsg = 'Verification code not found. Please double-check your code from the website.';
-      await sendTemporaryNotice(`❌ Verification check failed: ${errorMsg}`);
+      const errCode = checkResult.error || checkResult.reason || '';
+      let errorMsg = checkResult.message || 'That verification code is invalid.';
+      if (errCode === 'CODE_ALREADY_VERIFIED' || errCode === 'already_used') {
+        errorMsg = '❌ This tournament registration has already been verified on Discord.';
+      } else if (errCode === 'DISCORD_IDENTITY_CONFLICT') {
+        errorMsg = checkResult.message || '❌ This Discord account is already linked to a different Match District account.';
+      } else if (errCode === 'IDENTITY_DATA_CONFLICT') {
+        errorMsg = '❌ Identity database conflict detected. Please contact tournament support.';
+      } else if (errCode === 'CODE_INVALID' || errCode === 'not_found') {
+        errorMsg = '❌ Verification check failed: Verification code not found. Please double-check your code from the website.';
+      } else if (errCode === 'CODE_NOT_ELIGIBLE') {
+        errorMsg = `❌ Verification check failed: ${checkResult.message || 'Registration is not eligible for verification.'}`;
+      } else {
+        errorMsg = `❌ Verification check failed: ${errorMsg}`;
+      }
+      await sendTemporaryNotice(errorMsg);
       return true;
     }
   } catch (apiErr) {
@@ -1185,18 +1199,18 @@ export async function handleCentralVerificationMessage(message) {
   }
 
   const registeredCaptainUserId = String(
-    checkResult.match_district_user_id || checkResult.captain_user_id || checkResult.user_id || checkResult.captain_uid || ''
+    checkResult.match_district_user_id || checkResult.captain_user_id || checkResult.user_id || ''
   ).trim();
 
   let linkedIdentity = await getPermanentDiscordIdentityByDiscordId(message.author.id);
-  if (linkedIdentity && registeredCaptainUserId && String(linkedIdentity.matchDistrictUserId) !== registeredCaptainUserId) {
-    await sendTemporaryNotice('❌ This verification code belongs to a different Match District user account.');
+  if (linkedIdentity && registeredCaptainUserId && String(linkedIdentity.matchDistrictUserId).trim() !== registeredCaptainUserId) {
+    await sendTemporaryNotice('❌ This Discord account is already linked to a different Match District account.');
     return true;
   }
 
   if (registeredCaptainUserId) {
     const existingIdentityByMD = await getPermanentDiscordIdentityByMatchDistrictId(registeredCaptainUserId);
-    if (existingIdentityByMD && String(existingIdentityByMD.discordUserId) !== String(message.author.id)) {
+    if (existingIdentityByMD && String(existingIdentityByMD.discordUserId).trim() !== String(message.author.id)) {
       await sendTemporaryNotice('❌ This Match District account is already linked to a different Discord account.');
       return true;
     }
@@ -1210,7 +1224,7 @@ export async function handleCentralVerificationMessage(message) {
         discordUsername: message.author.tag || message.author.username,
       });
     } catch (identErr) {
-      if (identErr.code === 'DISCORD_ACCOUNT_ALREADY_LINKED' || identErr.code === 'USER_ALREADY_LINKED') {
+      if (identErr.code === 'DISCORD_IDENTITY_CONFLICT' || identErr.code === 'DISCORD_ACCOUNT_ALREADY_LINKED' || identErr.code === 'USER_ALREADY_LINKED') {
         await sendTemporaryNotice(identErr.message);
         return true;
       }

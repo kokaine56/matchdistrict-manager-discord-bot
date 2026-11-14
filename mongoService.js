@@ -422,9 +422,9 @@ export async function savePermanentDiscordIdentity({
     }
   }
 
-  if (existingByDiscord && String(existingByDiscord.matchDistrictUserId) !== mdId) {
-    const err = new Error(`This Discord account (<@${dId}>) is already permanently linked to a different Match District user.`);
-    err.code = 'DISCORD_ACCOUNT_ALREADY_LINKED';
+  if (existingByDiscord && String(existingByDiscord.matchDistrictUserId).trim() !== mdId) {
+    const err = new Error('❌ This Discord account is already linked to a different Match District account.');
+    err.code = 'DISCORD_IDENTITY_CONFLICT';
     throw err;
   }
 
@@ -438,9 +438,9 @@ export async function savePermanentDiscordIdentity({
     }
   }
 
-  if (existingByMD && String(existingByMD.discordUserId) !== dId) {
-    const err = new Error(`Match District account (${mdId}) is already permanently linked to a different Discord user.`);
-    err.code = 'USER_ALREADY_LINKED';
+  if (existingByMD && String(existingByMD.discordUserId).trim() !== dId) {
+    const err = new Error('❌ This Match District account is already linked to a different Discord account.');
+    err.code = 'DISCORD_IDENTITY_CONFLICT';
     throw err;
   }
 
@@ -471,6 +471,26 @@ export async function savePermanentDiscordIdentity({
         { upsert: true }
       );
     } catch (err) {
+      if (err.code === 11000 || String(err.message).includes('E11000')) {
+        // Concurrency collision recovery: inspect whether the collision is for the same pair or a different account
+        const col = mongoDb.collection('discord_permanent_identities');
+        const docByMD = await col.findOne({ matchDistrictUserId: mdId });
+        const docByDisc = await col.findOne({ discordUserId: dId });
+        if (docByMD && String(docByMD.discordUserId).trim() !== dId) {
+          const conflictErr = new Error('❌ This Match District account is already linked to a different Discord account.');
+          conflictErr.code = 'DISCORD_IDENTITY_CONFLICT';
+          throw conflictErr;
+        }
+        if (docByDisc && String(docByDisc.matchDistrictUserId).trim() !== mdId) {
+          const conflictErr = new Error('❌ This Discord account is already linked to a different Match District account.');
+          conflictErr.code = 'DISCORD_IDENTITY_CONFLICT';
+          throw conflictErr;
+        }
+        const resolved = docByDisc || docByMD || identityDoc;
+        localPermanentIdentitiesByDiscordId.set(dId, resolved);
+        localPermanentIdentitiesByMDId.set(mdId, resolved);
+        return resolved;
+      }
       console.warn(`[MongoDB] ⚠️ Error saving permanent identity for Discord ID ${dId}:`, err.message);
       throw err;
     }

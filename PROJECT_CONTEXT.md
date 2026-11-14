@@ -290,6 +290,21 @@ Tests are located in `test/` and run natively with `node --test`:
   - Upgraded `checkTournamentPlayerExclusivity`: actively cross-references membership `teamId`s against active tournament teams; detects and auto-heals stale memberships belonging to cancelled/deleted teams without generating false conflicts.
   - Hardened `saveConfigurableTeamWithExclusivity`: within atomic locks and transactions/fallbacks, detects and purges stale MongoDB membership records from previously cancelled/deleted teams to avoid unique index `E11000` collisions (`tournamentId: 1, discordUserId: 1`).
   - Added `team.status === 'CANCELLED'` check to `isTeamVerifiedForTournament` in `configurableRegistrationService.js` to reject cancelled squads from slot selection.
+* **Central Tournament Verification & Identity Validation Hardening**:
+  - Resolved false error `❌ This verification code belongs to a different Match District user account.` when users with unlinked Match District accounts submit valid verification codes.
+  - Root cause eliminated: the verification process previously mixed player in-game character UID (`captain_uid`, e.g. BGMI numeric UID) with canonical Match District user account ID (`users.id` / `match_district_user_id`).
+  - Strict 9-Step Verification Decision Flow:
+    1. Look up exact verification code in authoritative PostgreSQL `tournament_registrations`.
+    2. Check already-verified state (`discord_code_used`, `discord_verified`, `discord_verification_status = 'verified'`) BEFORE any identity checks, returning `CODE_ALREADY_VERIFIED` (`❌ This tournament registration has already been verified on Discord.`).
+    3. Validate registration eligibility (`CODE_NOT_ELIGIBLE` for rejected/cancelled/unapproved).
+    4. Resolve canonical Match District user ID (`reg.user_id`), keeping character UID (`reg.captain_uid`) strictly separate.
+    5. Permanent Discord Identity validation across PostgreSQL (`user_discord_connections`, `users`) and MongoDB (`discord_permanent_identities`).
+    6. Database cross-check: reports `IDENTITY_DATA_CONFLICT` if PostgreSQL and MongoDB disagree on account mappings, logging redacted diagnostics for administrators.
+    7. Identity conflict checks: rejects with `DISCORD_IDENTITY_CONFLICT` (`❌ This Discord account is already linked to a different Match District account.`) only when the Discord account is genuinely bound to another Match District account.
+    8. First-time Discord linking (`DISCORD_IDENTITY_UNLINKED`): allows users who have never linked Discord to establish their permanent link automatically upon submitting a valid, unused code.
+    9. Concurrency-safe identity persistence: `savePermanentDiscordIdentity` handles MongoDB unique index duplicate keys (`E11000`) and concurrent requests gracefully.
+  - Standardized backend error codes implemented: `CODE_ALREADY_VERIFIED`, `CODE_INVALID`, `CODE_NOT_ELIGIBLE`, `DISCORD_IDENTITY_UNLINKED`, `DISCORD_IDENTITY_CONFLICT`, `IDENTITY_DATA_CONFLICT`, `VERIFICATION_ALREADY_PENDING`, `VERIFICATION_SUCCESS`.
+
 * **Organizer Activation & Discord Verification System (MD-VERIFY vs MD-ORG Separation)**:
   - Strict distinction enforced: `MD-ORG-...` is exclusively for Discord Server Linking (`.organiser setup`), while `MD-VERIFY-...` is exclusively for Official Discord Organizer Verification in `#organiser-verify`.
   - Implemented `.setup org verification` interactive admin setup panel (`ChannelSelectMenuBuilder`, `RoleSelectMenuBuilder`, Save button) persisting to MongoDB collection `discord_organiser_verification_configs`.

@@ -1291,7 +1291,7 @@ function buildPendingVerificationComponents(pending) {
   return [new ActionRowBuilder().addComponents(selectMenu), new ActionRowBuilder().addComponents(cancelButton)];
 }
 
-async function requestVerificationCheck(guild, tournamentId, code) {
+async function requestVerificationCheck(guild, tournamentId, code, author = null) {
   const apiUrl = getBackendApiUrl();
   const secret = getBackendBotSecret();
   const response = await fetch(`${apiUrl}/api/bot/tournaments/${encodeURIComponent(tournamentId)}/verification/check-code`, {
@@ -1302,7 +1302,12 @@ async function requestVerificationCheck(guild, tournamentId, code) {
       ...(secret ? { Authorization: `Bearer ${secret}`, 'x-bot-secret': secret } : {}),
       'x-guild-id': guild.id,
     },
-    body: JSON.stringify({ code, guild_id: guild.id }),
+    body: JSON.stringify({
+      code,
+      guild_id: guild.id,
+      discord_user_id: author?.id || '',
+      discord_username: author?.tag || author?.username || '',
+    }),
   });
   const result = await response.json().catch(() => ({}));
   return { ok: response.ok && result.success === true, result, status: response.status };
@@ -1432,10 +1437,10 @@ async function completeTournamentVerification({
       status: 'CONFIRMED',
     }).catch((err) => console.warn('[Discord Bot] Warning syncing player memberships on verification:', err.message));
 
-    const captainUid = result.captain_uid || pending.captainUid || result.captain_user_id;
-    if (captainUid) {
+    const mdUserId = result.match_district_user_id || pending.matchDistrictUserId || result.captain_user_id || result.user_id;
+    if (mdUserId) {
       await savePermanentDiscordIdentity({
-        matchDistrictUserId: captainUid,
+        matchDistrictUserId: String(mdUserId).trim(),
         discordUserId: String(captainId),
         discordUsername: invokerUser?.tag || invokerUser?.username || '',
       }).catch((err) => console.warn('[Discord Bot] Warning saving permanent identity on verification:', err.message));
@@ -1548,20 +1553,27 @@ export async function handleTournamentVerificationMessage(message) {
 
   let pendingId = null;
   try {
-    const checked = await requestVerificationCheck(message.guild, tournamentId, code);
+    const checked = await requestVerificationCheck(message.guild, tournamentId, code, message.author);
     if (!checked.ok) {
-      const failure = String(checked.result.reason || checked.result.error || '').toLowerCase();
-      if (['not_found', 'different_tournament', 'registration_rejected', 'already_used'].includes(failure)) {
+      const errCode = checked.result.error || checked.result.reason || '';
+      if (['not_found', 'different_tournament', 'registration_rejected', 'already_used', 'CODE_ALREADY_VERIFIED', 'CODE_INVALID', 'CODE_NOT_ELIGIBLE'].includes(errCode)) {
         attempt.attempts.push(Date.now());
         verificationFailedAttempts.set(attempt.key, attempt.attempts);
       }
-      const reason = failure === 'already_used'
-        ? 'that code was already used.'
-        : failure === 'not_approved_yet'
-          ? 'the registration is not approved yet.'
-          : ['not_found', 'different_tournament', 'registration_rejected'].includes(failure)
-            ? 'that code is not valid for this tournament.'
-            : 'verification is temporarily unavailable.';
+      let reason = 'verification is temporarily unavailable.';
+      if (errCode === 'CODE_ALREADY_VERIFIED' || errCode === 'already_used') {
+        reason = 'this tournament registration has already been verified on Discord.';
+      } else if (errCode === 'DISCORD_IDENTITY_CONFLICT') {
+        reason = checked.result.message ? checked.result.message.replace(/^❌\s*/, '') : 'this Discord account is already linked to a different Match District account.';
+      } else if (errCode === 'IDENTITY_DATA_CONFLICT') {
+        reason = 'identity database conflict detected. Please contact tournament support.';
+      } else if (errCode === 'CODE_INVALID' || errCode === 'not_found') {
+        reason = 'that verification code was not found. Please double-check your code from the website.';
+      } else if (errCode === 'CODE_NOT_ELIGIBLE') {
+        reason = checked.result.message ? checked.result.message.replace(/^❌\s*/, '') : 'this registration is not eligible for verification.';
+      } else if (checked.result.message) {
+        reason = checked.result.message.replace(/^❌\s*/, '');
+      }
       await sendTemporaryReason(reason);
       return true;
     }
@@ -1586,18 +1598,18 @@ export async function handleTournamentVerificationMessage(message) {
     }
 
     // Canonical Match District user ID comparison
-    const registeredCaptainUserId = String(checked.result.match_district_user_id || checked.result.captain_user_id || checked.result.user_id || checked.result.captain_uid || '').trim();
+    const registeredCaptainUserId = String(checked.result.match_district_user_id || checked.result.captain_user_id || checked.result.user_id || '').trim();
 
     // Prevent one Discord account from registering as multiple independent users
-    if (linkedIdentity && registeredCaptainUserId && String(linkedIdentity.matchDistrictUserId) !== registeredCaptainUserId) {
-      await sendTemporaryReason('this verification code was created for a different Match District user account.');
+    if (linkedIdentity && registeredCaptainUserId && String(linkedIdentity.matchDistrictUserId).trim() !== registeredCaptainUserId) {
+      await sendTemporaryReason('this Discord account is already linked to a different Match District account.');
       return true;
     }
 
     // Prevent another Discord account from claiming a Match District account that is already linked
     if (registeredCaptainUserId) {
       const existingIdentityByMD = await getPermanentDiscordIdentityByMatchDistrictId(registeredCaptainUserId);
-      if (existingIdentityByMD && String(existingIdentityByMD.discordUserId) !== String(message.author.id)) {
+      if (existingIdentityByMD && String(existingIdentityByMD.discordUserId).trim() !== String(message.author.id)) {
         await sendTemporaryReason('this Match District account is already linked to a different Discord account.');
         return true;
       }
@@ -1611,8 +1623,8 @@ export async function handleTournamentVerificationMessage(message) {
           discordUsername: message.author.tag || message.author.username,
         });
       } catch (identErr) {
-        if (identErr.code === 'DISCORD_ACCOUNT_ALREADY_LINKED' || identErr.code === 'USER_ALREADY_LINKED') {
-          await sendTemporaryReason(identErr.message);
+        if (identErr.code === 'DISCORD_IDENTITY_CONFLICT' || identErr.code === 'DISCORD_ACCOUNT_ALREADY_LINKED' || identErr.code === 'USER_ALREADY_LINKED') {
+          await sendTemporaryReason(identErr.message.replace(/^❌\s*/, ''));
           return true;
         }
       }
@@ -1629,6 +1641,7 @@ export async function handleTournamentVerificationMessage(message) {
       teamName: String(checked.result.team_name || 'Your team'),
       captainName: String(checked.result.captain_name || ''),
       captainUid: String(checked.result.captain_uid || ''),
+      matchDistrictUserId: registeredCaptainUserId,
       squad: Array.isArray(checked.result.squad) ? checked.result.squad : [],
       players: Array.isArray(checked.result.players) ? checked.result.players : [],
       substitutes: Array.isArray(checked.result.substitutes) ? checked.result.substitutes : [],
