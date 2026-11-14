@@ -603,7 +603,7 @@ export async function createPendingTournamentVerification(record) {
   for (const [id, session] of localPendingVerifications.entries()) {
     if (
       session.tournamentId === tourId &&
-      ['active', 'awaiting_continue'].includes(session.status) &&
+      ['active', 'awaiting_continue', 'awaiting_teammates', 'awaiting_selection'].includes(session.status) &&
       (session.registrationId === regId || session.starterDiscordId === starterId)
     ) {
       session.status = 'superseded';
@@ -617,7 +617,7 @@ export async function createPendingTournamentVerification(record) {
       await mongoDb.collection('pending_tournament_verifications').updateMany(
         {
           tournamentId: tourId,
-          status: { $in: ['active', 'awaiting_continue'] },
+          status: { $in: ['active', 'awaiting_continue', 'awaiting_teammates', 'awaiting_selection'] },
           $or: [
             { registrationId: regId },
             { starterDiscordId: starterId },
@@ -694,7 +694,7 @@ export async function getActivePendingTournamentVerificationForUser({ tournament
 
       if (orConditions.length > 0) {
         const query = {
-          status: { $in: ['active', 'awaiting_continue'] },
+          status: { $in: ['active', 'awaiting_continue', 'awaiting_teammates', 'awaiting_selection'] },
           expiresAt: { $gt: now },
           $or: orConditions,
         };
@@ -710,7 +710,7 @@ export async function getActivePendingTournamentVerificationForUser({ tournament
   for (const session of localPendingVerifications.values()) {
     if (
       (!tourId || String(session.tournamentId) === tourId) &&
-      ['active', 'awaiting_continue'].includes(session.status) &&
+      ['active', 'awaiting_continue', 'awaiting_teammates', 'awaiting_selection'].includes(session.status) &&
       session.expiresAt &&
       new Date(session.expiresAt) > now
     ) {
@@ -733,7 +733,7 @@ export async function claimPendingTournamentVerification(pendingId, starterDisco
   // In-memory check first
   const local = localPendingVerifications.get(pid);
   if (local) {
-    if (String(local.starterDiscordId) !== starterId || local.status !== 'active') {
+    if (String(local.starterDiscordId) !== starterId || !['active', 'awaiting_continue', 'awaiting_teammates', 'awaiting_selection'].includes(local.status)) {
       return null;
     }
     if (local.expiresAt && new Date(local.expiresAt).getTime() <= now.getTime()) {
@@ -754,7 +754,7 @@ export async function claimPendingTournamentVerification(pendingId, starterDisco
       const result = await mongoDb.collection('pending_tournament_verifications').findOneAndUpdate({
         pendingId: pid,
         starterDiscordId: starterId,
-        status: 'active',
+        status: { $in: ['active', 'awaiting_continue', 'awaiting_teammates', 'awaiting_selection'] },
         expiresAt: { $gt: now },
         $or: [
           { completionClaimed: { $ne: true } },
@@ -844,7 +844,7 @@ export async function cancelPendingTournamentVerification(pendingId, starterDisc
       const result = await mongoDb.collection('pending_tournament_verifications').updateOne({
         pendingId: pid,
         starterDiscordId: starterId,
-        status: 'active',
+        status: { $in: ['active', 'awaiting_continue', 'awaiting_teammates', 'awaiting_selection'] },
       }, { $set: { status: 'cancelled', cancelledAt: now }, $unset: { code: '', completionClaimed: '', completionClaimedAt: '' } });
       return result.modifiedCount >= 1 || Boolean(local);
     } catch (dbErr) {
@@ -862,7 +862,7 @@ export async function cancelPendingTournamentVerificationsByTeam(tournamentId, t
   for (const [id, session] of localPendingVerifications.entries()) {
     const matchesTour = !tournamentId || session.tournamentId === tournamentId;
     const matchesTeam = (regId && session.registrationId === regId) || (tName && session.teamName === tName);
-    if (matchesTour && matchesTeam && ['active', 'awaiting_continue'].includes(session.status)) {
+    if (matchesTour && matchesTeam && ['active', 'awaiting_continue', 'awaiting_teammates', 'awaiting_selection'].includes(session.status)) {
       session.status = 'cancelled';
       session.cancelledAt = now;
       session.completionClaimed = false;
@@ -906,7 +906,7 @@ export async function expirePendingTournamentVerificationById(pendingId, starter
     try {
       const filter = {
         pendingId: pid,
-        status: { $in: ['awaiting_continue', 'active'] },
+        status: { $in: ['awaiting_continue', 'active', 'awaiting_teammates', 'awaiting_selection'] },
       };
       if (starterId) filter.starterDiscordId = starterId;
       const result = await mongoDb.collection('pending_tournament_verifications').updateOne(
@@ -927,7 +927,7 @@ export async function expirePendingTournamentVerifications() {
 
   for (const [id, session] of localPendingVerifications.entries()) {
     if (
-      ['awaiting_continue', 'active'].includes(session.status) &&
+      ['awaiting_continue', 'active', 'awaiting_teammates', 'awaiting_selection'].includes(session.status) &&
       session.expiresAt &&
       new Date(session.expiresAt).getTime() <= now.getTime()
     ) {
@@ -2660,6 +2660,7 @@ export async function saveCentralVerificationConfig(guildId, config) {
     setupChannelId: config.setupChannelId || null,
     verifyChannelId: config.verifyChannelId || null,
     dashboardMessageId: config.dashboardMessageId || null,
+    serverInviteUrl: config.serverInviteUrl || null,
     enabled: config.enabled !== undefined ? Boolean(config.enabled) : true,
     soloMentionRequirement: typeof config.soloMentionRequirement === 'number' ? config.soloMentionRequirement : 0,
     duoMentionRequirement: typeof config.duoMentionRequirement === 'number' ? config.duoMentionRequirement : 2,

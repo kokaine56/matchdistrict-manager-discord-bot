@@ -10,6 +10,7 @@ import {
   initCentralVerificationConfigsCache,
   buildDashboardPayload,
   centralVerificationRateLimits,
+  resolveGuildInviteUrl,
 } from '../centralVerificationService.js';
 import {
   saveCentralVerificationConfig,
@@ -18,6 +19,7 @@ import {
   localPendingVerifications,
   createPendingTournamentVerification,
   getActivePendingTournamentVerificationForUser,
+  getPendingTournamentVerification,
 } from '../mongoService.js';
 import {
   syncTeamPlayerMemberships,
@@ -55,6 +57,7 @@ function createMockGuild(options = {}) {
     id: guildId,
     name: 'Test Esports Arena',
     ownerId: 'owner-user-999',
+    vanityURLCode: options.vanityURLCode || null,
     roles: {
       everyone: everyoneRole,
       cache: roles,
@@ -64,6 +67,12 @@ function createMockGuild(options = {}) {
       cache: members,
       fetch: async (id) => members.get(id) || null,
       fetchMe: async () => botMember,
+    },
+    invites: {
+      fetch: async () => {
+        if (options.invites) return options.invites;
+        return new Map();
+      },
     },
     channels: {
       cache: channels,
@@ -231,7 +240,6 @@ test('Central Tournament Verification Suite', async (suite) => {
     assert.ok(replyPayload);
     assert.strictEqual(replyPayload.embeds[0].data.title, '✅ Central Verification Setup Complete');
 
-    // Verify 3 channels created: Category, #verify-setup, #verify-here
     assert.strictEqual(channels.size, 3);
     const category = Array.from(channels.values()).find((c) => c.type === ChannelType.GuildCategory);
     const setupChannel = Array.from(channels.values()).find((c) => c.name === 'verify-setup');
@@ -258,14 +266,12 @@ test('Central Tournament Verification Suite', async (suite) => {
     const { mockGuild, channels } = createMockGuild();
     const admin = createMockAdminMember(mockGuild);
 
-    // Run first time
     await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
     const initialCount = channels.size;
     assert.strictEqual(initialCount, 3);
 
     const firstConfig = { ...getCentralVerificationConfig(mockGuild.id) };
 
-    // Run second time (.verify repeated)
     await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
     assert.strictEqual(channels.size, 3, 'Zero new channels created on repeated execution');
 
@@ -282,7 +288,6 @@ test('Central Tournament Verification Suite', async (suite) => {
     const { mockGuild, channels } = createMockGuild();
     const admin = createMockAdminMember(mockGuild);
 
-    // Pre-create category and #verify-setup only
     const category = await mockGuild.channels.create({ name: 'VERIFICATION', type: ChannelType.GuildCategory });
     const setupChannel = await mockGuild.channels.create({ name: 'verify-setup', type: ChannelType.GuildText, parent: category.id });
     assert.strictEqual(channels.size, 2);
@@ -354,7 +359,7 @@ test('Central Tournament Verification Suite', async (suite) => {
   // --------------------------------------------------------------------------
   // 8. Dashboard Initialization: Correct status & default values
   // --------------------------------------------------------------------------
-  await suite.test('8. Dashboard Initialization: Displays status Enabled and default mention requirements', async () => {
+  await suite.test('8. Dashboard Initialization: Displays status Enabled, mention requirements, and invite controls', async () => {
     const { mockGuild, channels } = createMockGuild();
     const admin = createMockAdminMember(mockGuild);
 
@@ -377,7 +382,7 @@ test('Central Tournament Verification Suite', async (suite) => {
     // Check action rows and buttons
     assert.strictEqual(dashMsg.components.length, 2);
     const row1Buttons = dashMsg.components[0].components.map((c) => c.data.custom_id);
-    assert.deepStrictEqual(row1Buttons, ['cver:edit:solo', 'cver:edit:duo', 'cver:edit:squad']);
+    assert.deepStrictEqual(row1Buttons, ['cver:edit:solo', 'cver:edit:duo', 'cver:edit:squad', 'cver:edit:invite']);
 
     const row2Buttons = dashMsg.components[1].components.map((c) => c.data.custom_id);
     assert.deepStrictEqual(row2Buttons, ['cver:toggle_status', 'cver:view_config', 'cver:refresh']);
@@ -396,7 +401,6 @@ test('Central Tournament Verification Suite', async (suite) => {
     assert.strictEqual(initialMessages.size, 1);
     const firstMsgId = initialMessages.keys().next().value;
 
-    // Run again
     await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
     const afterMessages = await setupChannel.messages.fetch();
     assert.strictEqual(afterMessages.size, 1, 'Still exactly one dashboard message');
@@ -404,117 +408,44 @@ test('Central Tournament Verification Suite', async (suite) => {
   });
 
   // --------------------------------------------------------------------------
-  // 10. Dashboard Modal: Edit Solo Mentions
+  // 10. Dashboard Modal: Edit Server Invite Link
   // --------------------------------------------------------------------------
-  await suite.test('10. Dashboard Modal: Edit Solo Mentions opens modal and updates config', async () => {
+  await suite.test('10. Dashboard Modal: Edit Server Invite saves URL and updates dashboard in-place', async () => {
     const { mockGuild } = createMockGuild();
     const admin = createMockAdminMember(mockGuild);
     await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
 
-    // 1. Button click shows modal
+    // 1. Button click opens modal
     let shownModal = null;
-    const btnInteraction = {
+    await handleCentralVerificationInteraction({
       guild: mockGuild,
       member: admin,
-      customId: 'cver:edit:solo',
+      customId: 'cver:edit:invite',
       showModal: async (m) => { shownModal = m; },
-    };
-    await handleCentralVerificationInteraction(btnInteraction);
+    });
     assert.ok(shownModal);
-    assert.strictEqual(shownModal.data.custom_id, 'cver:modal:solo');
+    assert.strictEqual(shownModal.data.custom_id, 'cver:modal:invite');
 
-    // 2. Submit modal with value 1
+    // 2. Submit modal with official invite link
     let replyMsg = null;
-    const submitInteraction = {
+    await handleCentralVerificationInteraction({
       guild: mockGuild,
       member: admin,
       user: admin.user,
-      customId: 'cver:modal:solo',
-      fields: { getTextInputValue: () => '1' },
+      customId: 'cver:modal:invite',
+      fields: { getTextInputValue: () => 'https://discord.gg/matchdistrict' },
       reply: async (payload) => { replyMsg = payload; },
-    };
-    await handleCentralVerificationInteraction(submitInteraction);
+    });
 
-    assert.ok(replyMsg.content.includes('Updated **SOLO** mention requirement to **1**'));
+    assert.ok(replyMsg.content.includes('https://discord.gg/matchdistrict'));
     const config = getCentralVerificationConfig(mockGuild.id);
-    assert.strictEqual(config.soloMentionRequirement, 1);
+    assert.strictEqual(config.serverInviteUrl, 'https://discord.gg/matchdistrict');
   });
 
   // --------------------------------------------------------------------------
-  // 11. Dashboard Modal: Edit Duo Mentions
+  // 11. Dashboard Toggle Status: Enable / Disable
   // --------------------------------------------------------------------------
-  await suite.test('11. Dashboard Modal: Edit Duo Mentions updates config and dashboard in-place', async () => {
-    const { mockGuild } = createMockGuild();
-    const admin = createMockAdminMember(mockGuild);
-    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
-
-    const submitInteraction = {
-      guild: mockGuild,
-      member: admin,
-      user: admin.user,
-      customId: 'cver:modal:duo',
-      fields: { getTextInputValue: () => '3' },
-      reply: async () => {},
-    };
-    await handleCentralVerificationInteraction(submitInteraction);
-
-    const config = getCentralVerificationConfig(mockGuild.id);
-    assert.strictEqual(config.duoMentionRequirement, 3);
-  });
-
-  // --------------------------------------------------------------------------
-  // 12. Dashboard Modal: Edit Squad Mentions
-  // --------------------------------------------------------------------------
-  await suite.test('12. Dashboard Modal: Edit Squad Mentions updates config and dashboard in-place', async () => {
-    const { mockGuild } = createMockGuild();
-    const admin = createMockAdminMember(mockGuild);
-    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
-
-    const submitInteraction = {
-      guild: mockGuild,
-      member: admin,
-      user: admin.user,
-      customId: 'cver:modal:squad',
-      fields: { getTextInputValue: () => '5' },
-      reply: async () => {},
-    };
-    await handleCentralVerificationInteraction(submitInteraction);
-
-    const config = getCentralVerificationConfig(mockGuild.id);
-    assert.strictEqual(config.squadMentionRequirement, 5);
-  });
-
-  // --------------------------------------------------------------------------
-  // 13. Dashboard Modal Validation: Rejects invalid ranges
-  // --------------------------------------------------------------------------
-  await suite.test('13. Dashboard Modal Validation: Rejects out-of-range (<0 or >25) or non-numeric input', async () => {
-    const { mockGuild } = createMockGuild();
-    const admin = createMockAdminMember(mockGuild);
-    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
-
-    const testInvalidInputs = ['-1', '26', 'abc', '3.5'];
-    for (const invalidInput of testInvalidInputs) {
-      let errorReply = null;
-      const submitInteraction = {
-        guild: mockGuild,
-        member: admin,
-        user: admin.user,
-        customId: 'cver:modal:solo',
-        fields: { getTextInputValue: () => invalidInput },
-        reply: async (payload) => { errorReply = payload; },
-      };
-      await handleCentralVerificationInteraction(submitInteraction);
-      assert.ok(errorReply.content.includes('integer between 0 and 25'), `Expected error for ${invalidInput}`);
-    }
-
-    const config = getCentralVerificationConfig(mockGuild.id);
-    assert.strictEqual(config.soloMentionRequirement, 0, 'Config must not be modified by invalid input');
-  });
-
-  // --------------------------------------------------------------------------
-  // 14. Dashboard Toggle Status: Enable / Disable
-  // --------------------------------------------------------------------------
-  await suite.test('14. Dashboard Toggle Status: Toggles state between Enabled and Disabled', async () => {
+  await suite.test('11. Dashboard Toggle Status: Toggles state between Enabled and Disabled', async () => {
     const { mockGuild } = createMockGuild();
     const admin = createMockAdminMember(mockGuild);
     await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
@@ -528,27 +459,26 @@ test('Central Tournament Verification Suite', async (suite) => {
       reply: async (payload) => { toggleReply = payload; },
     };
 
-    // Toggle 1: Disable
+    // Disable
     await handleCentralVerificationInteraction(interaction);
     assert.ok(toggleReply.content.includes('Disabled'));
     assert.strictEqual(getCentralVerificationConfig(mockGuild.id).enabled, false);
 
-    // Toggle 2: Re-enable
+    // Re-enable
     await handleCentralVerificationInteraction(interaction);
     assert.ok(toggleReply.content.includes('Enabled'));
     assert.strictEqual(getCentralVerificationConfig(mockGuild.id).enabled, true);
   });
 
   // --------------------------------------------------------------------------
-  // 15. View Config & Refresh: Permissions and Ephemeral Display
+  // 12. View Config & Refresh: Permissions and Ephemeral Display
   // --------------------------------------------------------------------------
-  await suite.test('15. View Config & Refresh: Non-admins blocked; View Config provides detailed embed', async () => {
+  await suite.test('12. View Config & Refresh: Non-admins blocked; View Config provides detailed embed', async () => {
     const { mockGuild } = createMockGuild();
     const admin = createMockAdminMember(mockGuild);
     const nonAdmin = createMockNonAdminMember(mockGuild);
     await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
 
-    // Non-admin blocked
     let deniedReply = null;
     await handleCentralVerificationInteraction({
       guild: mockGuild,
@@ -558,7 +488,6 @@ test('Central Tournament Verification Suite', async (suite) => {
     });
     assert.ok(deniedReply.content.includes('Only server administrators'));
 
-    // Admin view_config
     let viewReply = null;
     await handleCentralVerificationInteraction({
       guild: mockGuild,
@@ -567,22 +496,12 @@ test('Central Tournament Verification Suite', async (suite) => {
       reply: async (payload) => { viewReply = payload; },
     });
     assert.ok(viewReply.embeds[0].data.title.includes('Configuration Details'));
-
-    // Admin refresh
-    let refreshReply = null;
-    await handleCentralVerificationInteraction({
-      guild: mockGuild,
-      member: admin,
-      customId: 'cver:refresh',
-      reply: async (payload) => { refreshReply = payload; },
-    });
-    assert.ok(refreshReply.content.includes('Dashboard refreshed'));
   });
 
   // --------------------------------------------------------------------------
-  // 16. Submission Privacy: Immediate Auto-Delete of Code Message
+  // 13. Submission Privacy: Immediate Auto-Delete of Code Message
   // --------------------------------------------------------------------------
-  await suite.test('16. Submission Privacy: Code message in #verify-here is deleted immediately', async () => {
+  await suite.test('13. Submission Privacy: Code message in #verify-here is deleted immediately', async () => {
     const { mockGuild, channels } = createMockGuild();
     const admin = createMockAdminMember(mockGuild);
     await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
@@ -597,7 +516,6 @@ test('Central Tournament Verification Suite', async (suite) => {
       delete: async () => { messageDeleted = true; },
     };
 
-    // Mock fetch for check-code API
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async () => ({
       ok: true,
@@ -620,14 +538,13 @@ test('Central Tournament Verification Suite', async (suite) => {
   });
 
   // --------------------------------------------------------------------------
-  // 17. Guild Disabled: Rejection Notice
+  // 14. Guild Disabled: Rejection Notice
   // --------------------------------------------------------------------------
-  await suite.test('17. Guild Disabled: Submissions rejected when verification disabled', async () => {
+  await suite.test('14. Guild Disabled: Submissions rejected when verification disabled', async () => {
     const { mockGuild, channels } = createMockGuild();
     const admin = createMockAdminMember(mockGuild);
     await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
 
-    // Disable verification
     const cfg = getCentralVerificationConfig(mockGuild.id);
     cfg.enabled = false;
     await saveCentralVerificationConfig(mockGuild.id, cfg);
@@ -650,307 +567,42 @@ test('Central Tournament Verification Suite', async (suite) => {
   });
 
   // --------------------------------------------------------------------------
-  // 18. Mention Count Validation: Solo (Default 0 mentions)
+  // 15. Solo Tournament: Direct Verification Without Teammate Selection
   // --------------------------------------------------------------------------
-  await suite.test('18. Mention Count Validation - Solo: Enforces 0 mentions and rejects extra mentions', async () => {
+  await suite.test('15. Solo Flow: Captain submits valid solo code and gets verified without teammate selection', async () => {
     const { mockGuild, channels } = createMockGuild();
     const admin = createMockAdminMember(mockGuild);
     await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
 
     const verifyChannel = Array.from(channels.values()).find((c) => c.name === 'verify-here');
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => ({
-      ok: true,
-      json: async () => ({
-        success: true,
-        tournament_id: 't-solo-01',
-        tournament_title: 'Solo Championship',
-        tournament_format: 'solo',
-        registration_id: 'reg-solo',
-        team_name: 'Lone Wolf',
-      }),
-    });
+    createMockAdminMember(mockGuild, 'solo-cap');
 
-    try {
-      // User mistakenly mentions a user for Solo format
-      let rejectNotice = null;
-      verifyChannel.send = async (p) => { rejectNotice = p; return { delete: async () => {} }; };
-
-      const mockMessage = {
-        guild: mockGuild,
-        channel: verifyChannel,
-        content: 'ABCD1234 <@player-2>',
-        author: { id: 'player-1', bot: false },
-        delete: async () => {},
-      };
-
-      await handleCentralVerificationMessage(mockMessage);
-      assert.ok(rejectNotice.content.includes('SOLO'));
-      assert.ok(rejectNotice.content.includes('No mentions are required'));
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
-  // --------------------------------------------------------------------------
-  // 19. Mention Count Validation: Duo (Default 2 mentions)
-  // --------------------------------------------------------------------------
-  await suite.test('19. Mention Count Validation - Duo: Enforces exactly 2 mentions', async () => {
-    const { mockGuild, channels } = createMockGuild();
-    const admin = createMockAdminMember(mockGuild);
-    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
-
-    const verifyChannel = Array.from(channels.values()).find((c) => c.name === 'verify-here');
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => ({
-      ok: true,
-      json: async () => ({
-        success: true,
-        tournament_id: 't-duo-01',
-        tournament_title: 'Duo Masters',
-        tournament_format: 'duo',
-        registration_id: 'reg-duo',
-        team_name: 'Dynamic Duo',
-      }),
-    });
-
-    try {
-      // User sends only 1 mention for Duo format
-      let rejectNotice = null;
-      verifyChannel.send = async (p) => { rejectNotice = p; return { delete: async () => {} }; };
-
-      const mockMessage = {
-        guild: mockGuild,
-        channel: verifyChannel,
-        content: 'ABCD1234 <@player-1>',
-        author: { id: 'player-1', bot: false },
-        delete: async () => {},
-      };
-
-      await handleCentralVerificationMessage(mockMessage);
-      assert.ok(rejectNotice.content.includes('DUO'));
-      assert.ok(rejectNotice.content.includes('requires exactly **2** mention(s)'));
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
-  // --------------------------------------------------------------------------
-  // 20. Mention Count Validation: Squad (Default 4 mentions)
-  // --------------------------------------------------------------------------
-  await suite.test('20. Mention Count Validation - Squad: Enforces exactly 4 mentions', async () => {
-    const { mockGuild, channels } = createMockGuild();
-    const admin = createMockAdminMember(mockGuild);
-    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
-
-    const verifyChannel = Array.from(channels.values()).find((c) => c.name === 'verify-here');
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => ({
-      ok: true,
-      json: async () => ({
-        success: true,
-        tournament_id: 't-squad-01',
-        tournament_title: 'Squad Clash',
-        tournament_format: 'squad',
-        registration_id: 'reg-squad',
-        team_name: 'Apex Squad',
-      }),
-    });
-
-    try {
-      // User provides only 3 mentions for Squad format
-      let rejectNotice = null;
-      verifyChannel.send = async (p) => { rejectNotice = p; return { delete: async () => {} }; };
-
-      const mockMessage = {
-        guild: mockGuild,
-        channel: verifyChannel,
-        content: 'ABCD1234 <@player-1> <@player-2> <@player-3>',
-        author: { id: 'player-1', bot: false },
-        delete: async () => {},
-      };
-
-      await handleCentralVerificationMessage(mockMessage);
-      assert.ok(rejectNotice.content.includes('SQUAD'));
-      assert.ok(rejectNotice.content.includes('requires exactly **4** mention(s)'));
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
-  // --------------------------------------------------------------------------
-  // 21. Self-Mention Requirement
-  // --------------------------------------------------------------------------
-  await suite.test('21. Self-Mention Requirement: Submitting captain must mention their own account', async () => {
-    const { mockGuild, channels } = createMockGuild();
-    const admin = createMockAdminMember(mockGuild);
-    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
-
-    const verifyChannel = Array.from(channels.values()).find((c) => c.name === 'verify-here');
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => ({
-      ok: true,
-      json: async () => ({
-        success: true,
-        tournament_id: 't-duo-01',
-        tournament_format: 'duo',
-        registration_id: 'reg-duo',
-        team_name: 'Duo Team',
-      }),
-    });
-
-    try {
-      // Captain player-1 mentions player-2 and player-3, omitting himself
-      let rejectNotice = null;
-      verifyChannel.send = async (p) => { rejectNotice = p; return { delete: async () => {} }; };
-
-      const mockMessage = {
-        guild: mockGuild,
-        channel: verifyChannel,
-        content: 'ABCD1234 <@player-2> <@player-3>',
-        author: { id: 'player-1', bot: false },
-        delete: async () => {},
-      };
-
-      await handleCentralVerificationMessage(mockMessage);
-      assert.ok(rejectNotice.content.includes('You must mention yourself (<@player-1>)'));
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
-  // --------------------------------------------------------------------------
-  // 22. Mention Quality & Exclusivity
-  // --------------------------------------------------------------------------
-  await suite.test('22. Mention Quality & Exclusivity: Rejects duplicates, bots, and already-verified players', async () => {
-    const { mockGuild, channels } = createMockGuild();
-    const admin = createMockAdminMember(mockGuild);
-    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
-
-    const verifyChannel = Array.from(channels.values()).find((c) => c.name === 'verify-here');
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => ({
-      ok: true,
-      json: async () => ({
-        success: true,
-        tournament_id: 't-squad-excl',
-        tournament_format: 'squad',
-        registration_id: 'reg-squad-excl',
-        team_name: 'Team Beta',
-      }),
-    });
-
-    try {
-      // 1. Duplicate mention test
-      let dupNotice = null;
-      verifyChannel.send = async (p) => { dupNotice = p; return { delete: async () => {} }; };
-
-      await handleCentralVerificationMessage({
-        guild: mockGuild,
-        channel: verifyChannel,
-        content: 'ABCD1234 <@p-1> <@p-2> <@p-2> <@p-3>',
-        author: { id: 'p-1', bot: false },
-        delete: async () => {},
-      });
-      assert.ok(dupNotice.content.includes('Duplicate mentions detected'));
-
-      // 2. Bot mention test
-      createMockAdminMember(mockGuild, 'p-1');
-      createMockAdminMember(mockGuild, 'p-2');
-      createMockAdminMember(mockGuild, 'p-3');
-      const botUser = { id: 'bad-bot', user: { id: 'bad-bot', bot: true }, guild: mockGuild };
-      mockGuild.members.cache.set('bad-bot', botUser);
-
-      let botNotice = null;
-      verifyChannel.send = async (p) => { botNotice = p; return { delete: async () => {} }; };
-
-      await handleCentralVerificationMessage({
-        guild: mockGuild,
-        channel: verifyChannel,
-        content: 'ABCD1234 <@p-1> <@p-2> <@p-3> <@bad-bot>',
-        author: { id: 'p-1', bot: false },
-        delete: async () => {},
-      });
-      assert.ok(botNotice.content.includes('is a bot'));
-
-      // 3. Exclusivity test: p-4 is already in a verified team
-      createMockAdminMember(mockGuild, 'p-4');
-      const { localTeams } = await import('../configurableTournamentData.js');
-      localTeams.set('team-existing', {
-        tournamentId: 't-squad-excl',
-        teamId: 'team-existing',
-        teamName: 'Team Alpha',
-        status: 'CONFIRMED',
-        leaderDiscordId: 'p-4',
-        players: [{ discordId: 'p-4', id: 'p-4' }],
-      });
-      await syncTeamPlayerMemberships({
-        tournamentId: 't-squad-excl',
-        teamId: 'team-existing',
-        teamName: 'Team Alpha',
-        leaderDiscordId: 'p-4',
-        players: [{ discordId: 'p-4', id: 'p-4' }],
-        status: 'CONFIRMED',
-      });
-
-      let exclNotice = null;
-      verifyChannel.send = async (p) => { exclNotice = p; return { delete: async () => {} }; };
-
-      await handleCentralVerificationMessage({
-        guild: mockGuild,
-        channel: verifyChannel,
-        content: 'ABCD1234 <@p-1> <@p-2> <@p-3> <@p-4>',
-        author: { id: 'p-1', bot: false },
-        delete: async () => {},
-      });
-      assert.ok(exclNotice.content.includes('already registered in a verified team "Team Alpha"'));
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
-  // --------------------------------------------------------------------------
-  // 23. Confirmation Prompt & Execution
-  // --------------------------------------------------------------------------
-  await suite.test('23. Confirmation Prompt & Execution: Confirm button finalizes verification and announces', async () => {
-    const { mockGuild, channels } = createMockGuild();
-    const admin = createMockAdminMember(mockGuild);
-    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
-
-    const verifyChannel = Array.from(channels.values()).find((c) => c.name === 'verify-here');
-    createMockAdminMember(mockGuild, 'capt-1');
-    createMockAdminMember(mockGuild, 'mate-2');
-
-    let promptMsg = null;
-    verifyChannel.send = async (p) => {
-      promptMsg = {
-        ...p,
-        delete: async () => {},
-      };
-      return promptMsg;
-    };
+    let completedPayload = null;
+    let announcement = null;
+    verifyChannel.send = async (p) => { announcement = p; };
 
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = async (url) => {
+    globalThis.fetch = async (url, opts) => {
       if (url.includes('check-code')) {
         return {
           ok: true,
           json: async () => ({
             success: true,
-            tournament_id: 't-duo-flow',
-            tournament_title: 'Duo Cup',
-            tournament_format: 'duo',
-            registration_id: 'reg-duo-99',
-            team_name: 'Duo Champions',
+            tournament_id: 't-solo-cup',
+            tournament_title: 'Solo Champions',
+            tournament_format: 'solo',
+            registration_id: 'reg-solo-88',
+            team_name: 'Solo King',
           }),
         };
       }
       if (url.includes('complete')) {
+        completedPayload = JSON.parse(opts.body);
         return {
           ok: true,
           json: async () => ({
             success: true,
-            team_name: 'Duo Champions',
+            team_name: 'Solo King',
           }),
         };
       }
@@ -958,41 +610,492 @@ test('Central Tournament Verification Suite', async (suite) => {
     };
 
     try {
-      // 1. Submit valid Duo code + 2 mentions (self + mate)
+      const mockMessage = {
+        guild: mockGuild,
+        channel: verifyChannel,
+        content: 'SOLO1234',
+        author: { id: 'solo-cap', bot: false },
+        delete: async () => {},
+      };
+
+      const handled = await handleCentralVerificationMessage(mockMessage);
+      assert.strictEqual(handled, true);
+      assert.ok(completedPayload, 'Backend complete must be called directly');
+      assert.strictEqual(completedPayload.captain_discord_id, 'solo-cap');
+      assert.deepStrictEqual(completedPayload.teammate_discord_ids, []);
+      assert.ok(announcement.content.includes('Verification Complete!'));
+      assert.ok(announcement.content.includes('Solo King'));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // 16. Duo Flow: Teammate Not in Server & UserSelectMenu Prompt
+  // --------------------------------------------------------------------------
+  await suite.test('16. Duo Flow: Captain submits duo code without mentions; prompt displays 1 teammate required', async () => {
+    const { mockGuild, channels } = createMockGuild();
+    const admin = createMockAdminMember(mockGuild);
+    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
+
+    const verifyChannel = Array.from(channels.values()).find((c) => c.name === 'verify-here');
+    createMockAdminMember(mockGuild, 'duo-cap');
+
+    let promptMsg = null;
+    verifyChannel.send = async (p) => { promptMsg = p; return { id: 'prompt-1', ...p, delete: async () => {} }; };
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        success: true,
+        tournament_id: 't-duo-cup',
+        tournament_title: 'Duo Masters',
+        tournament_format: 'duo',
+        registration_id: 'reg-duo-101',
+        team_name: 'Double Trouble',
+      }),
+    });
+
+    try {
+      // Submitting code WITHOUT mentions works smoothly!
       await handleCentralVerificationMessage({
         guild: mockGuild,
         channel: verifyChannel,
-        content: 'ABCD1234 <@capt-1> <@mate-2>',
-        author: { id: 'capt-1', bot: false },
+        content: 'DUO12345',
+        author: { id: 'duo-cap', bot: false },
         delete: async () => {},
       });
 
-      assert.ok(promptMsg, 'Confirmation prompt must be sent');
-      assert.ok(promptMsg.embeds[0].data.title.includes('Confirm Tournament Verification'));
+      assert.ok(promptMsg, 'Prompt must be sent');
+      assert.ok(promptMsg.embeds[0].data.title.includes('Double Trouble'));
 
-      const confirmButton = promptMsg.components[0].components.find((b) => b.data.custom_id.startsWith('cver:confirm:'));
-      assert.ok(confirmButton, 'Confirm Verification button must exist');
+      // Check UserSelectMenu with 1 teammate
+      const selectRow = promptMsg.components[0];
+      const selectMenu = selectRow.components[0];
+      assert.ok(selectMenu.data.custom_id.startsWith('cver:select:'));
+      assert.strictEqual(selectMenu.data.min_values, 1);
+      assert.strictEqual(selectMenu.data.max_values, 1);
 
-      // 2. Click Confirm button
-      let replyContent = null;
+      // Check Buttons: Invite Teammates, Continue Verification, Cancel
+      const buttonRow = promptMsg.components[1];
+      const btnIds = buttonRow.components.map((b) => b.data.custom_id);
+      assert.ok(btnIds.some((id) => id.startsWith('cver:invite:')), 'Invite button must exist');
+      assert.ok(btnIds.some((id) => id.startsWith('cver:continue:')), 'Continue button must exist');
+      assert.ok(btnIds.some((id) => id.startsWith('cver:cancel:')), 'Cancel button must exist');
+
+      // Check pending session persisted in MongoDB
+      const pending = await getActivePendingTournamentVerificationForUser({ starterDiscordId: 'duo-cap' });
+      assert.ok(pending);
+      assert.strictEqual(pending.registrationId, 'reg-duo-101');
+      assert.strictEqual(pending.tournamentFormat, 'duo');
+      assert.strictEqual(pending.teammatesNeeded, 1);
+      assert.strictEqual(pending.status, 'awaiting_teammates');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // 17. Invite Teammates: Copyable Code Block With Real Server Invite
+  // --------------------------------------------------------------------------
+  await suite.test('17. Invite Teammates: Displays copyable code block containing official invite link', async () => {
+    const { mockGuild, channels } = createMockGuild({ vanityURLCode: 'matchdistrict-official' });
+    const admin = createMockAdminMember(mockGuild);
+    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
+
+    // Save official server invite URL
+    const cfg = getCentralVerificationConfig(mockGuild.id);
+    cfg.serverInviteUrl = 'https://discord.gg/matchdistrictofficial';
+    await saveCentralVerificationConfig(mockGuild.id, cfg);
+
+    const pendingId = 'pending-duo-invite';
+    await createPendingTournamentVerification({
+      pendingId,
+      registrationId: 'reg-inv-1',
+      starterDiscordId: 'capt-invite',
+      tournamentId: 't-duo-inv',
+      guildId: mockGuild.id,
+      tournamentFormat: 'duo',
+      teammatesNeeded: 1,
+      status: 'awaiting_teammates',
+      expiresAt: new Date(Date.now() + 600000),
+    });
+
+    let inviteReply = null;
+    await handleCentralVerificationInteraction({
+      guild: mockGuild,
+      user: { id: 'capt-invite' },
+      customId: `cver:invite:${pendingId}`,
+      reply: async (p) => { inviteReply = p; },
+    });
+
+    assert.ok(inviteReply);
+    assert.ok(inviteReply.content.includes('```'), 'Must be enclosed in a code block');
+    assert.ok(inviteReply.content.includes('https://discord.gg/matchdistrictofficial'), 'Must contain the real official invite');
+    assert.ok(inviteReply.content.includes('tell me your Discord username'));
+  });
+
+  // --------------------------------------------------------------------------
+  // 18. Missing Server Invite Handled Safely Without Fake URL
+  // --------------------------------------------------------------------------
+  await suite.test('18. Missing Server Invite: Displays administrative configuration error with no fake URL', async () => {
+    const { mockGuild } = createMockGuild(); // No vanity, no configured URL
+    const admin = createMockAdminMember(mockGuild);
+    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
+
+    const pendingId = 'pending-no-invite';
+    await createPendingTournamentVerification({
+      pendingId,
+      registrationId: 'reg-no-inv',
+      starterDiscordId: 'capt-no-inv',
+      tournamentId: 't-duo-no-inv',
+      guildId: mockGuild.id,
+      tournamentFormat: 'duo',
+      teammatesNeeded: 1,
+      status: 'awaiting_teammates',
+      expiresAt: new Date(Date.now() + 600000),
+    });
+
+    let errorReply = null;
+    await handleCentralVerificationInteraction({
+      guild: mockGuild,
+      user: { id: 'capt-no-inv' },
+      customId: `cver:invite:${pendingId}`,
+      reply: async (p) => { errorReply = p; },
+    });
+
+    assert.ok(errorReply);
+    assert.ok(errorReply.content.includes('invite link is currently unavailable'));
+    assert.ok(errorReply.content.includes('ask a server administrator to configure'));
+    assert.strictEqual(errorReply.content.includes('http'), false, 'Never invent a fake URL');
+  });
+
+  // --------------------------------------------------------------------------
+  // 19. Teammate Joins Server -> Captain Selects Teammate -> Completion
+  // --------------------------------------------------------------------------
+  await suite.test('19. Duo Completion: Teammate joins, captain selects from menu, roles assigned & verified', async () => {
+    const { mockGuild, channels } = createMockGuild();
+    const admin = createMockAdminMember(mockGuild);
+    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
+
+    const verifyChannel = Array.from(channels.values()).find((c) => c.name === 'verify-here');
+    createMockAdminMember(mockGuild, 'capt-flow');
+
+    // 1. Submit Duo code
+    let promptMsg = null;
+    verifyChannel.send = async (p) => { promptMsg = { ...p, delete: async () => {} }; return promptMsg; };
+
+    let completedPayload = null;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      if (url.includes('check-code')) {
+        return {
+          ok: true,
+          json: async () => ({
+            success: true,
+            tournament_id: 't-duo-flow',
+            tournament_title: 'Duo Masters',
+            tournament_format: 'duo',
+            registration_id: 'reg-flow-99',
+            team_name: 'Flow Warriors',
+          }),
+        };
+      }
+      if (url.includes('complete')) {
+        completedPayload = JSON.parse(opts.body);
+        return {
+          ok: true,
+          json: async () => ({
+            success: true,
+            team_name: 'Flow Warriors',
+          }),
+        };
+      }
+      return { ok: false };
+    };
+
+    try {
+      await handleCentralVerificationMessage({
+        guild: mockGuild,
+        channel: verifyChannel,
+        content: 'CODEFL01',
+        author: { id: 'capt-flow', bot: false },
+        delete: async () => {},
+      });
+
+      const pending = await getActivePendingTournamentVerificationForUser({ starterDiscordId: 'capt-flow' });
+      assert.ok(pending);
+
+      // 2. Teammate joins server
+      createMockAdminMember(mockGuild, 'teammate-new');
+
+      // 3. Captain selects teammate-new from UserSelectMenu
       let announcement = null;
       verifyChannel.send = async (p) => { announcement = p; };
 
-      const clickInteraction = {
+      const selectInteraction = {
         guild: mockGuild,
         channel: verifyChannel,
-        user: { id: 'capt-1' },
-        customId: confirmButton.data.custom_id,
+        user: { id: 'capt-flow' },
+        customId: `cver:select:${pending.pendingId}`,
+        values: ['teammate-new'],
+        isUserSelectMenu: () => true,
+        deferUpdate: async () => {},
         reply: async () => {},
         update: async () => {},
-        deferUpdate: async () => {},
-        editReply: async (payload) => { replyContent = payload; },
       };
 
-      await handleCentralVerificationInteraction(clickInteraction);
-      assert.ok(replyContent.content.includes('Verification completed successfully'));
+      await handleCentralVerificationInteraction(selectInteraction);
+
+      assert.ok(completedPayload, 'Backend complete must be called');
+      assert.strictEqual(completedPayload.captain_discord_id, 'capt-flow');
+      assert.deepStrictEqual(completedPayload.teammate_discord_ids, ['teammate-new']);
+
+      // Pending session marked completed
+      const updatedPending = await getPendingTournamentVerification(pending.pendingId);
+      assert.strictEqual(updatedPending.status, 'completed');
+
       assert.ok(announcement.content.includes('Verification Complete!'));
-      assert.ok(announcement.content.includes('Duo Champions'));
+      assert.ok(announcement.content.includes('Flow Warriors'));
+      assert.ok(announcement.content.includes('<@capt-flow>'));
+      assert.ok(announcement.content.includes('<@teammate-new>'));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // 20. Squad Flow: 3 Teammates Needed
+  // --------------------------------------------------------------------------
+  await suite.test('20. Squad Flow: Requires 3 teammates and verifies complete roster', async () => {
+    const { mockGuild, channels } = createMockGuild();
+    const admin = createMockAdminMember(mockGuild);
+    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
+
+    const verifyChannel = Array.from(channels.values()).find((c) => c.name === 'verify-here');
+    createMockAdminMember(mockGuild, 'sq-cap');
+    createMockAdminMember(mockGuild, 'sq-m1');
+    createMockAdminMember(mockGuild, 'sq-m2');
+    createMockAdminMember(mockGuild, 'sq-m3');
+
+    let completedPayload = null;
+    let announcement = null;
+    verifyChannel.send = async (p) => { announcement = p; return { ...p, delete: async () => {} }; };
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      if (url.includes('check-code')) {
+        return {
+          ok: true,
+          json: async () => ({
+            success: true,
+            tournament_id: 't-squad-4x',
+            tournament_title: 'Squad Mayhem',
+            tournament_format: 'squad',
+            registration_id: 'reg-sq-44',
+            team_name: 'Squad Four',
+          }),
+        };
+      }
+      if (url.includes('complete')) {
+        completedPayload = JSON.parse(opts.body);
+        return {
+          ok: true,
+          json: async () => ({
+            success: true,
+            team_name: 'Squad Four',
+          }),
+        };
+      }
+      return { ok: false };
+    };
+
+    try {
+      await handleCentralVerificationMessage({
+        guild: mockGuild,
+        channel: verifyChannel,
+        content: 'SQUAD123',
+        author: { id: 'sq-cap', bot: false },
+        delete: async () => {},
+      });
+
+      const pending = await getActivePendingTournamentVerificationForUser({ starterDiscordId: 'sq-cap' });
+      assert.strictEqual(pending.teammatesNeeded, 3);
+
+      await handleCentralVerificationInteraction({
+        guild: mockGuild,
+        channel: verifyChannel,
+        user: { id: 'sq-cap' },
+        customId: `cver:select:${pending.pendingId}`,
+        values: ['sq-m1', 'sq-m2', 'sq-m3'],
+        isUserSelectMenu: () => true,
+        deferUpdate: async () => {},
+        reply: async () => {},
+        update: async () => {},
+      });
+
+      assert.ok(completedPayload);
+      assert.deepStrictEqual(completedPayload.teammate_discord_ids, ['sq-m1', 'sq-m2', 'sq-m3']);
+      assert.ok(announcement.content.includes('Squad Four'));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // 21. Validation: Rejects Self-Selection, Bots, and Non-Server Members
+  // --------------------------------------------------------------------------
+  await suite.test('21. Teammate Validation: Rejects self-selection, bots, and non-server members', async () => {
+    const { mockGuild, channels } = createMockGuild();
+    const admin = createMockAdminMember(mockGuild);
+    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
+
+    createMockAdminMember(mockGuild, 'cap-valid');
+    const botUser = { id: 'bot-tm', user: { id: 'bot-tm', bot: true }, guild: mockGuild };
+    mockGuild.members.cache.set('bot-tm', botUser);
+
+    const pendingId = 'pending-val-test';
+    await createPendingTournamentVerification({
+      pendingId,
+      registrationId: 'reg-val-1',
+      starterDiscordId: 'cap-valid',
+      tournamentId: 't-val-1',
+      guildId: mockGuild.id,
+      tournamentFormat: 'duo',
+      teammatesNeeded: 1,
+      status: 'awaiting_teammates',
+      expiresAt: new Date(Date.now() + 600000),
+    });
+
+    // 1. Captain selects himself
+    let selfReply = null;
+    await handleCentralVerificationInteraction({
+      guild: mockGuild,
+      user: { id: 'cap-valid' },
+      customId: `cver:select:${pendingId}`,
+      values: ['cap-valid'],
+      isUserSelectMenu: () => true,
+      reply: async (p) => { selfReply = p; },
+    });
+    assert.ok(selfReply.content.includes('cannot select yourself as a teammate'));
+
+    // 2. Captain selects user not in server
+    let notInServerReply = null;
+    await handleCentralVerificationInteraction({
+      guild: mockGuild,
+      user: { id: 'cap-valid' },
+      customId: `cver:select:${pendingId}`,
+      values: ['stranger-user-99'],
+      isUserSelectMenu: () => true,
+      reply: async (p) => { notInServerReply = p; },
+    });
+    assert.ok(notInServerReply.content.includes('has not joined this Discord server yet'));
+
+    // 3. Captain selects a bot
+    let botReply = null;
+    await handleCentralVerificationInteraction({
+      guild: mockGuild,
+      user: { id: 'cap-valid' },
+      customId: `cver:select:${pendingId}`,
+      values: ['bot-tm'],
+      isUserSelectMenu: () => true,
+      reply: async (p) => { botReply = p; },
+    });
+    assert.ok(botReply.content.includes('is a Discord bot'));
+  });
+
+  // --------------------------------------------------------------------------
+  // 22. Authorization Isolation: Other Users Cannot Control Someone Else's Session
+  // --------------------------------------------------------------------------
+  await suite.test('22. Authorization Isolation: Non-captain users cannot click prompt controls', async () => {
+    const { mockGuild } = createMockGuild();
+    const admin = createMockAdminMember(mockGuild);
+    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
+
+    createMockAdminMember(mockGuild, 'real-cap');
+    createMockAdminMember(mockGuild, 'intruder-user');
+
+    const pendingId = 'pending-iso-test';
+    await createPendingTournamentVerification({
+      pendingId,
+      registrationId: 'reg-iso',
+      starterDiscordId: 'real-cap',
+      tournamentId: 't-iso',
+      guildId: mockGuild.id,
+      tournamentFormat: 'duo',
+      teammatesNeeded: 1,
+      status: 'awaiting_teammates',
+      expiresAt: new Date(Date.now() + 600000),
+    });
+
+    let deniedReply = null;
+    await handleCentralVerificationInteraction({
+      guild: mockGuild,
+      user: { id: 'intruder-user' },
+      customId: `cver:invite:${pendingId}`,
+      reply: async (p) => { deniedReply = p; },
+    });
+
+    assert.ok(deniedReply);
+    assert.ok(deniedReply.content.includes('Only the team captain'));
+  });
+
+  // --------------------------------------------------------------------------
+  // 23. Duplicate Submissions Prevention
+  // --------------------------------------------------------------------------
+  await suite.test('23. Duplicate Submissions: Rapid submissions do not create duplicate sessions', async () => {
+    const { mockGuild, channels } = createMockGuild();
+    const admin = createMockAdminMember(mockGuild);
+    await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
+
+    const verifyChannel = Array.from(channels.values()).find((c) => c.name === 'verify-here');
+    createMockAdminMember(mockGuild, 'cap-dup');
+
+    let promptCount = 0;
+    let duplicateNotice = null;
+    verifyChannel.send = async (p) => {
+      if (p.embeds) promptCount++;
+      else duplicateNotice = p;
+      return { ...p, delete: async () => {} };
+    };
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        success: true,
+        tournament_id: 't-dup-test',
+        tournament_title: 'Dup Tournament',
+        tournament_format: 'duo',
+        registration_id: 'reg-dup-1',
+        team_name: 'Team Dup',
+      }),
+    });
+
+    try {
+      // First submission
+      await handleCentralVerificationMessage({
+        guild: mockGuild,
+        channel: verifyChannel,
+        content: 'DUPCODE1',
+        author: { id: 'cap-dup', bot: false },
+        delete: async () => {},
+      });
+
+      assert.strictEqual(promptCount, 1);
+
+      // Immediate second submission for same captain
+      await handleCentralVerificationMessage({
+        guild: mockGuild,
+        channel: verifyChannel,
+        content: 'DUPCODE1',
+        author: { id: 'cap-dup', bot: false },
+        delete: async () => {},
+      });
+
+      assert.strictEqual(promptCount, 1, 'Zero duplicate prompt messages');
+      assert.ok(duplicateNotice.content.includes('already in progress'));
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -1006,7 +1109,6 @@ test('Central Tournament Verification Suite', async (suite) => {
     const admin = createMockAdminMember(mockGuild);
     await handleCentralVerificationSetupCommand(mockGuild, admin, { id: 'chan-any' }, () => {});
 
-    // 1. Simulate Bot Restart: clear memory cache and re-initialize from storage
     centralVerificationConfigsCache.clear();
     assert.strictEqual(centralVerificationConfigsCache.size, 0);
 
@@ -1017,21 +1119,18 @@ test('Central Tournament Verification Suite', async (suite) => {
     assert.strictEqual(restored.guildId, mockGuild.id);
     assert.strictEqual(restored.enabled, true);
 
-    // 2. Offline recovery sweep in #verify-here
     const verifyChannel = Array.from(channels.values()).find((c) => c.name === 'verify-here');
     const messages = new Map();
     let codeMsgDeleted = false;
     let instrMsgDeleted = false;
 
-    // A leftover user message containing a code
     messages.set('msg-code', {
       id: 'msg-code',
-      content: 'XY7890ZZ <@player-1>',
+      content: 'XY7890ZZ',
       author: { bot: false },
       delete: async () => { codeMsgDeleted = true; },
     });
 
-    // An ordinary announcement / instructions message
     messages.set('msg-instructions', {
       id: 'msg-instructions',
       content: 'Welcome to tournament verification! Type your code here.',

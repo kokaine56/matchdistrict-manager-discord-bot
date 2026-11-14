@@ -8,6 +8,7 @@ import {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  UserSelectMenuBuilder,
 } from 'discord.js';
 import crypto from 'crypto';
 import {
@@ -21,6 +22,7 @@ import {
   getPendingTournamentVerification,
   getActivePendingTournamentVerificationForUser,
   finishPendingTournamentVerification,
+  cancelPendingTournamentVerification,
   expirePendingTournamentVerificationById,
   releasePendingTournamentVerificationClaim,
   saveTournamentToDb,
@@ -41,24 +43,12 @@ import { guildSettingsCache } from './index.js';
 
 /**
  * In-memory cache of central verification configurations:
- * Map<guildId, {
- *   guildId: string,
- *   categoryId: string|null,
- *   setupChannelId: string|null,
- *   verifyChannelId: string|null,
- *   dashboardMessageId: string|null,
- *   enabled: boolean,
- *   soloMentionRequirement: number,
- *   duoMentionRequirement: number,
- *   squadMentionRequirement: number,
- *   updatedBy: string|null,
- *   updatedAt: string,
- * }>
+ * Map<guildId, configDoc>
  */
 export const centralVerificationConfigsCache = new Map();
 
 /**
- * Tracks transient prompt auto-delete timers for confirmation prompts:
+ * Tracks transient prompt auto-delete timers for verification prompts:
  * Map<pendingId, NodeJS.Timeout>
  */
 const pendingPromptTimers = new Map();
@@ -81,6 +71,51 @@ export function isMemberAdmin(member) {
     member.permissions?.has(PermissionFlagsBits.ManageGuild) ||
     member.guild?.ownerId === member.id
   );
+}
+
+/**
+ * Resolves the official Match District Discord server invite link.
+ * Priority:
+ * 1. Admin-configured `serverInviteUrl` in guild verification config
+ * 2. Environment variable `DISCORD_SERVER_INVITE` / `DISCORD_INVITE_URL` / `MATCHDISTRICT_DISCORD_INVITE`
+ * 3. Guild vanity URL code (`https://discord.gg/${guild.vanityURLCode}`)
+ * 4. Existing active guild invites (`guild.invites.fetch()`)
+ *
+ * @param {import('discord.js').Guild} guild
+ * @param {object} config
+ * @returns {Promise<string|null>}
+ */
+export async function resolveGuildInviteUrl(guild, config = {}) {
+  // 1. Configured invite in central verification settings
+  if (config.serverInviteUrl && typeof config.serverInviteUrl === 'string' && config.serverInviteUrl.trim()) {
+    return config.serverInviteUrl.trim();
+  }
+
+  // 2. Global environment variable
+  const envInvite = process.env.DISCORD_SERVER_INVITE ||
+    process.env.DISCORD_INVITE_URL ||
+    process.env.MATCHDISTRICT_DISCORD_INVITE;
+  if (envInvite && typeof envInvite === 'string' && envInvite.trim()) {
+    return envInvite.trim();
+  }
+
+  // 3. Guild vanity URL
+  if (guild?.vanityURLCode) {
+    return `https://discord.gg/${guild.vanityURLCode}`;
+  }
+
+  // 4. Existing guild invites
+  if (guild?.invites?.fetch) {
+    try {
+      const invites = await guild.invites.fetch().catch(() => null);
+      if (invites?.size > 0) {
+        const first = typeof invites.first === 'function' ? invites.first() : Array.from(invites.values())[0];
+        if (first?.url) return first.url;
+      }
+    } catch {}
+  }
+
+  return null;
 }
 
 /**
@@ -117,6 +152,7 @@ export function getCentralVerificationConfig(guildId) {
     setupChannelId: null,
     verifyChannelId: null,
     dashboardMessageId: null,
+    serverInviteUrl: null,
     enabled: true,
     soloMentionRequirement: 0,
     duoMentionRequirement: 2,
@@ -137,13 +173,14 @@ export function buildDashboardPayload(config, guild) {
   const statusText = isEnabled ? '🟢 **Enabled**' : '🔴 **Disabled**';
   const updatedByText = config.updatedBy ? `<@${config.updatedBy}>` : 'System';
   const updatedAtText = config.updatedAt ? new Date(config.updatedAt).toUTCString() : 'N/A';
+  const inviteText = config.serverInviteUrl ? `\`${config.serverInviteUrl}\`` : '_Auto-detected / Not set_';
 
   const embed = new EmbedBuilder()
     .setTitle('🛡️ Central Tournament Verification Dashboard')
     .setColor(isEnabled ? 0x22c55e : 0xef4444)
     .setDescription(
-      'Configure the central tournament verification system and set mention requirements for different tournament formats.\n\n' +
-      'Players submit their 8-character verification code along with required team mentions in the submissions channel.'
+      'Configure the central tournament verification system and team invitation settings.\n\n' +
+      'Captains submit their 8-character verification code in the submissions channel. If teammates have not joined Discord yet, the captain can send them the official server invite and continue verification once they join.'
     )
     .addFields(
       { name: 'System Status', value: statusText, inline: true },
@@ -152,10 +189,15 @@ export function buildDashboardPayload(config, guild) {
       {
         name: 'Mention Requirements',
         value: [
-          `• **Solo:** \`${config.soloMentionRequirement ?? 0}\` mention(s) *(0 = self only, no mentions)*`,
-          `• **Duo:** \`${config.duoMentionRequirement ?? 2}\` mention(s) *(verifying user + 1 teammate)*`,
-          `• **Squad:** \`${config.squadMentionRequirement ?? 4}\` mention(s) *(verifying user + 3 teammates)*`,
+          `• **Solo:** \`${config.soloMentionRequirement ?? 0}\` mention(s)`,
+          `• **Duo:** \`${config.duoMentionRequirement ?? 2}\` mention(s)`,
+          `• **Squad:** \`${config.squadMentionRequirement ?? 4}\` mention(s)`,
         ].join('\n'),
+        inline: false,
+      },
+      {
+        name: 'Official Server Invite Link',
+        value: inviteText,
         inline: false,
       },
       {
@@ -185,7 +227,12 @@ export function buildDashboardPayload(config, guild) {
       .setCustomId('cver:edit:squad')
       .setLabel('Edit Squad Mentions')
       .setStyle(ButtonStyle.Secondary)
-      .setEmoji('🧑‍🤝‍🧑')
+      .setEmoji('🧑‍🤝‍🧑'),
+    new ButtonBuilder()
+      .setCustomId('cver:edit:invite')
+      .setLabel('Edit Server Invite')
+      .setStyle(ButtonStyle.Secondary)
+      .setEmoji('🔗')
   );
 
   const row2 = new ActionRowBuilder().addComponents(
@@ -234,6 +281,62 @@ export async function updateDashboardMessage(guild, config) {
     console.warn('[CentralVerification] Failed updating dashboard message:', err.message);
     return false;
   }
+}
+
+/**
+ * Builds the interactive teammate selection prompt for Duo or Squad verification.
+ * @param {object} pending
+ * @returns {{ embeds: EmbedBuilder[], components: ActionRowBuilder[] }}
+ */
+export function buildTeammateSelectionPrompt(pending) {
+  const needed = Number(pending.teammatesNeeded) || (pending.tournamentFormat === 'duo' ? 1 : 3);
+  const formatUpper = String(pending.tournamentFormat || 'team').toUpperCase();
+  const teamName = pending.teamName || 'Your Team';
+
+  const embed = new EmbedBuilder()
+    .setTitle(`📋 Tournament Verification — ${teamName}`)
+    .setColor(0x3b82f6)
+    .setDescription(
+      `Verification for **${pending.tournamentTitle || 'Tournament'}** (\`${formatUpper}\`).\n\n` +
+      `• **Team Captain:** <@${pending.starterDiscordId}>\n` +
+      `• **Teammates Required:** **${needed}** teammate${needed === 1 ? '' : 's'}\n\n` +
+      `Use the dropdown menu below to select your teammate${needed === 1 ? '' : 's'}.\n` +
+      `If your teammates have not joined this Discord server yet, click **Invite Teammates** to get an invitation message to share with them.`
+    )
+    .addFields(
+      { name: 'Team Name', value: `**${teamName}**`, inline: true },
+      { name: 'Format', value: `\`${formatUpper}\``, inline: true },
+      { name: 'Status', value: `⏳ Awaiting Teammates (${needed} required)`, inline: true }
+    )
+    .setFooter({ text: 'Match District Tournament Verification • Only the captain can select teammates' });
+
+  const selectRow = new ActionRowBuilder().addComponents(
+    new UserSelectMenuBuilder()
+      .setCustomId(`cver:select:${pending.pendingId}`)
+      .setPlaceholder(`Select ${needed} teammate${needed === 1 ? '' : 's'}...`)
+      .setMinValues(needed)
+      .setMaxValues(needed)
+  );
+
+  const buttonRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`cver:invite:${pending.pendingId}`)
+      .setLabel('Invite Teammates')
+      .setStyle(ButtonStyle.Primary)
+      .setEmoji('📨'),
+    new ButtonBuilder()
+      .setCustomId(`cver:continue:${pending.pendingId}`)
+      .setLabel('Continue Verification')
+      .setStyle(ButtonStyle.Success)
+      .setEmoji('🔄'),
+    new ButtonBuilder()
+      .setCustomId(`cver:cancel:${pending.pendingId}`)
+      .setLabel('Cancel')
+      .setStyle(ButtonStyle.Secondary)
+      .setEmoji('✖️')
+  );
+
+  return { embeds: [embed], components: [selectRow, buttonRow] };
 }
 
 /**
@@ -293,8 +396,7 @@ export async function handleCentralVerificationSetupCommand(guild, member, chann
   const everyoneRole = guild.roles.everyone;
   const botId = botMember?.id || guild.client?.user?.id;
 
-  // Define permissions for #verify-setup:
-  // Admin/Manage server can view/manage; @everyone denied ViewChannel; Bot has full access.
+  // Permissions for #verify-setup:
   const setupOverwrites = [
     {
       id: everyoneRole.id,
@@ -316,8 +418,7 @@ export async function handleCentralVerificationSetupCommand(guild, member, chann
     });
   }
 
-  // Define permissions for #verify-here:
-  // @everyone can view and send messages; THREADS STRICTLY DENIED; Bot has full access.
+  // Permissions for #verify-here:
   const verifyHereOverwrites = [
     {
       id: everyoneRole.id,
@@ -365,7 +466,6 @@ export async function handleCentralVerificationSetupCommand(guild, member, chann
       permissionOverwrites: setupOverwrites,
     });
   } else if (setupChannel) {
-    // Ensure parent and permissions are consistent
     if (category?.id && setupChannel.parentId !== category.id && setupChannel.setParent) {
       await setupChannel.setParent(category.id).catch(() => {});
     }
@@ -393,7 +493,6 @@ export async function handleCentralVerificationSetupCommand(guild, member, chann
       permissionOverwrites: verifyHereOverwrites,
     });
   } else if (verifyChannel) {
-    // Ensure parent and permissions are consistent
     if (category?.id && verifyChannel.parentId !== category.id && verifyChannel.setParent) {
       await verifyChannel.setParent(category.id).catch(() => {});
     }
@@ -409,6 +508,7 @@ export async function handleCentralVerificationSetupCommand(guild, member, chann
     setupChannelId: setupChannel?.id || null,
     verifyChannelId: verifyChannel?.id || null,
     dashboardMessageId: existingConfig.dashboardMessageId || null,
+    serverInviteUrl: existingConfig.serverInviteUrl || null,
     enabled: existingConfig.enabled !== undefined ? existingConfig.enabled : true,
     soloMentionRequirement: existingConfig.soloMentionRequirement ?? 0,
     duoMentionRequirement: existingConfig.duoMentionRequirement ?? 2,
@@ -436,7 +536,7 @@ export async function handleCentralVerificationSetupCommand(guild, member, chann
   await saveConfigToDb(guild.id, updatedConfig);
   centralVerificationConfigsCache.set(guild.id, updatedConfig);
 
-  // 8. Confirm in the channel where .verify was run
+  // 8. Confirm in invoking channel
   const successEmbed = new EmbedBuilder()
     .setTitle('✅ Central Verification Setup Complete')
     .setColor(0x22c55e)
@@ -445,14 +545,14 @@ export async function handleCentralVerificationSetupCommand(guild, member, chann
       `• **Category:** \`${category?.name || 'VERIFICATION'}\`\n` +
       `• **Dashboard:** ${setupChannel ? `<#${setupChannel.id}>` : '_None_'}\n` +
       `• **Submissions:** ${verifyChannel ? `<#${verifyChannel.id}>` : '_None_'}\n\n` +
-      `Administrators can customize mention requirements in ${setupChannel ? `<#${setupChannel.id}>` : '#verify-setup'}.`
+      `Administrators can customize mention requirements and server invite link in ${setupChannel ? `<#${setupChannel.id}>` : '#verify-setup'}.`
     );
 
   await replyFn({ embeds: [successEmbed] });
 }
 
 /**
- * Handles all interaction components (buttons, modals) for central verification (prefix `cver:`).
+ * Handles all interaction components (buttons, modals, user select menus) for central verification (prefix `cver:`).
  * @param {import('discord.js').Interaction} interaction
  * @returns {Promise<boolean>}
  */
@@ -465,6 +565,24 @@ export async function handleCentralVerificationInteraction(interaction) {
 
   const config = getCentralVerificationConfig(guild.id);
 
+  // Safe private reply helper
+  const replyPrivate = async (target, payload) => {
+    const opts = typeof payload === 'string' ? { content: payload, ephemeral: true } : { ...payload, ephemeral: true };
+    if (target.replied || target.deferred) {
+      if (typeof target.followUp === 'function') {
+        return target.followUp(opts).catch(async () => {
+          if (typeof target.editReply === 'function') return target.editReply(payload).catch(() => {});
+        });
+      }
+      if (typeof target.editReply === 'function') {
+        return target.editReply(payload).catch(() => {});
+      }
+    }
+    if (typeof target.reply === 'function') {
+      return target.reply(opts).catch(() => {});
+    }
+  };
+
   // -------------------------------------------------------------
   // Admin Management Actions: cver:edit:*, cver:toggle_status, cver:view_config, cver:refresh, cver:modal:*
   // -------------------------------------------------------------
@@ -476,16 +594,47 @@ export async function handleCentralVerificationInteraction(interaction) {
     customId.startsWith('cver:modal:')
   ) {
     if (!isMemberAdmin(interaction.member)) {
-      await interaction.reply({
-        content: '⛔ Only server administrators can manage the tournament verification configuration.',
-        ephemeral: true,
-      });
+      await replyPrivate(interaction, '⛔ Only server administrators can manage the tournament verification configuration.');
+      return true;
+    }
+
+    // Modal Display: Edit Server Invite Link
+    if (customId === 'cver:edit:invite') {
+      const modal = new ModalBuilder()
+        .setCustomId('cver:modal:invite')
+        .setTitle('Edit Server Invite URL');
+
+      const input = new TextInputBuilder()
+        .setCustomId('cver:input:invite')
+        .setLabel('Official Discord Server Invite URL')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setPlaceholder('https://discord.gg/your-invite or leave empty')
+        .setValue(String(config.serverInviteUrl || ''));
+
+      modal.addComponents(new ActionRowBuilder().addComponents(input));
+      if (interaction.showModal) await interaction.showModal(modal);
+      return true;
+    }
+
+    // Modal Submission: Edit Server Invite Link
+    if (customId === 'cver:modal:invite') {
+      const rawUrl = interaction.fields?.getTextInputValue('cver:input:invite')?.trim() || '';
+      config.serverInviteUrl = rawUrl || null;
+      config.updatedBy = interaction.user.id;
+      config.updatedAt = new Date().toISOString();
+
+      await saveConfigToDb(guild.id, config);
+      centralVerificationConfigsCache.set(guild.id, config);
+      await updateDashboardMessage(guild, config);
+
+      await replyPrivate(interaction, `✅ Official server invite URL has been ${config.serverInviteUrl ? `set to \`${config.serverInviteUrl}\`` : 'cleared (auto-detection enabled)'}.`);
       return true;
     }
 
     // Modal Display: Edit Solo / Duo / Squad Mentions
     if (customId.startsWith('cver:edit:')) {
-      const format = customId.split(':')[2]; // 'solo' | 'duo' | 'squad'
+      const format = customId.split(':')[2];
       let currentVal = 0;
       if (format === 'solo') currentVal = config.soloMentionRequirement ?? 0;
       else if (format === 'duo') currentVal = config.duoMentionRequirement ?? 2;
@@ -505,21 +654,18 @@ export async function handleCentralVerificationInteraction(interaction) {
         .setValue(String(currentVal));
 
       modal.addComponents(new ActionRowBuilder().addComponents(input));
-      await interaction.showModal(modal);
+      if (interaction.showModal) await interaction.showModal(modal);
       return true;
     }
 
     // Modal Submission: Process Mention Requirement Update
     if (customId.startsWith('cver:modal:')) {
-      const format = customId.split(':')[2]; // 'solo' | 'duo' | 'squad'
+      const format = customId.split(':')[2];
       const rawVal = interaction.fields?.getTextInputValue('cver:input:mentions')?.trim() || '';
       const num = parseInt(rawVal, 10);
 
       if (isNaN(num) || num < 0 || num > 25 || String(num) !== rawVal) {
-        await interaction.reply({
-          content: '❌ Invalid input: Mentions requirement must be an integer between 0 and 25.',
-          ephemeral: true,
-        });
+        await replyPrivate(interaction, '❌ Invalid input: Mentions requirement must be an integer between 0 and 25.');
         return true;
       }
 
@@ -534,10 +680,7 @@ export async function handleCentralVerificationInteraction(interaction) {
       centralVerificationConfigsCache.set(guild.id, config);
       await updateDashboardMessage(guild, config);
 
-      await interaction.reply({
-        content: `✅ Updated **${format.toUpperCase()}** mention requirement to **${num}**.`,
-        ephemeral: true,
-      });
+      await replyPrivate(interaction, `✅ Updated **${format.toUpperCase()}** mention requirement to **${num}**.`);
       return true;
     }
 
@@ -551,10 +694,7 @@ export async function handleCentralVerificationInteraction(interaction) {
       centralVerificationConfigsCache.set(guild.id, config);
       await updateDashboardMessage(guild, config);
 
-      await interaction.reply({
-        content: `✅ Central Tournament Verification is now **${config.enabled ? 'Enabled' : 'Disabled'}**.`,
-        ephemeral: true,
-      });
+      await replyPrivate(interaction, `✅ Central Tournament Verification is now **${config.enabled ? 'Enabled' : 'Disabled'}**.`);
       return true;
     }
 
@@ -570,6 +710,7 @@ export async function handleCentralVerificationInteraction(interaction) {
           { name: 'Setup Channel', value: config.setupChannelId ? `<#${config.setupChannelId}>` : '_None_', inline: true },
           { name: 'Verify Channel', value: config.verifyChannelId ? `<#${config.verifyChannelId}>` : '_None_', inline: true },
           { name: 'Dashboard Msg ID', value: config.dashboardMessageId ? `\`${config.dashboardMessageId}\`` : '_None_', inline: true },
+          { name: 'Server Invite URL', value: config.serverInviteUrl ? `\`${config.serverInviteUrl}\`` : '_Auto-detected / Not set_', inline: false },
           { name: 'Solo Mentions', value: `\`${config.soloMentionRequirement ?? 0}\``, inline: true },
           { name: 'Duo Mentions', value: `\`${config.duoMentionRequirement ?? 2}\``, inline: true },
           { name: 'Squad Mentions', value: `\`${config.squadMentionRequirement ?? 4}\``, inline: true },
@@ -578,256 +719,334 @@ export async function handleCentralVerificationInteraction(interaction) {
         )
         .setTimestamp();
 
-      await interaction.reply({ embeds: [viewEmbed], ephemeral: true });
+      await replyPrivate(interaction, { embeds: [viewEmbed] });
       return true;
     }
 
     // Refresh Dashboard In-Place
     if (customId === 'cver:refresh') {
       await updateDashboardMessage(guild, config);
-      await interaction.reply({ content: '✅ Dashboard refreshed.', ephemeral: true });
+      await replyPrivate(interaction, '✅ Dashboard refreshed.');
       return true;
     }
   }
 
   // -------------------------------------------------------------
-  // User Verification Confirmation Flow: cver:confirm:* and cver:cancel:*
+  // Teammates Verification Actions: cver:invite:*, cver:continue:*, cver:select:*, cver:cancel:*
   // -------------------------------------------------------------
-  if (customId.startsWith('cver:confirm:') || customId.startsWith('cver:cancel:')) {
-    const action = customId.startsWith('cver:confirm:') ? 'confirm' : 'cancel';
-    const pendingId = customId.split(':')[2];
+  if (
+    customId.startsWith('cver:invite:') ||
+    customId.startsWith('cver:continue:') ||
+    customId.startsWith('cver:select:') ||
+    customId.startsWith('cver:cancel:') ||
+    customId.startsWith('cver:confirm:')
+  ) {
+    const parts = customId.split(':');
+    const action = parts[1];
+    const pendingId = parts[2];
 
     const pending = await getPendingTournamentVerification(pendingId);
-    if (!pending || pending.status !== 'active') {
-      const replyFn = interaction.reply || interaction.update;
-      if (replyFn) {
-        await replyFn.call(interaction, {
-          content: '⚠️ This verification session has expired or has already been completed.',
-          ephemeral: true,
-        });
+    const now = Date.now();
+    const isExpired = pending?.expiresAt && new Date(pending.expiresAt).getTime() <= now;
+
+    if (!pending || isExpired || !['active', 'awaiting_continue', 'awaiting_teammates', 'awaiting_selection'].includes(pending.status)) {
+      if (pendingId && isExpired) {
+        await expirePendingTournamentVerificationById(pendingId, interaction.user.id).catch(() => {});
       }
+      await replyPrivate(interaction, '⚠️ This verification session has expired or has already been completed. Please submit your verification code in #verify-here to start a fresh session.');
       return true;
     }
 
-    // Ensure only the user who started this verification can click Confirm or Cancel
+    // Only the captain who submitted the code may use these controls
     if (String(pending.starterDiscordId) !== String(interaction.user.id)) {
-      const replyFn = interaction.reply || interaction.update;
-      if (replyFn) {
-        await replyFn.call(interaction, {
-          content: `⛔ Only <@${pending.starterDiscordId}> can confirm or cancel this verification.`,
-          ephemeral: true,
-        });
-      }
+      await replyPrivate(interaction, `⛔ Only the team captain (<@${pending.starterDiscordId}>) who submitted this verification code can operate these controls.`);
       return true;
     }
 
-    // Clear auto-delete timer
-    if (pendingPromptTimers.has(pendingId)) {
-      clearTimeout(pendingPromptTimers.get(pendingId));
-      pendingPromptTimers.delete(pendingId);
-    }
-
-    // Cancel Action
-    if (action === 'cancel') {
-      await releasePendingTournamentVerificationClaim(pendingId, interaction.user.id);
-      await interaction.update({
-        content: `<@${interaction.user.id}> ❌ Verification has been cancelled.`,
-        embeds: [],
-        components: [],
-      });
-      return true;
-    }
-
-    // Confirm Action: Execute verification!
-    await interaction.deferUpdate().catch(() => {});
-
-    const tournamentId = pending.tournamentId;
-    const registrationId = pending.registrationId;
-    const captainId = pending.starterDiscordId;
-    const teammateIds = pending.teammateDiscordIds || [];
-    const allParticipantIds = [captainId, ...teammateIds];
-
-    // Re-verify exclusivity before final execution
-    const exclCheck = await checkTournamentPlayerExclusivity(tournamentId, allParticipantIds, registrationId);
-    if (!exclCheck.ok) {
-      const conflict = exclCheck.conflicts?.[0];
-      await releasePendingTournamentVerificationClaim(pendingId, captainId);
-      await interaction.editReply({
-        content: `❌ Verification aborted: <@${conflict?.discordId}> is already registered in a verified team for this tournament.`,
-        embeds: [],
-        components: [],
-      });
-      return true;
-    }
-
-    // Call Website API to complete verification
-    let backendVerified = false;
-    try {
-      const apiUrl = getBackendApiUrl();
-      const secret = getBackendBotSecret();
-      const response = await fetch(`${apiUrl}/api/bot/verification/complete`, {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-          ...(secret ? { Authorization: `Bearer ${secret}`, 'x-bot-secret': secret } : {}),
-          'x-guild-id': guild.id,
-        },
-        body: JSON.stringify({
-          registration_id: registrationId,
-          captain_discord_id: captainId,
-          teammate_discord_ids: teammateIds,
-          guild_id: guild.id,
-        }),
-      });
-
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok || !result.success) {
-        if (result.error === 'ALREADY_USED' || result.reason === 'already_used') {
-          await finishPendingTournamentVerification(pendingId, captainId, 'completed');
-        } else {
-          await releasePendingTournamentVerificationClaim(pendingId, captainId);
-        }
-        await interaction.editReply({
-          content: `❌ Verification failed: ${result.message || result.error || 'Server error'}.`,
-          embeds: [],
-          components: [],
-        });
+    // --- Action: Invite Teammates (Step 3) ---
+    if (action === 'invite') {
+      const inviteUrl = await resolveGuildInviteUrl(guild, config);
+      if (!inviteUrl) {
+        console.warn(`[CentralVerification] ⚠️ Guild ${guild.name} (${guild.id}) has no valid server invite link configured.`);
+        await replyPrivate(
+          interaction,
+          '⚠️ The official Match District server invite link is currently unavailable. Please ask a server administrator to configure the server invite URL in #verify-setup.'
+        );
         return true;
       }
 
-      backendVerified = true;
-      await finishPendingTournamentVerification(pendingId, captainId, 'completed');
-
-      const resolvedTeamName = result.team_name || pending.teamName || 'Your team';
-      const verifiedAt = new Date().toISOString();
-
-      // Update tournament data in cache and MongoDB
-      const savedTournament = guildSettingsCache?.[guild.id]?.tournaments?.[tournamentId] || {};
-      savedTournament.verifiedRegistrations ||= {};
-      savedTournament.verifiedRegistrations[String(registrationId)] = {
-        registrationId: String(registrationId),
-        teamId: String(registrationId),
-        teamName: resolvedTeamName,
-        status: 'CONFIRMED',
-        discordId: String(captainId),
-        verifiedAt,
-        mentionedMemberIds: teammateIds,
-        captain: {
-          ign: result.captain_name || pending.captainName || '',
-          uid: result.captain_uid || pending.captainUid || '',
-          discord_id: String(captainId),
-        },
-        squad: Array.isArray(result.squad) ? result.squad : pending.squad,
-        substitutes: Array.isArray(result.substitutes) ? result.substitutes : pending.substitutes,
-        discordMemberIds: allParticipantIds.map(String),
-      };
-
-      if (guildSettingsCache?.[guild.id]) {
-        guildSettingsCache[guild.id].tournaments ||= {};
-        guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
-      }
-      await saveTournamentToDb(guild.id, tournamentId, savedTournament);
-
-      // Sync player memberships for exclusivity
-      await syncTeamPlayerMemberships({
-        tournamentId,
-        teamId: String(registrationId),
-        teamName: resolvedTeamName,
-        leaderDiscordId: String(captainId),
-        players: teammateIds.map((id) => ({ discordId: String(id), id: String(id) })),
-        status: 'CONFIRMED',
-      }).catch((err) => console.warn('[CentralVerification] Warning syncing player memberships:', err.message));
-
-      // Save permanent Match District identity if UID is present
-      const captainUid = result.captain_uid || pending.captainUid || result.captain_user_id;
-      if (captainUid) {
-        await savePermanentDiscordIdentity({
-          matchDistrictUserId: captainUid,
-          discordUserId: String(captainId),
-          discordUsername: interaction.user.tag || interaction.user.username || '',
-        }).catch((err) => console.warn('[CentralVerification] Warning saving permanent identity:', err.message));
+      let inviteMessageText = '';
+      if (pending.tournamentFormat === 'duo') {
+        inviteMessageText = `Join our Match District Discord server so we can complete tournament verification:\n${inviteUrl}\n\nAfter joining, tell me your Discord username so I can select you during verification.`;
+      } else if (pending.tournamentFormat === 'squad') {
+        inviteMessageText = `Join our Match District Discord server so we can complete our tournament verification:\n${inviteUrl}\n\nAll squad members must join the server before the captain can complete verification.`;
+      } else {
+        inviteMessageText = `Join our Match District Discord server to complete tournament verification:\n${inviteUrl}\n\nPlease join and let your captain know once you are inside.`;
       }
 
-      // Assign tournament role to all verified members
-      if (savedTournament.roleId) {
-        for (const uid of allParticipantIds) {
-          const m = guild.members.cache.get(uid) || (await guild.members.fetch(uid).catch(() => null));
-          if (m) {
-            await queueRoleAdd(
-              m,
-              savedTournament.roleId,
-              `Verified participant for ${savedTournament.tournamentTitle || 'tournament'}`
-            ).catch(() => {});
-          }
+      await replyPrivate(
+        interaction,
+        `📋 **Copy and share this invitation with your teammates:**\n\`\`\`\n${inviteMessageText}\n\`\`\``
+      );
+      return true;
+    }
+
+    // --- Action: Continue Verification (Step 4) ---
+    if (action === 'continue') {
+      const promptData = buildTeammateSelectionPrompt(pending);
+      if (interaction.message?.edit) {
+        await interaction.message.edit(promptData).catch(() => {});
+      }
+      await replyPrivate(interaction, `ℹ️ Please select your **${pending.teammatesNeeded}** teammate(s) from the dropdown menu above once they have joined.`);
+      return true;
+    }
+
+    // --- Action: Cancel Verification ---
+    if (action === 'cancel') {
+      if (pendingPromptTimers.has(pendingId)) {
+        clearTimeout(pendingPromptTimers.get(pendingId));
+        pendingPromptTimers.delete(pendingId);
+      }
+      await cancelPendingTournamentVerification(pendingId, interaction.user.id);
+      if (interaction.update) {
+        await interaction.update({
+          content: `<@${interaction.user.id}> ❌ Verification cancelled. Your registration code remains unused and can be submitted again.`,
+          embeds: [],
+          components: [],
+        });
+      } else {
+        await replyPrivate(interaction, '❌ Verification cancelled. Your registration code remains unused.');
+      }
+      return true;
+    }
+
+    // --- Action: Teammate Selection Menu (Step 5) ---
+    if (action === 'select') {
+      const selectedIds = Array.isArray(interaction.values) ? interaction.values.map(String) : [];
+      const needed = Number(pending.teammatesNeeded) || (pending.tournamentFormat === 'duo' ? 1 : 3);
+
+      if (selectedIds.length !== needed) {
+        await replyPrivate(interaction, `❌ Please select exactly ${needed} teammate${needed === 1 ? '' : 's'}. You selected ${selectedIds.length}.`);
+        return true;
+      }
+
+      if (new Set(selectedIds).size !== selectedIds.length) {
+        await replyPrivate(interaction, '❌ Duplicate teammates selected. Each teammate must be unique.');
+        return true;
+      }
+
+      if (selectedIds.includes(interaction.user.id)) {
+        await replyPrivate(interaction, '❌ You cannot select yourself as a teammate. The team captain is already included automatically.');
+        return true;
+      }
+
+      // Verify every selected user is a present server member and not a bot
+      for (const uid of selectedIds) {
+        let member = guild.members.cache.get(uid);
+        if (!member && guild.members.fetch) {
+          member = await guild.members.fetch(uid).catch(() => null);
+        }
+        if (!member) {
+          await replyPrivate(
+            interaction,
+            `❌ <@${uid}> has not joined this Discord server yet. Click **Invite Teammates** to copy the server invite and send it to them, then try again once they join.`
+          );
+          return true;
+        }
+        if (member.user?.bot) {
+          await replyPrivate(interaction, `❌ <@${uid}> is a Discord bot. Discord bots cannot be added as teammates.`);
+          return true;
         }
       }
 
-      // Send public confirmation announcement in #verify-here
-      const allMentionsText = allParticipantIds.map((id) => `<@${id}>`).join(', ');
-      if (interaction.channel?.send) {
-        await interaction.channel.send({
-          content: `🎉 **Verification Complete!**\nTeam **${resolvedTeamName}** is now confirmed for **${savedTournament.tournamentTitle || 'the tournament'}**!\n**Roster:** ${allMentionsText}`,
-          allowedMentions: { users: allParticipantIds },
-        }).catch(() => {});
+      // Tournament player exclusivity check across all roster members
+      const allRosterIds = [interaction.user.id, ...selectedIds];
+      const exclCheck = await checkTournamentPlayerExclusivity(pending.tournamentId, allRosterIds, pending.registrationId);
+      if (!exclCheck.ok) {
+        const conflict = exclCheck.conflicts?.[0];
+        const teamName = conflict?.teamName ? ` "${conflict.teamName}"` : '';
+        await replyPrivate(
+          interaction,
+          `❌ <@${conflict?.discordId}> is already registered in a verified team${teamName} for this tournament.`
+        );
+        return true;
       }
 
-      // Update prompt message in-place
-      await interaction.editReply({
-        content: `✅ Verification completed successfully for **${resolvedTeamName}**.`,
-        embeds: [],
-        components: [],
-      });
+      if (interaction.deferUpdate) await interaction.deferUpdate().catch(() => {});
 
-      // Send tournament management audit log
-      if (typeof sendTournamentManagementLog === 'function') {
-        await sendTournamentManagementLog(
-          guild,
-          { id: tournamentId, title: savedTournament.tournamentTitle },
-          null,
-          'Team Verified & Confirmed (Central Verification)',
-          interaction.user,
-          [
-            { name: 'Team Name', value: resolvedTeamName },
-            { name: 'Team Leader', value: `<@${captainId}>` },
-            ...(teammateIds.length ? [{ name: 'Squad', value: teammateIds.map((id) => `<@${id}>`).join(', ') }] : []),
-            { name: 'Registration ID', value: String(registrationId) },
-          ]
-        ).catch(() => {});
-      }
+      // Call Website API to complete verification
+      let backendVerified = false;
+      const tournamentId = pending.tournamentId;
+      const registrationId = pending.registrationId;
+      const captainId = pending.starterDiscordId;
 
-      // Update #registered-team roster message
       try {
-        if (typeof fetchTournamentRegistrationsFromBackend === 'function' && typeof updateTeamsRosterMessages === 'function') {
-          const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId).catch(() => null);
-          if (backendData?.teams && savedTournament.channels?.tournamentTeamsId) {
-            const teamsChannel = guild.channels.cache.get(savedTournament.channels.tournamentTeamsId) ||
-              await guild.channels.fetch(savedTournament.channels.tournamentTeamsId).catch(() => null);
-            if (teamsChannel) {
-              await updateTeamsRosterMessages(
-                guild,
-                backendData.tournament || { id: tournamentId, title: savedTournament.tournamentTitle },
-                backendData.teams,
-                teamsChannel,
-                savedTournament
-              );
+        const apiUrl = getBackendApiUrl();
+        const secret = getBackendBotSecret();
+        const response = await fetch(`${apiUrl}/api/bot/verification/complete`, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            ...(secret ? { Authorization: `Bearer ${secret}`, 'x-bot-secret': secret } : {}),
+            'x-guild-id': guild.id,
+          },
+          body: JSON.stringify({
+            registration_id: registrationId,
+            captain_discord_id: captainId,
+            teammate_discord_ids: selectedIds,
+            guild_id: guild.id,
+          }),
+        });
+
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.success) {
+          if (result.error === 'ALREADY_USED' || result.reason === 'already_used') {
+            await finishPendingTournamentVerification(pendingId, captainId, 'completed');
+          } else {
+            await releasePendingTournamentVerificationClaim(pendingId, captainId);
+          }
+          await replyPrivate(interaction, `❌ Verification failed: ${result.message || result.error || 'Server error'}.`);
+          return true;
+        }
+
+        backendVerified = true;
+        await finishPendingTournamentVerification(pendingId, captainId, 'completed');
+
+        const resolvedTeamName = result.team_name || pending.teamName || 'Your team';
+        const verifiedAt = new Date().toISOString();
+
+        // Update tournament record in cache and MongoDB
+        const savedTournament = guildSettingsCache?.[guild.id]?.tournaments?.[tournamentId] || {};
+        savedTournament.verifiedRegistrations ||= {};
+        savedTournament.verifiedRegistrations[String(registrationId)] = {
+          registrationId: String(registrationId),
+          teamId: String(registrationId),
+          teamName: resolvedTeamName,
+          status: 'CONFIRMED',
+          discordId: String(captainId),
+          verifiedAt,
+          mentionedMemberIds: selectedIds,
+          captain: {
+            ign: result.captain_name || pending.captainName || '',
+            uid: result.captain_uid || pending.captainUid || '',
+            discord_id: String(captainId),
+          },
+          squad: Array.isArray(result.squad) ? result.squad : pending.squad,
+          substitutes: Array.isArray(result.substitutes) ? result.substitutes : pending.substitutes,
+          discordMemberIds: allRosterIds.map(String),
+        };
+
+        if (guildSettingsCache?.[guild.id]) {
+          guildSettingsCache[guild.id].tournaments ||= {};
+          guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
+        }
+        await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+
+        // Sync player memberships for exclusivity
+        await syncTeamPlayerMemberships({
+          tournamentId,
+          teamId: String(registrationId),
+          teamName: resolvedTeamName,
+          leaderDiscordId: String(captainId),
+          players: selectedIds.map((id) => ({ discordId: String(id), id: String(id) })),
+          status: 'CONFIRMED',
+        }).catch((err) => console.warn('[CentralVerification] Warning syncing player memberships:', err.message));
+
+        // Save permanent Match District identity if UID is present
+        const captainUid = result.captain_uid || pending.captainUid || result.captain_user_id;
+        if (captainUid) {
+          await savePermanentDiscordIdentity({
+            matchDistrictUserId: captainUid,
+            discordUserId: String(captainId),
+            discordUsername: interaction.user?.tag || interaction.user?.username || '',
+          }).catch((err) => console.warn('[CentralVerification] Warning saving permanent identity:', err.message));
+        }
+
+        // Assign tournament role to all verified members
+        if (savedTournament.roleId) {
+          for (const uid of allRosterIds) {
+            const m = guild.members.cache.get(uid) || (await guild.members.fetch(uid).catch(() => null));
+            if (m) {
+              await queueRoleAdd(
+                m,
+                savedTournament.roleId,
+                `Verified participant for ${savedTournament.tournamentTitle || 'tournament'}`
+              ).catch(() => {});
             }
           }
         }
-      } catch (rosterErr) {
-        console.warn('[CentralVerification] Squad refresh after verification error:', rosterErr.message);
-      }
 
-      return true;
-    } catch (error) {
-      if (!backendVerified) await releasePendingTournamentVerificationClaim(pendingId, captainId).catch(() => {});
-      console.error('[CentralVerification] Verification completion error:', error);
-      await interaction.editReply({
-        content: '❌ Verification could not be completed due to an unexpected error. Please try again.',
-        embeds: [],
-        components: [],
-      });
-      return true;
+        // Public confirmation announcement in #verify-here
+        const allMentionsText = allRosterIds.map((id) => `<@${id}>`).join(', ');
+        if (interaction.channel?.send) {
+          await interaction.channel.send({
+            content: `🎉 **Verification Complete!**\nTeam **${resolvedTeamName}** is now confirmed for **${savedTournament.tournamentTitle || 'the tournament'}**!\n**Roster:** ${allMentionsText}`,
+            allowedMentions: { users: allRosterIds },
+          }).catch(() => {});
+        }
+
+        // Update prompt message in-place
+        if (interaction.editReply) {
+          await interaction.editReply({
+            content: `✅ Verification completed successfully for **${resolvedTeamName}**.`,
+            embeds: [],
+            components: [],
+          }).catch(() => {});
+        } else if (interaction.message?.edit) {
+          await interaction.message.edit({
+            content: `✅ Verification completed successfully for **${resolvedTeamName}**.`,
+            embeds: [],
+            components: [],
+          }).catch(() => {});
+        }
+
+        // Tournament management audit log
+        if (typeof sendTournamentManagementLog === 'function') {
+          await sendTournamentManagementLog(
+            guild,
+            { id: tournamentId, title: savedTournament.tournamentTitle },
+            null,
+            'Team Verified & Confirmed (Central Verification)',
+            interaction.user,
+            [
+              { name: 'Team Name', value: resolvedTeamName },
+              { name: 'Team Leader', value: `<@${captainId}>` },
+              { name: 'Squad', value: selectedIds.map((id) => `<@${id}>`).join(', ') },
+              { name: 'Registration ID', value: String(registrationId) },
+            ]
+          ).catch(() => {});
+        }
+
+        // Update #registered-team roster display
+        try {
+          if (typeof fetchTournamentRegistrationsFromBackend === 'function' && typeof updateTeamsRosterMessages === 'function') {
+            const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId).catch(() => null);
+            if (backendData?.teams && savedTournament.channels?.tournamentTeamsId) {
+              const teamsChannel = guild.channels.cache.get(savedTournament.channels.tournamentTeamsId) ||
+                await guild.channels.fetch(savedTournament.channels.tournamentTeamsId).catch(() => null);
+              if (teamsChannel) {
+                await updateTeamsRosterMessages(
+                  guild,
+                  backendData.tournament || { id: tournamentId, title: savedTournament.tournamentTitle },
+                  backendData.teams,
+                  teamsChannel,
+                  savedTournament
+                );
+              }
+            }
+          }
+        } catch (rosterErr) {
+          console.warn('[CentralVerification] Squad refresh after verification error:', rosterErr.message);
+        }
+
+        return true;
+      } catch (error) {
+        if (!backendVerified) await releasePendingTournamentVerificationClaim(pendingId, captainId).catch(() => {});
+        console.error('[CentralVerification] Verification completion error:', error);
+        await replyPrivate(interaction, '❌ Verification could not be completed due to an unexpected server error. Please try again.');
+        return true;
+      }
     }
   }
 
@@ -920,18 +1139,7 @@ export async function handleCentralVerificationMessage(message) {
     return true;
   }
 
-  // 5. Extract mentions from raw message content (supports Discord snowflake IDs and alphanumeric IDs)
-  const mentionMatches = [...(message.content || '').matchAll(/<@!?([a-zA-Z0-9_\-]{2,32})>/g)];
-  const rawMentionIds = mentionMatches.map((m) => m[1]);
-  const uniqueMentionIds = Array.from(new Set(rawMentionIds));
-
-  // Reject duplicate mentions
-  if (rawMentionIds.length !== uniqueMentionIds.length) {
-    await sendTemporaryNotice('❌ Duplicate mentions detected. Each team member must be mentioned only once.');
-    return true;
-  }
-
-  // 6. Query website backend to validate verification code and retrieve tournament format
+  // 5. Query website backend to validate verification code and retrieve tournament format
   let checkResult;
   try {
     const apiUrl = getBackendApiUrl();
@@ -967,56 +1175,10 @@ export async function handleCentralVerificationMessage(message) {
   const tournamentId = checkResult.tournament_id;
   const registrationId = checkResult.registration_id;
   const format = String(checkResult.tournament_format || checkResult.format || 'squad').toLowerCase();
+  const teamName = checkResult.team_name || 'Your Team';
+  const tournamentTitle = checkResult.tournament_title || 'Tournament';
 
-  // 7. Enforce mention requirements based on detected tournament format
-  let requiredMentions = 0;
-  if (format === 'solo') {
-    requiredMentions = config.soloMentionRequirement ?? 0;
-  } else if (format === 'duo') {
-    requiredMentions = config.duoMentionRequirement ?? 2;
-  } else {
-    // Squad / team format
-    requiredMentions = config.squadMentionRequirement ?? 4;
-  }
-
-  if (uniqueMentionIds.length !== requiredMentions) {
-    if (requiredMentions === 0) {
-      await sendTemporaryNotice(
-        `❌ This is a **SOLO** tournament. No mentions are required (submit only your 8-character code). You provided ${uniqueMentionIds.length} mention(s).`
-      );
-    } else {
-      await sendTemporaryNotice(
-        `❌ This is a **${format.toUpperCase()}** tournament which requires exactly **${requiredMentions}** mention(s) (including yourself). You provided ${uniqueMentionIds.length} mention(s).`
-      );
-    }
-    return true;
-  }
-
-  // 8. When required mentions > 0, verifying user must explicitly mention themselves
-  if (requiredMentions > 0 && !uniqueMentionIds.includes(message.author.id)) {
-    await sendTemporaryNotice(
-      `❌ You must mention yourself (<@${message.author.id}>) as part of your team's ${requiredMentions} mentions.`
-    );
-    return true;
-  }
-
-  // 9. Validate all mentioned users are distinct, valid, non-bot server members
-  for (const uid of uniqueMentionIds) {
-    let member = guild.members.cache.get(uid);
-    if (!member && guild.members.fetch) {
-      member = await guild.members.fetch(uid).catch(() => null);
-    }
-    if (!member) {
-      await sendTemporaryNotice(`❌ Mentioned user <@${uid}> is not present in this Discord server.`);
-      return true;
-    }
-    if (member.user?.bot) {
-      await sendTemporaryNotice(`❌ Mentioned user <@${uid}> is a bot. Discord bots cannot be added to tournament rosters.`);
-      return true;
-    }
-  }
-
-  // 10. Captain identity and permanent identity check
+  // 6. Captain identity and permanent identity check
   if (checkResult.captain_discord_id && String(checkResult.captain_discord_id) !== String(message.author.id)) {
     await sendTemporaryNotice('❌ That verification code was issued to a different team captain Discord account.');
     return true;
@@ -1055,84 +1217,190 @@ export async function handleCentralVerificationMessage(message) {
     }
   }
 
-  // 11. Exclusivity check across ALL participants
-  const candidateIdsToCheck = uniqueMentionIds.length > 0 ? uniqueMentionIds : [message.author.id];
-  const exclCheck = await checkTournamentPlayerExclusivity(tournamentId, candidateIdsToCheck, registrationId);
-  if (!exclCheck.ok) {
-    const conflict = exclCheck.conflicts?.[0];
-    const teamName = conflict?.teamName ? ` "${conflict.teamName}"` : '';
-    await sendTemporaryNotice(`❌ <@${conflict?.discordId}> is already registered in a verified team${teamName} for this tournament.`);
+  // 7. Exclusivity check for captain
+  const captainExcl = await checkTournamentPlayerExclusivity(tournamentId, [message.author.id], registrationId);
+  if (!captainExcl.ok) {
+    const conflict = captainExcl.conflicts?.[0];
+    const conflictTeamName = conflict?.teamName ? ` "${conflict.teamName}"` : '';
+    await sendTemporaryNotice(`❌ You are already registered in a verified team${conflictTeamName} for this tournament.`);
     return true;
   }
 
-  // 12. Create pending verification session and post Confirmation Prompt
-  const teammateIds = uniqueMentionIds.filter((id) => id !== message.author.id);
+  // -------------------------------------------------------------
+  // Step 2A: SOLO Tournaments — Direct Completion (No Teammates Required)
+  // -------------------------------------------------------------
+  if (format === 'solo') {
+    let backendVerified = false;
+    try {
+      const apiUrl = getBackendApiUrl();
+      const secret = getBackendBotSecret();
+      const response = await fetch(`${apiUrl}/api/bot/verification/complete`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          ...(secret ? { Authorization: `Bearer ${secret}`, 'x-bot-secret': secret } : {}),
+          'x-guild-id': guild.id,
+        },
+        body: JSON.stringify({
+          registration_id: registrationId,
+          captain_discord_id: message.author.id,
+          teammate_discord_ids: [],
+          guild_id: guild.id,
+        }),
+      });
+
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.success) {
+        await sendTemporaryNotice(`❌ Solo verification failed: ${result.message || result.error || 'Server error'}.`);
+        return true;
+      }
+
+      backendVerified = true;
+      const resolvedTeamName = result.team_name || teamName;
+      const verifiedAt = new Date().toISOString();
+
+      const savedTournament = guildSettingsCache?.[guild.id]?.tournaments?.[tournamentId] || {};
+      savedTournament.verifiedRegistrations ||= {};
+      savedTournament.verifiedRegistrations[String(registrationId)] = {
+        registrationId: String(registrationId),
+        teamId: String(registrationId),
+        teamName: resolvedTeamName,
+        status: 'CONFIRMED',
+        discordId: String(message.author.id),
+        verifiedAt,
+        mentionedMemberIds: [],
+        captain: {
+          ign: result.captain_name || checkResult.captain_name || '',
+          uid: result.captain_uid || checkResult.captain_uid || '',
+          discord_id: String(message.author.id),
+        },
+        squad: Array.isArray(result.squad) ? result.squad : checkResult.squad,
+        substitutes: Array.isArray(result.substitutes) ? result.substitutes : checkResult.substitutes,
+        discordMemberIds: [String(message.author.id)],
+      };
+
+      if (guildSettingsCache?.[guild.id]) {
+        guildSettingsCache[guild.id].tournaments ||= {};
+        guildSettingsCache[guild.id].tournaments[tournamentId] = savedTournament;
+      }
+      await saveTournamentToDb(guild.id, tournamentId, savedTournament);
+
+      await syncTeamPlayerMemberships({
+        tournamentId,
+        teamId: String(registrationId),
+        teamName: resolvedTeamName,
+        leaderDiscordId: String(message.author.id),
+        players: [],
+        status: 'CONFIRMED',
+      }).catch((err) => console.warn('[CentralVerification] Warning syncing solo membership:', err.message));
+
+      if (savedTournament.roleId) {
+        const m = guild.members.cache.get(message.author.id) || (await guild.members.fetch(message.author.id).catch(() => null));
+        if (m) {
+          await queueRoleAdd(
+            m,
+            savedTournament.roleId,
+            `Verified solo participant for ${savedTournament.tournamentTitle || 'tournament'}`
+          ).catch(() => {});
+        }
+      }
+
+      await message.channel.send({
+        content: `🎉 **Verification Complete!**\nSolo Player **${resolvedTeamName}** (<@${message.author.id}>) is now confirmed for **${tournamentTitle}**!`,
+        allowedMentions: { users: [message.author.id] },
+      }).catch(() => {});
+
+      if (typeof sendTournamentManagementLog === 'function') {
+        await sendTournamentManagementLog(
+          guild,
+          { id: tournamentId, title: savedTournament.tournamentTitle || tournamentTitle },
+          null,
+          'Solo Verified & Confirmed',
+          message.author,
+          [
+            { name: 'Player Name', value: resolvedTeamName },
+            { name: 'Discord ID', value: `<@${message.author.id}>` },
+            { name: 'Registration ID', value: String(registrationId) },
+          ]
+        ).catch(() => {});
+      }
+
+      try {
+        if (typeof fetchTournamentRegistrationsFromBackend === 'function' && typeof updateTeamsRosterMessages === 'function') {
+          const backendData = await fetchTournamentRegistrationsFromBackend(tournamentId).catch(() => null);
+          if (backendData?.teams && savedTournament.channels?.tournamentTeamsId) {
+            const teamsChannel = guild.channels.cache.get(savedTournament.channels.tournamentTeamsId) ||
+              await guild.channels.fetch(savedTournament.channels.tournamentTeamsId).catch(() => null);
+            if (teamsChannel) {
+              await updateTeamsRosterMessages(
+                guild,
+                backendData.tournament || { id: tournamentId, title: savedTournament.tournamentTitle || tournamentTitle },
+                backendData.teams,
+                teamsChannel,
+                savedTournament
+              );
+            }
+          }
+        }
+      } catch (rosterErr) {
+        console.warn('[CentralVerification] Solo roster refresh error:', rosterErr.message);
+      }
+
+      return true;
+    } catch (soloErr) {
+      console.error('[CentralVerification] Solo verification error:', soloErr);
+      await sendTemporaryNotice('❌ Solo verification could not be completed due to a server error. Please try again.');
+      return true;
+    }
+  }
+
+  // -------------------------------------------------------------
+  // Step 2B: DUO / SQUAD Tournaments — Deferred Teammate Selection & Invitation Prompt
+  // -------------------------------------------------------------
+  const teammatesNeeded = format === 'duo' ? 1 : 3;
   const pendingId = crypto.randomUUID();
 
-  await createPendingTournamentVerification({
+  const pendingDoc = {
     pendingId,
     registrationId: String(registrationId),
     starterDiscordId: message.author.id,
     tournamentId,
     guildId: guild.id,
     channelId: message.channel.id,
-    status: 'active',
-    teamName: String(checkResult.team_name || 'Your team'),
+    status: 'awaiting_teammates',
+    teamName: String(teamName),
     captainName: String(checkResult.captain_name || ''),
     captainUid: String(checkResult.captain_uid || ''),
-    squad: Array.isArray(checkResult.squad) ? checkResult.squad : [],
-    players: Array.isArray(checkResult.players) ? checkResult.players : [],
-    substitutes: Array.isArray(checkResult.substitutes) ? checkResult.substitutes : [],
-    teammatesNeeded: teammateIds.length,
-    teammateDiscordIds: teammateIds,
-    uniqueMentionIds: candidateIdsToCheck,
-    expiresAt: new Date(Date.now() + 2 * 60 * 1000), // 2 minutes expiration
-  });
+    matchDistrictUserId: String(registeredCaptainUserId || ''),
+    tournamentFormat: format,
+    tournamentTitle: String(tournamentTitle),
+    teammatesNeeded,
+    selectedTeammateIds: [],
+    expiresAt: new Date(Date.now() + 15 * 60 * 1000), // 15 minutes session
+    createdAt: new Date().toISOString(),
+  };
 
-  const confirmEmbed = new EmbedBuilder()
-    .setTitle('📋 Confirm Tournament Verification')
-    .setColor(0x3b82f6)
-    .setDescription(`Please review your team registration details for **${checkResult.tournament_title || 'Tournament'}**:`)
-    .addFields(
-      { name: 'Team Name', value: `**${checkResult.team_name || 'Your Team'}**`, inline: true },
-      { name: 'Format', value: `\`${format.toUpperCase()}\``, inline: true },
-      { name: 'Team Leader', value: `<@${message.author.id}>`, inline: true },
-      {
-        name: 'Squad Members',
-        value: candidateIdsToCheck.length > 0
-          ? candidateIdsToCheck.map((id) => `• <@${id}>`).join('\n')
-          : `• <@${message.author.id}> (Solo)`,
-        inline: false,
-      }
-    )
-    .setFooter({ text: 'Click Confirm Verification within 2 minutes to finalize. Only you can confirm.' });
+  await createPendingTournamentVerification(pendingDoc);
 
-  const actionRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`cver:confirm:${pendingId}`)
-      .setLabel('Confirm Verification')
-      .setStyle(ButtonStyle.Primary)
-      .setEmoji('✅'),
-    new ButtonBuilder()
-      .setCustomId(`cver:cancel:${pendingId}`)
-      .setLabel('Cancel')
-      .setStyle(ButtonStyle.Secondary)
-      .setEmoji('✖️')
-  );
+  const promptPayload = buildTeammateSelectionPrompt(pendingDoc);
 
   const promptMsg = await message.channel.send({
     content: `<@${message.author.id}>`,
-    embeds: [confirmEmbed],
-    components: [actionRow],
+    ...promptPayload,
     allowedMentions: { users: [message.author.id] },
   });
 
-  // Schedule auto-expiration / prompt cleanup after 2 minutes
+  if (promptMsg?.id) {
+    pendingDoc.promptMessageId = promptMsg.id;
+  }
+
+  // Schedule auto-expiration after 15 minutes
   const timer = setTimeout(async () => {
     pendingPromptTimers.delete(pendingId);
     await promptMsg.delete().catch(() => {});
     await expirePendingTournamentVerificationById(pendingId, message.author.id).catch(() => {});
-  }, 2 * 60 * 1000);
+  }, 15 * 60 * 1000);
   timer.unref?.();
   pendingPromptTimers.set(pendingId, timer);
 
@@ -1166,11 +1434,11 @@ export async function cleanupCentralVerificationOfflineMessages(guild) {
 
     for (const msg of messages.values()) {
       if (msg.author?.bot) {
-        // Remove stale confirmation prompts older than 2 minutes
+        // Remove stale verification prompts older than 15 minutes
         const hasPrompt = msg.components?.some((row) =>
-          row.components?.some((comp) => comp.customId?.startsWith('cver:confirm:'))
+          row.components?.some((comp) => comp.customId?.startsWith('cver:select:') || comp.customId?.startsWith('cver:invite:'))
         );
-        if (hasPrompt && Date.now() - (msg.createdTimestamp || 0) > 2 * 60 * 1000) {
+        if (hasPrompt && Date.now() - (msg.createdTimestamp || 0) > 15 * 60 * 1000) {
           await msg.delete().catch(() => {});
         }
         continue;
