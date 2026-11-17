@@ -231,6 +231,21 @@ import {
   handleBulkRoleInteraction,
 } from './bulkRoleService.js';
 import {
+  handleWelcomeRoleCommand,
+  handleWelcomeRoleInteraction,
+  handleWelcomeRoleOnMemberJoin,
+  loadAllWelcomeConfigsFromDb,
+  WELCOME_ROLE_PREFIX,
+} from './welcomeRoleService.js';
+import {
+  handleRolePeriodCommand,
+  handleRolePeriodInteraction,
+  handleRolePeriodMemberJoin,
+  loadAllRolePeriodConfigsFromDb,
+  startRolePeriodScheduler,
+  ROLE_PERIOD_PREFIX,
+} from './rolePeriodService.js';
+import {
   handleHelpCommand,
   handleHelpInteraction,
   getHelpResponse,
@@ -2881,6 +2896,12 @@ client.once(Events.ClientReady, async (readyClient) => {
     console.warn('[RolePrefix] ⚠️ Startup cache init warning:', rpErr.message);
   });
 
+  // Initialize role period progression configs and background scheduler
+  await loadAllRolePeriodConfigsFromDb().catch((rPeriodErr) => {
+    console.warn('[RolePeriod] ⚠️ Startup configs load warning:', rPeriodErr.message);
+  });
+  startRolePeriodScheduler(readyClient);
+
   // Restore each persisted dashboard in place and clean its command channel after every restart.
   for (const guild of readyClient.guilds.cache.values()) {
     const tournaments = guildSettingsCache[guild.id]?.tournaments || {};
@@ -3320,6 +3341,18 @@ client.on(Events.MessageCreate, async (message) => {
         return;
       } else if (cmd === 'role') {
         const sub = (args[0] || '').toLowerCase();
+        if (sub === 'period') {
+          await handleRolePeriodCommand(
+            message.guild,
+            message.member,
+            message.channel,
+            args.slice(1),
+            (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+            client,
+            message
+          );
+          return;
+        }
         if (sub === 'add' || sub === 'bulk') {
           await handleBulkRoleCommand(
             message.guild,
@@ -3357,6 +3390,17 @@ client.on(Events.MessageCreate, async (message) => {
           return;
         }
         await message.reply(`ℹ️ **Usage:** \`${PREFIX}remove threads\` — Disable thread creation permissions in this channel.`);
+        return;
+      } else if (cmd === 'welcome') {
+        await handleWelcomeRoleCommand(
+          message.guild,
+          message.member,
+          message.channel,
+          args,
+          (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+          client,
+          message
+        );
         return;
       }
     }
@@ -3451,6 +3495,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // Handle Bulk Role Assignment interactions (select menus & buttons)
   if (interaction.customId?.startsWith('bulk_role:')) {
     const handled = await handleBulkRoleInteraction(interaction);
+    if (handled) return;
+  }
+
+  // Handle Welcome Role & Message Configuration interactions (select menus & buttons)
+  if (interaction.customId?.startsWith(WELCOME_ROLE_PREFIX)) {
+    const handled = await handleWelcomeRoleInteraction(interaction, client);
+    if (handled) return;
+  }
+
+  // Handle Role Progression System interactions (setup panel, modals, select menus & buttons)
+  if (interaction.customId?.startsWith(ROLE_PERIOD_PREFIX)) {
+    const handled = await handleRolePeriodInteraction(interaction, client);
     if (handled) return;
   }
 
@@ -3747,6 +3803,18 @@ client.on(Events.GuildMemberAdd, async (member) => {
   }
 
   try {
+    await handleWelcomeRoleOnMemberJoin(member, client);
+  } catch (roleWelcErr) {
+    console.warn(`[WelcomeRole] ⚠️ Error in welcome role join handler for member ${member?.id}:`, roleWelcErr.message);
+  }
+
+  try {
+    await handleRolePeriodMemberJoin(member);
+  } catch (periodErr) {
+    console.warn(`[RolePeriod] ⚠️ Error in role progression join handler for member ${member?.id}:`, periodErr.message);
+  }
+
+  try {
     if (member?.guild && isOfficialGuild(member.guild)) {
       await syncMemberTournamentRoles(member).catch((roleErr) => {
         console.warn(`[Discord Bot] ⚠️ Error syncing roles on join for member ${member?.id}:`, roleErr.message);
@@ -3793,6 +3861,7 @@ export async function startBot(tokenOverride) {
       const [dbSettings, tournaments] = await Promise.all([
         loadAllGuildSettingsFromDb(),
         loadAllTournamentsFromDb(),
+        loadAllWelcomeConfigsFromDb(),
       ]);
       guildSettingsCache = { ...guildSettingsCache, ...dbSettings };
       for (const tournament of tournaments) {

@@ -9,7 +9,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function isRateLimitError(error) {
   return error?.status === 429 || error?.code === 429 || error?.retryAfter != null ||
-    error?.rawError?.retry_after != null || /rate.?limit/i.test(error?.message || '');
+    error?.rawError?.retry_after != null || error?.data?.retry_after != null ||
+    error?.name === 'GatewayRateLimitError' ||
+    /rate.?limit/i.test(error?.message || '');
 }
 
 function retryAfterMs(error) {
@@ -24,7 +26,12 @@ function retryAfterMs(error) {
 function logFetchErrorOnce(guild, error) {
   if (loggedFetchErrors.has(guild.id)) return;
   loggedFetchErrors.add(guild.id);
-  console.warn(`[Discord Bot] Full member cache fetch failed for guild ${guild.id}: ${error?.message || error}`, error);
+  const retryMs = retryAfterMs(error);
+  if (isRateLimitError(error)) {
+    console.warn(`[Discord Bot] Gateway rate limit hit while fetching member cache for guild ${guild.id}. Backing off for ${Math.ceil(retryMs / 1000)}s.`);
+  } else {
+    console.warn(`[Discord Bot] Full member cache fetch failed for guild ${guild.id}: ${error?.message || error}`);
+  }
 }
 
 /** Full member list fetch is startup-only, shared per guild, and throttled. */

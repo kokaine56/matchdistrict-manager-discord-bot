@@ -4,6 +4,8 @@ import { MongoClient } from 'mongodb';
 import { ensureInviteCampaignIndexes } from './bot/discord/features/inviteCampaign/models/inviteCampaignModels.js';
 import { ensureArenaIndexes } from './bot/discord/features/arena/models/arenaModels.js';
 import { ensureRolePrefixIndexes } from './bot/discord/features/rolePrefix/index.js';
+import { ensureWelcomeRoleIndexes } from './welcomeRoleService.js';
+import { ensureRolePeriodIndexes } from './rolePeriodService.js';
 
 let discordAuditClient = null;
 let logTournamentActionFn = null;
@@ -370,6 +372,8 @@ async function ensureMongoIndexes() {
     await ensureInviteCampaignIndexes(mongoDb);
     await ensureArenaIndexes(mongoDb);
     await ensureRolePrefixIndexes(mongoDb);
+    await ensureWelcomeRoleIndexes(mongoDb);
+    await ensureRolePeriodIndexes(mongoDb);
 
     console.log('[MongoDB] 🔒 Indexes verified across managed collections.');
   } catch (err) {
