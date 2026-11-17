@@ -227,6 +227,10 @@ import {
   initRolePrefixCache,
 } from './bot/discord/features/rolePrefix/index.js';
 import {
+  handleBulkRoleCommand,
+  handleBulkRoleInteraction,
+} from './bulkRoleService.js';
+import {
   handleHelpCommand,
   handleHelpInteraction,
   getHelpResponse,
@@ -3298,7 +3302,36 @@ client.on(Events.MessageCreate, async (message) => {
           message
         );
         return;
+      } else if (cmd === 'add') {
+        const sub = (args[0] || '').toLowerCase();
+        if (sub === 'role') {
+          await handleBulkRoleCommand(
+            message.guild,
+            message.member,
+            message.channel,
+            args.slice(1),
+            (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+            client,
+            message
+          );
+          return;
+        }
+        await message.reply(`ℹ️ **Usage:** \`${PREFIX}add role\` — Bulk assign a role to server members.`);
+        return;
       } else if (cmd === 'role') {
+        const sub = (args[0] || '').toLowerCase();
+        if (sub === 'add' || sub === 'bulk') {
+          await handleBulkRoleCommand(
+            message.guild,
+            message.member,
+            message.channel,
+            args.slice(1),
+            (text, opts) => message.reply(typeof text === 'object' ? text : { content: text, ...opts }),
+            client,
+            message
+          );
+          return;
+        }
         await handleRoleCommand(
           message.guild,
           message.member,
@@ -3412,6 +3445,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // Handle Role Prefix wizard interactions (select menus & buttons)
   if (interaction.customId?.startsWith('role_pre:')) {
     const handled = await handleRolePrefixInteraction(interaction);
+    if (handled) return;
+  }
+
+  // Handle Bulk Role Assignment interactions (select menus & buttons)
+  if (interaction.customId?.startsWith('bulk_role:')) {
+    const handled = await handleBulkRoleInteraction(interaction);
     if (handled) return;
   }
 

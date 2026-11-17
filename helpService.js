@@ -11,13 +11,15 @@ export const HELP_ACCENT_COLOR = 0xF97316; // Match District Orange accent
 
 export const COMMAND_CATEGORIES = {
   GENERAL: 'General Commands',
-  TOURNAMENT: 'Tournament Commands',
-  TDM: '1V1 TDM Commands',
-  ROOM_MAKER: 'Room Maker Commands',
-  MODERATION: 'Moderation Commands',
-  ADMINISTRATION: 'Administration Commands',
-  UTILITY: 'Utility Commands',
-  CONFIGURATION: 'Configuration Commands',
+  TOURNAMENT: 'Tournament Management',
+  REGISTRATION_VERIFICATION: 'Registration & Verification',
+  TEAM_MANAGEMENT: 'Team Management',
+  ROUND_MANAGEMENT: 'Round Management',
+  ORGANISER: 'Organiser Commands',
+  TDM: '1V1 TDM Arena',
+  INVITE_EARN: 'Invite & Earn',
+  ROLE_SERVER: 'Role & Server Management',
+  ADMIN_UTILITY: 'Admin & Utility Commands',
 };
 
 export const CATEGORY_METADATA = {
@@ -27,31 +29,39 @@ export const CATEGORY_METADATA = {
   },
   [COMMAND_CATEGORIES.TOURNAMENT]: {
     emoji: '🏆',
-    description: 'Esports tournament control panel, rounds, and squad management',
+    description: 'Tournament listing, selection, control panel, and management',
+  },
+  [COMMAND_CATEGORIES.REGISTRATION_VERIFICATION]: {
+    emoji: '📝',
+    description: 'Central tournament player verification and organiser verification setup',
+  },
+  [COMMAND_CATEGORIES.TEAM_MANAGEMENT]: {
+    emoji: '👥',
+    description: 'Team roster provisioning, live squad sync, and participant role reconciliation',
+  },
+  [COMMAND_CATEGORIES.ROUND_MANAGEMENT]: {
+    emoji: '🔄',
+    description: 'Match room credentials publication and score submission prompts',
+  },
+  [COMMAND_CATEGORIES.ORGANISER]: {
+    emoji: '👑',
+    description: 'Connect and manage MatchDistrict tournament organiser accounts',
   },
   [COMMAND_CATEGORIES.TDM]: {
     emoji: '⚔️',
-    description: 'BGMI 1v1 TDM matchmaking, private matches, and dispute resolution',
+    description: '1v1 TDM matchmaking arena, room maker volunteers, and dispute resolution',
   },
-  [COMMAND_CATEGORIES.ROOM_MAKER]: {
-    emoji: '🎮',
-    description: 'Room Maker volunteer profiles, availability status, and match claims',
+  [COMMAND_CATEGORIES.INVITE_EARN]: {
+    emoji: '🎁',
+    description: 'Invite & Earn campaigns, tracking, leaderboards, and prize rewards',
   },
-  [COMMAND_CATEGORIES.MODERATION]: {
-    emoji: '🛡️',
-    description: 'Member moderation, audit logs, timeouts, bans, and message cleanup',
+  [COMMAND_CATEGORIES.ROLE_SERVER]: {
+    emoji: '🏷️',
+    description: 'Bulk role assignment, role nickname prefixes, audit setup, and voice stats',
   },
-  [COMMAND_CATEGORIES.ADMINISTRATION]: {
+  [COMMAND_CATEGORIES.ADMIN_UTILITY]: {
     emoji: '⚙️',
-    description: 'Server management, thread controls, role prefixes, and invite events',
-  },
-  [COMMAND_CATEGORIES.UTILITY]: {
-    emoji: '🛠️',
-    description: 'Personal invite links, referral histories, and leaderboard metrics',
-  },
-  [COMMAND_CATEGORIES.CONFIGURATION]: {
-    emoji: '🔧',
-    description: 'Server setup, management channels, welcome DMs, and ticket panels',
+    description: 'Moderation, bulk message clearing, welcome onboarding, announcements, and tickets',
   },
 };
 
@@ -60,7 +70,9 @@ export const CATEGORY_METADATA = {
  * Maps all registered bot commands, aliases, syntax, and permission requirements.
  */
 export const COMMAND_DIRECTORY = [
-  // --- General Commands ---
+  // ==========================================
+  // 1. General Commands
+  // ==========================================
   {
     name: 'help',
     category: COMMAND_CATEGORIES.GENERAL,
@@ -98,92 +110,9 @@ export const COMMAND_DIRECTORY = [
     permission: null,
   },
 
-  // --- Room Maker Commands ---
-  {
-    name: 'roommaker profile',
-    category: COMMAND_CATEGORIES.ROOM_MAKER,
-    syntax: (p) => `${p}roommaker profile`,
-    description: 'View your Room Maker profile, match counts, and availability.',
-    aliases: (p) => [`${p}volunteer profile`, `${p}roommaker stats`],
-    adminOnly: false,
-    permission: null,
-  },
-  {
-    name: 'roommaker status',
-    category: COMMAND_CATEGORIES.ROOM_MAKER,
-    syntax: (p) => `${p}roommaker status`,
-    description: 'Toggle your Room Maker availability status (AVAILABLE / UNAVAILABLE).',
-    aliases: (p) => [`${p}volunteer status`],
-    adminOnly: false,
-    permission: null,
-  },
-  {
-    name: 'mymatches',
-    category: COMMAND_CATEGORIES.ROOM_MAKER,
-    syntax: (p) => `${p}mymatches`,
-    description: 'View active 1v1 matches currently assigned to you.',
-    aliases: () => [],
-    adminOnly: false,
-    permission: null,
-  },
-  {
-    name: 'leave',
-    category: COMMAND_CATEGORIES.ROOM_MAKER,
-    syntax: (p) => `${p}leave <matchId>`,
-    description: 'Leave an assigned match before room credentials have been submitted.',
-    aliases: (p) => [`${p}release <matchId>`],
-    adminOnly: false,
-    permission: null,
-  },
-
-  // --- Utility Commands ---
-  {
-    name: 'invite links',
-    category: COMMAND_CATEGORIES.UTILITY,
-    syntax: (p) => `${p}invite links`,
-    description: 'View your personalized invite link and referral metrics.',
-    aliases: (p) => [`${p}invite link`],
-    adminOnly: false,
-    permission: null,
-  },
-  {
-    name: 'invite leaderboard',
-    category: COMMAND_CATEGORIES.UTILITY,
-    syntax: (p) => `${p}invite leaderboard`,
-    description: 'View the live Invite & Earn campaign leaderboard rankings.',
-    aliases: (p) => [`${p}invite lb`, `${p}invite eligible`],
-    adminOnly: false,
-    permission: null,
-  },
-  {
-    name: 'invite history',
-    category: COMMAND_CATEGORIES.UTILITY,
-    syntax: (p) => `${p}invite history`,
-    description: 'View your recent invite referrals and verification statuses.',
-    aliases: (p) => [`${p}invite referrals`],
-    adminOnly: false,
-    permission: null,
-  },
-
-  // --- Tournament Commands (Admin/Organiser) ---
-  {
-    name: 'organiser',
-    category: COMMAND_CATEGORIES.TOURNAMENT,
-    syntax: (p) => `${p}organiser`,
-    description: 'Connect this Discord server to your MatchDistrict organiser account.',
-    aliases: (p) => [`${p}organizer`],
-    adminOnly: true,
-    permission: 'Admin / Organiser',
-  },
-  {
-    name: 'organiser unlink',
-    category: COMMAND_CATEGORIES.TOURNAMENT,
-    syntax: (p) => `${p}organiser unlink`,
-    description: 'Disconnect this Discord server from the linked organiser account.',
-    aliases: (p) => [`${p}organizer unlink`],
-    adminOnly: true,
-    permission: 'Admin / Organiser',
-  },
+  // ==========================================
+  // 2. Tournament Management
+  // ==========================================
   {
     name: 'list tournament',
     category: COMMAND_CATEGORIES.TOURNAMENT,
@@ -212,42 +141,6 @@ export const COMMAND_DIRECTORY = [
     permission: 'Admin / Organiser',
   },
   {
-    name: 'fetch teams',
-    category: COMMAND_CATEGORIES.TOURNAMENT,
-    syntax: (p) => `${p}fetch teams <id>`,
-    description: 'Provision tournament channels & sync live registered squads.',
-    aliases: (p) => [`${p}fetch team <id>`],
-    adminOnly: true,
-    permission: 'Admin / Organiser',
-  },
-  {
-    name: 'cred',
-    category: COMMAND_CATEGORIES.TOURNAMENT,
-    syntax: (p) => `${p}cred <room_id> <password>`,
-    description: 'Publish match credentials inside a private group channel.',
-    aliases: (p) => [`${p}credentials`, `${p}room`],
-    adminOnly: true,
-    permission: 'Admin / Organiser',
-  },
-  {
-    name: 'submit',
-    category: COMMAND_CATEGORIES.TOURNAMENT,
-    syntax: (p) => `${p}submit`,
-    description: 'Open match score and screenshot submission prompt in group channel.',
-    aliases: () => [],
-    adminOnly: true,
-    permission: 'Admin / Organiser',
-  },
-  {
-    name: 'sync roles',
-    category: COMMAND_CATEGORIES.TOURNAMENT,
-    syntax: (p) => `${p}sync roles [id]`,
-    description: 'Synchronize participant access and tournament roles in the server.',
-    aliases: (p) => [`${p}reconcile`],
-    adminOnly: true,
-    permission: 'Admin / Organiser',
-  },
-  {
     name: 'delete tournament',
     category: COMMAND_CATEGORIES.TOURNAMENT,
     syntax: (p) => `${p}delete tournament <id>`,
@@ -257,7 +150,135 @@ export const COMMAND_DIRECTORY = [
     permission: 'Admin Only',
   },
 
-  // --- 1V1 TDM Commands ---
+  // ==========================================
+  // 3. Registration & Verification
+  // ==========================================
+  {
+    name: 'verify',
+    category: COMMAND_CATEGORIES.REGISTRATION_VERIFICATION,
+    syntax: (p) => `${p}verify`,
+    description: 'Deploy and configure central tournament verification panel in #verify-setup / #verify-here.',
+    aliases: () => [],
+    adminOnly: true,
+    permission: 'Admin / Organiser',
+  },
+  {
+    name: 'setup org verification',
+    category: COMMAND_CATEGORIES.REGISTRATION_VERIFICATION,
+    syntax: (p) => `${p}setup org verification`,
+    description: 'Deploy organiser verification setup and role claim panel.',
+    aliases: (p) => [`${p}setup org verify`],
+    adminOnly: true,
+    permission: 'Admin Only',
+  },
+
+  // ==========================================
+  // 4. Team Management
+  // ==========================================
+  {
+    name: 'fetch teams',
+    category: COMMAND_CATEGORIES.TEAM_MANAGEMENT,
+    syntax: (p) => `${p}fetch teams <id>`,
+    description: 'Provision tournament channels & sync live registered squads.',
+    aliases: (p) => [`${p}fetch team <id>`],
+    adminOnly: true,
+    permission: 'Admin / Organiser',
+  },
+  {
+    name: 'sync roles',
+    category: COMMAND_CATEGORIES.TEAM_MANAGEMENT,
+    syntax: (p) => `${p}sync roles [id]`,
+    description: 'Synchronize participant access and tournament roles in the server.',
+    aliases: (p) => [`${p}reconcile`],
+    adminOnly: true,
+    permission: 'Admin / Organiser',
+  },
+
+  // ==========================================
+  // 5. Round Management
+  // ==========================================
+  {
+    name: 'cred',
+    category: COMMAND_CATEGORIES.ROUND_MANAGEMENT,
+    syntax: (p) => `${p}cred <room_id> <password>`,
+    description: 'Publish match credentials inside a private group channel.',
+    aliases: (p) => [`${p}credentials`, `${p}room`],
+    adminOnly: true,
+    permission: 'Admin / Organiser',
+  },
+  {
+    name: 'submit',
+    category: COMMAND_CATEGORIES.ROUND_MANAGEMENT,
+    syntax: (p) => `${p}submit`,
+    description: 'Open match score and screenshot submission prompt in group channel.',
+    aliases: () => [],
+    adminOnly: true,
+    permission: 'Admin / Organiser',
+  },
+
+  // ==========================================
+  // 6. Organiser Commands
+  // ==========================================
+  {
+    name: 'organiser',
+    category: COMMAND_CATEGORIES.ORGANISER,
+    syntax: (p) => `${p}organiser`,
+    description: 'Connect this Discord server to your MatchDistrict organiser account.',
+    aliases: (p) => [`${p}organizer`],
+    adminOnly: true,
+    permission: 'Admin / Organiser',
+  },
+  {
+    name: 'organiser unlink',
+    category: COMMAND_CATEGORIES.ORGANISER,
+    syntax: (p) => `${p}organiser unlink`,
+    description: 'Disconnect this Discord server from the linked organiser account.',
+    aliases: (p) => [`${p}organizer unlink`],
+    adminOnly: true,
+    permission: 'Admin / Organiser',
+  },
+
+  // ==========================================
+  // 7. 1V1 TDM Arena
+  // ==========================================
+  // --- Member / Room Maker Volunteer Commands ---
+  {
+    name: 'roommaker profile',
+    category: COMMAND_CATEGORIES.TDM,
+    syntax: (p) => `${p}roommaker profile`,
+    description: 'View your Room Maker profile, match counts, and availability.',
+    aliases: (p) => [`${p}volunteer profile`, `${p}roommaker stats`],
+    adminOnly: false,
+    permission: null,
+  },
+  {
+    name: 'roommaker status',
+    category: COMMAND_CATEGORIES.TDM,
+    syntax: (p) => `${p}roommaker status`,
+    description: 'Toggle your Room Maker availability status (AVAILABLE / UNAVAILABLE).',
+    aliases: (p) => [`${p}volunteer status`],
+    adminOnly: false,
+    permission: null,
+  },
+  {
+    name: 'mymatches',
+    category: COMMAND_CATEGORIES.TDM,
+    syntax: (p) => `${p}mymatches`,
+    description: 'View active 1v1 matches currently assigned to you.',
+    aliases: () => [],
+    adminOnly: false,
+    permission: null,
+  },
+  {
+    name: 'leave',
+    category: COMMAND_CATEGORIES.TDM,
+    syntax: (p) => `${p}leave <matchId>`,
+    description: 'Leave an assigned match before room credentials have been submitted.',
+    aliases: (p) => [`${p}release <matchId>`],
+    adminOnly: false,
+    permission: null,
+  },
+  // --- Admin 1V1 TDM Commands ---
   {
     name: 'arena setup',
     category: COMMAND_CATEGORIES.TDM,
@@ -385,111 +406,59 @@ export const COMMAND_DIRECTORY = [
     permission: 'Admin Only',
   },
 
-  // --- Moderation Commands ---
+  // ==========================================
+  // 8. Invite & Earn
+  // ==========================================
+  // --- Member Invite Commands ---
   {
-    name: 'ban',
-    category: COMMAND_CATEGORIES.MODERATION,
-    syntax: (p) => `${p}ban @user [reason]`,
-    description: 'Ban a member with role hierarchy checks and audit logging.',
-    aliases: () => [],
-    adminOnly: true,
-    permission: 'Mod / Ban Members',
+    name: 'invite links',
+    category: COMMAND_CATEGORIES.INVITE_EARN,
+    syntax: (p) => `${p}invite links [@user]`,
+    description: 'View your personalized invite link and referral metrics.',
+    aliases: (p) => [`${p}invite link`],
+    adminOnly: false,
+    permission: null,
   },
   {
-    name: 'mute',
-    category: COMMAND_CATEGORIES.MODERATION,
-    syntax: (p) => `${p}mute <@user|id> <minutes>`,
-    description: 'Apply native Discord timeout to a member for specified minutes.',
-    aliases: () => [],
-    adminOnly: true,
-    permission: 'Mod / Moderate Members',
+    name: 'invite leaderboard',
+    category: COMMAND_CATEGORIES.INVITE_EARN,
+    syntax: (p) => `${p}invite leaderboard`,
+    description: 'View the live Invite & Earn campaign leaderboard rankings.',
+    aliases: (p) => [`${p}invite lb`, `${p}invite eligible`],
+    adminOnly: false,
+    permission: null,
   },
   {
-    name: 'unmute',
-    category: COMMAND_CATEGORIES.MODERATION,
-    syntax: (p) => `${p}unmute <@user|id>`,
-    description: 'Remove timeout from a timed-out member.',
-    aliases: () => [],
-    adminOnly: true,
-    permission: 'Mod / Moderate Members',
+    name: 'invite history',
+    category: COMMAND_CATEGORIES.INVITE_EARN,
+    syntax: (p) => `${p}invite history [@user]`,
+    description: 'View your recent invite referrals and verification statuses.',
+    aliases: (p) => [`${p}invite referrals`],
+    adminOnly: false,
+    permission: null,
   },
+  // --- Admin Invite Commands ---
   {
-    name: 'unban',
-    category: COMMAND_CATEGORIES.MODERATION,
-    syntax: (p) => `${p}unban <@user|id>`,
-    description: 'Unban a previously banned user from the server.',
-    aliases: () => [],
-    adminOnly: true,
-    permission: 'Mod / Ban Members',
-  },
-  {
-    name: 'clear',
-    category: COMMAND_CATEGORIES.MODERATION,
-    syntax: (p) => `${p}clear <1-100>`,
-    description: 'Bulk delete recent channel messages (excludes audit channels).',
-    aliases: () => [],
-    adminOnly: true,
-    permission: 'Mod / Manage Messages',
-  },
-
-  // --- Administration Commands ---
-  {
-    name: 'remove threads',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
-    syntax: (p) => `${p}remove threads`,
-    description: 'Disable thread creation permissions in this channel.',
-    aliases: (p) => [`${p}removethreads`],
-    adminOnly: true,
-    permission: 'Admin Only',
-  },
-  {
-    name: 'role pre',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
-    syntax: (p) => `${p}role pre <prefix>`,
-    description: 'Configure an automatic role-based nickname prefix with interactive role selector.',
+    name: 'invite create',
+    category: COMMAND_CATEGORIES.INVITE_EARN,
+    syntax: (p) => `${p}invite create`,
+    description: 'Open interactive campaign creation form and channel selector.',
     aliases: () => [],
     adminOnly: true,
     permission: 'Admin Only',
   },
   {
-    name: 'role pre list',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
-    syntax: (p) => `${p}role pre list`,
-    description: 'Show all configured role nickname prefixes in this server.',
-    aliases: () => [],
-    adminOnly: true,
-    permission: 'Admin Only',
-  },
-  {
-    name: 'role pre remove',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
-    syntax: (p) => `${p}role pre remove [role]`,
-    description: 'Remove a role prefix configuration and revert managed member nicknames.',
-    aliases: () => [],
-    adminOnly: true,
-    permission: 'Admin Only',
-  },
-  {
-    name: 'role pre refresh',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
-    syntax: (p) => `${p}role pre refresh`,
-    description: 'Reapply configured prefixes to all eligible server members.',
-    aliases: () => [],
-    adminOnly: true,
-    permission: 'Admin Only',
-  },
-  {
-    name: 'invite min',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
-    syntax: (p) => `${p}invite min <number>`,
-    description: 'Set minimum successful invite threshold for the active campaign.',
+    name: 'invite start',
+    category: COMMAND_CATEGORIES.INVITE_EARN,
+    syntax: (p) => `${p}invite start|pause|resume|end`,
+    description: 'Manage campaign lifecycle transitions.',
     aliases: () => [],
     adminOnly: true,
     permission: 'Admin Only',
   },
   {
     name: 'invite poster',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
+    category: COMMAND_CATEGORIES.INVITE_EARN,
     syntax: (p) => `${p}invite poster`,
     description: 'Set or replace the campaign announcement poster image from an attachment.',
     aliases: () => [],
@@ -498,7 +467,7 @@ export const COMMAND_DIRECTORY = [
   },
   {
     name: 'invite poster remove',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
+    category: COMMAND_CATEGORIES.INVITE_EARN,
     syntax: (p) => `${p}invite poster remove`,
     description: 'Remove campaign poster and restore the default embed on the panel.',
     aliases: () => [],
@@ -506,8 +475,35 @@ export const COMMAND_DIRECTORY = [
     permission: 'Admin Only',
   },
   {
+    name: 'invite min',
+    category: COMMAND_CATEGORIES.INVITE_EARN,
+    syntax: (p) => `${p}invite min <number>`,
+    description: 'Set minimum successful invite threshold for the active campaign.',
+    aliases: () => [],
+    adminOnly: true,
+    permission: 'Admin Only',
+  },
+  {
+    name: 'invite status',
+    category: COMMAND_CATEGORIES.INVITE_EARN,
+    syntax: (p) => `${p}invite status`,
+    description: 'View campaign metrics, active participants, and referral stats.',
+    aliases: (p) => [`${p}invite stats`],
+    adminOnly: true,
+    permission: 'Admin Only',
+  },
+  {
+    name: 'invite rewards',
+    category: COMMAND_CATEGORIES.INVITE_EARN,
+    syntax: (p) => `${p}invite rewards`,
+    description: 'View configured invite campaign prize tiers and reward distribution.',
+    aliases: (p) => [`${p}invite config`],
+    adminOnly: true,
+    permission: 'Admin Only',
+  },
+  {
     name: 'invite set prize',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
+    category: COMMAND_CATEGORIES.INVITE_EARN,
     syntax: (p) => `${p}invite set prize <rank> <amount>`,
     description: 'Configure leaderboard rank prize rewards.',
     aliases: () => [],
@@ -516,7 +512,7 @@ export const COMMAND_DIRECTORY = [
   },
   {
     name: 'invite set',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
+    category: COMMAND_CATEGORIES.INVITE_EARN,
     syntax: (p) => `${p}invite set <start|end|channel> <val>`,
     description: 'Configure campaign schedule dates and target Discord channels.',
     aliases: () => [],
@@ -524,35 +520,8 @@ export const COMMAND_DIRECTORY = [
     permission: 'Admin Only',
   },
   {
-    name: 'invite start',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
-    syntax: (p) => `${p}invite start|pause|resume|end`,
-    description: 'Manage campaign lifecycle transitions.',
-    aliases: () => [],
-    adminOnly: true,
-    permission: 'Admin Only',
-  },
-  {
-    name: 'invite rewards',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
-    syntax: (p) => `${p}invite rewards`,
-    description: 'View configured invite campaign prize tiers and reward distribution.',
-    aliases: (p) => [`${p}invite config`],
-    adminOnly: true,
-    permission: 'Admin Only',
-  },
-  {
-    name: 'invite status',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
-    syntax: (p) => `${p}invite status`,
-    description: 'View campaign metrics, active participants, and referral stats.',
-    aliases: (p) => [`${p}invite stats`],
-    adminOnly: true,
-    permission: 'Admin Only',
-  },
-  {
     name: 'invite disqualify',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
+    category: COMMAND_CATEGORIES.INVITE_EARN,
     syntax: (p) => `${p}invite disqualify @user <reason>`,
     description: 'Disqualify a fraudulent participant and void their referrals.',
     aliases: (p) => [`${p}invite dq`],
@@ -561,27 +530,74 @@ export const COMMAND_DIRECTORY = [
   },
   {
     name: 'invite review',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
+    category: COMMAND_CATEGORIES.INVITE_EARN,
     syntax: (p) => `${p}invite review`,
     description: 'Review flagged unattributed joins and referral audit integrity.',
     aliases: () => [],
     adminOnly: true,
     permission: 'Admin Only',
   },
+
+  // ==========================================
+  // 9. Role & Server Management
+  // ==========================================
   {
-    name: 'deletemsg',
-    category: COMMAND_CATEGORIES.ADMINISTRATION,
-    syntax: (p) => `${p}deletemsg <message_id>`,
-    description: 'Delete a managed bot message record from DB and Discord.',
-    aliases: (p) => [`${p}deletemessage`],
+    name: 'add role',
+    category: COMMAND_CATEGORIES.ROLE_SERVER,
+    syntax: (p) => `${p}add role`,
+    description: 'Bulk assign a role to multiple selected members or all eligible server members with interactive dropdowns.',
+    aliases: (p) => [`${p}role add`, `${p}role bulk`],
+    adminOnly: true,
+    permission: 'Admin / Manage Roles',
+  },
+  {
+    name: 'role pre',
+    category: COMMAND_CATEGORIES.ROLE_SERVER,
+    syntax: (p) => `${p}role pre <prefix>`,
+    description: 'Configure an automatic role-based nickname prefix with interactive role selector.',
+    aliases: () => [],
     adminOnly: true,
     permission: 'Admin Only',
   },
-
-  // --- Configuration Commands ---
+  {
+    name: 'role pre list',
+    category: COMMAND_CATEGORIES.ROLE_SERVER,
+    syntax: (p) => `${p}role pre list`,
+    description: 'Show all configured role nickname prefixes in this server.',
+    aliases: () => [],
+    adminOnly: true,
+    permission: 'Admin Only',
+  },
+  {
+    name: 'role pre remove',
+    category: COMMAND_CATEGORIES.ROLE_SERVER,
+    syntax: (p) => `${p}role pre remove [role]`,
+    description: 'Remove a role prefix configuration and revert managed member nicknames.',
+    aliases: () => [],
+    adminOnly: true,
+    permission: 'Admin Only',
+  },
+  {
+    name: 'role pre refresh',
+    category: COMMAND_CATEGORIES.ROLE_SERVER,
+    syntax: (p) => `${p}role pre refresh`,
+    description: 'Reapply configured prefixes to all eligible server members.',
+    aliases: () => [],
+    adminOnly: true,
+    permission: 'Admin Only',
+  },
+  {
+    name: 'remove threads',
+    category: COMMAND_CATEGORIES.ROLE_SERVER,
+    syntax: (p) => `${p}remove threads`,
+    description: 'Disable thread creation permissions in this channel.',
+    aliases: (p) => [`${p}removethreads`],
+    adminOnly: true,
+    permission: 'Admin Only',
+  },
   {
     name: 'setup',
-    category: COMMAND_CATEGORIES.CONFIGURATION,
+    category: COMMAND_CATEGORIES.ROLE_SERVER,
     syntax: (p) => `${p}setup`,
     description: 'Create and configure server audit channels and member count.',
     aliases: () => [],
@@ -590,7 +606,7 @@ export const COMMAND_DIRECTORY = [
   },
   {
     name: 'setup remove',
-    category: COMMAND_CATEGORIES.CONFIGURATION,
+    category: COMMAND_CATEGORIES.ROLE_SERVER,
     syntax: (p) => `${p}setup remove`,
     description: 'Safely initiate 30-second confirmed removal of management channels.',
     aliases: () => [],
@@ -599,7 +615,7 @@ export const COMMAND_DIRECTORY = [
   },
   {
     name: 'setup confirm',
-    category: COMMAND_CATEGORIES.CONFIGURATION,
+    category: COMMAND_CATEGORIES.ROLE_SERVER,
     syntax: (p) => `${p}setup confirm`,
     description: 'Confirm pending removal of bot-managed audit channels.',
     aliases: () => [],
@@ -608,7 +624,7 @@ export const COMMAND_DIRECTORY = [
   },
   {
     name: 'setup cancel',
-    category: COMMAND_CATEGORIES.CONFIGURATION,
+    category: COMMAND_CATEGORIES.ROLE_SERVER,
     syntax: (p) => `${p}setup cancel`,
     description: 'Cancel pending channel removal request.',
     aliases: () => [],
@@ -617,7 +633,7 @@ export const COMMAND_DIRECTORY = [
   },
   {
     name: 'setup tournament',
-    category: COMMAND_CATEGORIES.CONFIGURATION,
+    category: COMMAND_CATEGORIES.ROLE_SERVER,
     syntax: (p) => `${p}setup tournament`,
     description: 'Launch interactive setup wizard to configure a custom tournament.',
     aliases: () => [],
@@ -626,16 +642,74 @@ export const COMMAND_DIRECTORY = [
   },
   {
     name: 'member count',
-    category: COMMAND_CATEGORIES.CONFIGURATION,
+    category: COMMAND_CATEGORIES.ROLE_SERVER,
     syntax: (p) => `${p}member count <text>`,
     description: 'Set custom text prefix for the member-count voice channel.',
     aliases: () => [],
     adminOnly: true,
     permission: 'Admin Only',
   },
+
+  // ==========================================
+  // 10. Admin & Utility Commands
+  // ==========================================
+  {
+    name: 'ban',
+    category: COMMAND_CATEGORIES.ADMIN_UTILITY,
+    syntax: (p) => `${p}ban @user [reason]`,
+    description: 'Ban a member with role hierarchy checks and audit logging.',
+    aliases: () => [],
+    adminOnly: true,
+    permission: 'Mod / Ban Members',
+  },
+  {
+    name: 'mute',
+    category: COMMAND_CATEGORIES.ADMIN_UTILITY,
+    syntax: (p) => `${p}mute <@user|id> <minutes>`,
+    description: 'Apply native Discord timeout to a member for specified minutes.',
+    aliases: () => [],
+    adminOnly: true,
+    permission: 'Mod / Moderate Members',
+  },
+  {
+    name: 'unmute',
+    category: COMMAND_CATEGORIES.ADMIN_UTILITY,
+    syntax: (p) => `${p}unmute <@user|id>`,
+    description: 'Remove timeout from a timed-out member.',
+    aliases: () => [],
+    adminOnly: true,
+    permission: 'Mod / Moderate Members',
+  },
+  {
+    name: 'unban',
+    category: COMMAND_CATEGORIES.ADMIN_UTILITY,
+    syntax: (p) => `${p}unban <@user|id>`,
+    description: 'Unban a previously banned user from the server.',
+    aliases: () => [],
+    adminOnly: true,
+    permission: 'Mod / Ban Members',
+  },
+  {
+    name: 'clear',
+    category: COMMAND_CATEGORIES.ADMIN_UTILITY,
+    syntax: (p) => `${p}clear <1-100>`,
+    description: 'Bulk delete recent channel messages (excludes audit channels).',
+    aliases: () => [],
+    adminOnly: true,
+    permission: 'Mod / Manage Messages',
+  },
+  {
+    name: 'deletemsg',
+    category: COMMAND_CATEGORIES.ADMIN_UTILITY,
+    syntax: (p) => `${p}deletemsg <message_id>`,
+    description: 'Delete a managed bot message record from DB and Discord.',
+    aliases: (p) => [`${p}deletemessage`],
+    adminOnly: true,
+    permission: 'Admin Only',
+  },
   {
     name: 'dm welcome on',
-    category: COMMAND_CATEGORIES.CONFIGURATION,
+    category: COMMAND_CATEGORIES.ADMIN_UTILITY,
     syntax: (p) => `${p}dm welcome on`,
     description: 'Enable welcome DMs for new members.',
     aliases: () => [],
@@ -644,7 +718,7 @@ export const COMMAND_DIRECTORY = [
   },
   {
     name: 'dm welcome off',
-    category: COMMAND_CATEGORIES.CONFIGURATION,
+    category: COMMAND_CATEGORIES.ADMIN_UTILITY,
     syntax: (p) => `${p}dm welcome off`,
     description: 'Disable welcome DMs for new members.',
     aliases: () => [],
@@ -652,26 +726,8 @@ export const COMMAND_DIRECTORY = [
     permission: 'Admin Only',
   },
   {
-    name: 'ticket setup',
-    category: COMMAND_CATEGORIES.CONFIGURATION,
-    syntax: (p) => `${p}ticket setup`,
-    description: 'Deploy the interactive support ticket panel in this channel.',
-    aliases: () => [],
-    adminOnly: true,
-    permission: 'Admin Only',
-  },
-  {
-    name: 'ticket delete',
-    category: COMMAND_CATEGORIES.CONFIGURATION,
-    syntax: (p) => `${p}ticket delete`,
-    description: 'Delete the support ticket panel and clean up ticket records.',
-    aliases: () => [],
-    adminOnly: true,
-    permission: 'Admin Only',
-  },
-  {
     name: 'annc',
-    category: COMMAND_CATEGORIES.CONFIGURATION,
+    category: COMMAND_CATEGORIES.ADMIN_UTILITY,
     syntax: (p) => `${p}annc [channel|setup]`,
     description: 'Launch announcement manager to send channel announcements or configure DM delivery.',
     aliases: (p) => [`${p}announcement`],
@@ -680,9 +736,27 @@ export const COMMAND_DIRECTORY = [
   },
   {
     name: 'annc setup',
-    category: COMMAND_CATEGORIES.CONFIGURATION,
+    category: COMMAND_CATEGORIES.ADMIN_UTILITY,
     syntax: (p) => `${p}annc setup`,
     description: 'Configure private announcement DM dispatch channel.',
+    aliases: () => [],
+    adminOnly: true,
+    permission: 'Admin Only',
+  },
+  {
+    name: 'ticket setup',
+    category: COMMAND_CATEGORIES.ADMIN_UTILITY,
+    syntax: (p) => `${p}ticket setup`,
+    description: 'Deploy the interactive support ticket panel in this channel.',
+    aliases: () => [],
+    adminOnly: true,
+    permission: 'Admin Only',
+  },
+  {
+    name: 'ticket delete',
+    category: COMMAND_CATEGORIES.ADMIN_UTILITY,
+    syntax: (p) => `${p}ticket delete`,
+    description: 'Delete the support ticket panel and clean up ticket records.',
     aliases: () => [],
     adminOnly: true,
     permission: 'Admin Only',
@@ -690,7 +764,8 @@ export const COMMAND_DIRECTORY = [
 ];
 
 /**
- * Returns available categories containing commands for the user.
+ * Returns available categories containing visible, active commands for the user.
+ * Dynamically excludes empty categories or disabled commands.
  * @param {object} param0
  * @param {boolean} param0.isAdmin
  * @returns {Array<string>}
@@ -698,6 +773,7 @@ export const COMMAND_DIRECTORY = [
 export function getHelpCategories({ isAdmin = false } = {}) {
   const visibleCategories = new Set();
   for (const cmd of COMMAND_DIRECTORY) {
+    if (cmd.disabled || cmd.enabled === false) continue;
     if (!cmd.adminOnly || isAdmin) {
       visibleCategories.add(cmd.category);
     }
@@ -709,47 +785,48 @@ export function getHelpCategories({ isAdmin = false } = {}) {
 
 /**
  * Retrieves commands for a specific category.
+ * Automatically excludes disabled commands and filters by user permissions.
  */
 export function getCommandsByCategory(category, { isAdmin = false, prefix = '.' } = {}) {
   return COMMAND_DIRECTORY.filter(
-    (cmd) => cmd.category === category && (!cmd.adminOnly || isAdmin)
+    (cmd) =>
+      cmd.category === category &&
+      !cmd.disabled &&
+      cmd.enabled !== false &&
+      (!cmd.adminOnly || isAdmin)
   );
 }
 
 /**
- * Defines page groupings for paginated overview.
+ * Defines page groupings for the paginated Overview embed.
  * Ensures each page never exceeds Discord embed limits.
  */
 export function getHelpPageGroups(isAdmin = false) {
   if (!isAdmin) {
-    // Ordinary member commands: General, Room Maker, Utility fit nicely on 1 page
-    return [
-      [
-        COMMAND_CATEGORIES.GENERAL,
-        COMMAND_CATEGORIES.ROOM_MAKER,
-        COMMAND_CATEGORIES.UTILITY,
-      ],
-    ];
+    const regularCats = getHelpCategories({ isAdmin: false });
+    return [regularCats];
   }
 
-  // Admin pages:
-  // Page 0: General, Room Maker, Utility (Member commands)
-  // Page 1: Tournament, 1V1 TDM (Gaming operations)
-  // Page 2: Moderation, Administration, Configuration (Management & Config)
+  // Admin pages: 10 categories distributed logically across 3 pages
+  // Page 1: General, Tournament Management, Registration & Verification, Team Management
+  // Page 2: Round Management, Organiser Commands, 1V1 TDM Arena
+  // Page 3: Invite & Earn, Role & Server Management, Admin & Utility Commands
   return [
     [
       COMMAND_CATEGORIES.GENERAL,
-      COMMAND_CATEGORIES.ROOM_MAKER,
-      COMMAND_CATEGORIES.UTILITY,
+      COMMAND_CATEGORIES.TOURNAMENT,
+      COMMAND_CATEGORIES.REGISTRATION_VERIFICATION,
+      COMMAND_CATEGORIES.TEAM_MANAGEMENT,
     ],
     [
-      COMMAND_CATEGORIES.TOURNAMENT,
+      COMMAND_CATEGORIES.ROUND_MANAGEMENT,
+      COMMAND_CATEGORIES.ORGANISER,
       COMMAND_CATEGORIES.TDM,
     ],
     [
-      COMMAND_CATEGORIES.MODERATION,
-      COMMAND_CATEGORIES.ADMINISTRATION,
-      COMMAND_CATEGORIES.CONFIGURATION,
+      COMMAND_CATEGORIES.INVITE_EARN,
+      COMMAND_CATEGORIES.ROLE_SERVER,
+      COMMAND_CATEGORIES.ADMIN_UTILITY,
     ],
   ];
 }
@@ -796,16 +873,26 @@ export function buildHelpEmbed({
     .setColor(HELP_ACCENT_COLOR)
     .setTimestamp();
 
+  const categories = getHelpCategories({ isAdmin });
+
+  // 1. Single Category View
   if (selectedCategory) {
     const meta = CATEGORY_METADATA[selectedCategory] || { emoji: '📁', description: '' };
-    embed.setTitle(`${meta.emoji} ${selectedCategory}`);
+    const catIndex = categories.indexOf(selectedCategory);
+    const catPageStr = catIndex >= 0 ? ` (${catIndex + 1}/${categories.length})` : '';
+
+    embed.setTitle(`${meta.emoji} ${selectedCategory}${catPageStr}`);
     if (meta.description) {
       embed.setDescription(`*${meta.description}*\n────────────────────────────────────────`);
     }
 
     const commands = getCommandsByCategory(selectedCategory, { isAdmin, prefix });
     if (commands.length === 0) {
-      embed.addFields({ name: 'Commands', value: '*No commands available in this category for your permission level.*', inline: false });
+      embed.addFields({
+        name: 'Commands',
+        value: '*No commands available in this category for your permission level.*',
+        inline: false,
+      });
     } else {
       const commandLines = commands.map((cmd) => {
         const syntaxStr = cmd.syntax(prefix);
@@ -819,12 +906,12 @@ export function buildHelpEmbed({
     }
 
     embed.setFooter({
-      text: `Prefix: "${prefix}" • Use menu to switch category or return to All Pages`,
+      text: `Category ${catIndex >= 0 ? catIndex + 1 : 1} of ${categories.length} • Prefix: "${prefix}" • Use buttons or menu to browse`,
     });
     return embed;
   }
 
-  // Multi-category page
+  // 2. Multi-Category Overview Page
   const pageGroups = getHelpPageGroups(isAdmin);
   const safePageIndex = Math.max(0, Math.min(pageIndex, pageGroups.length - 1));
   const activeCategories = pageGroups[safePageIndex] || [];
@@ -871,15 +958,15 @@ export function buildHelpComponents({
   const pageGroups = getHelpPageGroups(isAdmin);
   const totalPages = pageGroups.length;
   const adminFlag = isAdmin ? '1' : '0';
+  const categories = getHelpCategories({ isAdmin });
 
   const components = [];
 
-  // 1. Category Select Menu
-  const categories = getHelpCategories({ isAdmin });
+  // Row 1: Category Select Menu
   if (categories.length > 0) {
     const options = [
       {
-        label: '📖 All Commands (Overview)',
+        label: '📖 All Categories (Overview)',
         description: 'View paginated command overview',
         value: 'all',
         default: !selectedCategory,
@@ -899,20 +986,57 @@ export function buildHelpComponents({
 
     const selectMenu = new StringSelectMenuBuilder()
       .setCustomId(`help:cat:${adminFlag}:${pageIndex}`)
-      .setPlaceholder('Filter by command category...')
+      .setPlaceholder('Select a command category...')
       .addOptions(options.slice(0, 25));
 
     components.push(new ActionRowBuilder().addComponents(selectMenu));
   }
 
-  // 2. Pagination Buttons (only if not in single category and more than 1 page)
-  if (totalPages > 1 && !selectedCategory) {
+  // Row 2: Category Navigation Buttons (when inside a single category)
+  if (selectedCategory) {
+    const catIndex = Math.max(0, categories.indexOf(selectedCategory));
+
+    const prevCatBtn = new ButtonBuilder()
+      .setCustomId(`help:cnav:${adminFlag}:${catIndex - 1}`)
+      .setLabel('Prev Category')
+      .setEmoji('◀️')
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(catIndex <= 0);
+
+    const indicatorBtn = new ButtonBuilder()
+      .setCustomId(`help:ind:${catIndex}`)
+      .setLabel(`${catIndex + 1} / ${categories.length}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(true);
+
+    const nextCatBtn = new ButtonBuilder()
+      .setCustomId(`help:cnav:${adminFlag}:${catIndex + 1}`)
+      .setLabel('Next Category')
+      .setEmoji('▶️')
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(catIndex >= categories.length - 1);
+
+    const overviewBtn = new ButtonBuilder()
+      .setCustomId(`help:p:0:${adminFlag}`)
+      .setLabel('All Categories')
+      .setEmoji('📖')
+      .setStyle(ButtonStyle.Secondary);
+
+    components.push(new ActionRowBuilder().addComponents(prevCatBtn, indicatorBtn, nextCatBtn, overviewBtn));
+  } else if (totalPages > 1) {
+    // Row 2: Overview Pagination Buttons (when viewing multi-category overview)
     const prevBtn = new ButtonBuilder()
       .setCustomId(`help:p:${pageIndex - 1}:${adminFlag}`)
       .setLabel('Previous')
       .setEmoji('◀️')
       .setStyle(ButtonStyle.Primary)
       .setDisabled(pageIndex <= 0);
+
+    const pageIndicatorBtn = new ButtonBuilder()
+      .setCustomId(`help:pind:${pageIndex}`)
+      .setLabel(`Page ${pageIndex + 1} / ${totalPages}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(true);
 
     const nextBtn = new ButtonBuilder()
       .setCustomId(`help:p:${pageIndex + 1}:${adminFlag}`)
@@ -921,15 +1045,7 @@ export function buildHelpComponents({
       .setStyle(ButtonStyle.Primary)
       .setDisabled(pageIndex >= totalPages - 1);
 
-    components.push(new ActionRowBuilder().addComponents(prevBtn, nextBtn));
-  } else if (selectedCategory) {
-    const backBtn = new ButtonBuilder()
-      .setCustomId(`help:p:0:${adminFlag}`)
-      .setLabel('Back to All Pages')
-      .setEmoji('🔙')
-      .setStyle(ButtonStyle.Secondary);
-
-    components.push(new ActionRowBuilder().addComponents(backBtn));
+    components.push(new ActionRowBuilder().addComponents(prevBtn, pageIndicatorBtn, nextBtn));
   }
 
   return components;
@@ -937,7 +1053,6 @@ export function buildHelpComponents({
 
 /**
  * Text representation builder for backwards compatibility and unit testing.
- * Ensures tests like `assert.match(help, /\.remove threads/)` pass seamlessly.
  */
 export function buildHelpText(prefix = '.', { isAdmin = true } = {}) {
   const lines = [
@@ -982,19 +1097,22 @@ export function getHelpResponse(prefix = '.', options = {}) {
 }
 
 /**
- * Resolves a category name from partial user input (e.g. "tdm", "mod", "admin", "roommaker").
+ * Resolves a category name from partial user input.
  */
 export function resolveCategoryFromInput(input) {
   if (!input) return null;
   const lower = input.trim().toLowerCase();
-  if (lower === 'tdm' || lower === 'arena' || lower === '1v1') return COMMAND_CATEGORIES.TDM;
-  if (lower === 'tournament' || lower === 'tournaments' || lower === 'tourney') return COMMAND_CATEGORIES.TOURNAMENT;
-  if (lower === 'roommaker' || lower === 'volunteer' || lower === 'room') return COMMAND_CATEGORIES.ROOM_MAKER;
-  if (lower === 'mod' || lower === 'moderation') return COMMAND_CATEGORIES.MODERATION;
-  if (lower === 'admin' || lower === 'administration') return COMMAND_CATEGORIES.ADMINISTRATION;
-  if (lower === 'config' || lower === 'configuration' || lower === 'setup') return COMMAND_CATEGORIES.CONFIGURATION;
-  if (lower === 'util' || lower === 'utility' || lower === 'invite') return COMMAND_CATEGORIES.UTILITY;
-  if (lower === 'general' || lower === 'info') return COMMAND_CATEGORIES.GENERAL;
+
+  if (['general', 'gen', 'info'].includes(lower)) return COMMAND_CATEGORIES.GENERAL;
+  if (['tournament', 'tournaments', 'tourney', 'tour'].includes(lower)) return COMMAND_CATEGORIES.TOURNAMENT;
+  if (['registration', 'verify', 'verification', 'reg', 'register'].includes(lower)) return COMMAND_CATEGORIES.REGISTRATION_VERIFICATION;
+  if (['team', 'teams', 'team management', 'squad', 'squads'].includes(lower)) return COMMAND_CATEGORIES.TEAM_MANAGEMENT;
+  if (['round', 'rounds', 'round management', 'cred', 'creds', 'submit'].includes(lower)) return COMMAND_CATEGORIES.ROUND_MANAGEMENT;
+  if (['organiser', 'organizer', 'org'].includes(lower)) return COMMAND_CATEGORIES.ORGANISER;
+  if (['tdm', 'arena', '1v1', '1v1 tdm', 'volunteer', 'roommaker', 'room maker'].includes(lower)) return COMMAND_CATEGORIES.TDM;
+  if (['invite', 'earn', 'invite & earn', 'invite and earn', 'referral', 'campaign'].includes(lower)) return COMMAND_CATEGORIES.INVITE_EARN;
+  if (['role', 'roles', 'server', 'prefix', 'role & server', 'role and server'].includes(lower)) return COMMAND_CATEGORIES.ROLE_SERVER;
+  if (['admin', 'utility', 'mod', 'moderation', 'admin & utility', 'admin and utility', 'util'].includes(lower)) return COMMAND_CATEGORIES.ADMIN_UTILITY;
 
   return Object.values(COMMAND_CATEGORIES).find(
     (c) => c.toLowerCase() === lower || c.toLowerCase().includes(lower)
@@ -1036,8 +1154,9 @@ export async function handleHelpInteraction(interaction, prefix = '.') {
   if (!customId.startsWith('help:')) return false;
 
   const parts = customId.split(':');
-  const type = parts[1]; // 'p' (page) or 'cat' (category)
+  const type = parts[1]; // 'p' (page), 'cat' (select menu), 'cnav' (category nav)
 
+  // 1. Overview Pagination (Page Next / Prev / Overview)
   if (type === 'p') {
     const pageIndex = parseInt(parts[2], 10) || 0;
     const isAdminUser = parts[3] === '1';
@@ -1064,6 +1183,7 @@ export async function handleHelpInteraction(interaction, prefix = '.') {
     return true;
   }
 
+  // 2. Select Menu Category Selection
   if (type === 'cat') {
     const isAdminUser = parts[2] === '1';
     const pageIndex = parseInt(parts[3], 10) || 0;
@@ -1090,6 +1210,40 @@ export async function handleHelpInteraction(interaction, prefix = '.') {
       embeds: [embed],
       components,
     }).catch(() => {});
+    return true;
+  }
+
+  // 3. Category Navigation Buttons (Prev Category / Next Category)
+  if (type === 'cnav') {
+    const isAdminUser = parts[2] === '1';
+    const targetCatIndex = parseInt(parts[3], 10) || 0;
+    const categories = getHelpCategories({ isAdmin: isAdminUser });
+    const selectedCategory = categories[targetCatIndex] || null;
+
+    const embed = buildHelpEmbed({
+      prefix,
+      isAdmin: isAdminUser,
+      pageIndex: 0,
+      selectedCategory,
+      guild: interaction.guild,
+    });
+
+    const components = buildHelpComponents({
+      prefix,
+      isAdmin: isAdminUser,
+      pageIndex: 0,
+      selectedCategory,
+    });
+
+    await interaction.update({
+      embeds: [embed],
+      components,
+    }).catch(() => {});
+    return true;
+  }
+
+  // Non-actionable indicator buttons
+  if (type === 'ind' || type === 'pind') {
     return true;
   }
 
